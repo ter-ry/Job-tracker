@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+data/*.sqlite
+data/generated_applications/
+data/generated_resumes/
+data/generated_cover_letters/
+data/uploads/
+data/uploaded_resumes/
+data/semantic_cache/
+models/
+.cache/
+*.docx
+*.pdf
+*.key
+*.pem
