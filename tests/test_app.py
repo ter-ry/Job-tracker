@@ -3,12 +3,19 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+import zipfile
 
 import app as app_module
 import grounding
 import semantic_matching
 import seniority
 import tailoring
+from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.opc.constants import RELATIONSHIP_TYPE as RT
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.shared import Inches, Pt
 
 
 class FakeEmbeddingBackend:
@@ -64,7 +71,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("Flask dashboards", upload.get_json()["resume_text"])
 
     def test_job_create_scores_and_dashboard(self):
-        self.seed_profile_for_documents()
+        self.seed_profile_for_documents(with_template=True)
         response = self.client.post(
             "/api/jobs",
             json={
@@ -85,7 +92,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(dashboard["high_fit"], 1)
 
     def test_generation_saves_versions_and_exports(self):
-        self.seed_profile_for_documents()
+        self.seed_profile_for_documents(with_template=True)
         created = self.client.post(
             "/api/jobs",
             json={
@@ -581,7 +588,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertNotEqual(first["profile_resume_hash"], second["profile_resume_hash"])
 
     def test_generated_versions_mark_outdated_after_profile_change(self):
-        self.seed_profile_for_documents()
+        self.seed_profile_for_documents(with_template=True)
         created = self.client.post(
             "/api/jobs",
             json={"company": "OpsTools", "title": "Software Developer", "job_description": "Python SQL Flask"},
@@ -591,6 +598,94 @@ class JobAssistantTest(unittest.TestCase):
         self.client.post("/api/profile", json={**self.rece_profile(), "name": "New Profile"})
         versions = self.client.get(f"/api/jobs/{created['id']}/versions").get_json()
         self.assertTrue(any(version["status"] == "Outdated — regenerate using current profile" for version in versions))
+
+    def test_tailored_resume_preserves_master_docx_formatting(self):
+        self.seed_profile_for_documents(with_template=True)
+        profile = self.client.get("/api/profile").get_json()
+        master_path = Path(profile["resume_docx_template_path"])
+        master_before = master_path.read_bytes()
+        created = self.client.post(
+            "/api/shortlist",
+            json={
+                "company": "Northstar",
+                "title": "Software Developer",
+                "location": "Toronto",
+                "url": "https://example.com/job/format",
+                "job_description": "Python Flask SQL React dashboards cloud automation",
+            },
+        ).get_json()
+        self.assertEqual(created["resume_generation_status"], "generated")
+        resume_path = Path(created["resume_docx_path"])
+        self.assertEqual(master_before, master_path.read_bytes())
+
+        master_doc = Document(io.BytesIO(master_path.read_bytes()))
+        tailored_doc = Document(io.BytesIO(resume_path.read_bytes()))
+
+        self.assertEqual(len(master_doc.sections), len(tailored_doc.sections))
+        self.assertEqual(len(master_doc.paragraphs), len(tailored_doc.paragraphs))
+        self.assertEqual(len(master_doc.tables), len(tailored_doc.tables))
+
+        self.assertEqual(master_doc.paragraphs[0].style.name, tailored_doc.paragraphs[0].style.name)
+        self.assertEqual(master_doc.paragraphs[0].text, tailored_doc.paragraphs[0].text)
+
+        self.assertNotEqual(master_doc.paragraphs[2].text, tailored_doc.paragraphs[2].text)
+        self.assertEqual(master_doc.paragraphs[2].runs[0].font.name, tailored_doc.paragraphs[2].runs[0].font.name)
+        self.assertEqual(master_doc.paragraphs[2].runs[0].font.size.pt, tailored_doc.paragraphs[2].runs[0].font.size.pt)
+
+        self.assertEqual(master_doc.paragraphs[5].style.name, "List Bullet")
+        self.assertEqual(tailored_doc.paragraphs[5].style.name, "List Bullet")
+        self.assertEqual(master_doc.paragraphs[5].text, tailored_doc.paragraphs[5].text)
+        self.assertEqual(master_doc.paragraphs[6].text, tailored_doc.paragraphs[6].text)
+        self.assertEqual(master_doc.paragraphs[8].style.name, tailored_doc.paragraphs[8].style.name)
+        self.assertEqual(master_doc.paragraphs[8].text, tailored_doc.paragraphs[8].text)
+
+        self.assertEqual(tailored_doc.tables[0].cell(1, 1).text, "Flask, React")
+        self.assertEqual(tailored_doc.tables[1].cell(1, 1).text, "Computer programming diploma")
+        with zipfile.ZipFile(resume_path) as archive:
+            xml = archive.read("word/document.xml").decode("utf-8", errors="ignore")
+        self.assertNotIn("Suggested summary", xml)
+        self.assertIn("w:hyperlink", xml)
+
+    def test_pdf_only_profile_cannot_request_format_preserving_export(self):
+        self.client.post(
+            "/api/profile",
+            json={
+                "name": "Sparse Profile",
+                "resume_text": "Built Python reports with SQL.",
+                "work_experience": "Supported families, planned play-based learning, and completed developmental observation and documentation in a classroom setting.",
+                "preferred_roles": "software developer",
+                "key_skills": "Python, SQL",
+            },
+        )
+        created = self.client.post(
+            "/api/shortlist",
+            json={
+                "company": "SparseCo",
+                "title": "Software Developer",
+                "location": "Toronto",
+                "url": "https://example.com/sparse",
+                "job_description": "Python SQL Flask",
+            },
+        ).get_json()
+        self.assertEqual(created["resume_generation_status"], "failed")
+        self.assertIn("Upload a DOCX resume", created["generation_error"])
+
+    def test_output_docx_is_readable(self):
+        self.seed_profile_for_documents(with_template=True)
+        created = self.client.post(
+            "/api/shortlist",
+            json={
+                "company": "Northstar",
+                "title": "Software Developer",
+                "location": "Toronto",
+                "url": "https://example.com/job/readable",
+                "job_description": "Python Flask SQL React dashboards cloud automation",
+            },
+        ).get_json()
+        resume_path = Path(created["resume_docx_path"])
+        opened = Document(io.BytesIO(resume_path.read_bytes()))
+        self.assertGreater(len(opened.paragraphs), 0)
+        self.assertIn("Terry Mak", opened.paragraphs[0].text)
 
     def test_empty_projects_or_education_do_not_fabricate(self):
         profile = self.rece_profile()
@@ -627,7 +722,7 @@ class JobAssistantTest(unittest.TestCase):
             app_module.score_job(job, senior_only)["seniority_score"],
         )
 
-    def seed_profile_for_documents(self):
+    def seed_profile_for_documents(self, with_template: bool = False):
         self.client.post(
             "/api/profile",
             json={
@@ -638,12 +733,112 @@ class JobAssistantTest(unittest.TestCase):
                 "projects": "Built a Flask job tracker with SQLite, scoring, dashboards, and document generation.",
                 "education": "Computer programming diploma, Toronto.",
                 "work_experience": "Developer Intern at Northstar from 2024 to 2025. Built Python automation, cloud deployment notes, and SQL reports for operations teams.",
-                "resume_text": "Terry Mak. Developer Intern at Northstar from 2024 to 2025. Built Python automation, Flask tools, SQL reports, React interfaces, cloud deployment notes, and dashboards. Education: Computer programming diploma.",
+                "resume_text": "Terry Mak. Developer Intern at Northstar from 2024 to 2025. made Python automation, Flask tools, SQL reports, React interfaces, and dashboards. Education: Computer programming diploma.",
             },
         )
+        if with_template:
+            self.upload_master_resume_template()
+
+    def upload_master_resume_template(self):
+        master = self.build_formatted_resume_fixture()
+        with open(master, "rb") as handle:
+            response = self.client.post(
+                "/api/profile/upload",
+                data={"file": (handle, "master_resume.docx")},
+                content_type="multipart/form-data",
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("resume_docx_template_path", response.get_json())
+
+    def build_formatted_resume_fixture(self):
+        path = Path(self.tmpdir.name) / "master_resume_fixture.docx"
+        doc = Document()
+        section = doc.sections[0]
+        section.top_margin = Inches(0.75)
+        section.bottom_margin = Inches(0.75)
+        section.left_margin = Inches(0.85)
+        section.right_margin = Inches(0.85)
+
+        title = doc.add_paragraph()
+        title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = title.add_run("Terry Mak")
+        run.bold = True
+        run.font.name = "Aptos"
+        run.font.size = Pt(18)
+
+        summary_heading = doc.add_paragraph()
+        summary_heading.style = "Heading 1"
+        summary_heading.add_run("Professional Summary")
+        summary = doc.add_paragraph()
+        summary_run = summary.add_run("Software developer with Python automation and SQL reporting experience.")
+        summary_run.font.name = "Georgia"
+        summary_run.font.size = Pt(11)
+
+        experience_heading = doc.add_paragraph()
+        experience_heading.style = "Heading 1"
+        experience_heading.add_run("Work Experience")
+        experience = doc.add_paragraph()
+        experience.add_run("Software Developer").bold = True
+        experience.add_run(" | Northstar Labs | 2021-2025")
+
+        bullet1 = doc.add_paragraph(style="List Bullet")
+        bullet1.add_run("made Python automation, Flask tools, SQL reports, React interfaces, and dashboards.")
+        bullet2 = doc.add_paragraph(style="List Bullet")
+        bullet2_run1 = bullet2.add_run("Maintained team documentation standards")
+        bullet2_run1.italic = True
+        bullet2.add_run(" across internal projects.")
+
+        skills_heading = doc.add_paragraph()
+        skills_heading.style = "Heading 1"
+        skills_heading.add_run("Skills")
+        skills = doc.add_paragraph()
+        skills.add_run("Skills: ").bold = True
+        skills.add_run("React, dashboards, Python, SQL, Flask, cloud")
+
+        categories = doc.add_table(rows=2, cols=3)
+        categories.style = "Table Grid"
+        categories.cell(0, 0).text = "Languages"
+        categories.cell(0, 1).text = "Technologies"
+        categories.cell(0, 2).text = "Tools & Platforms"
+        categories.cell(1, 0).text = "Python, SQL"
+        categories.cell(1, 1).text = "Flask, React"
+        categories.cell(1, 2).text = "cloud, dashboards"
+
+        contact = doc.add_paragraph()
+        contact.add_run("Portfolio: ")
+        self.add_hyperlink(contact, "https://example.com/portfolio", "example.com/portfolio")
+
+        table = doc.add_table(rows=2, cols=2)
+        table.style = "Table Grid"
+        table.cell(0, 0).text = "Category"
+        table.cell(0, 1).text = "Detail"
+        table.cell(1, 0).text = "Certification"
+        table.cell(1, 1).text = "Computer programming diploma"
+
+        doc.save(path)
+        return path
+
+    def add_hyperlink(self, paragraph, url, text):
+        r_id = paragraph.part.relate_to(url, RT.HYPERLINK, is_external=True)
+        hyperlink = OxmlElement("w:hyperlink")
+        hyperlink.set(qn("r:id"), r_id)
+        run = OxmlElement("w:r")
+        rPr = OxmlElement("w:rPr")
+        color = OxmlElement("w:color")
+        color.set(qn("w:val"), "0000FF")
+        rPr.append(color)
+        underline = OxmlElement("w:u")
+        underline.set(qn("w:val"), "single")
+        rPr.append(underline)
+        run.append(rPr)
+        t = OxmlElement("w:t")
+        t.text = text
+        run.append(t)
+        hyperlink.append(run)
+        paragraph._p.append(hyperlink)
 
     def test_shortlist_persistence_generation_safe_names_and_downloads(self):
-        self.seed_profile_for_documents()
+        self.seed_profile_for_documents(with_template=True)
         response = self.client.post(
             "/api/shortlist",
             json={
@@ -718,7 +913,7 @@ class JobAssistantTest(unittest.TestCase):
             },
         ).get_json()
         self.assertEqual(created["resume_generation_status"], "failed")
-        self.seed_profile_for_documents()
+        self.seed_profile_for_documents(with_template=True)
         regenerated = self.client.post(f"/api/shortlist/{created['id']}/regenerate", json={})
         self.assertEqual(regenerated.status_code, 200)
         job = regenerated.get_json()

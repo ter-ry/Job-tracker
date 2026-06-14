@@ -6,17 +6,19 @@ import io
 import json
 import os
 import re
+import shutil
 import sqlite3
 import urllib.error
 import urllib.request
 import zipfile
+import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
 
 from docx import Document
-from flask import Flask, Response, g, jsonify, render_template, request
+from flask import Flask, Response, g, jsonify, render_template, request, send_file
 
 from grounding import (
     PDF_CORRUPTION_MESSAGE,
@@ -33,6 +35,7 @@ from semantic_matching import MODEL_DOWNLOAD_SIZE, MODEL_NAME, analyze_resume_ma
 from seniority import DETECTED_LEVELS, SENIORITY_LEVELS, analyze_job_seniority, score_seniority_fit
 from sources.jobspy_source import fetch_jobspy_jobs
 from tailoring import generate_tailored_resume_draft
+from werkzeug.utils import secure_filename
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -208,6 +211,7 @@ PROFILE_COLUMNS = {
     "education": "TEXT NOT NULL DEFAULT ''",
     "work_experience": "TEXT NOT NULL DEFAULT ''",
     "resume_text": "TEXT NOT NULL DEFAULT ''",
+    "resume_docx_template_path": "TEXT NOT NULL DEFAULT ''",
     "cover_letter_template": "TEXT NOT NULL DEFAULT ''",
     "target_seniority_levels": "TEXT NOT NULL DEFAULT 'entry_level,junior,intermediate'",
     "maximum_required_years": "TEXT NOT NULL DEFAULT '3'",
@@ -240,7 +244,7 @@ def create_app() -> Flask:
     @app.post("/api/profile")
     def save_profile() -> Response:
         payload = request.get_json(force=True)
-        profile = normalize_profile_payload(payload)
+        profile = normalize_profile_payload(payload, load_profile())
         upsert_profile(profile)
         return jsonify(load_profile())
 
@@ -250,14 +254,28 @@ def create_app() -> Flask:
         if not uploaded:
             return jsonify({"error": "No file uploaded"}), 400
         filename = uploaded.filename or "resume.txt"
+        suffix = Path(filename).suffix.lower()
         try:
-            extracted = extract_uploaded_text(filename, uploaded.read())
+            content = uploaded.read()
+            extracted = extract_uploaded_text(filename, content)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         profile = load_profile()
         profile["resume_text"] = extracted
+        warning = ""
+        if suffix == ".docx":
+            template_path = save_master_resume_template(filename, content)
+            profile["resume_docx_template_path"] = str(template_path)
+        else:
+            profile["resume_docx_template_path"] = ""
+            warning = "Upload a DOCX resume to generate a format-preserving tailored resume."
         upsert_profile(profile)
-        return jsonify({"resume_text": extracted})
+        response = {"resume_text": extracted}
+        if warning:
+            response["warning"] = warning
+        else:
+            response["resume_docx_template_path"] = profile["resume_docx_template_path"]
+        return jsonify(response)
 
     @app.get("/api/jobs")
     def list_jobs() -> Response:
@@ -911,7 +929,7 @@ def generate_and_store_shortlist_documents(job_id: int) -> dict[str, Any]:
         cover_name = safe_filename(f"{base}_Cover_Letter.docx")
         resume_path = folder / resume_name
         cover_path = folder / cover_name
-        write_docx(resume_path, f"{profile.get('name') or 'Candidate'} - Tailored Resume", output["resume_text"])
+        resume_result = build_format_preserving_resume(job, profile, output, resume_path)
         write_docx(cover_path, f"Cover Letter - {job.get('company') or 'Company'}", output["cover_letter"])
         metadata = {
             "job_id": job_id,
@@ -921,12 +939,21 @@ def generate_and_store_shortlist_documents(job_id: int) -> dict[str, Any]:
             "matched_keywords": output.get("matched_keywords", []),
             "salary_source": job.get("salary_source"),
             "fit_score": job.get("fit_score"),
+            "resume_template_path": profile.get("resume_docx_template_path", ""),
         }
         (folder / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         (folder / "resume.txt").write_text(output["resume_text"], encoding="utf-8")
         (folder / "cover_letter.txt").write_text(output["cover_letter"], encoding="utf-8")
-        update_generation_status(job_id, "generated", "generated", str(resume_path), str(cover_path), "")
-        return {"resume": "generated", "cover_letter": "generated", "error": ""}
+        (folder / "resume_change_log.json").write_text(json.dumps(resume_result["change_log"], indent=2), encoding="utf-8")
+        update_generation_status(
+            job_id,
+            resume_result["status"],
+            "generated",
+            str(resume_path) if resume_result["status"] == "generated" else "",
+            str(cover_path),
+            resume_result["error"],
+        )
+        return {"resume": resume_result["status"], "cover_letter": "generated", "error": resume_result["error"]}
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
         update_generation_status(job_id, "failed", "failed", "", "", error)
@@ -935,6 +962,284 @@ def generate_and_store_shortlist_documents(job_id: int) -> dict[str, Any]:
 
 def profile_has_generation_source(profile: dict[str, str]) -> bool:
     return evidence_has_generation_source(build_candidate_evidence(profile))
+
+
+def build_format_preserving_resume(
+    job: dict[str, Any],
+    profile: dict[str, str],
+    output: dict[str, Any],
+    resume_path: Path,
+) -> dict[str, Any]:
+    template_raw = text(profile.get("resume_docx_template_path"))
+    template_path = safe_local_path(template_raw)
+    warning = "Upload a DOCX resume to generate a format-preserving tailored resume."
+    if template_path is None or not template_path.exists():
+        return {
+            "status": "failed",
+            "error": warning,
+            "change_log": {
+                "master_resume_path": template_raw,
+                "output_path": str(resume_path),
+                "applied": [],
+                "skipped": [
+                    {
+                        "kind": "resume_template",
+                        "original": "",
+                        "replacement": "",
+                        "reason": warning,
+                    }
+                ],
+            },
+        }
+
+    shutil.copyfile(template_path, resume_path)
+    document = Document(resume_path)
+    plan = build_resume_change_plan(document, job, profile, output)
+    change_log = apply_resume_change_plan(document, plan)
+    document.save(resume_path)
+    return {
+        "status": "generated",
+        "error": "",
+        "change_log": {
+            "master_resume_path": str(template_path),
+            "output_path": str(resume_path),
+            **change_log,
+        },
+    }
+
+
+SUMMARY_HEADINGS = {
+    "summary",
+    "professional summary",
+    "profile summary",
+    "resume summary",
+}
+
+SKILLS_HEADINGS = {
+    "skills",
+    "technical skills",
+    "core competencies",
+    "skills & competencies",
+    "competencies",
+}
+
+EXPERIENCE_HEADINGS = {
+    "experience",
+    "work experience",
+    "professional experience",
+    "employment history",
+}
+
+
+def build_resume_change_plan(
+    document: Document,
+    job: dict[str, Any],
+    profile: dict[str, str],
+    output: dict[str, Any],
+) -> list[dict[str, Any]]:
+    plan: list[dict[str, Any]] = []
+    paragraphs = list(iter_document_paragraphs(document))
+    candidate_evidence = build_candidate_evidence(profile)
+    summary_paragraph = find_section_paragraph(paragraphs, SUMMARY_HEADINGS)
+    if summary_paragraph is not None:
+        plan.append(
+            {
+                "kind": "summary",
+                "original": summary_paragraph.text,
+                "replacement": output.get("summary", ""),
+                "supporting_evidence": supporting_snippet_for_plan(candidate_evidence, output, job),
+                "matched_job_requirement": text(job.get("title")),
+                "confidence": 90,
+            }
+        )
+
+    skills_paragraph = find_section_paragraph(paragraphs, SKILLS_HEADINGS)
+    supported_skills = output.get("skill_guidance", {}).get("supported_relevant", [])
+    if skills_paragraph is not None and supported_skills:
+        replacement = reorder_skills_text(skills_paragraph.text, supported_skills)
+        if normalize_space(replacement) != normalize_space(skills_paragraph.text):
+            plan.append(
+                {
+                    "kind": "skills",
+                    "original": skills_paragraph.text,
+                    "replacement": replacement,
+                    "supporting_evidence": ", ".join(supported_skills[:8]),
+                    "matched_job_requirement": "Supported skills already present in the saved profile and posting",
+                    "confidence": 75,
+                }
+            )
+
+    for suggestion in output.get("local_tailored_draft", {}).get("rewrite_suggestions", []):
+        original = text(suggestion.get("original_bullet"))
+        replacement = text(suggestion.get("proposed_bullet"))
+        confidence = clamp_int(suggestion.get("confidence"), 0, 100)
+        if not original or not replacement:
+            continue
+        if confidence < 60:
+            continue
+        plan.append(
+            {
+                "kind": "bullet",
+                "original": original,
+                "replacement": replacement,
+                "supporting_evidence": text(suggestion.get("supporting_evidence")),
+                "matched_job_requirement": text(suggestion.get("matched_job_requirement")),
+                "confidence": confidence,
+            }
+        )
+    return plan
+
+
+def supporting_snippet_for_plan(candidate_evidence: dict[str, Any], output: dict[str, Any], job: dict[str, Any]) -> str:
+    snippets = supporting_snippets(output.get("supported_keywords", [])[:4], candidate_evidence, limit=1)
+    if snippets:
+        return snippets[0]
+    return text(job.get("job_description"))[:160]
+
+
+def apply_resume_change_plan(document: Document, plan: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    paragraphs = list(iter_document_paragraphs(document))
+    applied: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for item in plan:
+        kind = item["kind"]
+        if kind in {"summary", "skills"}:
+            target = find_section_paragraph(paragraphs, SUMMARY_HEADINGS if kind == "summary" else SKILLS_HEADINGS)
+            if target is None:
+                skipped.append({**item, "reason": f"No {kind} section found in master resume."})
+                continue
+            if replace_paragraph_exact(target, item["original"], item["replacement"]):
+                applied.append(item)
+            else:
+                skipped.append({**item, "reason": "Exact paragraph text was not found."})
+            continue
+
+        matched = False
+        for paragraph in paragraphs:
+            if replace_paragraph_exact(paragraph, item["original"], item["replacement"]):
+                applied.append(item)
+                matched = True
+                break
+        if not matched:
+            skipped.append({**item, "reason": "Exact bullet text was not found."})
+    return {"applied": applied, "skipped": skipped}
+
+
+def find_section_paragraph(paragraphs: list[Any], headings: set[str]) -> Any | None:
+    for index, paragraph in enumerate(paragraphs):
+        if not is_section_heading(paragraph, headings):
+            continue
+        for following in paragraphs[index + 1 :]:
+            if normalize_space(following.text):
+                return following
+        return None
+    return None
+
+
+def is_section_heading(paragraph: Any, headings: set[str]) -> bool:
+    text_value = normalize_space(paragraph.text).lower().rstrip(":")
+    if not text_value:
+        return False
+    style_name = getattr(getattr(paragraph, "style", None), "name", "") or ""
+    return text_value in headings or style_name.lower().startswith("heading")
+
+
+def iter_document_paragraphs(document: Document) -> list[Any]:
+    paragraphs: list[Any] = []
+    for paragraph in document.paragraphs:
+        paragraphs.append(paragraph)
+    for table in document.tables:
+        paragraphs.extend(iter_table_paragraphs(table))
+    for section in document.sections:
+        paragraphs.extend(iter_container_paragraphs(section.header))
+        paragraphs.extend(iter_container_paragraphs(section.footer))
+    return paragraphs
+
+
+def iter_container_paragraphs(container: Any) -> list[Any]:
+    paragraphs: list[Any] = []
+    if hasattr(container, "paragraphs"):
+        paragraphs.extend(list(container.paragraphs))
+    if hasattr(container, "tables"):
+        for table in container.tables:
+            paragraphs.extend(iter_table_paragraphs(table))
+    return paragraphs
+
+
+def iter_table_paragraphs(table: Any) -> list[Any]:
+    paragraphs: list[Any] = []
+    for row in table.rows:
+        for cell in row.cells:
+            paragraphs.extend(iter_container_paragraphs(cell))
+    return paragraphs
+
+
+def replace_paragraph_exact(paragraph: Any, original: str, replacement: str) -> bool:
+    if normalize_space(paragraph.text) != normalize_space(original):
+        return False
+    runs = list(paragraph.runs)
+    if not runs:
+        paragraph.add_run(replacement)
+        return True
+    first_run = next((run for run in runs if text(run.text)), runs[0])
+    first_run.text = replacement
+    for run in runs:
+        if run is not first_run:
+            run.text = ""
+    return True
+
+
+def reorder_skills_text(original: str, supported_skills: list[str]) -> str:
+    text_value = original.strip()
+    if not text_value:
+        return text_value
+    prefix = ""
+    rest = text_value
+    if ":" in text_value:
+        prefix, rest = text_value.split(":", 1)
+        prefix = prefix.strip()
+        rest = rest.strip()
+    items = [item.strip() for item in re.split(r"[,;|/]+", rest) if item.strip()]
+    if not items:
+        return text_value
+    ordered: list[str] = []
+    remaining = items[:]
+    for supported in supported_skills:
+        for item in list(remaining):
+            if item.lower() == supported.lower() or contains_phrase(item, supported) or contains_phrase(supported, item):
+                ordered.append(item)
+                remaining.remove(item)
+                break
+    if not ordered:
+        return text_value
+    combined = ", ".join([*ordered, *remaining])
+    return f"{prefix}: {combined}" if prefix else combined
+
+
+def safe_local_path(value: str) -> Path | None:
+    raw = text(value)
+    if not raw:
+        return None
+    try:
+        path = Path(raw).resolve()
+    except (OSError, RuntimeError):
+        return None
+    root = DATA_DIR.resolve()
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return None
+    return path
+
+
+def save_master_resume_template(filename: str, content: bytes) -> Path:
+    suffix = Path(filename).suffix.lower() or ".docx"
+    stem = safe_filename(Path(filename).stem or "resume")
+    folder = DATA_DIR / "resume_templates"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"{stem}_{uuid.uuid4().hex[:10]}{suffix}"
+    path.write_bytes(content)
+    return path
 
 
 def update_generation_status(
@@ -999,10 +1304,11 @@ def download_shortlist_document(job_id: int, kind: str) -> Response:
     path = safe_generated_path(job.get(field))
     if path is None or not path.exists():
         return jsonify({"error": "Generated document is unavailable"}), 404
-    return Response(
-        path.read_bytes(),
+    return send_file(
+        path,
+        as_attachment=True,
+        download_name=secure_filename(path.name) or "document.docx",
         mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={"Content-Disposition": f"attachment; filename={path.name}"},
     )
 
 
@@ -1367,12 +1673,15 @@ def query_db(query: str, args: list[Any] | None = None, one: bool = False) -> An
     return (rows[0] if rows else None) if one else rows
 
 
-def normalize_profile_payload(payload: dict[str, Any]) -> dict[str, str]:
-    profile = {field: text(payload.get(field)) for field in PROFILE_COLUMNS}
+def normalize_profile_payload(payload: dict[str, Any], existing: dict[str, str] | None = None) -> dict[str, str]:
+    existing = existing or {}
+    profile = {field: text(payload.get(field, existing.get(field))) for field in PROFILE_COLUMNS}
     profile["target_seniority_levels"] = normalize_seniority_levels(payload.get("target_seniority_levels"))
     profile["maximum_required_years"] = text(payload.get("maximum_required_years")) or "3"
     profile["willing_to_apply_to_stretch_roles"] = normalize_bool_text(payload.get("willing_to_apply_to_stretch_roles"), True)
     profile["management_roles_allowed"] = normalize_bool_text(payload.get("management_roles_allowed"), False)
+    if "resume_docx_template_path" not in payload and existing.get("resume_docx_template_path"):
+        profile["resume_docx_template_path"] = text(existing.get("resume_docx_template_path"))
     return profile
 
 
