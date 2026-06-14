@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 from typing import Any, Protocol
 
+from grounding import build_candidate_evidence, is_corrupted_text
 
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 MODEL_DOWNLOAD_SIZE = "about 90 MB"
@@ -49,9 +50,10 @@ def analyze_resume_match(
     embedding_backend: EmbeddingBackend | None = None,
     use_semantic: bool = True,
 ) -> dict[str, Any]:
+    candidate_evidence = build_candidate_evidence(profile)
     evidence = extract_resume_evidence(profile)
     requirements = extract_job_requirements(job)
-    resume_hash = stable_hash(json.dumps(profile, sort_keys=True))
+    resume_hash = candidate_evidence["hash"]
     job_hash = stable_hash(json.dumps(job, sort_keys=True))
     cache_path = (cache_dir / f"{resume_hash}-{job_hash}.json") if cache_dir else None
     if cache_path and cache_path.exists():
@@ -87,7 +89,9 @@ def analyze_resume_match(
         "backend_error": backend_error,
         "cache_hit": False,
         "resume_hash": resume_hash,
+        "profile_resume_hash": resume_hash,
         "job_hash": job_hash,
+        "candidate_evidence": candidate_evidence,
         "evidence": evidence,
         "matches": matches,
         "direct_matches": direct,
@@ -111,14 +115,16 @@ def analyze_resume_match(
 def extract_resume_evidence(profile: dict[str, Any]) -> list[dict[str, Any]]:
     sections = [
         ("professional experience", "professional experience", str(profile.get("work_experience") or "")),
-        ("project", "project", str(profile.get("projects") or "")),
-        ("education", "education", str(profile.get("education") or "")),
         ("skill list", "skill", str(profile.get("key_skills") or "")),
+        ("education", "education", str(profile.get("education") or "")),
+        ("project", "project", str(profile.get("projects") or "")),
         ("professional experience", "professional experience", str(profile.get("resume_text") or "")),
     ]
     evidence: list[dict[str, Any]] = []
     seen: set[str] = set()
     for source, evidence_type, content in sections:
+        if source == "professional experience" and content == str(profile.get("resume_text") or "") and is_corrupted_text(content):
+            continue
         for item in split_evidence_items(content, source):
             key = item.lower()
             if key in seen:

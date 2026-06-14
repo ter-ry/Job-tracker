@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import app as app_module
+import grounding
 import semantic_matching
 import seniority
 import tailoring
@@ -63,6 +64,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("Flask dashboards", upload.get_json()["resume_text"])
 
     def test_job_create_scores_and_dashboard(self):
+        self.seed_profile_for_documents()
         response = self.client.post(
             "/api/jobs",
             json={
@@ -83,6 +85,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(dashboard["high_fit"], 1)
 
     def test_generation_saves_versions_and_exports(self):
+        self.seed_profile_for_documents()
         created = self.client.post(
             "/api/jobs",
             json={
@@ -492,6 +495,111 @@ class JobAssistantTest(unittest.TestCase):
         self.assertNotIn("Kubernetes", proposed)
         self.assertNotIn("%", proposed)
 
+    def rece_profile(self):
+        return {
+            "name": "Avery Chen",
+            "preferred_roles": "Registered Early Childhood Educator, Early Childhood Educator",
+            "key_skills": "child-centred programming, play-based learning, developmental observation, family communication, health and safety compliance, inclusive practice, teamwork",
+            "work_experience": "Registered Early Childhood Educator at Little Pines Child Care. Planned child-centred and play-based programming, completed developmental observation and documentation, maintained health and safety compliance, communicated with families, and supported inclusive classroom routines.",
+            "education": "Early Childhood Education diploma.",
+            "projects": "",
+            "resume_text": "",
+        }
+
+    def software_profile(self, extra_skills=""):
+        skills = "Python, SQL, Flask, cloud, automation"
+        if extra_skills:
+            skills = f"{skills}, {extra_skills}"
+        return {
+            "name": "Terry Mak",
+            "preferred_roles": "software developer",
+            "key_skills": skills,
+            "work_experience": "Software developer with Python automation, Flask APIs, SQL reports, and cloud deployment experience.",
+            "projects": "Built Flask tools for reporting and automation.",
+            "education": "Computer programming diploma.",
+            "resume_text": "Built Python, SQL, Flask, cloud, and automation projects.",
+        }
+
+    def ece_job(self):
+        return {
+            "company": "Little Sprouts",
+            "title": "Early Childhood Educator",
+            "required_skills": "child-centred programming, developmental observation, family communication, health and safety compliance",
+            "job_description": "Plan play-based learning, document development, communicate with families, and maintain safe inclusive classrooms.",
+        }
+
+    def software_job(self, required="Python, SQL, Flask, cloud, automation"):
+        return {
+            "company": "BuildCo",
+            "title": "Software Developer",
+            "required_skills": required,
+            "job_description": f"Build software using {required}.",
+        }
+
+    def test_rece_profile_does_not_generate_software_terminology(self):
+        output = app_module.generate_application_materials(self.ece_job(), self.rece_profile())
+        combined = "\n".join([output["resume_text"], output["cover_letter"], app_module.answers_to_text(output["short_answers"])])
+        self.assertIn("Registered Early Childhood Educator", combined)
+        self.assertIn("child-centred", combined)
+        self.assertNotRegex(combined.lower(), r"\b(aws|python|flask|react|sql|dashboard|api|cloud|software projects)\b")
+
+    def test_software_profile_can_generate_supported_software_terms(self):
+        output = app_module.generate_application_materials(self.software_job(), self.software_profile())
+        combined = "\n".join([output["resume_text"], output["cover_letter"]])
+        self.assertIn("Python", combined)
+        self.assertIn("Flask", combined)
+        self.assertIn("software developer", combined.lower())
+
+    def test_aws_suggestion_requires_candidate_evidence(self):
+        without_aws = app_module.generate_application_materials(self.software_job("AWS, Python"), self.software_profile())
+        self.assertIn("aws", [item.lower() for item in without_aws["unsupported_keywords"]])
+        self.assertNotIn("AWS", without_aws["skill_guidance"]["supported_relevant"])
+
+        with_aws = app_module.generate_application_materials(self.software_job("AWS, Python"), self.software_profile("AWS"))
+        self.assertIn("AWS", with_aws["skill_guidance"]["supported_relevant"])
+
+    def test_corrupted_pdf_text_detected_and_rejected(self):
+        noisy_pdf = b"%PDF-1.4\n1 0 obj\n<< /Type /Page /FontName /CIDFont /XObject >>\nstream\n\\x00\\xff\\x10FFFFAAAAFFFFAAAAFFFFAAAAFFFF\nendstream\nendobj\nxref\ntrailer\nstartxref"
+        with self.assertRaisesRegex(ValueError, "This PDF could not be read reliably"):
+            app_module.extract_pdf_text(noisy_pdf)
+
+    def test_structured_profile_used_when_pdf_extraction_fails(self):
+        profile = self.rece_profile()
+        profile["resume_text"] = "endobj xref trailer stream glyph CIDFont FFFFEEEEFFFFEEEE"
+        output = app_module.generate_application_materials(self.ece_job(), profile)
+        self.assertIn("developmental observation", output["resume_text"])
+        self.assertNotIn("CIDFont", output["resume_text"])
+
+    def test_cross_domain_generation_blocks_unsupported_terms(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported or conflicting phrases"):
+            app_module.generate_application_materials(self.software_job(), self.rece_profile())
+
+    def test_cache_invalidation_after_profile_change(self):
+        job = self.software_job()
+        first = semantic_matching.analyze_resume_match(job, self.software_profile(), cache_dir=None, use_semantic=False)
+        second = semantic_matching.analyze_resume_match(job, self.software_profile("AWS"), cache_dir=None, use_semantic=False)
+        self.assertNotEqual(first["profile_resume_hash"], second["profile_resume_hash"])
+
+    def test_generated_versions_mark_outdated_after_profile_change(self):
+        self.seed_profile_for_documents()
+        created = self.client.post(
+            "/api/jobs",
+            json={"company": "OpsTools", "title": "Software Developer", "job_description": "Python SQL Flask"},
+        ).get_json()
+        generated = self.client.post("/api/generate", json={**created, "id": created["id"]})
+        self.assertEqual(generated.status_code, 200)
+        self.client.post("/api/profile", json={**self.rece_profile(), "name": "New Profile"})
+        versions = self.client.get(f"/api/jobs/{created['id']}/versions").get_json()
+        self.assertTrue(any(version["status"] == "Outdated — regenerate using current profile" for version in versions))
+
+    def test_empty_projects_or_education_do_not_fabricate(self):
+        profile = self.rece_profile()
+        profile["projects"] = ""
+        profile["education"] = ""
+        output = app_module.generate_application_materials(self.ece_job(), profile)
+        self.assertNotIn("project", output["summary"].lower())
+        self.assertNotIn("education", output["summary"].lower())
+
     def test_cache_reuse_and_sentence_transformer_fallback(self):
         cache_dir = Path(self.tmpdir.name) / "semantic_cache"
         profile = {"work_experience": "Built Flask APIs."}
@@ -526,11 +634,11 @@ class JobAssistantTest(unittest.TestCase):
                 "name": "Terry Mak",
                 "preferred_roles": "software developer",
                 "preferred_locations": "Toronto, remote",
-                "key_skills": "Python, Flask, SQL, React, dashboards",
+                "key_skills": "Python, Flask, SQL, React, dashboards, cloud",
                 "projects": "Built a Flask job tracker with SQLite, scoring, dashboards, and document generation.",
                 "education": "Computer programming diploma, Toronto.",
-                "work_experience": "Developer Intern at Northstar from 2024 to 2025. Built Python automation and SQL reports for operations teams.",
-                "resume_text": "Terry Mak. Developer Intern at Northstar from 2024 to 2025. Built Python automation, Flask tools, SQL reports, React interfaces, and dashboards. Education: Computer programming diploma.",
+                "work_experience": "Developer Intern at Northstar from 2024 to 2025. Built Python automation, cloud deployment notes, and SQL reports for operations teams.",
+                "resume_text": "Terry Mak. Developer Intern at Northstar from 2024 to 2025. Built Python automation, Flask tools, SQL reports, React interfaces, cloud deployment notes, and dashboards. Education: Computer programming diploma.",
             },
         )
 

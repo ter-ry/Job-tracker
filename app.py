@@ -18,6 +18,17 @@ from xml.etree import ElementTree
 from docx import Document
 from flask import Flask, Response, g, jsonify, render_template, request
 
+from grounding import (
+    PDF_CORRUPTION_MESSAGE,
+    build_candidate_evidence,
+    classify_supported_skills,
+    evidence_has_generation_source,
+    is_corrupted_text,
+    job_keywords,
+    stable_hash as grounding_hash,
+    supporting_snippets,
+    validate_generated_content,
+)
 from semantic_matching import MODEL_DOWNLOAD_SIZE, MODEL_NAME, analyze_resume_match
 from seniority import DETECTED_LEVELS, SENIORITY_LEVELS, analyze_job_seniority, score_seniority_fit
 from sources.jobspy_source import fetch_jobspy_jobs
@@ -507,9 +518,9 @@ def create_app() -> Flask:
         result = generate_application_materials(job, profile)
         job_id = clamp_int(payload.get("id") or payload.get("job_id"), 0, 10**9)
         if job_id:
-            save_version(job_id, "resume", result["resume_text"])
-            save_version(job_id, "cover_letter", result["cover_letter"])
-            save_version(job_id, "answers", answers_to_text(result["short_answers"]))
+            save_version(job_id, "resume", result["resume_text"], result["candidate_evidence_hash"], result["job_hash"])
+            save_version(job_id, "cover_letter", result["cover_letter"], result["candidate_evidence_hash"], result["job_hash"])
+            save_version(job_id, "answers", answers_to_text(result["short_answers"]), result["candidate_evidence_hash"], result["job_hash"])
         return jsonify(result)
 
     @app.post("/api/jobs/analyse-resume-match")
@@ -550,7 +561,7 @@ def create_app() -> Flask:
         semantic = analyze_resume_match(job, profile, cache_dir=semantic_cache_dir(), use_semantic=True)
         seniority_fit = score_seniority_fit(profile, analyze_job_seniority(job))
         draft = generate_tailored_resume_draft(job, profile, semantic, seniority_fit)
-        save_version(job_id, "resume", draft["text"])
+        save_version(job_id, "resume", draft["text"], semantic.get("profile_resume_hash", ""), semantic.get("job_hash", ""))
         return jsonify({"draft": draft})
 
     @app.post("/api/jobs/rescore")
@@ -610,7 +621,18 @@ def create_app() -> Flask:
             "SELECT * FROM generated_versions WHERE job_id = ? ORDER BY created_at DESC, id DESC",
             [job_id],
         )
-        return jsonify([dict(row) for row in rows])
+        job_row = query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)
+        current_profile_hash = build_candidate_evidence(load_profile())["hash"]
+        current_job_hash = generation_job_hash(job_to_dict(job_row)) if job_row else ""
+        versions = []
+        for row in rows:
+            item = dict(row)
+            outdated = bool(item.get("profile_hash") and item["profile_hash"] != current_profile_hash)
+            outdated = outdated or bool(item.get("job_hash") and current_job_hash and item["job_hash"] != current_job_hash)
+            if outdated:
+                item["status"] = "Outdated — regenerate using current profile"
+            versions.append(item)
+        return jsonify(versions)
 
     @app.post("/api/follow-up")
     def follow_up() -> Response:
@@ -676,6 +698,13 @@ def create_app() -> Flask:
         )
         if row is None:
             return jsonify({"error": "No saved version found. Generate materials first."}), 404
+        job_row = query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)
+        current_profile_hash = build_candidate_evidence(load_profile())["hash"]
+        current_job_hash = generation_job_hash(job_to_dict(job_row)) if job_row else ""
+        if row["profile_hash"] and row["profile_hash"] != current_profile_hash:
+            return jsonify({"error": "Outdated — regenerate using current profile"}), 409
+        if row["job_hash"] and current_job_hash and row["job_hash"] != current_job_hash:
+            return jsonify({"error": "Outdated — regenerate using current profile"}), 409
         filename = f"job-{job_id}-{kind}.{fmt}"
         if fmt == "txt":
             return download_response(row["content"], filename, "text/plain")
@@ -905,8 +934,7 @@ def generate_and_store_shortlist_documents(job_id: int) -> dict[str, Any]:
 
 
 def profile_has_generation_source(profile: dict[str, str]) -> bool:
-    source = normalize_space(" ".join([profile.get("resume_text", ""), profile.get("work_experience", ""), profile.get("projects", ""), profile.get("education", "")]))
-    return len(source) >= 80
+    return evidence_has_generation_source(build_candidate_evidence(profile))
 
 
 def update_generation_status(
@@ -964,6 +992,9 @@ def download_shortlist_document(job_id: int, kind: str) -> Response:
     if row is None:
         return jsonify({"error": "Job not found"}), 404
     job = job_to_dict(row)
+    status_field = "resume_generation_status" if kind == "resume" else "cover_letter_generation_status"
+    if str(job.get(status_field, "")).startswith("Outdated"):
+        return jsonify({"error": "Outdated — regenerate using current profile"}), 409
     field = "resume_docx_path" if kind == "resume" else "cover_letter_docx_path"
     path = safe_generated_path(job.get(field))
     if path is None or not path.exists():
@@ -1302,10 +1333,21 @@ def init_db() -> None:
             job_id INTEGER NOT NULL,
             kind TEXT NOT NULL,
             content TEXT NOT NULL,
+            profile_hash TEXT NOT NULL DEFAULT '',
+            job_hash TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'current',
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
         )
         """
+    )
+    ensure_columns(
+        "generated_versions",
+        {
+            "profile_hash": "TEXT NOT NULL DEFAULT ''",
+            "job_hash": "TEXT NOT NULL DEFAULT ''",
+            "status": "TEXT NOT NULL DEFAULT 'current'",
+        },
     )
     db.commit()
 
@@ -1338,20 +1380,11 @@ def load_profile() -> dict[str, str]:
     row = query_db("SELECT * FROM profile WHERE id = 1", one=True)
     if row is None:
         profile = normalize_profile_payload({})
-        profile.update(
-            {
-                "preferred_roles": "junior developer, full-stack developer, cloud support, analyst, implementation specialist",
-                "preferred_locations": "Toronto, remote, hybrid, Ontario",
-                "key_skills": "Python, JavaScript, Flask, React, SQL, cloud, AWS, Azure, dashboards, automation, APIs, reporting",
-                "target_seniority_levels": "entry_level,junior,intermediate",
-                "maximum_required_years": "3",
-                "willing_to_apply_to_stretch_roles": "true",
-                "management_roles_allowed": "false",
-            }
-        )
         upsert_profile(profile)
         return profile
-    return normalize_profile_payload(dict(row))
+    profile = normalize_profile_payload(dict(row))
+    profile["updated_at"] = text(dict(row).get("updated_at"))
+    return profile
 
 
 def upsert_profile(profile: dict[str, str]) -> None:
@@ -1408,6 +1441,14 @@ def job_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:
         return {}
     data = dict(row)
     data["score_breakdown"] = parse_json_object(data.get("score_breakdown"))
+    if "profile_updated_at" in data and data.get("profile_updated_at"):
+        profile_row = query_db("SELECT updated_at FROM profile WHERE id = 1", one=True)
+        current_profile_updated = text(profile_row["updated_at"]) if profile_row else ""
+        if current_profile_updated and data["profile_updated_at"] != current_profile_updated:
+            if data.get("resume_generation_status") == "generated":
+                data["resume_generation_status"] = "Outdated — regenerate using current profile"
+            if data.get("cover_letter_generation_status") == "generated":
+                data["cover_letter_generation_status"] = "Outdated — regenerate using current profile"
     return data
 
 
@@ -1817,38 +1858,48 @@ def semantic_cache_dir() -> Path:
 
 
 def generate_application_materials(job: dict[str, Any], profile: dict[str, str]) -> dict[str, Any]:
-    profile_text = " ".join(profile.values())
+    candidate_evidence = build_candidate_evidence(profile)
+    if not evidence_has_generation_source(candidate_evidence):
+        raise ValueError("Complete the Profile page with resume, project, or work-experience details before generating documents.")
     job_text = " ".join([text(job.get("title")), text(job.get("job_description")), text(job.get("required_skills"))])
     semantic = analyze_resume_match(job, profile, cache_dir=semantic_cache_dir(), use_semantic=False)
     seniority_analysis = analyze_job_seniority(job)
     seniority_fit = score_seniority_fit(profile, seniority_analysis)
     scoring = score_job(job, profile, semantic)
     tailored = generate_tailored_resume_draft(job, profile, semantic, seniority_fit)
-    matched = keyword_hits(job_text, REWARD_KEYWORDS)
-    supported = [word for word in matched if contains_phrase(profile_text, word)]
-    unsupported = [word for word in matched if word not in supported]
-    missing_truthful = [word for word in REWARD_KEYWORDS if contains_phrase(profile_text, word) and not contains_phrase(job_text, word)][:8]
-    focus = supported[:4] or keyword_hits(profile_text, REWARD_KEYWORDS)[:4] or ["practical software tools"]
+    skill_groups = classify_supported_skills(job, candidate_evidence)
+    matched = job_keywords(job)
+    supported = skill_groups["supported_relevant"]
+    unsupported = skill_groups["unsupported_job_keywords"]
+    transferable = skill_groups["transferable_supported"]
+    focus = supported[:4]
     resume_lines = [item["proposed_bullet"] for item in tailored["rewrite_suggestions"]] or source_backed_bullets(profile, focus)
-    summary = build_summary(profile, job, focus)
-    skills_section = ", ".join(dict.fromkeys([*focus, *missing_truthful[:5]]))
-    cover_letter = build_cover_letter(profile, job, focus)
-    answers = build_answers(profile, job, focus)
+    summary = build_summary(profile, job, focus, candidate_evidence)
+    skills_section = format_skills_guidance(skill_groups)
+    cover_letter = build_cover_letter(profile, job, focus, candidate_evidence)
+    answers = build_answers(profile, job, focus, candidate_evidence)
     resume_text = (
         f"Suggested summary\n{summary}\n\n"
-        f"Suggested skills section\n{skills_section}\n\n"
+        f"Suggested skills guidance\n{skills_section}\n\n"
         f"Suggested bullet rewrites\n" + "\n".join([f"- {line}" for line in resume_lines]) + "\n\n"
-        f"Missing keywords you can truthfully add\n{', '.join(missing_truthful) or 'None found from saved profile.'}\n\n"
-        f"Keywords not supported by profile\n{', '.join(unsupported) or 'None from the current posting.'}"
+        f"Unsupported job keywords - do not add\n{', '.join(unsupported) or 'None from the current posting.'}"
     )
     local_tailored_text = tailored["text"]
+    validation = validate_generated_content("\n\n".join([resume_text, cover_letter, answers_to_text(answers)]), candidate_evidence, job)
+    if not validation["ok"]:
+        conflicts = ", ".join(validation["conflicting_phrases"]) or "empty or corrupted candidate evidence"
+        raise ValueError(f"Generated content failed grounding validation. Unsupported or conflicting phrases: {conflicts}")
     return {
         "fit_score": scoring["fit_score"],
         "score_breakdown": scoring,
         "matched_keywords": matched,
         "supported_keywords": supported,
-        "missing_keywords": missing_truthful,
+        "missing_keywords": transferable,
         "unsupported_keywords": unsupported,
+        "skill_guidance": skill_groups,
+        "candidate_evidence_hash": candidate_evidence["hash"],
+        "job_hash": generation_job_hash(job),
+        "validation": validation,
         "summary": summary,
         "skills_section": skills_section,
         "resume_bullets": resume_lines,
@@ -1870,8 +1921,11 @@ def source_backed_bullets(profile: dict[str, str], focus: list[str]) -> list[str
         return ["Add project or work-experience detail in Profile first so rewrites stay grounded in your real experience."]
     bullets = []
     for snippet in snippets[:5]:
-        keyword = next((item for item in focus if contains_phrase(snippet, item)), focus[0])
-        bullets.append(f"Reframe existing experience around {keyword}: {snippet}")
+        if focus:
+            keyword = next((item for item in focus if contains_phrase(snippet, item)), focus[0])
+            bullets.append(f"Reframe existing experience around {keyword}: {snippet}")
+        else:
+            bullets.append(snippet)
     return bullets
 
 
@@ -1880,53 +1934,93 @@ def split_sentences(value: str) -> list[str]:
     return [part.strip(" -") for part in parts if len(part.strip()) > 30]
 
 
-def build_summary(profile: dict[str, str], job: dict[str, Any], focus: list[str]) -> str:
-    name_intro = "Software and cloud-focused developer"
-    if profile.get("education"):
-        name_intro += " with hands-on project and education experience"
-    return (
-        f"{name_intro} across {', '.join(focus[:4])}. Interested in the "
-        f"{text(job.get('title')) or 'role'} because it connects practical engineering, business workflows, "
-        f"and maintainable internal tools."
+def build_summary(profile: dict[str, str], job: dict[str, Any], focus: list[str], candidate_evidence: dict[str, Any]) -> str:
+    target = text(job.get("title")) or "target role"
+    role = first_supported_role(profile, candidate_evidence)
+    snippets = supporting_snippets(focus, candidate_evidence, limit=2)
+    skill_phrase = ", ".join(focus[:4]) if focus else "documented profile experience"
+    base = f"{role or 'Candidate'} for {target} with supported experience in {skill_phrase}."
+    if snippets:
+        return f"{base} Evidence includes {snippets[0]}"
+    return f"{base} Summary kept conservative because saved evidence is limited."
+
+
+def format_skills_guidance(skill_groups: dict[str, list[str]]) -> str:
+    return "\n".join(
+        [
+            "Supported and relevant skills",
+            ", ".join(skill_groups["supported_relevant"]) or "None found in both the posting and saved profile.",
+            "",
+            "Transferable supported skills",
+            ", ".join(skill_groups["transferable_supported"]) or "None found.",
+            "",
+            "Unsupported job keywords - do not add",
+            ", ".join(skill_groups["unsupported_job_keywords"]) or "None found.",
+        ]
     )
 
 
-def build_cover_letter(profile: dict[str, str], job: dict[str, Any], focus: list[str]) -> str:
+def first_supported_role(profile: dict[str, str], candidate_evidence: dict[str, Any]) -> str:
+    roles = [role for role in str(profile.get("preferred_roles") or "").split(",") if role.strip()]
+    for role in roles:
+        clean = role.strip()
+        if clean and clean.lower() in str(candidate_evidence.get("full_text") or "").lower():
+            return clean
+    return roles[0].strip() if roles else ""
+
+
+def generation_job_hash(job: dict[str, Any]) -> str:
+    relevant = {
+        field: text(job.get(field))
+        for field in ["company", "title", "required_skills", "preferred_skills", "responsibilities", "job_description"]
+    }
+    return grounding_hash(json.dumps(relevant, sort_keys=True))
+
+
+def build_cover_letter(profile: dict[str, str], job: dict[str, Any], focus: list[str], candidate_evidence: dict[str, Any]) -> str:
     company = text(job.get("company")) or "your team"
     title = text(job.get("title")) or "the role"
-    template = profile.get("cover_letter_template", "")
-    style_line = "I like building useful systems that make everyday work clearer and faster."
-    if template:
-        first_sentence = split_sentences(template)
-        if first_sentence:
-            style_line = first_sentence[0]
+    role = first_supported_role(profile, candidate_evidence) or "candidate"
+    snippets = supporting_snippets(focus, candidate_evidence, limit=3)
+    skill_phrase = ", ".join(focus[:4]) if focus else "the experience saved in my profile"
+    body_evidence = " ".join(snippets[:2]) if snippets else "My saved profile provides the basis for the details in this application."
     return (
         f"Dear {company} Hiring Team,\n\n"
-        f"I am writing about the {title} role. {style_line} This position stood out to me because it "
-        f"touches the kind of practical work I enjoy: {', '.join(focus[:4])}, business workflows, "
-        f"and tools that help teams move with less friction.\n\n"
-        f"My saved profile points to hands-on experience with software projects, dashboards, automation, "
-        f"cloud-aware development, APIs, and database-backed applications. I would bring a careful, "
-        f"useful-builder mindset to the team: clear communication, readable implementation, and a bias "
-        f"toward tools that solve real operational problems.\n\n"
+        f"I am writing about the {title} role. My background as a {role} aligns with the role through "
+        f"{skill_phrase}.\n\n"
+        f"{body_evidence}\n\n"
+        f"I would bring careful communication, reliable follow-through, and respect for the responsibilities "
+        f"of the position.\n\n"
         f"Thank you for considering my application. I would welcome the chance to discuss how my background "
         f"fits the work at {company}.\n\n"
         f"Sincerely,\n{profile.get('name', '')}"
     )
 
 
-def build_answers(profile: dict[str, str], job: dict[str, Any], focus: list[str]) -> list[dict[str, str]]:
+def first_job_responsibility(job: dict[str, Any]) -> str:
+    for field in ["responsibilities", "job_description"]:
+        snippets = split_sentences(text(job.get(field)))
+        if snippets:
+            return trim(snippets[0], 140)
+    return ""
+
+
+def build_answers(profile: dict[str, str], job: dict[str, Any], focus: list[str], candidate_evidence: dict[str, Any]) -> list[dict[str, str]]:
     company = text(job.get("company")) or "the company"
     title = text(job.get("title")) or "this role"
     auth = profile.get("work_authorization") or "Yes, I am legally authorized to work in Canada."
+    role = first_supported_role(profile, candidate_evidence) or "background"
+    skill_phrase = ", ".join(focus[:3]) if focus else "my saved experience"
+    snippets = supporting_snippets(focus, candidate_evidence, limit=1)
+    evidence_line = snippets[0] if snippets else "My saved profile contains the supporting details for this application."
     return [
-        {"question": COMMON_QUESTIONS[0], "answer": f"I am interested in {title} because it combines {', '.join(focus[:3])} with practical software that supports real users and business workflows."},
-        {"question": COMMON_QUESTIONS[1], "answer": f"{company} stood out because the role appears connected to useful product or internal systems work where reliable execution and clear communication matter."},
-        {"question": COMMON_QUESTIONS[2], "answer": "My relevant experience includes building software projects with backend logic, frontend interfaces, data persistence, APIs, dashboards, automation, and cloud-oriented deployment thinking."},
+        {"question": COMMON_QUESTIONS[0], "answer": f"I am interested in {title} because it connects with my {role} experience and {skill_phrase}."},
+        {"question": COMMON_QUESTIONS[1], "answer": f"{company} stood out because the role responsibilities appear aligned with the experience and skills saved in my profile."},
+        {"question": COMMON_QUESTIONS[2], "answer": f"My relevant experience includes: {evidence_line}"},
         {"question": COMMON_QUESTIONS[3], "answer": auth},
         {"question": COMMON_QUESTIONS[4], "answer": "I am open to discussing compensation based on the scope of the role, growth expectations, and total package."},
         {"question": COMMON_QUESTIONS[5], "answer": "I can discuss a start date based on the interview timeline and team needs."},
-        {"question": COMMON_QUESTIONS[6], "answer": "I am especially interested in roles where I can build practical tools, learn quickly, and help teams simplify operational work through good software."},
+        {"question": COMMON_QUESTIONS[6], "answer": "I would be glad to provide any additional details that help confirm fit for the role."},
     ]
 
 
@@ -1934,10 +2028,13 @@ def answers_to_text(answers: list[dict[str, str]]) -> str:
     return "\n\n".join([f"{item['question']}\n{item['answer']}" for item in answers])
 
 
-def save_version(job_id: int, kind: str, content: str) -> int:
+def save_version(job_id: int, kind: str, content: str, profile_hash: str = "", job_hash: str = "") -> int:
     cursor = get_db().execute(
-        "INSERT INTO generated_versions (job_id, kind, content) VALUES (?, ?, ?)",
-        [job_id, kind, content],
+        """
+        INSERT INTO generated_versions (job_id, kind, content, profile_hash, job_hash, status)
+        VALUES (?, ?, ?, ?, ?, 'current')
+        """,
+        [job_id, kind, content, profile_hash, job_hash],
     )
     get_db().commit()
     return int(cursor.lastrowid)
@@ -1949,8 +2046,8 @@ def generate_follow_up(company: str, title: str, date_applied: str) -> str:
         f"Subject: Following up on {title}\n\n"
         f"Hello {company} Hiring Team,\n\n"
         f"I hope you are doing well.{date_line} I wanted to follow up on my application for the "
-        f"{title} role and reaffirm my interest. The role looks aligned with my experience building "
-        f"practical software tools, dashboards, automation, cloud-aware applications, and internal systems.\n\n"
+        f"{title} role and reaffirm my interest. The role looks aligned with the experience and "
+        f"skills in my saved profile.\n\n"
         f"Please let me know if there is any additional information I can provide.\n\n"
         f"Best,\n"
     )
@@ -2072,14 +2169,43 @@ def extract_docx_text(content: bytes) -> str:
 
 
 def extract_pdf_text(content: bytes) -> str:
+    cleaned = extract_pdf_text_with_library(content) or extract_pdf_text_basic(content)
+    if not cleaned.strip() or is_corrupted_text(cleaned):
+        raise ValueError(PDF_CORRUPTION_MESSAGE)
+    return cleaned
+
+
+def extract_pdf_text_with_library(content: bytes) -> str:
+    try:
+        from pypdf import PdfReader  # type: ignore
+    except Exception:
+        try:
+            from PyPDF2 import PdfReader  # type: ignore
+        except Exception:
+            return ""
+    try:
+        reader = PdfReader(io.BytesIO(content))
+        pages = [page.extract_text() or "" for page in reader.pages[:10]]
+    except Exception:
+        return ""
+    return normalize_space("\n".join(pages))
+
+
+def extract_pdf_text_basic(content: bytes) -> str:
     decoded = content.decode("latin-1", errors="ignore")
     chunks = re.findall(r"\(([^()]{2,})\)\s*Tj", decoded)
     if not chunks:
+        chunks = re.findall(r"\[(.*?)\]\s*TJ", decoded, flags=re.S)
+    if not chunks:
         chunks = re.findall(r"\(([^()]{2,})\)", decoded)
-    cleaned = "\n".join(html.unescape(chunk.replace("\\n", "\n").replace("\\(", "(").replace("\\)", ")")) for chunk in chunks)
-    if not cleaned.strip():
-        raise ValueError("Could not extract text from this PDF. Paste the resume text manually instead.")
-    return cleaned
+    cleaned_chunks = []
+    for chunk in chunks:
+        pieces = re.findall(r"\(([^()]*)\)", chunk) or [chunk]
+        cleaned_chunks.extend(
+            html.unescape(piece.replace("\\n", "\n").replace("\\(", "(").replace("\\)", ")").replace("\\r", "\n"))
+            for piece in pieces
+        )
+    return normalize_space("\n".join(cleaned_chunks))
 
 
 def download_response(content: str, filename: str, mimetype: str) -> Response:

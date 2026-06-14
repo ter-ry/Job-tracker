@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from grounding import build_candidate_evidence, classify_supported_skills, supporting_snippets
+
 
 LABEL = "Rule-based local tailored draft - manual review required"
 
@@ -66,7 +68,15 @@ def prioritized_skills(profile: dict[str, Any], matches: list[dict[str, Any]]) -
         for skill in profile_skills:
             if skill.lower() in requirement.lower() or skill.lower() in str(match.get("matched_resume_evidence", "")).lower():
                 matched_terms.append(skill)
-    return list(dict.fromkeys([*matched_terms, *profile_skills]))[:16]
+    supported = []
+    evidence_text = " ".join(
+        str(profile.get(field) or "")
+        for field in ["work_experience", "key_skills", "education", "projects", "resume_text"]
+    ).lower()
+    for skill in matched_terms:
+        if skill.lower() in evidence_text:
+            supported.append(skill)
+    return list(dict.fromkeys(supported))[:16]
 
 
 def build_rewrite_suggestions(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -84,6 +94,7 @@ def build_rewrite_suggestions(matches: list[dict[str, Any]]) -> list[dict[str, A
                 "proposed_bullet": proposed,
                 "matched_job_requirement": match.get("job_requirement", ""),
                 "supporting_evidence": original,
+                "changed_wording": changed_wording(original, proposed),
                 "explanation": "Reordered and lightly standardized existing evidence only; no new tools, metrics, employers, or duties were added.",
                 "confidence": match.get("confidence", 0),
                 "manual_review_warning": "Review carefully before using; keep only wording you can defend in an interview.",
@@ -109,6 +120,12 @@ def controlled_rewrite(original: str, requirement: str) -> str:
     return clean
 
 
+def changed_wording(original: str, proposed: str) -> str:
+    if original.strip() == proposed.strip():
+        return "No factual changes; original wording preserved."
+    return "Opening verb or supported requirement phrase was lightly reordered."
+
+
 def extract_terms(content: str) -> list[str]:
     terms = []
     for part in re.split(r"[,;/]|\band\b", content):
@@ -125,9 +142,13 @@ def build_supported_summary(
     evidence: list[dict[str, Any]],
 ) -> str:
     role = str(job.get("title") or "target role")
+    candidate_evidence = build_candidate_evidence(profile)
+    grouped = classify_supported_skills(job, candidate_evidence)
+    supported_focus = grouped["supported_relevant"] or skills[:4]
     education = " with relevant education" if str(profile.get("education") or "").strip() else ""
-    focus = ", ".join(skills[:4]) if skills else "supported software projects"
-    proof = evidence[0]["text"] if evidence else str(profile.get("work_experience") or profile.get("projects") or "").strip()
+    focus = ", ".join(supported_focus[:4]) if supported_focus else "documented profile experience"
+    snippets = supporting_snippets(supported_focus, candidate_evidence, limit=1)
+    proof = evidence[0]["text"] if evidence else (snippets[0] if snippets else "")
     proof_clause = f" Evidence includes: {proof}" if proof else ""
     return f"Candidate for {role}{education}, with supported experience across {focus}.{proof_clause}"
 
@@ -159,6 +180,9 @@ def format_draft(
                 f"Original: {item['original_bullet']}",
                 f"Proposed: {item['proposed_bullet']}",
                 f"Requirement: {item['matched_job_requirement']}",
+                f"Supporting evidence: {item['supporting_evidence']}",
+                f"Changed wording: {item['changed_wording']}",
+                f"Confidence: {item['confidence']}",
                 f"Why: {item['explanation']}",
                 "",
             ]
