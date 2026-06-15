@@ -770,7 +770,30 @@ class JobAssistantTest(unittest.TestCase):
             self.ece_job(),
         )
         self.assertFalse(bad_validation["ok"])
-        self.assertTrue(any("section headings" in item for item in bad_validation["conflicting_phrases"]))
+        self.assertTrue(any("Resume section dump detected" in item for item in bad_validation["conflicting_phrases"]))
+
+        prose_validation = grounding.validate_cover_letter_output(
+            "I built Python and Flask applications backed by PostgreSQL and used validation, logging, and data-cleaning logic to improve reliability.",
+            grounding.build_candidate_evidence(self.software_profile()),
+            self.software_job(),
+        )
+        self.assertTrue(prose_validation["ok"])
+
+        keyword_validation = grounding.validate_cover_letter_output(
+            "Python, Flask, SQL, AWS, Linux, React, JavaScript, APIs, cloud, dashboards, automation.",
+            grounding.build_candidate_evidence(self.software_profile("AWS")),
+            self.software_job("AWS, Python"),
+        )
+        self.assertFalse(keyword_validation["ok"])
+        self.assertTrue(any("Raw keyword list detected" in item for item in keyword_validation["conflicting_phrases"]))
+
+        section_dump_validation = grounding.validate_cover_letter_output(
+            "Skills\nPython Flask SQL\nExperience\nBuilt reports.",
+            grounding.build_candidate_evidence(self.software_profile()),
+            self.software_job(),
+        )
+        self.assertFalse(section_dump_validation["ok"])
+        self.assertTrue(any("Resume section dump detected" in item for item in section_dump_validation["conflicting_phrases"]))
 
         long_paragraph = "Python " * 90
         length_validation = grounding.validate_cover_letter_output(
@@ -779,6 +802,107 @@ class JobAssistantTest(unittest.TestCase):
             self.ece_job(),
         )
         self.assertFalse(length_validation["ok"])
+
+    def test_cover_letter_template_falls_back_for_unrelated_retail_content(self):
+        self.seed_profile_for_documents(with_template=True)
+        retail_template = self.build_retail_cover_letter_fixture()
+        payload = self.upload_cover_letter_template(retail_template)
+        self.assertEqual(payload["cover_letter_template_status"], "DOCX template uploaded")
+
+        created = self.client.post(
+            "/api/shortlist",
+            json={
+                "company": "Northstar",
+                "title": "Python Developer",
+                "location": "Toronto",
+                "url": "https://example.com/job/cover-retail",
+                "job_description": "Python Flask SQL React dashboards cloud automation",
+            },
+        ).get_json()
+        self.assertEqual(created["cover_letter_generation_status"], "generated")
+        self.assertIn("incompatible role-specific content", created["cover_letter_generation_warning"])
+
+        cover_doc = Document(io.BytesIO(Path(created["cover_letter_docx_path"]).read_bytes()))
+        cover_text = "\n".join(paragraph.text for paragraph in cover_doc.paragraphs)
+        self.assertNotIn("supermarket", cover_text.lower())
+        self.assertNotIn("customer service", cover_text.lower())
+        self.assertIn("Northstar Hiring Team", cover_text)
+
+    def test_shortlist_restore_reuses_existing_row_and_regenerates_documents(self):
+        self.seed_profile_for_documents(with_template=True)
+        created = self.client.post(
+            "/api/shortlist",
+            json={
+                "company": "RestorableCo",
+                "title": "Software Developer",
+                "location": "Toronto",
+                "url": "https://example.com/job/restorable",
+                "job_description": "Python Flask SQL React dashboards cloud automation",
+            },
+        ).get_json()
+        job_id = created["id"]
+
+        removed = self.client.delete(f"/api/shortlist/{job_id}").get_json()
+        self.assertTrue(removed["restored_to_saved"])
+        self.assertEqual(self.client.get("/api/shortlist").get_json(), [])
+
+        restored = self.client.post(
+            "/api/shortlist",
+            json={
+                "company": "RestorableCo",
+                "title": "Software Developer",
+                "location": "Toronto",
+                "url": "https://example.com/job/restorable?utm_source=search",
+                "job_description": "Python Flask SQL React dashboards cloud automation",
+            },
+        )
+        self.assertEqual(restored.status_code, 200)
+        restored_job = restored.get_json()
+        self.assertTrue(restored_job["restored"])
+        self.assertEqual(restored_job["id"], job_id)
+        self.assertEqual(len(self.client.get("/api/shortlist").get_json()), 1)
+        self.assertEqual(restored_job["resume_generation_status"], "generated")
+        self.assertEqual(restored_job["cover_letter_generation_status"], "generated")
+
+    def test_cover_failure_does_not_block_resume_download(self):
+        self.seed_profile_for_documents(with_template=True)
+        with patch.object(app_module, "build_format_preserving_cover_letter", side_effect=RuntimeError("cover exploded")):
+            created = self.client.post(
+                "/api/shortlist",
+                json={
+                    "company": "SplitCo",
+                    "title": "Software Developer",
+                    "location": "Toronto",
+                    "url": "https://example.com/job/split-cover",
+                    "job_description": "Python Flask SQL React dashboards cloud automation",
+                },
+            ).get_json()
+        self.assertEqual(created["resume_generation_status"], "generated")
+        self.assertEqual(created["cover_letter_generation_status"], "failed")
+        self.assertIn("cover exploded", created["cover_letter_generation_error"])
+        self.assertTrue(Path(created["resume_docx_path"]).exists())
+        self.assertEqual(self.client.get(f"/api/shortlist/{created['id']}/resume").status_code, 200)
+        self.assertEqual(self.client.get(f"/api/shortlist/{created['id']}/cover-letter").status_code, 404)
+
+    def test_resume_failure_does_not_block_cover_download(self):
+        self.seed_profile_for_documents(with_template=True)
+        with patch.object(app_module, "build_format_preserving_resume", side_effect=RuntimeError("resume exploded")):
+            created = self.client.post(
+                "/api/shortlist",
+                json={
+                    "company": "SplitCo",
+                    "title": "Software Developer",
+                    "location": "Toronto",
+                    "url": "https://example.com/job/split-resume",
+                    "job_description": "Python Flask SQL React dashboards cloud automation",
+                },
+            ).get_json()
+        self.assertEqual(created["resume_generation_status"], "failed")
+        self.assertEqual(created["cover_letter_generation_status"], "generated")
+        self.assertIn("resume exploded", created["resume_generation_error"])
+        self.assertTrue(Path(created["cover_letter_docx_path"]).exists())
+        self.assertEqual(self.client.get(f"/api/shortlist/{created['id']}/resume").status_code, 404)
+        self.assertEqual(self.client.get(f"/api/shortlist/{created['id']}/cover-letter").status_code, 200)
 
     def test_pdf_only_profile_cannot_request_format_preserving_export(self):
         self.client.post(
@@ -1061,6 +1185,18 @@ class JobAssistantTest(unittest.TestCase):
         signature_run = signature.add_run("Terry Mak")
         signature_run.bold = True
 
+        doc.save(path)
+        return path
+
+    def build_retail_cover_letter_fixture(self):
+        path = Path(self.tmpdir.name) / "retail_cover_letter_template_fixture.docx"
+        doc = Document()
+        heading = doc.add_paragraph()
+        heading.add_run("Terry Mak")
+        doc.add_paragraph("Retail customer service associate with supermarket and cashier experience.")
+        doc.add_paragraph("Managed customer service duties, inventory, and merchandising for a busy store.")
+        doc.add_paragraph("Sincerely,")
+        doc.add_paragraph("Terry Mak")
         doc.save(path)
         return path
 

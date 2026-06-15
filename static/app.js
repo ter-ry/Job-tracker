@@ -743,7 +743,11 @@ function renderDiscoveryCard(job, index) {
   const warnings = job.warnings?.length
     ? `<div class="warning-list">${job.warnings.map((warning) => `<span>${escapeHtml(warning)}</span>`).join("")}</div>`
     : "";
-  const saved = job.already_saved ? `<span class="risk low">Saved</span>` : "";
+  const savedStatus = String(job.saved_job_status || job.status || "").toLowerCase();
+  const alreadySaved = Boolean(job.already_saved || savedStatus);
+  const buttonLabel = alreadySaved && savedStatus !== "shortlisted" ? "Add to shortlist again" : alreadySaved ? "Shortlisted" : "Save to shortlist";
+  const buttonDisabled = alreadySaved && savedStatus === "shortlisted" ? "disabled" : "";
+  const saved = alreadySaved ? `<span class="risk low">${escapeHtml(job.saved_job_status || job.status || "Saved")}</span>` : "";
   return `
     <section class="discovery-card" data-index="${index}">
       <div class="discovery-card-main">
@@ -758,7 +762,7 @@ function renderDiscoveryCard(job, index) {
       ${warnings}
       <div class="mini-breakdown">${miniBreakdown(job)}</div>
       <div class="row-actions">
-        <button class="button small" type="button" onclick="saveDiscoveryJob(${index})" ${job.already_saved ? "disabled" : ""}>${job.already_saved ? "Shortlisted" : "Save to shortlist"}</button>
+        <button class="button small" type="button" onclick="saveDiscoveryJob(${index})" ${buttonDisabled}>${buttonLabel}</button>
         <button class="button small ghost" type="button" onclick="hideDiscoveryJob(${index})">Ignore</button>
         ${job.url ? `<a class="button small ghost" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open job</a>` : ""}
         ${applicationUrl ? `<a class="button small ghost" href="${escapeAttribute(applicationUrl)}" target="_blank" rel="noreferrer">Application</a>` : ""}
@@ -769,12 +773,14 @@ function renderDiscoveryCard(job, index) {
 
 async function saveDiscoveryJob(index) {
   const job = state.discoveryResults[index];
-  if (!job || job.already_saved) return;
+  if (!job) return;
+  if (String(job.saved_job_status || job.status || "").toLowerCase() === "shortlisted") return;
   try {
     const saved = await api.send("/api/shortlist", "POST", job);
     job.already_saved = true;
     job.id = saved.id;
-    toast(saved.duplicate ? "Already shortlisted" : `${saved.company || "Job"} shortlisted`);
+    job.saved_job_status = saved.status || job.saved_job_status || job.status || "shortlisted";
+    toast(saved.restored ? "Restored to shortlist" : saved.duplicate ? "Already shortlisted" : `${saved.company || "Job"} shortlisted`);
     await loadAll();
     document.querySelector('[data-tab="shortlist"]').click();
     renderDiscoveryResults({
@@ -853,6 +859,74 @@ async function removeShortlist(id) {
   try {
     await api.send(`/api/shortlist/${id}`, "DELETE", {});
     toast("Removed from shortlist");
+    await loadAll();
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+function renderShortlistCard(job) {
+  const resumeReady = job.resume_generation_status === "generated";
+  const coverReady = job.cover_letter_generation_status === "generated";
+  const salaryLabel = job.salary_source === "estimated" ? `${job.salary} (estimated)` : job.salary || "Salary unavailable";
+  const resumeStatus = job.resume_generation_status || "pending";
+  const coverStatus = job.cover_letter_generation_status || "pending";
+  const resumeError = job.resume_generation_error ? `<p class="risk high">Resume error: ${escapeHtml(job.resume_generation_error)}</p>` : "";
+  const coverError = job.cover_letter_generation_error ? `<p class="risk high">Cover letter error: ${escapeHtml(job.cover_letter_generation_error)}</p>` : "";
+  const coverWarning = job.cover_letter_generation_warning ? `<p class="warning">Cover letter warning: ${escapeHtml(job.cover_letter_generation_warning)}</p>` : "";
+  return `
+    <section class="discovery-card">
+      <div class="discovery-card-main">
+        <div>
+          <h3>${escapeHtml(job.title || "Untitled role")}</h3>
+          <p><strong>${escapeHtml(job.company || "Unknown company")}</strong> Â· ${escapeHtml(job.location || "Location unavailable")}</p>
+          <p class="muted">${escapeHtml(job.source || "")} Â· ${escapeHtml(salaryLabel)} Â· Shortlisted ${escapeHtml(job.date_shortlisted || job.date_added || "")}</p>
+          <p>${scorePill(job.fit_score)} <span class="muted">${miniBreakdown(job)}</span></p>
+          <p class="muted">Resume: ${escapeHtml(resumeStatus)}${resumeReady ? " (ready)" : ""}</p>
+          ${resumeError}
+          <p class="muted">Cover letter: ${escapeHtml(coverStatus)}${coverReady ? " (ready)" : ""}</p>
+          ${coverError}
+          ${coverWarning}
+        </div>
+      </div>
+      <div class="row-actions">
+        ${job.url ? `<a class="button small ghost" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open job</a>` : ""}
+        <a class="button small ghost ${resumeReady ? "" : "disabled-link"}" href="/api/shortlist/${job.id}/resume">Download resume</a>
+        <a class="button small ghost ${coverReady ? "" : "disabled-link"}" href="/api/shortlist/${job.id}/cover-letter">Download cover letter</a>
+        <button class="button small ghost" type="button" onclick="regenerateShortlistResume(${job.id})">Regenerate resume</button>
+        <button class="button small ghost" type="button" onclick="regenerateShortlistCoverLetter(${job.id})">Regenerate cover letter</button>
+        <button class="button small ghost" type="button" onclick="regenerateShortlist(${job.id})">Regenerate both</button>
+        <button class="button small ghost" type="button" onclick="markShortlistApplied(${job.id})">Mark applied</button>
+        <button class="button small ghost danger" type="button" onclick="removeShortlist(${job.id})">Remove</button>
+      </div>
+    </section>
+  `;
+}
+
+async function regenerateShortlist(id) {
+  try {
+    await api.send(`/api/shortlist/${id}/regenerate`, "POST", {});
+    toast("Documents regenerated");
+    await loadAll();
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+async function regenerateShortlistResume(id) {
+  try {
+    await api.send(`/api/shortlist/${id}/regenerate-resume`, "POST", {});
+    toast("Resume regenerated");
+    await loadAll();
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+async function regenerateShortlistCoverLetter(id) {
+  try {
+    await api.send(`/api/shortlist/${id}/regenerate-cover-letter`, "POST", {});
+    toast("Cover letter regenerated");
     await loadAll();
   } catch (error) {
     toast(error.message);

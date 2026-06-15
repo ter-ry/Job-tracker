@@ -48,6 +48,7 @@ MAX_FETCH_BYTES = 1_200_000
 DISCOVERY_SOURCES = ["linkedin", "indeed", "google", "zip_recruiter"]
 GENERATED_APPLICATIONS_DIRNAME = "generated_applications"
 SEMANTIC_CACHE_DIRNAME = "semantic_cache"
+RESTORABLE_SHORTLIST_STATUSES = {"Archived", "Rejected", "Saved", "Drafting"}
 
 STATUSES = ["Saved", "shortlisted", "Drafting", "Applied", "Interview", "Offer", "Rejected", "Archived"]
 
@@ -196,6 +197,9 @@ JOB_COLUMNS = {
     "cover_letter_docx_path": "TEXT NOT NULL DEFAULT ''",
     "resume_generation_status": "TEXT NOT NULL DEFAULT ''",
     "cover_letter_generation_status": "TEXT NOT NULL DEFAULT ''",
+    "resume_generation_error": "TEXT NOT NULL DEFAULT ''",
+    "cover_letter_generation_error": "TEXT NOT NULL DEFAULT ''",
+    "cover_letter_generation_warning": "TEXT NOT NULL DEFAULT ''",
     "generation_error": "TEXT NOT NULL DEFAULT ''",
     "generated_at": "TEXT NOT NULL DEFAULT ''",
     "profile_updated_at": "TEXT NOT NULL DEFAULT ''",
@@ -362,9 +366,15 @@ def create_app() -> Flask:
     def create_shortlist_item() -> Response:
         payload = request.get_json(force=True)
         clean = normalize_job_payload({**payload, "status": "shortlisted"})
-        existing = find_existing_shortlist(clean)
+        existing = find_existing_shortlist_match(clean)
         if existing is not None:
-            return jsonify({**job_to_dict(existing), "duplicate": True})
+            existing_dict = job_to_dict(existing)
+            if text(existing_dict.get("status")) == "shortlisted":
+                return jsonify({**existing_dict, "duplicate": True, "restored": False})
+            restore_shortlist_item(existing_dict["id"])
+            generation = generate_and_store_shortlist_documents(existing_dict["id"])
+            job = query_db("SELECT * FROM jobs WHERE id = ?", [existing_dict["id"]], one=True)
+            return jsonify({**job_to_dict(job), "generation": generation, "duplicate": False, "restored": True}), 200
 
         today = date.today().isoformat()
         clean["status"] = "shortlisted"
@@ -372,6 +382,10 @@ def create_app() -> Flask:
         clean["date_added"] = text(clean.get("date_added")) or today
         clean["resume_generation_status"] = "pending"
         clean["cover_letter_generation_status"] = "pending"
+        clean["resume_generation_error"] = ""
+        clean["cover_letter_generation_error"] = ""
+        clean["cover_letter_generation_warning"] = ""
+        clean["generation_error"] = ""
         db = get_db()
         cursor = db.execute(
             f"""
@@ -384,7 +398,7 @@ def create_app() -> Flask:
         job_id = int(cursor.lastrowid)
         generation = generate_and_store_shortlist_documents(job_id)
         job = query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)
-        return jsonify({**job_to_dict(job), "generation": generation, "duplicate": False}), 201
+        return jsonify({**job_to_dict(job), "generation": generation, "duplicate": False, "restored": False}), 201
 
     @app.post("/api/shortlist/<int:job_id>/regenerate")
     def regenerate_shortlist_documents(job_id: int) -> Response:
@@ -395,14 +409,49 @@ def create_app() -> Flask:
         refreshed = query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)
         return jsonify({**job_to_dict(refreshed), "generation": generation})
 
+    @app.post("/api/shortlist/<int:job_id>/regenerate-resume")
+    def regenerate_shortlist_resume(job_id: int) -> Response:
+        job = query_db("SELECT * FROM jobs WHERE id = ? AND status = 'shortlisted'", [job_id], one=True)
+        if job is None:
+            return jsonify({"error": "Shortlisted job not found"}), 404
+        generation = generate_and_store_shortlist_documents(job_id, {"resume"})
+        refreshed = query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)
+        return jsonify({**job_to_dict(refreshed), "generation": generation})
+
+    @app.post("/api/shortlist/<int:job_id>/regenerate-cover-letter")
+    def regenerate_shortlist_cover_letter(job_id: int) -> Response:
+        job = query_db("SELECT * FROM jobs WHERE id = ? AND status = 'shortlisted'", [job_id], one=True)
+        if job is None:
+            return jsonify({"error": "Shortlisted job not found"}), 404
+        generation = generate_and_store_shortlist_documents(job_id, {"cover_letter"})
+        refreshed = query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)
+        return jsonify({**job_to_dict(refreshed), "generation": generation})
+
     @app.delete("/api/shortlist/<int:job_id>")
     def remove_shortlist_item(job_id: int) -> Response:
         existing = query_db("SELECT * FROM jobs WHERE id = ? AND status = 'shortlisted'", [job_id], one=True)
         if existing is None:
             return jsonify({"error": "Shortlisted job not found"}), 404
-        get_db().execute("UPDATE jobs SET status = 'Archived', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
+        get_db().execute(
+            """
+            UPDATE jobs
+            SET status = 'Saved',
+                resume_generation_status = '',
+                cover_letter_generation_status = '',
+                resume_generation_error = '',
+                cover_letter_generation_error = '',
+                cover_letter_generation_warning = '',
+                generation_error = '',
+                resume_docx_path = '',
+                cover_letter_docx_path = '',
+                generated_at = '',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            [job_id],
+        )
         get_db().commit()
-        return jsonify({"ok": True})
+        return jsonify({"ok": True, "restored_to_saved": True})
 
     @app.post("/api/shortlist/<int:job_id>/applied")
     def mark_shortlist_applied(job_id: int) -> Response:
@@ -524,6 +573,10 @@ def create_app() -> Flask:
             duplicate_found = False
             if keys & existing_keys:
                 clean["already_saved"] = True
+                existing_match = find_existing_job_match(clean)
+                if existing_match is not None:
+                    clean["saved_job_id"] = int(existing_match["id"])
+                    clean["saved_job_status"] = text(existing_match["status"])
                 duplicate_found = True
             if keys & seen_keys:
                 clean["duplicate_in_search"] = True
@@ -920,9 +973,13 @@ def existing_job_dedupe_keys() -> set[str]:
     return keys
 
 
-def find_existing_shortlist(job: dict[str, Any]) -> sqlite3.Row | None:
+def find_existing_job_match(job: dict[str, Any]) -> sqlite3.Row | None:
     keys = dedupe_keys(job, job.get("source_job_id"))
-    rows = query_db("SELECT * FROM jobs WHERE status = 'shortlisted'")
+    rows = query_db("SELECT * FROM jobs")
+    for row in rows:
+        existing = job_to_dict(row)
+        if text(existing.get("status")) == "shortlisted" and keys & dedupe_keys(existing, existing.get("source_job_id")):
+            return row
     for row in rows:
         existing = job_to_dict(row)
         if keys & dedupe_keys(existing, existing.get("source_job_id")):
@@ -930,65 +987,216 @@ def find_existing_shortlist(job: dict[str, Any]) -> sqlite3.Row | None:
     return None
 
 
+def find_existing_shortlist_match(job: dict[str, Any]) -> sqlite3.Row | None:
+    return find_existing_job_match(job)
+
+
+def restore_shortlist_item(job_id: int) -> None:
+    today = date.today().isoformat()
+    get_db().execute(
+        """
+        UPDATE jobs
+        SET status = 'shortlisted',
+            date_shortlisted = ?,
+            resume_generation_status = 'pending',
+            cover_letter_generation_status = 'pending',
+            resume_generation_error = '',
+            cover_letter_generation_error = '',
+            cover_letter_generation_warning = '',
+            generation_error = '',
+            resume_docx_path = '',
+            cover_letter_docx_path = '',
+            generated_at = '',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        [today, job_id],
+    )
+    get_db().commit()
+
+
 def generated_applications_dir() -> Path:
     return DATA_DIR / GENERATED_APPLICATIONS_DIRNAME
 
 
-def generate_and_store_shortlist_documents(job_id: int) -> dict[str, Any]:
+def run_document_generation(kind: str, builder: Any) -> dict[str, Any]:
+    try:
+        result = builder()
+        if not isinstance(result, dict):
+            raise TypeError(f"{kind} builder returned an invalid result")
+        return result
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        return {
+            "status": "failed",
+            "error": error,
+            "warning": "",
+            "change_log": {
+                f"master_{kind}_path": "",
+                "output_path": "",
+                "applied": [],
+                "skipped": [
+                    {
+                        "kind": kind,
+                        "original": "",
+                        "replacement": "",
+                        "reason": error,
+                    }
+                ],
+            },
+        }
+
+
+def generate_and_store_shortlist_documents(job_id: int, kinds: set[str] | None = None) -> dict[str, Any]:
     job_row = query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)
     if job_row is None:
         return {"resume": "failed", "cover_letter": "failed", "error": "Job not found"}
     job = job_to_dict(job_row)
+    requested_kinds = set(kinds or {"resume", "cover_letter"})
     profile = load_profile()
     if not profile_has_generation_source(profile):
         error = "Complete the Profile page with resume, project, or work-experience details before generating documents."
-        update_generation_status(job_id, "failed", "failed", "", "", error)
-        return {"resume": "failed", "cover_letter": "failed", "error": error}
-
-    try:
-        output = generate_application_materials(job, profile)
-        folder = generated_applications_dir() / str(job_id)
-        folder.mkdir(parents=True, exist_ok=True)
-        base = safe_filename("_".join([profile.get("name") or "Candidate", job.get("company") or "Company", job.get("title") or "Role"]))
-        resume_name = safe_filename(f"{base}_Resume.docx")
-        cover_name = safe_filename(f"{base}_Cover_Letter.docx")
-        resume_path = folder / resume_name
-        cover_path = folder / cover_name
-        resume_result = build_format_preserving_resume(job, profile, output, resume_path)
-        cover_result = build_format_preserving_cover_letter(job, profile, output, cover_path)
-        metadata = {
-            "job_id": job_id,
-            "company": job.get("company"),
-            "title": job.get("title"),
-            "generated_at": datetime.now().isoformat(timespec="seconds"),
-            "matched_keywords": output.get("matched_keywords", []),
-            "salary_source": job.get("salary_source"),
-            "fit_score": job.get("fit_score"),
-            "resume_template_path": profile.get("resume_docx_template_path", ""),
-            "cover_letter_template_path": profile.get("cover_letter_docx_template_path", ""),
-        }
-        (folder / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-        (folder / "resume.txt").write_text(output["resume_text"], encoding="utf-8")
-        (folder / "cover_letter.txt").write_text(output["cover_letter"], encoding="utf-8")
-        (folder / "resume_change_log.json").write_text(json.dumps(resume_result["change_log"], indent=2), encoding="utf-8")
-        (folder / "cover_letter_change_log.json").write_text(json.dumps(cover_result["change_log"], indent=2), encoding="utf-8")
+        current_resume_status = text(job.get("resume_generation_status")) or "pending"
+        current_cover_status = text(job.get("cover_letter_generation_status")) or "pending"
+        resume_status = "failed" if "resume" in requested_kinds else current_resume_status
+        cover_status = "failed" if "cover_letter" in requested_kinds else current_cover_status
+        resume_error = error if "resume" in requested_kinds else text(job.get("resume_generation_error"))
+        cover_error = error if "cover_letter" in requested_kinds else text(job.get("cover_letter_generation_error"))
         update_generation_status(
             job_id,
-            resume_result["status"],
-            cover_result["status"],
-            str(resume_path) if resume_result["status"] == "generated" else "",
-            str(cover_path) if cover_result["status"] == "generated" else "",
-            "; ".join(filter(None, [resume_result["error"], cover_result["error"]])),
+            resume_status,
+            cover_status,
+            "" if "resume" in requested_kinds else text(job.get("resume_docx_path")),
+            "" if "cover_letter" in requested_kinds else text(job.get("cover_letter_docx_path")),
+            error if "resume" in requested_kinds and "cover_letter" in requested_kinds else "; ".join(filter(None, [resume_error, cover_error])),
+            resume_error,
+            cover_error,
         )
-        return {
-            "resume": resume_result["status"],
-            "cover_letter": cover_result["status"],
-            "error": "; ".join(filter(None, [resume_result["error"], cover_result["error"]])),
-        }
-    except Exception as exc:
-        error = f"{type(exc).__name__}: {exc}"
-        update_generation_status(job_id, "failed", "failed", "", "", error)
         return {"resume": "failed", "cover_letter": "failed", "error": error}
+
+    output = generate_application_materials(job, profile, raise_on_validation=False)
+    folder = generated_applications_dir() / str(job_id)
+    folder.mkdir(parents=True, exist_ok=True)
+    base = safe_filename("_".join([profile.get("name") or "Candidate", job.get("company") or "Company", job.get("title") or "Role"]))
+    resume_name = safe_filename(f"{base}_Resume.docx")
+    cover_name = safe_filename(f"{base}_Cover_Letter.docx")
+    resume_path = folder / resume_name
+    cover_path = folder / cover_name
+
+    current_resume_status = text(job.get("resume_generation_status")) or "pending"
+    current_cover_status = text(job.get("cover_letter_generation_status")) or "pending"
+    current_resume_error = text(job.get("resume_generation_error"))
+    current_cover_error = text(job.get("cover_letter_generation_error"))
+    current_cover_warning = text(job.get("cover_letter_generation_warning"))
+    current_resume_path = text(job.get("resume_docx_path"))
+    current_cover_path = text(job.get("cover_letter_docx_path"))
+    resume_validation = output.get("resume_validation") or {"ok": True, "conflicting_phrases": []}
+    cover_validation = output.get("cover_validation") or {"ok": True, "conflicting_phrases": []}
+
+    resume_result = {
+        "status": current_resume_status,
+        "error": current_resume_error,
+        "warning": "",
+        "change_log": {"master_resume_path": "", "output_path": current_resume_path, "applied": [], "skipped": []},
+    }
+    cover_result = {
+        "status": current_cover_status,
+        "error": current_cover_error,
+        "warning": current_cover_warning,
+        "change_log": {"master_cover_letter_path": "", "output_path": current_cover_path, "applied": [], "skipped": []},
+    }
+
+    if "resume" in requested_kinds:
+        if resume_validation.get("ok"):
+            resume_result = run_document_generation(
+                "resume",
+                lambda: build_format_preserving_resume(job, profile, output, resume_path),
+            )
+        else:
+            resume_result = {
+                "status": "failed",
+                "error": f"Generated resume failed grounding validation. Unsupported or conflicting phrases: {', '.join(resume_validation.get('conflicting_phrases', [])) or 'empty or corrupted candidate evidence'}",
+                "warning": "",
+                "change_log": {
+                    "master_resume_path": text(profile.get("resume_docx_template_path")),
+                    "output_path": "",
+                    "applied": [],
+                    "skipped": [
+                        {
+                            "kind": "resume_validation",
+                            "original": "",
+                            "replacement": "",
+                            "reason": f"Generated resume failed grounding validation. Unsupported or conflicting phrases: {', '.join(resume_validation.get('conflicting_phrases', [])) or 'empty or corrupted candidate evidence'}",
+                        }
+                    ],
+                },
+            }
+
+    if "cover_letter" in requested_kinds:
+        if cover_validation.get("ok"):
+            cover_result = run_document_generation(
+                "cover_letter",
+                lambda: build_format_preserving_cover_letter(job, profile, output, cover_path),
+            )
+        else:
+            cover_result = {
+                "status": "failed",
+                "error": f"Generated cover letter failed grounding validation. Unsupported or conflicting phrases: {', '.join(cover_validation.get('conflicting_phrases', [])) or 'empty or corrupted candidate evidence'}",
+                "warning": "",
+                "change_log": {
+                    "master_cover_letter_path": text(profile.get("cover_letter_docx_template_path")),
+                    "output_path": "",
+                    "applied": [],
+                    "skipped": [
+                        {
+                            "kind": "cover_letter_validation",
+                            "original": "",
+                            "replacement": "",
+                            "reason": f"Generated cover letter failed grounding validation. Unsupported or conflicting phrases: {', '.join(cover_validation.get('conflicting_phrases', [])) or 'empty or corrupted candidate evidence'}",
+                        }
+                    ],
+                },
+            }
+
+    metadata = {
+        "job_id": job_id,
+        "company": job.get("company"),
+        "title": job.get("title"),
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "matched_keywords": output.get("matched_keywords", []),
+        "salary_source": job.get("salary_source"),
+        "fit_score": job.get("fit_score"),
+        "resume_template_path": profile.get("resume_docx_template_path", ""),
+        "cover_letter_template_path": profile.get("cover_letter_docx_template_path", ""),
+    }
+    (folder / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    (folder / "resume.txt").write_text(output["resume_text"], encoding="utf-8")
+    (folder / "cover_letter.txt").write_text(output["cover_letter"], encoding="utf-8")
+    (folder / "resume_change_log.json").write_text(json.dumps(resume_result["change_log"], indent=2), encoding="utf-8")
+    (folder / "cover_letter_change_log.json").write_text(json.dumps(cover_result["change_log"], indent=2), encoding="utf-8")
+    resume_status = resume_result["status"] if "resume" in requested_kinds else current_resume_status
+    cover_status = cover_result["status"] if "cover_letter" in requested_kinds else current_cover_status
+    resume_error = resume_result["error"] if "resume" in requested_kinds else current_resume_error
+    cover_error = cover_result["error"] if "cover_letter" in requested_kinds else current_cover_error
+    resume_warning = resume_result.get("warning", "") if "resume" in requested_kinds else ""
+    cover_warning = cover_result.get("warning", "") if "cover_letter" in requested_kinds else current_cover_warning
+    update_generation_status(
+        job_id,
+        resume_status,
+        cover_status,
+        str(resume_path) if "resume" in requested_kinds and resume_result["status"] == "generated" else ("" if "resume" in requested_kinds else current_resume_path),
+        str(cover_path) if "cover_letter" in requested_kinds and cover_result["status"] == "generated" else ("" if "cover_letter" in requested_kinds else current_cover_path),
+        "; ".join(filter(None, [resume_error, cover_error])),
+        resume_error,
+        cover_error,
+        resume_warning,
+        cover_warning,
+    )
+    return {
+        "resume": resume_status,
+        "cover_letter": cover_status,
+        "error": "; ".join(filter(None, [resume_result["error"], cover_result["error"]])),
+    }
 
 
 def profile_has_generation_source(profile: dict[str, str]) -> bool:
@@ -1047,7 +1255,6 @@ def build_format_preserving_cover_letter(
 ) -> dict[str, Any]:
     template_raw = text(profile.get("cover_letter_docx_template_path"))
     template_path = safe_local_path(template_raw)
-    warning = ""
     if template_path is None or not template_path.exists():
         write_cover_letter_docx(cover_path, output["cover_letter"])
         return {
@@ -1064,11 +1271,34 @@ def build_format_preserving_cover_letter(
 
     shutil.copyfile(template_path, cover_path)
     document = Document(cover_path)
+    template_warning = detect_incompatible_cover_letter_template(document)
+    if template_warning is not None:
+        write_cover_letter_docx(cover_path, output["cover_letter"])
+        return {
+            "status": "generated",
+            "error": "",
+            "warning": template_warning,
+            "change_log": {
+                "master_cover_letter_path": str(template_path),
+                "output_path": str(cover_path),
+                "applied": [],
+                "skipped": [
+                    {
+                        "kind": "cover_letter_template",
+                        "original": "",
+                        "replacement": "",
+                        "reason": template_warning,
+                    }
+                ],
+                "template_mode": "standard_fallback",
+            },
+        }
+
     change_log = apply_cover_letter_template(document, job, profile, output)
     document.save(cover_path)
     return {
         "status": "generated",
-        "error": warning,
+        "error": "",
         "change_log": {
             "master_cover_letter_path": str(template_path),
             "output_path": str(cover_path),
@@ -1148,6 +1378,25 @@ def apply_cover_letter_template(
             )
         else:
             skipped.append({"kind": "paragraph", "original": original, "replacement": replacement, "reason": "Paragraph text did not match."})
+
+    for paragraph in editable_paragraphs[len(editable_sections):]:
+        original = paragraph.text
+        if not original.strip():
+            continue
+        if replace_paragraph_text(paragraph, original, ""):
+            applied.append(
+                {
+                    "kind": "paragraph",
+                    "original": original,
+                    "replacement": "",
+                    "matched_job_requirement": text(job.get("title")) or "",
+                    "supporting_evidence": "",
+                    "confidence": 100,
+                    "validation_status": "passed",
+                }
+            )
+        else:
+            skipped.append({"kind": "paragraph", "original": original, "replacement": "", "reason": "Paragraph text did not match."})
     return {"applied": applied, "skipped": skipped, "template_mode": "fallback"}
 
 
@@ -1495,7 +1744,11 @@ def update_generation_status(
     cover_status: str,
     resume_path: str,
     cover_path: str,
-    error: str,
+    generation_error: str,
+    resume_error: str,
+    cover_error: str,
+    resume_warning: str = "",
+    cover_warning: str = "",
 ) -> None:
     generated_at = datetime.now().isoformat(timespec="seconds") if resume_status == "generated" or cover_status == "generated" else ""
     profile_updated = text(load_profile().get("updated_at"))
@@ -1504,17 +1757,49 @@ def update_generation_status(
         UPDATE jobs
         SET resume_generation_status = ?,
             cover_letter_generation_status = ?,
-            resume_docx_path = COALESCE(NULLIF(?, ''), resume_docx_path),
-            cover_letter_docx_path = COALESCE(NULLIF(?, ''), cover_letter_docx_path),
+            resume_docx_path = ?,
+            cover_letter_docx_path = ?,
+            resume_generation_error = ?,
+            cover_letter_generation_error = ?,
+            cover_letter_generation_warning = ?,
             generation_error = ?,
             generated_at = ?,
             profile_updated_at = ?,
             updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
         """,
-        [resume_status, cover_status, resume_path, cover_path, error, generated_at, profile_updated, job_id],
+        [
+            resume_status,
+            cover_status,
+            resume_path,
+            cover_path,
+            resume_error,
+            cover_error,
+            cover_warning,
+            generation_error,
+            generated_at,
+            profile_updated,
+            job_id,
+        ],
     )
     get_db().commit()
+
+
+INCOMPATIBLE_COVER_TEMPLATE_TERMS = [
+    "customer service",
+    "customer-support",
+    "retail",
+    "supermarket",
+    "cashier",
+    "sales associate",
+    "store manager",
+    "food service",
+    "restaurant",
+    "hospitality",
+    "merchandising",
+    "inventory",
+    "stockroom",
+]
 
 
 def write_docx(path: Path, title: str, body: str) -> None:
@@ -1546,6 +1831,19 @@ def write_cover_letter_docx(path: Path, body: str) -> None:
             for line in lines[1:]:
                 document.add_paragraph(line)
     document.save(path)
+
+
+def detect_incompatible_cover_letter_template(document: Document) -> str | None:
+    for paragraph in iter_document_paragraphs(document):
+        content = normalize_space(paragraph.text).lower()
+        if not content:
+            continue
+        if contains_resume_section_heading(content) or contains_contact_details(content):
+            continue
+        for term in INCOMPATIBLE_COVER_TEMPLATE_TERMS:
+            if term in content:
+                return f"Standard cover-letter formatting was used because the uploaded template contained incompatible role-specific content: {term}."
+    return None
 
 
 def safe_filename(value: str) -> str:
@@ -2432,7 +2730,11 @@ def semantic_cache_dir() -> Path:
     return path
 
 
-def generate_application_materials(job: dict[str, Any], profile: dict[str, str]) -> dict[str, Any]:
+def generate_application_materials(
+    job: dict[str, Any],
+    profile: dict[str, str],
+    raise_on_validation: bool = True,
+) -> dict[str, Any]:
     candidate_evidence = build_candidate_evidence(profile)
     if not evidence_has_generation_source(candidate_evidence):
         raise ValueError("Complete the Profile page with resume, project, or work-experience details before generating documents.")
@@ -2453,9 +2755,6 @@ def generate_application_materials(job: dict[str, Any], profile: dict[str, str])
     skills_section = format_skills_guidance(skill_groups)
     cover_letter = build_cover_letter(profile, job, focus, candidate_evidence)
     cover_validation = validate_cover_letter_output(cover_letter, candidate_evidence, job)
-    if not cover_validation["ok"]:
-        conflicts = ", ".join(cover_validation["conflicting_phrases"]) or "empty or corrupted candidate evidence"
-        raise ValueError(f"Generated cover letter failed grounding validation. Unsupported or conflicting phrases: {conflicts}")
     answers = build_answers(profile, job, focus, candidate_evidence)
     resume_text = (
         f"Suggested summary\n{summary}\n\n"
@@ -2464,10 +2763,21 @@ def generate_application_materials(job: dict[str, Any], profile: dict[str, str])
         f"Unsupported job keywords - do not add\n{', '.join(unsupported) or 'None from the current posting.'}"
     )
     local_tailored_text = tailored["text"]
-    validation = validate_generated_content("\n\n".join([resume_text, cover_letter, answers_to_text(answers)]), candidate_evidence, job)
-    if not validation["ok"]:
-        conflicts = ", ".join(validation["conflicting_phrases"]) or "empty or corrupted candidate evidence"
-        raise ValueError(f"Generated content failed grounding validation. Unsupported or conflicting phrases: {conflicts}")
+    resume_validation = validate_generated_content("\n\n".join([resume_text, answers_to_text(answers)]), candidate_evidence, job)
+    validation = {
+        "ok": resume_validation["ok"] and cover_validation["ok"],
+        "conflicting_phrases": list(dict.fromkeys([*resume_validation["conflicting_phrases"], *cover_validation["conflicting_phrases"]])),
+        "empty_or_corrupted_evidence": resume_validation["empty_or_corrupted_evidence"] or cover_validation["empty_or_corrupted_evidence"],
+        "resume_ok": resume_validation["ok"],
+        "cover_letter_ok": cover_validation["ok"],
+    }
+    if raise_on_validation:
+        if not resume_validation["ok"]:
+            conflicts = ", ".join(resume_validation["conflicting_phrases"]) or "empty or corrupted candidate evidence"
+            raise ValueError(f"Generated resume failed grounding validation. Unsupported or conflicting phrases: {conflicts}")
+        if not cover_validation["ok"]:
+            conflicts = ", ".join(cover_validation["conflicting_phrases"]) or "empty or corrupted candidate evidence"
+            raise ValueError(f"Generated cover letter failed grounding validation. Unsupported or conflicting phrases: {conflicts}")
     return {
         "fit_score": scoring["fit_score"],
         "score_breakdown": scoring,
@@ -2489,6 +2799,8 @@ def generate_application_materials(job: dict[str, Any], profile: dict[str, str])
         "seniority_analysis": seniority_analysis,
         "seniority_fit": seniority_fit,
         "cover_letter": cover_letter,
+        "cover_validation": cover_validation,
+        "resume_validation": resume_validation,
         "short_answers": answers,
     }
 

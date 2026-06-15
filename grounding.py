@@ -96,6 +96,21 @@ COMMON_JOB_WORDS = {
 
 RESUME_SECTION_HEADINGS = {"education", "skills", "experience", "projects"}
 
+INCOMPATIBLE_TEMPLATE_CLAIMS = {
+    "customer service",
+    "retail",
+    "supermarket",
+    "cashier",
+    "sales associate",
+    "store manager",
+    "food service",
+    "restaurant",
+    "hospitality",
+    "merchandising",
+    "inventory",
+    "stockroom",
+}
+
 CONTACT_PATTERNS = [
     re.compile(r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b"),
     re.compile(r"\b(?:https?://)?(?:www\.)?linkedin\.com\b", re.I),
@@ -266,20 +281,16 @@ def validate_cover_letter_output(
     lower = validation_claim_text(content).lower()
     paragraphs = [paragraph.strip() for paragraph in re.split(r"\n\s*\n", content) if paragraph.strip()]
 
-    for paragraph in paragraphs:
+    for index, paragraph in enumerate(paragraphs, start=1):
         if len(paragraph) > max_paragraph_chars:
-            conflicts.append("cover letter paragraph exceeds the configured length limit")
-        if contains_resume_section_heading(paragraph):
-            conflicts.append("cover letter body contains resume section headings")
-        if contains_contact_details(paragraph):
-            conflicts.append("cover letter body contains contact details")
+            conflicts.append(f"Paragraph {index} exceeds the configured length limit")
+        issue = classify_cover_letter_paragraph_issue(paragraph, index, evidence, job)
+        if issue is not None:
+            conflicts.append(issue)
 
     for term in TECHNICAL_TERMS:
         if contains_phrase(lower, term) and not evidence_supports_phrase(term, evidence):
             conflicts.append(term)
-
-    if looks_like_keyword_dump(lower):
-        conflicts.append("cover letter appears to be keyword dumping")
 
     if job_domain_conflict(lower, evidence, job):
         conflicts.append("candidate/job domain conflict")
@@ -384,9 +395,49 @@ def contains_contact_details(paragraph: str) -> bool:
 
 
 def looks_like_keyword_dump(content: str) -> bool:
-    if sum(1 for term in TECHNICAL_TERMS if contains_phrase(content, term)) >= 12:
-        return True
-    return any(chunk.count(",") >= 10 for chunk in re.split(r"\n+", content))
+    return classify_keyword_dump_reason(content) is not None
+
+
+def classify_cover_letter_paragraph_issue(paragraph: str, paragraph_index: int, evidence: dict[str, Any], job: dict[str, Any]) -> str | None:
+    if contains_resume_section_heading(paragraph):
+        return f"Resume section dump detected in paragraph {paragraph_index}"
+    if contains_contact_details(paragraph):
+        return f"Contact details detected in paragraph {paragraph_index}"
+    dump_reason = classify_keyword_dump_reason(paragraph)
+    if dump_reason is not None:
+        return f"{dump_reason} in paragraph {paragraph_index}"
+    template_reason = classify_unrelated_template_claim(paragraph, evidence, job)
+    if template_reason is not None:
+        return f"Unrelated template claim detected: {template_reason} in paragraph {paragraph_index}"
+    return None
+
+
+def classify_keyword_dump_reason(content: str) -> str | None:
+    paragraphs = [part.strip() for part in re.split(r"\n+", content) if part.strip()]
+    for paragraph in paragraphs or [content]:
+        sentence_like = bool(re.search(r"[.!?]", paragraph))
+        chunks = [chunk.strip(" -*\t.,;:") for chunk in re.split(r"[,/|]+", paragraph) if chunk.strip(" -*\t.,;:")]
+        short_chunks = [chunk for chunk in chunks if len(chunk.split()) <= 2]
+        technical_hits = sum(1 for term in TECHNICAL_TERMS if contains_phrase(paragraph, term))
+        if technical_hits >= 6 and len(short_chunks) >= 5 and not sentence_like:
+            return "Raw keyword list detected"
+        if len(chunks) >= 8 and len(short_chunks) >= 6 and technical_hits >= 4:
+            return "Raw keyword list detected"
+        if len(chunks) >= 10 and not sentence_like:
+            return "Raw keyword list detected"
+    return None
+
+
+def classify_unrelated_template_claim(paragraph: str, evidence: dict[str, Any], job: dict[str, Any]) -> str | None:
+    lowered = paragraph.lower()
+    job_content = job_text(job)
+    for claim in sorted(INCOMPATIBLE_TEMPLATE_CLAIMS, key=len, reverse=True):
+        if claim not in lowered:
+            continue
+        if evidence_supports_phrase(claim, evidence) or contains_phrase(job_content, claim):
+            continue
+        return claim
+    return None
 
 
 def job_domain_conflict(content: str, evidence: dict[str, Any], job: dict[str, Any]) -> bool:
