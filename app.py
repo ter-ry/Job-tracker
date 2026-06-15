@@ -1422,6 +1422,20 @@ EXPERIENCE_HEADINGS = {
     "employment history",
 }
 
+PROJECTS_HEADINGS = {
+    "projects",
+    "project experience",
+    "selected projects",
+    "technical projects",
+}
+
+RESUME_HEADING_TO_SECTION = {
+    **{heading: "summary" for heading in SUMMARY_HEADINGS},
+    **{heading: "skills" for heading in SKILLS_HEADINGS},
+    **{heading: "experience" for heading in EXPERIENCE_HEADINGS},
+    **{heading: "projects" for heading in PROJECTS_HEADINGS},
+}
+
 
 def build_resume_change_plan(
     document: Document,
@@ -1430,27 +1444,41 @@ def build_resume_change_plan(
     output: dict[str, Any],
 ) -> list[dict[str, Any]]:
     plan: list[dict[str, Any]] = []
-    paragraphs = list(iter_document_paragraphs(document))
+    contexts = collect_resume_paragraph_contexts(document)
     candidate_evidence = build_candidate_evidence(profile)
-    summary_paragraph = find_section_paragraph(paragraphs, SUMMARY_HEADINGS)
-    if summary_paragraph is not None:
-        plan.append(
-            {
-                "kind": "summary",
-                "paragraph_type": "summary_paragraph",
-                "original": summary_paragraph.text,
-                "replacement": output.get("summary", ""),
-                "supporting_evidence": supporting_snippet_for_plan(candidate_evidence, output, job),
-                "matched_job_requirement": text(job.get("title")),
-                "confidence": 90,
-                "validation_status": "passed",
-            }
+    job_requirement = normalize_space(
+        " ".join(
+            [
+                text(job.get("required_skills")),
+                text(job.get("preferred_skills")),
+                text(job.get("responsibilities")),
+                text(job.get("job_description")),
+                text(job.get("title")),
+            ]
         )
+    )
+    candidate_map: dict[str, dict[str, Any]] = {}
+
+    summary_context = next((ctx for ctx in contexts if ctx["section"] == "summary" and ctx["editable"]), None)
+    if summary_context is not None:
+        candidate_map["summary"] = {
+            "kind": "summary",
+            "paragraph_type": "summary_paragraph",
+            "section": "summary",
+            "original": summary_context["text"],
+            "replacement": output.get("summary", ""),
+            "supporting_evidence": supporting_snippet_for_plan(candidate_evidence, output, job),
+            "matched_job_requirement": text(job.get("title")),
+            "confidence": 90,
+            "validation_status": "pending",
+            "priority": 2,
+        }
     else:
         plan.append(
             {
                 "kind": "summary",
                 "paragraph_type": "summary_paragraph",
+                "section": "summary",
                 "original": "",
                 "replacement": "",
                 "supporting_evidence": "",
@@ -1461,70 +1489,219 @@ def build_resume_change_plan(
             }
         )
 
-    skills_paragraph = find_section_paragraph(paragraphs, SKILLS_HEADINGS)
+    skills_context = next((ctx for ctx in contexts if ctx["section"] == "skills" and ctx["editable"]), None)
     supported_skills = output.get("skill_guidance", {}).get("supported_relevant", [])
-    if skills_paragraph is not None and supported_skills:
-        replacement = reorder_skills_text(skills_paragraph.text, supported_skills)
-        if normalize_space(replacement) != normalize_space(skills_paragraph.text):
+    if skills_context is not None and supported_skills:
+        replacement = reorder_skills_text(skills_context["text"], supported_skills)
+        if normalize_space(replacement) != normalize_space(skills_context["text"]):
+            candidate_map["skills"] = {
+                "kind": "skills",
+                "paragraph_type": "skills_paragraph",
+                "section": "skills",
+                "original": skills_context["text"],
+                "replacement": replacement,
+                "supporting_evidence": ", ".join(supported_skills[:8]),
+                "matched_job_requirement": "Supported skills already present in the saved profile and posting",
+                "confidence": 75,
+                "validation_status": "pending",
+                "priority": 3,
+            }
+        else:
             plan.append(
                 {
                     "kind": "skills",
                     "paragraph_type": "skills_paragraph",
-                    "original": skills_paragraph.text,
-                    "replacement": replacement,
+                    "section": "skills",
+                    "original": skills_context["text"],
+                    "replacement": skills_context["text"],
                     "supporting_evidence": ", ".join(supported_skills[:8]),
                     "matched_job_requirement": "Supported skills already present in the saved profile and posting",
-                    "confidence": 75,
-                    "validation_status": "passed",
+                    "confidence": 55,
+                    "validation_status": "skipped",
+                    "reason": "No ATS benefit: skill order already matches the job-relevant priority.",
+                    "priority": 3,
                 }
             )
+    elif skills_context is not None:
+        plan.append(
+            {
+                "kind": "skills",
+                "paragraph_type": "skills_paragraph",
+                "section": "skills",
+                "original": skills_context["text"],
+                "replacement": skills_context["text"],
+                "supporting_evidence": "",
+                "matched_job_requirement": "Supported skills already present in the saved profile and posting",
+                "confidence": 40,
+                "validation_status": "skipped",
+                "reason": "No supported skills were available to reorder.",
+                "priority": 3,
+            }
+        )
 
     for suggestion in output.get("local_tailored_draft", {}).get("rewrite_suggestions", []):
-        original = text(suggestion.get("original_bullet"))
-        replacement = text(suggestion.get("proposed_bullet"))
+        original = normalize_space(text(suggestion.get("original_bullet")))
+        replacement = normalize_space(text(suggestion.get("proposed_bullet")))
         confidence = clamp_int(suggestion.get("confidence"), 0, 100)
         if not original or not replacement:
             continue
+        context = next((ctx for ctx in contexts if normalize_space(ctx["text"]) == original and ctx["editable"]), None)
+        if context is None:
+            plan.append(
+                {
+                    "kind": "bullet",
+                    "paragraph_type": "bullet_paragraph",
+                    "section": "",
+                    "original": original,
+                    "replacement": replacement,
+                    "supporting_evidence": text(suggestion.get("supporting_evidence")),
+                    "matched_job_requirement": text(suggestion.get("matched_job_requirement")),
+                    "confidence": confidence,
+                    "validation_status": "skipped",
+                    "reason": "Exact text not found in an editable paragraph.",
+                    "priority": 9,
+                }
+            )
+            continue
+        if context["section"] not in {"experience", "projects"}:
+            plan.append(
+                {
+                    "kind": "bullet",
+                    "paragraph_type": "bullet_paragraph",
+                    "section": context["section"],
+                    "original": original,
+                    "replacement": replacement,
+                    "supporting_evidence": text(suggestion.get("supporting_evidence")),
+                    "matched_job_requirement": text(suggestion.get("matched_job_requirement")),
+                    "confidence": confidence,
+                    "validation_status": "skipped",
+                    "reason": "Protected paragraph.",
+                    "priority": 9,
+                    "source": "suggestion",
+                }
+            )
+            continue
         if confidence < 60:
+            plan.append(
+                {
+                    "kind": "bullet",
+                    "paragraph_type": "bullet_paragraph",
+                    "section": context["section"],
+                    "original": original,
+                    "replacement": replacement,
+                    "supporting_evidence": text(suggestion.get("supporting_evidence")),
+                    "matched_job_requirement": text(suggestion.get("matched_job_requirement")),
+                    "confidence": confidence,
+                    "validation_status": "skipped",
+                    "reason": "Low semantic relevance.",
+                    "priority": 0 if context["section"] == "experience" else 1,
+                    "source": "suggestion",
+                }
+            )
             continue
-        plan.append(
-            {
-                "kind": "bullet",
-                "paragraph_type": "bullet_paragraph",
-                "original": original,
-                "replacement": replacement,
-                "supporting_evidence": text(suggestion.get("supporting_evidence")),
-                "matched_job_requirement": text(suggestion.get("matched_job_requirement")),
-                "confidence": confidence,
-                "validation_status": "pending",
-            }
-        )
+        candidate_map[normalize_space(original)] = {
+            "kind": "bullet",
+            "paragraph_type": "bullet_paragraph",
+            "section": context["section"],
+            "original": original,
+            "replacement": replacement,
+            "supporting_evidence": text(suggestion.get("supporting_evidence")),
+            "matched_job_requirement": text(suggestion.get("matched_job_requirement")),
+            "confidence": confidence,
+            "validation_status": "pending",
+            "priority": 0 if context["section"] == "experience" else 1,
+            "source": "suggestion",
+        }
 
-    planned_originals = {item["original"] for item in plan if item.get("original")}
-    job_requirement = text(job.get("required_skills")) or text(job.get("job_description")) or text(job.get("title"))
-    for paragraph in paragraphs:
-        if not is_editable_resume_paragraph(paragraph, "bullet"):
+    for context in contexts:
+        if context["section"] not in {"experience", "projects"} or not context["editable"] or not context["is_bullet"]:
             continue
-        original = normalize_space(paragraph.text)
-        if not original or original in planned_originals:
+        original = context["text"]
+        key = normalize_space(original)
+        if not key or key in candidate_map:
             continue
-        replacement = controlled_rewrite(original, job_requirement)
-        if normalize_space(replacement) == original:
+        replacement = controlled_rewrite(original, job_requirement, evidence_text=candidate_evidence["full_text"], section=context["section"])
+        if normalize_space(replacement) == key:
+            plan.append(
+                {
+                    "kind": "bullet",
+                    "paragraph_type": "bullet_paragraph",
+                    "section": context["section"],
+                    "original": original,
+                    "replacement": replacement,
+                    "supporting_evidence": original,
+                    "matched_job_requirement": job_requirement,
+                    "confidence": 45,
+                    "validation_status": "skipped",
+                    "reason": "No ATS benefit: wording already reads well for the current job.",
+                    "priority": 0 if context["section"] == "experience" else 1,
+                    "source": "generic",
+                }
+            )
             continue
+        confidence = resume_change_confidence(original, replacement, job_requirement, candidate_evidence["full_text"])
+        candidate = {
+            "kind": "bullet",
+            "paragraph_type": "bullet_paragraph",
+            "section": context["section"],
+            "original": original,
+            "replacement": replacement,
+            "supporting_evidence": original,
+            "matched_job_requirement": job_requirement,
+            "confidence": confidence,
+            "validation_status": "pending",
+            "priority": 0 if context["section"] == "experience" else 1,
+            "source": "generic",
+        }
+        existing = candidate_map.get(key)
+        concrete_ats_signals = ["testing", "database structures", "cross-functional", "data-cleaning", "for python applications"]
+        has_concrete_signal = any(signal in candidate["replacement"].lower() for signal in concrete_ats_signals)
+        if existing is None or (
+            existing.get("source") == "suggestion" and (has_concrete_signal or candidate["confidence"] >= int(existing.get("confidence", 0)) - 5)
+        ) or int(candidate["confidence"]) > int(existing.get("confidence", 0)):
+            candidate_map[key] = candidate
+
+    pending_candidates = sorted(
+        candidate_map.values(),
+        key=lambda item: (item["priority"], -int(item["confidence"]), item["section"], item["original"]),
+    )
+    selected_candidates = pending_candidates[:6]
+    selected_keys = {normalize_space(item["original"]) for item in selected_candidates}
+    for item in pending_candidates[6:]:
         plan.append(
             {
-                "kind": "bullet",
-                "paragraph_type": "bullet_paragraph",
-                "original": original,
-                "replacement": replacement,
-                "supporting_evidence": original,
-                "matched_job_requirement": job_requirement,
-                "confidence": 70,
-                "validation_status": "pending",
+                **item,
+                "validation_status": "skipped",
+                "reason": "Lower ranked than selected changes.",
             }
         )
-        planned_originals.add(original)
+    plan.extend(selected_candidates)
     return plan
+
+
+def resume_change_confidence(original: str, replacement: str, requirement: str, evidence_text: str) -> int:
+    original_terms = {term for term in extract_rewrite_terms(original)}
+    replacement_terms = {term for term in extract_rewrite_terms(replacement)}
+    requirement_terms = {term for term in extract_rewrite_terms(requirement)}
+    evidence_terms = {term for term in extract_rewrite_terms(evidence_text)}
+    shared_terms = (original_terms | replacement_terms) & (requirement_terms | evidence_terms)
+    score = 55 + min(20, len(shared_terms) * 4)
+    if any(term in replacement.lower() for term in ["database", "testing", "documentation", "collaboration", "python", "aws", "linux"]):
+        score += 5
+    length_ratio = len(replacement) / max(1, len(original))
+    if 0.75 <= length_ratio <= 1.25:
+        score += 5
+    if len(shared_terms) >= 2:
+        score += 5
+    return clamp_int(score, 0, 100)
+
+
+def extract_rewrite_terms(content: str) -> list[str]:
+    return [
+        term
+        for term in re.findall(r"[A-Za-z][A-Za-z0-9+#.-]{1,}", content.lower())
+        if term not in {"and", "the", "for", "with", "from", "that", "this", "into", "using", "built"}
+    ]
 
 
 def supporting_snippet_for_plan(candidate_evidence: dict[str, Any], output: dict[str, Any], job: dict[str, Any]) -> str:
@@ -1536,28 +1713,38 @@ def supporting_snippet_for_plan(candidate_evidence: dict[str, Any], output: dict
 
 def apply_resume_change_plan(document: Document, plan: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     paragraphs = list(iter_document_paragraphs(document))
+    editable_paragraph_count = sum(
+        1 for paragraph in paragraphs if any(
+            [
+                is_editable_resume_paragraph(paragraph, "summary"),
+                is_editable_resume_paragraph(paragraph, "skills"),
+                is_editable_resume_paragraph(paragraph, "bullet"),
+            ]
+        )
+    )
     applied: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     for item in plan:
+        item = dict(item)
         if item.get("validation_status") == "skipped":
-            skipped.append(item)
+            skipped.append({**item, "applied": False, "skip_reason": item.get("reason", "Skipped.")})
             continue
         kind = item["kind"]
         if kind in {"summary", "skills"}:
             target = find_section_paragraph(paragraphs, SUMMARY_HEADINGS if kind == "summary" else SKILLS_HEADINGS)
             if target is None:
-                skipped.append({**item, "reason": f"No {kind} section found in master resume."})
+                skipped.append({**item, "applied": False, "skip_reason": f"No {kind} section found in master resume."})
                 continue
             if kind == "summary" and not is_editable_resume_paragraph(target, "summary"):
-                skipped.append({**item, "reason": "Summary paragraph is protected or not editable."})
+                skipped.append({**item, "applied": False, "skip_reason": "Summary paragraph is protected or not editable."})
                 continue
             if kind == "skills" and not is_editable_resume_paragraph(target, "skills"):
-                skipped.append({**item, "reason": "Skills paragraph is protected or not editable."})
+                skipped.append({**item, "applied": False, "skip_reason": "Skills paragraph is protected or not editable."})
                 continue
             if replace_paragraph_exact(target, item["original"], item["replacement"]):
-                applied.append(item)
+                applied.append({**item, "applied": True})
             else:
-                skipped.append({**item, "reason": "Exact paragraph text was not found."})
+                skipped.append({**item, "applied": False, "skip_reason": "Exact paragraph text was not found."})
             continue
 
         matched = False
@@ -1565,12 +1752,21 @@ def apply_resume_change_plan(document: Document, plan: list[dict[str, Any]]) -> 
             if not is_editable_resume_paragraph(paragraph, "bullet"):
                 continue
             if replace_paragraph_exact(paragraph, item["original"], item["replacement"]):
-                applied.append(item)
+                applied.append({**item, "applied": True})
                 matched = True
                 break
         if not matched:
-            skipped.append({**item, "reason": "Exact bullet text was not found."})
-    return {"applied": applied, "skipped": skipped}
+            skipped.append({**item, "applied": False, "skip_reason": "Exact bullet text was not found."})
+    return {
+        "summary": {
+            "total_editable_paragraphs": editable_paragraph_count,
+            "total_proposed_changes": len(plan),
+            "total_applied_changes": len(applied),
+            "total_skipped_changes": len(skipped),
+        },
+        "applied": applied,
+        "skipped": skipped,
+    }
 
 
 def find_section_paragraph(paragraphs: list[Any], headings: set[str]) -> Any | None:
@@ -1589,6 +1785,42 @@ def is_section_heading(paragraph: Any, headings: set[str]) -> bool:
     if not text_value:
         return False
     return text_value in headings
+
+
+def paragraph_resume_section(paragraph: Any) -> str:
+    text_value = normalize_space(paragraph.text).lower().rstrip(":")
+    return RESUME_HEADING_TO_SECTION.get(text_value, "")
+
+
+def collect_resume_paragraph_contexts(document: Document) -> list[dict[str, Any]]:
+    contexts: list[dict[str, Any]] = []
+    current_section = ""
+    for paragraph in iter_document_paragraphs(document):
+        section = paragraph_resume_section(paragraph)
+        if section:
+            current_section = section
+        paragraph_text = normalize_space(paragraph.text)
+        style_name = getattr(getattr(paragraph, "style", None), "name", "") or ""
+        is_bullet = style_name.lower().startswith("list") or paragraph_text.startswith(("-", "â€¢", "*"))
+        editable = False
+        if current_section == "summary":
+            editable = is_editable_resume_paragraph(paragraph, "summary")
+        elif current_section == "skills":
+            editable = is_editable_resume_paragraph(paragraph, "skills")
+        elif current_section in {"experience", "projects"} and is_bullet:
+            editable = is_editable_resume_paragraph(paragraph, "bullet")
+        contexts.append(
+            {
+                "paragraph": paragraph,
+                "text": paragraph_text,
+                "section": current_section,
+                "style_name": style_name,
+                "editable": editable,
+                "is_bullet": is_bullet,
+                "is_heading": bool(section),
+            }
+        )
+    return contexts
 
 
 def iter_document_paragraphs(document: Document) -> list[Any]:
@@ -2830,7 +3062,7 @@ def build_summary(profile: dict[str, str], job: dict[str, Any], focus: list[str]
     role = first_supported_role(profile, candidate_evidence)
     snippets = supporting_snippets(focus, candidate_evidence, limit=2)
     skill_phrase = ", ".join(focus[:4]) if focus else "documented profile experience"
-    base = f"{role or 'Candidate'} for {target} with supported experience in {skill_phrase}."
+    base = f"{role or 'Candidate'} with supported experience in {skill_phrase} for the {target} role."
     if snippets:
         return f"{base} Evidence includes {snippets[0]}"
     return f"{base} Summary kept conservative because saved evidence is limited."

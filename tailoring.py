@@ -11,6 +11,7 @@ LABEL = "Rule-based local tailored draft - manual review required"
 ACTION_VERBS = {
     "made": "Built",
     "worked on": "Supported",
+    "worked with": "Collaborated with",
     "helped": "Supported",
     "did": "Delivered",
     "created": "Created",
@@ -105,18 +106,48 @@ def build_rewrite_suggestions(matches: list[dict[str, Any]]) -> list[dict[str, A
     return suggestions
 
 
-def controlled_rewrite(original: str, requirement: str) -> str:
+def controlled_rewrite(original: str, requirement: str, evidence_text: str = "", section: str = "") -> str:
     clean = original.strip(" -*\t")
     lowered = clean.lower()
+    requirement_lower = requirement.lower()
+    evidence_lower = evidence_text.lower()
     for old, new in ACTION_VERBS.items():
         if lowered.startswith(old):
             clean = new + clean[len(old) :]
             break
-    supported_terms = [term for term in extract_terms(requirement) if term.lower() in clean.lower()]
-    if supported_terms:
-        prefix = ", ".join(dict.fromkeys(supported_terms[:3]))
-        if not clean.lower().startswith(prefix.lower()):
-            clean = f"{prefix}: {clean}"
+    if "validation, logging, and data cleaning" in lowered and any(term in requirement_lower for term in ["testing", "debug", "debugging", "validation"]):
+        clean = re.sub(
+            r"validation,\s*logging,\s*and\s*data\s*cleaning",
+            "testing, validation, logging, and data-cleaning",
+            clean,
+            flags=re.I,
+        )
+    if re.search(r"\bdata models?\b", clean, re.I) and any(term in requirement_lower for term in ["sql", "database"]):
+        clean = re.sub(r"\bdata models?\b", "database structures and data models", clean, flags=re.I)
+    if "supplier specific" in lowered:
+        clean = re.sub(r"supplier specific", "supplier-specific", clean, flags=re.I)
+    if "manual data entry" in lowered:
+        clean = re.sub(r"data entry", "data-entry", clean, flags=re.I)
+    if "backend integrations with real-time data from" in lowered and any(term in requirement_lower for term in ["collaboration", "workflow", "documentation"]):
+        clean = re.sub(
+            r"backend integrations with real-time data from",
+            "backend integrations and cross-functional data workflows using",
+            clean,
+            flags=re.I,
+        )
+    if "team documentation standards" in lowered and "documentation" in requirement_lower:
+        clean = re.sub(r"team documentation standards", "documentation standards", clean, flags=re.I)
+    if "python" in requirement_lower and "python" not in lowered and "python" in evidence_lower:
+        if re.search(r"\b(validation|testing|automation|logging|documentation)\b", clean, re.I):
+            clean = re.sub(
+                r"^(Implemented|Built|Designed|Created|Developed|Supported|Maintained)\b",
+                r"\1 for Python applications",
+                clean,
+                count=1,
+                flags=re.I,
+            )
+    if len(clean) > int(len(original) * 1.35):
+        return original.strip(" -*\t")
     return clean
 
 

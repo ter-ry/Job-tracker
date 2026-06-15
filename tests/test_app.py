@@ -702,6 +702,60 @@ class JobAssistantTest(unittest.TestCase):
         self.assertNotIn("Suggested summary", xml)
         self.assertNotIn("analysis", xml.lower())
 
+    def test_resume_tailoring_makes_grounded_ats_edits_for_python_developer_job(self):
+        self.seed_python_developer_profile()
+        self.upload_resume_template(self.build_python_developer_resume_fixture())
+        profile = self.client.get("/api/profile").get_json()
+        master_path = Path(profile["resume_docx_template_path"])
+        master_before = master_path.read_bytes()
+
+        created = self.client.post(
+            "/api/shortlist",
+            json={
+                "company": "Northstar",
+                "title": "Python Developer",
+                "location": "Toronto",
+                "url": "https://example.com/job/python-dev",
+                "job_description": "Python SQL database design AWS Linux testing debugging documentation collaboration",
+            },
+        ).get_json()
+
+        self.assertEqual(created["resume_generation_status"], "generated")
+        resume_path = Path(created["resume_docx_path"])
+        self.assertEqual(master_before, master_path.read_bytes())
+
+        change_log = json.loads((resume_path.parent / "resume_change_log.json").read_text(encoding="utf-8"))
+        self.assertGreaterEqual(change_log["summary"]["total_editable_paragraphs"], 6)
+        self.assertGreaterEqual(change_log["summary"]["total_proposed_changes"], 4)
+        self.assertGreaterEqual(change_log["summary"]["total_applied_changes"], 4)
+        self.assertLessEqual(change_log["summary"]["total_applied_changes"], 6)
+        self.assertGreaterEqual(change_log["summary"]["total_skipped_changes"], 1)
+        self.assertTrue(any(item.get("applied") for item in change_log["applied"]))
+        self.assertTrue(any(item.get("skip_reason") for item in change_log["skipped"]))
+
+        tailored_doc = Document(io.BytesIO(resume_path.read_bytes()))
+        tailored_text = "\n".join(paragraph.text for paragraph in tailored_doc.paragraphs)
+        self.assertIn("George Brown College", tailored_text)
+        self.assertIn("Software Developer | Northstar Labs | 2021-2025", tailored_text)
+        self.assertIn("Computer programming diploma | 2023", tailored_text)
+        self.assertIn("validation, logging", tailored_text.lower())
+        self.assertIn("testing, validation, logging, and data-cleaning logic", tailored_text)
+        self.assertIn("database structures and data models", tailored_text)
+        self.assertIn("cross-functional data workflows using Retool and Google Docs", tailored_text)
+
+        skills_line = next(paragraph.text for paragraph in tailored_doc.paragraphs if paragraph.text.startswith("Skills:"))
+        self.assertTrue(skills_line.startswith("Skills: Python, SQL, AWS, Linux"))
+        self.assertIn("documentation", skills_line.lower())
+        self.assertIn("collaboration", skills_line.lower())
+
+        bullet_texts = [paragraph.text for paragraph in tailored_doc.paragraphs if getattr(getattr(paragraph, "style", None), "name", "").startswith("List")]
+        self.assertTrue(any("testing, validation, logging, and data-cleaning" in text for text in bullet_texts))
+        self.assertTrue(any("database structures and data models" in text for text in bullet_texts))
+        self.assertTrue(any("cross-functional data workflows using Retool and Google Docs" in text for text in bullet_texts))
+
+        opened = Document(io.BytesIO(resume_path.read_bytes()))
+        self.assertGreater(len(opened.paragraphs), 0)
+
     def test_cover_letter_template_upload_and_placeholder_replacement(self):
         self.seed_profile_for_documents(with_template=True)
         profile = self.client.get("/api/profile").get_json()
@@ -1000,6 +1054,21 @@ class JobAssistantTest(unittest.TestCase):
             else:
                 self.upload_master_resume_template()
 
+    def seed_python_developer_profile(self):
+        self.client.post(
+            "/api/profile",
+            json={
+                "name": "Terry Mak",
+                "preferred_roles": "software developer",
+                "preferred_locations": "Toronto, remote",
+                "key_skills": "Python, SQL, database design, AWS, Linux, testing, debugging, documentation, collaboration, Flask, React, cloud",
+                "projects": "Built a Python inventory tool with database design, AWS deployment scripts, Linux server checks, testing, and documentation for a small operations team.",
+                "education": "Computer programming diploma, George Brown College.",
+                "work_experience": "Software Developer at Northstar Labs from 2021 to 2025. Implemented robust validation, logging, and data cleaning logic to detect malformed inputs and reduce manual data entry errors by 90%. Designed data models and application logic for products, supplier specific items, and pricing records. Built backend integrations with real-time data from Retool and Google Docs for operations reporting and handoffs. Worked with cross-functional teammates to debug issues and document release steps.",
+                "resume_text": "Terry Mak. Software Developer at Northstar Labs from 2021 to 2025. Implemented robust validation, logging, and data cleaning logic to detect malformed inputs and reduce manual data entry errors by 90%. Designed data models and application logic for products, supplier specific items, and pricing records. Built backend integrations with real-time data from Retool and Google Docs for operations reporting and handoffs. Worked with cross-functional teammates to debug issues and document release steps. Education: Computer programming diploma, George Brown College.",
+            },
+        )
+
     def upload_master_resume_template(self):
         self.upload_resume_template(self.build_formatted_resume_fixture())
 
@@ -1137,6 +1206,75 @@ class JobAssistantTest(unittest.TestCase):
         skills_heading.add_run("Skills")
         skills = doc.add_paragraph()
         skills.add_run("Python, Flask, SQL, React")
+
+        contact_two = doc.add_paragraph()
+        contact_two.add_run("Portfolio: example.com/portfolio")
+
+        doc.save(path)
+        return path
+
+    def build_python_developer_resume_fixture(self):
+        path = Path(self.tmpdir.name) / "python_developer_resume_fixture.docx"
+        doc = Document()
+        section = doc.sections[0]
+        section.top_margin = Inches(0.75)
+        section.bottom_margin = Inches(0.75)
+        section.left_margin = Inches(0.85)
+        section.right_margin = Inches(0.85)
+
+        title = doc.add_paragraph()
+        title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = title.add_run("Terry Mak")
+        run.bold = True
+        run.font.name = "Aptos"
+        run.font.size = Pt(18)
+
+        contact = doc.add_paragraph()
+        contact.add_run("terry@example.com | LinkedIn | GitHub")
+
+        summary_heading = doc.add_paragraph()
+        summary_heading.style = "Heading 1"
+        summary_heading.add_run("Professional Summary")
+        summary = doc.add_paragraph()
+        summary.add_run("Software developer with Python, SQL, AWS, Linux, and documentation experience.")
+
+        experience_heading = doc.add_paragraph()
+        experience_heading.style = "Heading 1"
+        experience_heading.add_run("Work Experience")
+        experience = doc.add_paragraph()
+        experience.add_run("Software Developer").bold = True
+        experience.add_run(" | Northstar Labs | 2021-2025")
+
+        bullet1 = doc.add_paragraph(style="List Bullet")
+        bullet1.add_run("Implemented robust validation, logging, and data cleaning logic to detect malformed inputs and reduce manual data entry errors by 90%.")
+        bullet2 = doc.add_paragraph(style="List Bullet")
+        bullet2.add_run("Worked with cross-functional teammates to debug issues and document release steps across Python and SQL tools.")
+
+        projects_heading = doc.add_paragraph()
+        projects_heading.style = "Heading 1"
+        projects_heading.add_run("Projects")
+        project_title = doc.add_paragraph()
+        project_title.add_run("Inventory Reconciler").bold = True
+        project_title.add_run(" | Personal Project | 2024")
+        project_bullet1 = doc.add_paragraph(style="List Bullet")
+        project_bullet1.add_run("Designed data models and application logic for products, supplier specific items, and pricing records in an internal tool.")
+        project_bullet2 = doc.add_paragraph(style="List Bullet")
+        project_bullet2.add_run("Built backend integrations with real-time data from Retool and Google Docs for reporting and handoffs.")
+
+        skills_heading = doc.add_paragraph()
+        skills_heading.style = "Heading 1"
+        skills_heading.add_run("Skills")
+        skills = doc.add_paragraph()
+        skills.add_run("Skills: ").bold = True
+        skills.add_run("React, dashboards, AWS, Linux, Python, SQL, Flask, documentation, collaboration, testing")
+
+        education_heading = doc.add_paragraph()
+        education_heading.style = "Heading 1"
+        education_heading.add_run("Education")
+        college = doc.add_paragraph()
+        college.add_run("George Brown College")
+        diploma = doc.add_paragraph()
+        diploma.add_run("Computer programming diploma | 2023")
 
         contact_two = doc.add_paragraph()
         contact_two.add_run("Portfolio: example.com/portfolio")
