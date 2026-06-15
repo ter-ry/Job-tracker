@@ -496,6 +496,7 @@ async function generateForJob(id) {
 
 function renderGenerated(output) {
   const jobId = value("job-id");
+  const review = output.tailoring_review || {};
   const exportLinks = jobId
     ? `<div class="export-row">
         <a class="button small ghost" href="/export/${jobId}/cover_letter.txt">Cover .txt</a>
@@ -527,6 +528,21 @@ function renderGenerated(output) {
       <p><strong>Do not add unsupported:</strong> ${escapeHtml(output.unsupported_keywords.join(", ") || "None")}</p>
     </section>
     <section>
+      <h3>Tailoring review</h3>
+      <p><strong>Extracted phrases:</strong> ${escapeHtml((review.extracted_job_phrases || []).map((item) => item.phrase || item).join(", ") || "None")}</p>
+      <p><strong>Applied resume changes:</strong> ${renderReviewItems(review.applied_resume_changes)}</p>
+      <p><strong>Skipped resume changes:</strong> ${renderReviewItems(review.skipped_resume_changes)}</p>
+      <p><strong>Cover-letter blocks:</strong> ${renderReviewItems(review.cover_letter_evidence_blocks)}</p>
+      <details>
+        <summary>Matching evidence</summary>
+        ${renderReviewItems(review.matching_resume_evidence, true)}
+      </details>
+      <details>
+        <summary>Cover letter preview</summary>
+        <pre>${escapeHtml(review.final_cover_letter_preview || output.cover_letter || "")}</pre>
+      </details>
+    </section>
+    <section>
       <h3>Resume suggestions</h3>
       ${output.local_tailored_text ? `<pre>${escapeHtml(output.local_tailored_text)}</pre>` : ""}
       <pre>${escapeHtml(output.resume_text)}</pre>
@@ -553,6 +569,24 @@ function renderGenerated(output) {
 
 function scoreItem(label, value) {
   return `<div><span>${Number(value || 0)}</span><p>${escapeHtml(label)}</p></div>`;
+}
+
+function renderReviewItems(items, includeMatch = false) {
+  if (!Array.isArray(items) || !items.length) return `<span class="muted">None</span>`;
+  return `
+    <ul class="review-list">
+      ${items
+        .slice(0, 6)
+        .map((item) => {
+          const title = item.matched_job_phrase || item.job_phrase || item.original_text || item.section || "Item";
+          const detail = includeMatch
+            ? `${item.evidence_section || ""} · ${item.exact_original_resume_paragraph || item.supporting_evidence || ""}`
+            : item.new_text || item.proposed_text || item.supporting_evidence || "";
+          return `<li><strong>${escapeHtml(title)}</strong><div>${escapeHtml(detail)}</div></li>`;
+        })
+        .join("")}
+    </ul>
+  `;
 }
 
 function formatGeneratedText(output) {

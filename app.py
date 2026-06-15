@@ -38,6 +38,7 @@ from semantic_matching import MODEL_DOWNLOAD_SIZE, MODEL_NAME, analyze_resume_ma
 from seniority import DETECTED_LEVELS, SENIORITY_LEVELS, analyze_job_seniority, score_seniority_fit
 from sources.jobspy_source import fetch_jobspy_jobs
 from tailoring import controlled_rewrite, generate_tailored_resume_draft
+from tailoring_pipeline import build_tailoring_plan
 from werkzeug.utils import secure_filename
 
 
@@ -1314,8 +1315,11 @@ def apply_cover_letter_template(
     output: dict[str, Any],
 ) -> dict[str, list[dict[str, Any]]]:
     paragraphs = list(iter_document_paragraphs(document))
-    focus = list(output.get("supported_keywords", [])[:4])
-    generated_sections = build_cover_letter_sections(profile, job, focus, build_candidate_evidence(profile))
+    tailoring_plan = output.get("tailoring_plan") or build_tailoring_plan(job, profile, output.get("semantic_match", {}))
+    generated_sections = tailoring_plan.get("cover_letter_paragraphs") or []
+    if not generated_sections:
+        focus = list(output.get("supported_keywords", [])[:4])
+        generated_sections = build_cover_letter_sections(profile, job, focus, build_candidate_evidence(profile))
     replacements = {
         "{{DATE}}": date.today().isoformat(),
         "{{COMPANY}}": text(job.get("company")) or "your team",
@@ -1443,7 +1447,6 @@ def build_resume_change_plan(
     profile: dict[str, str],
     output: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    plan: list[dict[str, Any]] = []
     contexts = collect_resume_paragraph_contexts(document)
     candidate_evidence = build_candidate_evidence(profile)
     job_requirement = normalize_space(
@@ -1457,6 +1460,8 @@ def build_resume_change_plan(
             ]
         )
     )
+    tailoring_plan = output.get("tailoring_plan") or build_tailoring_plan(job, profile, output.get("semantic_match", {}))
+    plan: list[dict[str, Any]] = []
     candidate_map: dict[str, dict[str, Any]] = {}
 
     summary_context = next((ctx for ctx in contexts if ctx["section"] == "summary" and ctx["editable"]), None)
@@ -1490,9 +1495,78 @@ def build_resume_change_plan(
         )
 
     skills_context = next((ctx for ctx in contexts if ctx["section"] == "skills" and ctx["editable"]), None)
-    supported_skills = output.get("skill_guidance", {}).get("supported_relevant", [])
-    if skills_context is not None and supported_skills:
-        replacement = reorder_skills_text(skills_context["text"], supported_skills)
+    skills_block = next((item for item in tailoring_plan.get("resume_change_blocks", []) if item.get("section") == "skills"), None)
+    if skills_context is not None:
+        skill_pool = [
+            skill.strip()
+            for skill in re.split(r"[,;\n]+", str(profile.get("key_skills") or ""))
+            if skill.strip()
+        ]
+        job_lower = job_requirement.lower()
+        phrase_order = [str(phrase.get("phrase", "")).lower() for phrase in tailoring_plan.get("extracted_job_phrases", [])]
+        supported_skills = [
+            skill
+            for skill in skill_pool
+            if skill.lower() in job_lower
+            or skill.lower() in candidate_evidence["full_text"].lower()
+            or any(
+                skill.lower() in str(phrase.get("phrase", "")).lower() or str(phrase.get("phrase", "")).lower() in skill.lower()
+                for phrase in tailoring_plan.get("extracted_job_phrases", [])
+            )
+        ]
+        if any(term in job_lower for term in ["aws", "linux", "testing", "debugging", "documentation", "collaboration", "database design"]):
+            priority_terms = [
+                "Python",
+                "SQL",
+                "AWS",
+                "Linux",
+                "testing",
+                "debugging",
+                "documentation",
+                "collaboration",
+                "Flask",
+                "React",
+                "cloud",
+                "dashboards",
+            ]
+        else:
+            priority_terms = [
+                "Python",
+                "Flask",
+                "SQL",
+                "React",
+                "dashboards",
+                "cloud",
+            ]
+        ordered_skills: list[str] = []
+        for term in priority_terms:
+            for skill in supported_skills:
+                if skill in ordered_skills:
+                    continue
+                lower_skill = skill.lower()
+                lower_term = term.lower()
+                if lower_skill == lower_term or lower_term in lower_skill or lower_skill in lower_term:
+                    ordered_skills.append(skill)
+        for skill in supported_skills:
+            if skill not in ordered_skills:
+                ordered_skills.append(skill)
+        supported_skills = ordered_skills
+        if skills_block is not None:
+            replacement = reorder_skills_text(skills_context["text"], supported_skills)
+            confidence = clamp_int(skills_block.get("confidence"), 0, 100)
+            supporting_evidence = text(skills_block.get("supporting_evidence"))
+            matched_job_requirement = text(skills_block.get("matched_job_phrase"))
+        else:
+            replacement = reorder_skills_text(skills_context["text"], supported_skills)
+            confidence = 70 if normalize_space(replacement) != normalize_space(skills_context["text"]) else 40
+            supporting_evidence = ", ".join(supported_skills[:8])
+            matched_job_requirement = "Supported skills already present in the saved profile and posting"
+        if ":" in skills_context["text"]:
+            prefix = skills_context["text"].split(":", 1)[0].strip() or "Skills"
+            remainder = replacement.split(":", 1)[1].strip() if ":" in replacement else replacement.strip()
+            replacement = f"{prefix}: {remainder}"
+        elif not replacement.lower().startswith("skills:"):
+            replacement = f"Skills: {replacement.strip()}"
         if normalize_space(replacement) != normalize_space(skills_context["text"]):
             candidate_map["skills"] = {
                 "kind": "skills",
@@ -1500,9 +1574,9 @@ def build_resume_change_plan(
                 "section": "skills",
                 "original": skills_context["text"],
                 "replacement": replacement,
-                "supporting_evidence": ", ".join(supported_skills[:8]),
-                "matched_job_requirement": "Supported skills already present in the saved profile and posting",
-                "confidence": 75,
+                "supporting_evidence": supporting_evidence,
+                "matched_job_requirement": matched_job_requirement,
+                "confidence": confidence,
                 "validation_status": "pending",
                 "priority": 3,
             }
@@ -1514,35 +1588,19 @@ def build_resume_change_plan(
                     "section": "skills",
                     "original": skills_context["text"],
                     "replacement": skills_context["text"],
-                    "supporting_evidence": ", ".join(supported_skills[:8]),
-                    "matched_job_requirement": "Supported skills already present in the saved profile and posting",
-                    "confidence": 55,
+                    "supporting_evidence": supporting_evidence,
+                    "matched_job_requirement": matched_job_requirement,
+                    "confidence": confidence,
                     "validation_status": "skipped",
                     "reason": "No ATS benefit: skill order already matches the job-relevant priority.",
                     "priority": 3,
                 }
             )
-    elif skills_context is not None:
-        plan.append(
-            {
-                "kind": "skills",
-                "paragraph_type": "skills_paragraph",
-                "section": "skills",
-                "original": skills_context["text"],
-                "replacement": skills_context["text"],
-                "supporting_evidence": "",
-                "matched_job_requirement": "Supported skills already present in the saved profile and posting",
-                "confidence": 40,
-                "validation_status": "skipped",
-                "reason": "No supported skills were available to reorder.",
-                "priority": 3,
-            }
-        )
 
-    for suggestion in output.get("local_tailored_draft", {}).get("rewrite_suggestions", []):
-        original = normalize_space(text(suggestion.get("original_bullet")))
-        replacement = normalize_space(text(suggestion.get("proposed_bullet")))
-        confidence = clamp_int(suggestion.get("confidence"), 0, 100)
+    for block in tailoring_plan.get("resume_change_blocks", []):
+        original = normalize_space(text(block.get("original_text")))
+        replacement = normalize_space(text(block.get("proposed_text")))
+        confidence = clamp_int(block.get("confidence"), 0, 100)
         if not original or not replacement:
             continue
         context = next((ctx for ctx in contexts if normalize_space(ctx["text"]) == original and ctx["editable"]), None)
@@ -1551,15 +1609,16 @@ def build_resume_change_plan(
                 {
                     "kind": "bullet",
                     "paragraph_type": "bullet_paragraph",
-                    "section": "",
+                    "section": text(block.get("section")),
                     "original": original,
                     "replacement": replacement,
-                    "supporting_evidence": text(suggestion.get("supporting_evidence")),
-                    "matched_job_requirement": text(suggestion.get("matched_job_requirement")),
+                    "supporting_evidence": text(block.get("supporting_evidence")),
+                    "matched_job_requirement": text(block.get("matched_job_phrase")),
                     "confidence": confidence,
                     "validation_status": "skipped",
                     "reason": "Exact text not found in an editable paragraph.",
                     "priority": 9,
+                    "source": "shared-plan",
                 }
             )
             continue
@@ -1571,13 +1630,13 @@ def build_resume_change_plan(
                     "section": context["section"],
                     "original": original,
                     "replacement": replacement,
-                    "supporting_evidence": text(suggestion.get("supporting_evidence")),
-                    "matched_job_requirement": text(suggestion.get("matched_job_requirement")),
+                    "supporting_evidence": text(block.get("supporting_evidence")),
+                    "matched_job_requirement": text(block.get("matched_job_phrase")),
                     "confidence": confidence,
                     "validation_status": "skipped",
                     "reason": "Protected paragraph.",
                     "priority": 9,
-                    "source": "suggestion",
+                    "source": "shared-plan",
                 }
             )
             continue
@@ -1589,13 +1648,13 @@ def build_resume_change_plan(
                     "section": context["section"],
                     "original": original,
                     "replacement": replacement,
-                    "supporting_evidence": text(suggestion.get("supporting_evidence")),
-                    "matched_job_requirement": text(suggestion.get("matched_job_requirement")),
+                    "supporting_evidence": text(block.get("supporting_evidence")),
+                    "matched_job_requirement": text(block.get("matched_job_phrase")),
                     "confidence": confidence,
                     "validation_status": "skipped",
                     "reason": "Low semantic relevance.",
                     "priority": 0 if context["section"] == "experience" else 1,
-                    "source": "suggestion",
+                    "source": "shared-plan",
                 }
             )
             continue
@@ -1605,12 +1664,12 @@ def build_resume_change_plan(
             "section": context["section"],
             "original": original,
             "replacement": replacement,
-            "supporting_evidence": text(suggestion.get("supporting_evidence")),
-            "matched_job_requirement": text(suggestion.get("matched_job_requirement")),
+            "supporting_evidence": text(block.get("supporting_evidence")),
+            "matched_job_requirement": text(block.get("matched_job_phrase")),
             "confidence": confidence,
             "validation_status": "pending",
             "priority": 0 if context["section"] == "experience" else 1,
-            "source": "suggestion",
+            "source": "shared-plan",
         }
 
     for context in contexts:
@@ -1654,11 +1713,7 @@ def build_resume_change_plan(
             "source": "generic",
         }
         existing = candidate_map.get(key)
-        concrete_ats_signals = ["testing", "database structures", "cross-functional", "data-cleaning", "for python applications"]
-        has_concrete_signal = any(signal in candidate["replacement"].lower() for signal in concrete_ats_signals)
-        if existing is None or (
-            existing.get("source") == "suggestion" and (has_concrete_signal or candidate["confidence"] >= int(existing.get("confidence", 0)) - 5)
-        ) or int(candidate["confidence"]) > int(existing.get("confidence", 0)):
+        if existing is None or int(candidate["confidence"]) > int(existing.get("confidence", 0)):
             candidate_map[key] = candidate
 
     pending_candidates = sorted(
@@ -1666,7 +1721,6 @@ def build_resume_change_plan(
         key=lambda item: (item["priority"], -int(item["confidence"]), item["section"], item["original"]),
     )
     selected_candidates = pending_candidates[:6]
-    selected_keys = {normalize_space(item["original"]) for item in selected_candidates}
     for item in pending_candidates[6:]:
         plan.append(
             {
@@ -2976,6 +3030,7 @@ def generate_application_materials(
     seniority_fit = score_seniority_fit(profile, seniority_analysis)
     scoring = score_job(job, profile, semantic)
     tailored = generate_tailored_resume_draft(job, profile, semantic, seniority_fit)
+    tailoring_plan = tailored.get("tailoring_plan") or build_tailoring_plan(job, profile, semantic)
     skill_groups = classify_supported_skills(job, candidate_evidence)
     matched = job_keywords(job)
     supported = skill_groups["supported_relevant"]
@@ -2983,15 +3038,16 @@ def generate_application_materials(
     transferable = skill_groups["transferable_supported"]
     focus = supported[:4]
     resume_lines = [item["proposed_bullet"] for item in tailored["rewrite_suggestions"]] or source_backed_bullets(profile, focus)
+    grounded_resume_lines = [block["proposed_text"] for block in tailoring_plan.get("resume_change_blocks", []) if block.get("grounded")]
     summary = build_summary(profile, job, focus, candidate_evidence)
     skills_section = format_skills_guidance(skill_groups)
-    cover_letter = build_cover_letter(profile, job, focus, candidate_evidence)
+    cover_letter = tailoring_plan.get("cover_letter_text") or build_cover_letter(profile, job, focus, candidate_evidence)
     cover_validation = validate_cover_letter_output(cover_letter, candidate_evidence, job)
     answers = build_answers(profile, job, focus, candidate_evidence)
     resume_text = (
         f"Suggested summary\n{summary}\n\n"
         f"Suggested skills guidance\n{skills_section}\n\n"
-        f"Suggested bullet rewrites\n" + "\n".join([f"- {line}" for line in resume_lines]) + "\n\n"
+        f"Suggested bullet rewrites\n" + "\n".join([f"- {line}" for line in (grounded_resume_lines or resume_lines)]) + "\n\n"
         f"Unsupported job keywords - do not add\n{', '.join(unsupported) or 'None from the current posting.'}"
     )
     local_tailored_text = tailored["text"]
@@ -3023,7 +3079,7 @@ def generate_application_materials(
         "validation": validation,
         "summary": summary,
         "skills_section": skills_section,
-        "resume_bullets": resume_lines,
+        "resume_bullets": grounded_resume_lines or resume_lines,
         "resume_text": resume_text,
         "local_tailored_draft": tailored,
         "local_tailored_text": local_tailored_text,
@@ -3034,6 +3090,16 @@ def generate_application_materials(
         "cover_validation": cover_validation,
         "resume_validation": resume_validation,
         "short_answers": answers,
+        "tailoring_plan": tailoring_plan,
+        "tailoring_review": {
+            "extracted_job_phrases": tailoring_plan.get("extracted_job_phrases", []),
+            "matching_resume_evidence": tailoring_plan.get("phrase_to_evidence_matches", []),
+            "proposed_resume_changes": tailoring_plan.get("resume_change_blocks", []),
+            "applied_resume_changes": tailoring_plan.get("change_log", {}).get("applied_changes", []),
+            "skipped_resume_changes": tailoring_plan.get("change_log", {}).get("skipped_changes", []),
+            "cover_letter_evidence_blocks": tailoring_plan.get("selected_cover_letter_blocks", []),
+            "final_cover_letter_preview": tailoring_plan.get("cover_letter_text", ""),
+        },
     }
 
 

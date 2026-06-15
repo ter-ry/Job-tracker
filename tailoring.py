@@ -4,6 +4,7 @@ import re
 from typing import Any
 
 from grounding import build_candidate_evidence, classify_supported_skills, supporting_snippets
+from tailoring_pipeline import build_tailoring_plan, rewrite_paragraph
 
 
 LABEL = "Rule-based local tailored draft - manual review required"
@@ -25,11 +26,27 @@ def generate_tailored_resume_draft(
     match_result: dict[str, Any],
     seniority_result: dict[str, Any],
 ) -> dict[str, Any]:
+    plan = build_tailoring_plan(job, profile, match_result)
     evidence = match_result.get("evidence", [])
     matches = match_result.get("matches", [])
     ranked_evidence = rank_evidence(evidence, matches)
     supported_skills = prioritized_skills(profile, matches)
-    suggestions = build_rewrite_suggestions(matches)
+    suggestions = [
+        {
+            "original_bullet": block["original_text"],
+            "proposed_bullet": block["proposed_text"],
+            "matched_job_requirement": block["matched_job_phrase"],
+            "supporting_evidence": block["supporting_evidence"],
+            "changed_wording": block["changed_wording"],
+            "explanation": "Grounded rewrite derived from the shared tailoring plan.",
+            "confidence": block["confidence"],
+            "manual_review_warning": "Review carefully before using; keep only wording you can defend in an interview.",
+            "grounded": block["grounded"],
+            "evidence_id": block["evidence_id"],
+        }
+        for block in plan["resume_change_blocks"]
+        if block.get("section") in {"experience", "projects"}
+    ]
     gaps = match_result.get("unsupported_requirements") or match_result.get("missing_requirements") or []
     summary = build_supported_summary(job, profile, supported_skills, ranked_evidence)
     draft_text = format_draft(summary, supported_skills, ranked_evidence, suggestions, gaps, seniority_result)
@@ -41,6 +58,8 @@ def generate_tailored_resume_draft(
         "rewrite_suggestions": suggestions,
         "gaps_that_must_not_be_added": gaps,
         "seniority_suitability_note": seniority_result.get("explanation", ""),
+        "tailoring_plan": plan,
+        "cover_letter_evidence_blocks": plan.get("selected_cover_letter_blocks", []),
         "text": draft_text,
     }
 
@@ -108,6 +127,17 @@ def build_rewrite_suggestions(matches: list[dict[str, Any]]) -> list[dict[str, A
 
 def controlled_rewrite(original: str, requirement: str, evidence_text: str = "", section: str = "") -> str:
     clean = original.strip(" -*\t")
+    if not clean:
+        return clean
+    if requirement and evidence_text:
+        match = {
+            "job_phrase": requirement,
+            "job_phrase_category": "domain terminology",
+            "evidence_text": evidence_text,
+        }
+        proposed, _, validation, _ = rewrite_paragraph(clean, requirement, match, {"job_description": requirement}, {"full_text": evidence_text})
+        if validation.get("grounded"):
+            return proposed
     lowered = clean.lower()
     requirement_lower = requirement.lower()
     evidence_lower = evidence_text.lower()
