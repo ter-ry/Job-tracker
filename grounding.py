@@ -94,6 +94,15 @@ COMMON_JOB_WORDS = {
     "team",
 }
 
+RESUME_SECTION_HEADINGS = {"education", "skills", "experience", "projects"}
+
+CONTACT_PATTERNS = [
+    re.compile(r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b"),
+    re.compile(r"\b(?:https?://)?(?:www\.)?linkedin\.com\b", re.I),
+    re.compile(r"\b(?:https?://)?(?:www\.)?github\.com\b", re.I),
+    re.compile(r"\b\d{3}[-.)\s]?\d{3}[-.\s]?\d{4}\b"),
+]
+
 
 def build_candidate_evidence(profile: dict[str, Any]) -> dict[str, Any]:
     sections: list[dict[str, str]] = []
@@ -247,6 +256,43 @@ def validate_generated_content(content: str, evidence: dict[str, Any], job: dict
     }
 
 
+def validate_cover_letter_output(
+    content: str,
+    evidence: dict[str, Any],
+    job: dict[str, Any],
+    max_paragraph_chars: int = 400,
+) -> dict[str, Any]:
+    conflicts: list[str] = []
+    lower = validation_claim_text(content).lower()
+    paragraphs = [paragraph.strip() for paragraph in re.split(r"\n\s*\n", content) if paragraph.strip()]
+
+    for paragraph in paragraphs:
+        if len(paragraph) > max_paragraph_chars:
+            conflicts.append("cover letter paragraph exceeds the configured length limit")
+        if contains_resume_section_heading(paragraph):
+            conflicts.append("cover letter body contains resume section headings")
+        if contains_contact_details(paragraph):
+            conflicts.append("cover letter body contains contact details")
+
+    for term in TECHNICAL_TERMS:
+        if contains_phrase(lower, term) and not evidence_supports_phrase(term, evidence):
+            conflicts.append(term)
+
+    if looks_like_keyword_dump(lower):
+        conflicts.append("cover letter appears to be keyword dumping")
+
+    if job_domain_conflict(lower, evidence, job):
+        conflicts.append("candidate/job domain conflict")
+
+    empty_or_corrupted = not evidence_has_generation_source(evidence) or is_corrupted_text(str(evidence.get("full_text") or ""))
+    return {
+        "ok": not conflicts and not empty_or_corrupted,
+        "conflicting_phrases": list(dict.fromkeys(conflicts)),
+        "empty_or_corrupted_evidence": empty_or_corrupted,
+        "paragraph_count": len(paragraphs),
+    }
+
+
 def validation_claim_text(content: str) -> str:
     kept = []
     skip_next = False
@@ -323,6 +369,36 @@ def contains_token_overlap(left: str, right: str) -> bool:
     if not left_tokens:
         return False
     return len(left_tokens & right_tokens) / len(left_tokens) >= 0.6
+
+
+def contains_resume_section_heading(paragraph: str) -> bool:
+    for line in paragraph.splitlines():
+        lower = normalize_space(line).lower().rstrip(":")
+        if lower and lower in RESUME_SECTION_HEADINGS:
+            return True
+    return False
+
+
+def contains_contact_details(paragraph: str) -> bool:
+    return any(pattern.search(paragraph) for pattern in CONTACT_PATTERNS)
+
+
+def looks_like_keyword_dump(content: str) -> bool:
+    if sum(1 for term in TECHNICAL_TERMS if contains_phrase(content, term)) >= 12:
+        return True
+    return any(chunk.count(",") >= 10 for chunk in re.split(r"\n+", content))
+
+
+def job_domain_conflict(content: str, evidence: dict[str, Any], job: dict[str, Any]) -> bool:
+    job_text_value = job_text(job).lower()
+    domain_terms = ["developer", "engineer", "python", "flask", "sql", "database", "cloud", "api", "react"]
+    if not any(term in job_text_value for term in domain_terms):
+        return False
+    evidence_text = str(evidence.get("full_text") or "").lower()
+    if not evidence_text:
+        return True
+    evidence_hits = sum(1 for term in domain_terms if term in evidence_text)
+    return evidence_hits == 0
 
 
 def stable_hash(value: str) -> str:

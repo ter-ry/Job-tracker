@@ -24,17 +24,20 @@ from grounding import (
     PDF_CORRUPTION_MESSAGE,
     build_candidate_evidence,
     classify_supported_skills,
+    contains_contact_details,
+    contains_resume_section_heading,
     evidence_has_generation_source,
     is_corrupted_text,
     job_keywords,
     stable_hash as grounding_hash,
     supporting_snippets,
+    validate_cover_letter_output,
     validate_generated_content,
 )
 from semantic_matching import MODEL_DOWNLOAD_SIZE, MODEL_NAME, analyze_resume_match
 from seniority import DETECTED_LEVELS, SENIORITY_LEVELS, analyze_job_seniority, score_seniority_fit
 from sources.jobspy_source import fetch_jobspy_jobs
-from tailoring import generate_tailored_resume_draft
+from tailoring import controlled_rewrite, generate_tailored_resume_draft
 from werkzeug.utils import secure_filename
 
 
@@ -213,6 +216,8 @@ PROFILE_COLUMNS = {
     "resume_text": "TEXT NOT NULL DEFAULT ''",
     "resume_docx_template_path": "TEXT NOT NULL DEFAULT ''",
     "cover_letter_template": "TEXT NOT NULL DEFAULT ''",
+    "cover_letter_docx_template_path": "TEXT NOT NULL DEFAULT ''",
+    "cover_letter_template_status": "TEXT NOT NULL DEFAULT ''",
     "target_seniority_levels": "TEXT NOT NULL DEFAULT 'entry_level,junior,intermediate'",
     "maximum_required_years": "TEXT NOT NULL DEFAULT '3'",
     "willing_to_apply_to_stretch_roles": "TEXT NOT NULL DEFAULT 'true'",
@@ -254,6 +259,7 @@ def create_app() -> Flask:
         if not uploaded:
             return jsonify({"error": "No file uploaded"}), 400
         filename = uploaded.filename or "resume.txt"
+        template_kind = text(request.form.get("template_kind")).lower()
         suffix = Path(filename).suffix.lower()
         try:
             content = uploaded.read()
@@ -261,20 +267,39 @@ def create_app() -> Flask:
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         profile = load_profile()
-        profile["resume_text"] = extracted
         warning = ""
-        if suffix == ".docx":
-            template_path = save_master_resume_template(filename, content)
-            profile["resume_docx_template_path"] = str(template_path)
+        status_message = ""
+        if template_kind == "cover_letter":
+            if suffix != ".docx":
+                return jsonify({"error": "Upload a DOCX cover-letter template."}), 400
+            template_path = save_master_cover_letter_template(filename, content)
+            profile["cover_letter_template"] = extracted
+            profile["cover_letter_docx_template_path"] = str(template_path)
+            profile["cover_letter_template_status"] = "DOCX template uploaded"
+            status_message = "DOCX template uploaded — formatting-preserving generation available"
         else:
-            profile["resume_docx_template_path"] = ""
-            warning = "Upload a DOCX resume to generate a format-preserving tailored resume."
+            profile["resume_text"] = extracted
+            if suffix == ".docx":
+                template_path = save_master_resume_template(filename, content)
+                profile["resume_docx_template_path"] = str(template_path)
+            else:
+                profile["resume_docx_template_path"] = ""
+                warning = "Upload a DOCX resume to generate a format-preserving tailored resume."
         upsert_profile(profile)
-        response = {"resume_text": extracted}
+        response: dict[str, Any] = {}
         if warning:
             response["warning"] = warning
         else:
-            response["resume_docx_template_path"] = profile["resume_docx_template_path"]
+            if template_kind == "cover_letter":
+                response["cover_letter_template"] = extracted
+                response["cover_letter_docx_template_path"] = profile["cover_letter_docx_template_path"]
+                response["cover_letter_template_status"] = profile["cover_letter_template_status"]
+                response["status_message"] = status_message
+            else:
+                response["resume_text"] = extracted
+                response["resume_docx_template_path"] = profile["resume_docx_template_path"]
+        if template_kind != "cover_letter" and "resume_text" not in response:
+            response["resume_text"] = extracted
         return jsonify(response)
 
     @app.get("/api/jobs")
@@ -930,7 +955,7 @@ def generate_and_store_shortlist_documents(job_id: int) -> dict[str, Any]:
         resume_path = folder / resume_name
         cover_path = folder / cover_name
         resume_result = build_format_preserving_resume(job, profile, output, resume_path)
-        write_docx(cover_path, f"Cover Letter - {job.get('company') or 'Company'}", output["cover_letter"])
+        cover_result = build_format_preserving_cover_letter(job, profile, output, cover_path)
         metadata = {
             "job_id": job_id,
             "company": job.get("company"),
@@ -940,20 +965,26 @@ def generate_and_store_shortlist_documents(job_id: int) -> dict[str, Any]:
             "salary_source": job.get("salary_source"),
             "fit_score": job.get("fit_score"),
             "resume_template_path": profile.get("resume_docx_template_path", ""),
+            "cover_letter_template_path": profile.get("cover_letter_docx_template_path", ""),
         }
         (folder / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         (folder / "resume.txt").write_text(output["resume_text"], encoding="utf-8")
         (folder / "cover_letter.txt").write_text(output["cover_letter"], encoding="utf-8")
         (folder / "resume_change_log.json").write_text(json.dumps(resume_result["change_log"], indent=2), encoding="utf-8")
+        (folder / "cover_letter_change_log.json").write_text(json.dumps(cover_result["change_log"], indent=2), encoding="utf-8")
         update_generation_status(
             job_id,
             resume_result["status"],
-            "generated",
+            cover_result["status"],
             str(resume_path) if resume_result["status"] == "generated" else "",
-            str(cover_path),
-            resume_result["error"],
+            str(cover_path) if cover_result["status"] == "generated" else "",
+            "; ".join(filter(None, [resume_result["error"], cover_result["error"]])),
         )
-        return {"resume": resume_result["status"], "cover_letter": "generated", "error": resume_result["error"]}
+        return {
+            "resume": resume_result["status"],
+            "cover_letter": cover_result["status"],
+            "error": "; ".join(filter(None, [resume_result["error"], cover_result["error"]])),
+        }
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
         update_generation_status(job_id, "failed", "failed", "", "", error)
@@ -1008,6 +1039,118 @@ def build_format_preserving_resume(
     }
 
 
+def build_format_preserving_cover_letter(
+    job: dict[str, Any],
+    profile: dict[str, str],
+    output: dict[str, Any],
+    cover_path: Path,
+) -> dict[str, Any]:
+    template_raw = text(profile.get("cover_letter_docx_template_path"))
+    template_path = safe_local_path(template_raw)
+    warning = ""
+    if template_path is None or not template_path.exists():
+        write_cover_letter_docx(cover_path, output["cover_letter"])
+        return {
+            "status": "generated",
+            "error": "",
+            "change_log": {
+                "master_cover_letter_path": "",
+                "output_path": str(cover_path),
+                "applied": [],
+                "skipped": [],
+                "template_mode": "standard",
+            },
+        }
+
+    shutil.copyfile(template_path, cover_path)
+    document = Document(cover_path)
+    change_log = apply_cover_letter_template(document, job, profile, output)
+    document.save(cover_path)
+    return {
+        "status": "generated",
+        "error": warning,
+        "change_log": {
+            "master_cover_letter_path": str(template_path),
+            "output_path": str(cover_path),
+            **change_log,
+        },
+    }
+
+
+def apply_cover_letter_template(
+    document: Document,
+    job: dict[str, Any],
+    profile: dict[str, str],
+    output: dict[str, Any],
+) -> dict[str, list[dict[str, Any]]]:
+    paragraphs = list(iter_document_paragraphs(document))
+    focus = list(output.get("supported_keywords", [])[:4])
+    generated_sections = build_cover_letter_sections(profile, job, focus, build_candidate_evidence(profile))
+    replacements = {
+        "{{DATE}}": date.today().isoformat(),
+        "{{COMPANY}}": text(job.get("company")) or "your team",
+        "{{JOB_TITLE}}": text(job.get("title")) or "the role",
+        "{{HIRING_MANAGER}}": f"{text(job.get('company')) or 'the company'} Hiring Team",
+        "{{OPENING_PARAGRAPH}}": generated_sections[1],
+        "{{EXPERIENCE_PARAGRAPH}}": generated_sections[2],
+        "{{FIT_PARAGRAPH}}": generated_sections[3],
+        "{{CLOSING_PARAGRAPH}}": "\n\n".join(generated_sections[4:6]),
+    }
+    applied: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    placeholder_hits = 0
+
+    for paragraph in paragraphs:
+        original = paragraph.text
+        if not original.strip():
+            continue
+        replaced = False
+        for placeholder, replacement in replacements.items():
+            if placeholder in original:
+                if replace_paragraph_text(paragraph, original, original.replace(placeholder, replacement)):
+                    applied.append(
+                        {
+                            "kind": "placeholder",
+                            "original": original,
+                            "replacement": original.replace(placeholder, replacement),
+                            "matched_job_requirement": placeholder,
+                            "supporting_evidence": "",
+                            "confidence": 95,
+                            "validation_status": "passed",
+                        }
+                    )
+                    placeholder_hits += 1
+                    replaced = True
+                break
+        if replaced:
+            continue
+
+    if placeholder_hits:
+        return {"applied": applied, "skipped": skipped, "template_mode": "placeholder"}
+
+    editable_sections = generated_sections[1:5]
+    editable_paragraphs = [paragraph for paragraph in paragraphs if is_editable_cover_letter_paragraph(paragraph)]
+    for paragraph, replacement in zip(editable_paragraphs, editable_sections):
+        original = paragraph.text
+        if not original.strip():
+            continue
+        if replace_paragraph_text(paragraph, original, replacement):
+            applied.append(
+                {
+                    "kind": "paragraph",
+                    "original": original,
+                    "replacement": replacement,
+                    "matched_job_requirement": text(job.get("title")) or "",
+                    "supporting_evidence": "",
+                    "confidence": 80,
+                    "validation_status": "passed",
+                }
+            )
+        else:
+            skipped.append({"kind": "paragraph", "original": original, "replacement": replacement, "reason": "Paragraph text did not match."})
+    return {"applied": applied, "skipped": skipped, "template_mode": "fallback"}
+
+
 SUMMARY_HEADINGS = {
     "summary",
     "professional summary",
@@ -1045,11 +1188,27 @@ def build_resume_change_plan(
         plan.append(
             {
                 "kind": "summary",
+                "paragraph_type": "summary_paragraph",
                 "original": summary_paragraph.text,
                 "replacement": output.get("summary", ""),
                 "supporting_evidence": supporting_snippet_for_plan(candidate_evidence, output, job),
                 "matched_job_requirement": text(job.get("title")),
                 "confidence": 90,
+                "validation_status": "passed",
+            }
+        )
+    else:
+        plan.append(
+            {
+                "kind": "summary",
+                "paragraph_type": "summary_paragraph",
+                "original": "",
+                "replacement": "",
+                "supporting_evidence": "",
+                "matched_job_requirement": "",
+                "confidence": 0,
+                "validation_status": "skipped",
+                "reason": "Skipped summary tailoring: no existing summary section",
             }
         )
 
@@ -1061,11 +1220,13 @@ def build_resume_change_plan(
             plan.append(
                 {
                     "kind": "skills",
+                    "paragraph_type": "skills_paragraph",
                     "original": skills_paragraph.text,
                     "replacement": replacement,
                     "supporting_evidence": ", ".join(supported_skills[:8]),
                     "matched_job_requirement": "Supported skills already present in the saved profile and posting",
                     "confidence": 75,
+                    "validation_status": "passed",
                 }
             )
 
@@ -1080,13 +1241,40 @@ def build_resume_change_plan(
         plan.append(
             {
                 "kind": "bullet",
+                "paragraph_type": "bullet_paragraph",
                 "original": original,
                 "replacement": replacement,
                 "supporting_evidence": text(suggestion.get("supporting_evidence")),
                 "matched_job_requirement": text(suggestion.get("matched_job_requirement")),
                 "confidence": confidence,
+                "validation_status": "pending",
             }
         )
+
+    planned_originals = {item["original"] for item in plan if item.get("original")}
+    job_requirement = text(job.get("required_skills")) or text(job.get("job_description")) or text(job.get("title"))
+    for paragraph in paragraphs:
+        if not is_editable_resume_paragraph(paragraph, "bullet"):
+            continue
+        original = normalize_space(paragraph.text)
+        if not original or original in planned_originals:
+            continue
+        replacement = controlled_rewrite(original, job_requirement)
+        if normalize_space(replacement) == original:
+            continue
+        plan.append(
+            {
+                "kind": "bullet",
+                "paragraph_type": "bullet_paragraph",
+                "original": original,
+                "replacement": replacement,
+                "supporting_evidence": original,
+                "matched_job_requirement": job_requirement,
+                "confidence": 70,
+                "validation_status": "pending",
+            }
+        )
+        planned_originals.add(original)
     return plan
 
 
@@ -1102,11 +1290,20 @@ def apply_resume_change_plan(document: Document, plan: list[dict[str, Any]]) -> 
     applied: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     for item in plan:
+        if item.get("validation_status") == "skipped":
+            skipped.append(item)
+            continue
         kind = item["kind"]
         if kind in {"summary", "skills"}:
             target = find_section_paragraph(paragraphs, SUMMARY_HEADINGS if kind == "summary" else SKILLS_HEADINGS)
             if target is None:
                 skipped.append({**item, "reason": f"No {kind} section found in master resume."})
+                continue
+            if kind == "summary" and not is_editable_resume_paragraph(target, "summary"):
+                skipped.append({**item, "reason": "Summary paragraph is protected or not editable."})
+                continue
+            if kind == "skills" and not is_editable_resume_paragraph(target, "skills"):
+                skipped.append({**item, "reason": "Skills paragraph is protected or not editable."})
                 continue
             if replace_paragraph_exact(target, item["original"], item["replacement"]):
                 applied.append(item)
@@ -1116,6 +1313,8 @@ def apply_resume_change_plan(document: Document, plan: list[dict[str, Any]]) -> 
 
         matched = False
         for paragraph in paragraphs:
+            if not is_editable_resume_paragraph(paragraph, "bullet"):
+                continue
             if replace_paragraph_exact(paragraph, item["original"], item["replacement"]):
                 applied.append(item)
                 matched = True
@@ -1140,8 +1339,7 @@ def is_section_heading(paragraph: Any, headings: set[str]) -> bool:
     text_value = normalize_space(paragraph.text).lower().rstrip(":")
     if not text_value:
         return False
-    style_name = getattr(getattr(paragraph, "style", None), "name", "") or ""
-    return text_value in headings or style_name.lower().startswith("heading")
+    return text_value in headings
 
 
 def iter_document_paragraphs(document: Document) -> list[Any]:
@@ -1186,6 +1384,45 @@ def replace_paragraph_exact(paragraph: Any, original: str, replacement: str) -> 
     for run in runs:
         if run is not first_run:
             run.text = ""
+    return True
+
+
+def replace_paragraph_text(paragraph: Any, original: str, replacement: str) -> bool:
+    return replace_paragraph_exact(paragraph, original, replacement)
+
+
+def is_editable_resume_paragraph(paragraph: Any, kind: str) -> bool:
+    paragraph_text = normalize_space(paragraph.text)
+    if not paragraph_text:
+        return False
+    style_name = getattr(getattr(paragraph, "style", None), "name", "") or ""
+    if style_name.lower().startswith("heading"):
+        return False
+    if contains_contact_details(paragraph_text):
+        return False
+    if kind == "bullet":
+        return style_name.lower().startswith("list") or paragraph_text.startswith(("-", "•", "*"))
+    if kind in {"summary", "skills"}:
+        return not paragraph_text.lower().startswith(("dear ", "sincerely", "best regards"))
+    return True
+
+
+def is_editable_cover_letter_paragraph(paragraph: Any) -> bool:
+    paragraph_text = normalize_space(paragraph.text)
+    if not paragraph_text:
+        return False
+    lower = paragraph_text.lower()
+    style_name = getattr(getattr(paragraph, "style", None), "name", "") or ""
+    if style_name.lower().startswith("heading"):
+        return False
+    if contains_resume_section_heading(paragraph_text) or contains_contact_details(paragraph_text):
+        return False
+    if lower.startswith(("dear ", "sincerely", "best regards", "regards", "thank you")):
+        return False
+    if "{{" in paragraph_text and "}}" in paragraph_text:
+        return False
+    if len(paragraph_text) <= 40 and len(paragraph_text.split()) <= 5 and "." not in paragraph_text and "," not in paragraph_text:
+        return False
     return True
 
 
@@ -1242,6 +1479,16 @@ def save_master_resume_template(filename: str, content: bytes) -> Path:
     return path
 
 
+def save_master_cover_letter_template(filename: str, content: bytes) -> Path:
+    suffix = Path(filename).suffix.lower() or ".docx"
+    stem = safe_filename(Path(filename).stem or "cover_letter")
+    folder = DATA_DIR / "cover_letter_templates"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"{stem}_{uuid.uuid4().hex[:10]}{suffix}"
+    path.write_bytes(content)
+    return path
+
+
 def update_generation_status(
     job_id: int,
     resume_status: str,
@@ -1283,6 +1530,21 @@ def write_docx(path: Path, title: str, body: str) -> None:
             document.add_paragraph(lines[0])
             for line in lines[1:]:
                 document.add_paragraph(line.lstrip("- "), style="List Bullet" if line.strip().startswith("-") else None)
+    document.save(path)
+
+
+def write_cover_letter_docx(path: Path, body: str) -> None:
+    document = Document()
+    for block in body.split("\n\n"):
+        lines = [line for line in block.splitlines() if line.strip()]
+        if not lines:
+            continue
+        if len(lines) == 1:
+            document.add_paragraph(lines[0])
+        else:
+            document.add_paragraph(lines[0])
+            for line in lines[1:]:
+                document.add_paragraph(line)
     document.save(path)
 
 
@@ -1682,6 +1944,10 @@ def normalize_profile_payload(payload: dict[str, Any], existing: dict[str, str] 
     profile["management_roles_allowed"] = normalize_bool_text(payload.get("management_roles_allowed"), False)
     if "resume_docx_template_path" not in payload and existing.get("resume_docx_template_path"):
         profile["resume_docx_template_path"] = text(existing.get("resume_docx_template_path"))
+    if "cover_letter_docx_template_path" not in payload and existing.get("cover_letter_docx_template_path"):
+        profile["cover_letter_docx_template_path"] = text(existing.get("cover_letter_docx_template_path"))
+    if "cover_letter_template_status" not in payload and existing.get("cover_letter_template_status"):
+        profile["cover_letter_template_status"] = text(existing.get("cover_letter_template_status"))
     return profile
 
 
@@ -2186,6 +2452,10 @@ def generate_application_materials(job: dict[str, Any], profile: dict[str, str])
     summary = build_summary(profile, job, focus, candidate_evidence)
     skills_section = format_skills_guidance(skill_groups)
     cover_letter = build_cover_letter(profile, job, focus, candidate_evidence)
+    cover_validation = validate_cover_letter_output(cover_letter, candidate_evidence, job)
+    if not cover_validation["ok"]:
+        conflicts = ", ".join(cover_validation["conflicting_phrases"]) or "empty or corrupted candidate evidence"
+        raise ValueError(f"Generated cover letter failed grounding validation. Unsupported or conflicting phrases: {conflicts}")
     answers = build_answers(profile, job, focus, candidate_evidence)
     resume_text = (
         f"Suggested summary\n{summary}\n\n"
@@ -2287,23 +2557,101 @@ def generation_job_hash(job: dict[str, Any]) -> str:
 
 
 def build_cover_letter(profile: dict[str, str], job: dict[str, Any], focus: list[str], candidate_evidence: dict[str, Any]) -> str:
+    return "\n\n".join(build_cover_letter_sections(profile, job, focus, candidate_evidence))
+
+
+def build_cover_letter_sections(
+    profile: dict[str, str],
+    job: dict[str, Any],
+    focus: list[str],
+    candidate_evidence: dict[str, Any],
+) -> list[str]:
     company = text(job.get("company")) or "your team"
     title = text(job.get("title")) or "the role"
     role = first_supported_role(profile, candidate_evidence) or "candidate"
-    snippets = supporting_snippets(focus, candidate_evidence, limit=3)
+    evidence_items = select_cover_letter_evidence(profile, job, focus, candidate_evidence)
     skill_phrase = ", ".join(focus[:4]) if focus else "the experience saved in my profile"
-    body_evidence = " ".join(snippets[:2]) if snippets else "My saved profile provides the basis for the details in this application."
-    return (
-        f"Dear {company} Hiring Team,\n\n"
-        f"I am writing about the {title} role. My background as a {role} aligns with the role through "
-        f"{skill_phrase}.\n\n"
-        f"{body_evidence}\n\n"
-        f"I would bring careful communication, reliable follow-through, and respect for the responsibilities "
-        f"of the position.\n\n"
-        f"Thank you for considering my application. I would welcome the chance to discuss how my background "
-        f"fits the work at {company}.\n\n"
-        f"Sincerely,\n{profile.get('name', '')}"
+    greeting = f"Dear {company} Hiring Team,"
+    opening = (
+        f"I’m excited to apply for the {title} role at {company}. My background as a {role} aligns with the position "
+        f"through {skill_phrase}, and I’m drawn to opportunities where careful execution and practical problem-solving "
+        f"matter as much as technical breadth."
     )
+
+    if evidence_items:
+        evidence_text = evidence_items[0]
+    else:
+        evidence_text = "My saved profile contains the relevant experience and project detail for this application."
+    experience = (
+        f"In recent experience, {evidence_text} This kind of work has helped me build careful habits around practical checks, "
+        f"documentation, and clear communication with business users and teammates."
+    )
+
+    fit = (
+        f"I would bring that same focus to {company}, especially where the role values {skill_phrase} and dependable follow-through, "
+        f"clear communication with business users or teammates, and steady attention to documented results rather than keyword-heavy claims."
+    )
+
+    closing = (
+        f"Thank you for your time and consideration. I would welcome the chance to discuss how my background can support "
+        f"{company} in the {title} role."
+    )
+    signature = f"Sincerely,\n{profile.get('name', '')}"
+    return [greeting, opening, experience, fit, closing, signature]
+
+
+def select_cover_letter_evidence(
+    profile: dict[str, str],
+    job: dict[str, Any],
+    focus: list[str],
+    candidate_evidence: dict[str, Any],
+) -> list[str]:
+    snippets: list[str] = []
+    terms = focus[:4] or []
+    for section in candidate_evidence.get("sections", []):
+        for sentence in split_sentences(section["text"]):
+            clean = normalize_space(sentence)
+            if not clean or len(clean) > 400:
+                continue
+            if contains_resume_section_heading(clean) or contains_contact_details(clean):
+                continue
+            if terms and not any(contains_phrase(clean, term) or contains_phrase(term, clean) for term in terms):
+                continue
+            snippets.append(trim_cover_letter_evidence(clean))
+            if len(snippets) >= 3:
+                return snippets
+    if not snippets:
+        fallback_terms = [term for term in terms if term]
+        for section in candidate_evidence.get("sections", []):
+            for sentence in split_sentences(section["text"]):
+                clean = normalize_space(sentence)
+                if not clean or len(clean) > 400:
+                    continue
+                if contains_resume_section_heading(clean) or contains_contact_details(clean):
+                    continue
+                if fallback_terms and any(contains_phrase(clean, term) or contains_phrase(term, clean) for term in fallback_terms):
+                    snippets.append(trim_cover_letter_evidence(clean))
+                    if len(snippets) >= 3:
+                        return snippets
+    if not snippets:
+        project = text(profile.get("projects"))
+        if project:
+            snippets.append(trim_cover_letter_evidence(trim(project, 180)))
+    return snippets[:3]
+
+
+def trim_cover_letter_evidence(value: str, limit: int = 180) -> str:
+    clean = normalize_space(value)
+    if len(clean) <= limit:
+        return clean
+    return trim(clean, limit)
+
+
+def truncate_text(value: str, limit: int) -> str:
+    value = normalize_space(value)
+    if len(value) <= limit:
+        return value
+    return value[: max(0, limit - 3)].rstrip() + "..."
 
 
 def first_job_responsibility(job: dict[str, Any]) -> str:

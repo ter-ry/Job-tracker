@@ -102,6 +102,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("extract-description").addEventListener("click", extractDescription);
   document.getElementById("extract-url").addEventListener("click", extractUrl);
   document.getElementById("resume-upload").addEventListener("change", uploadResume);
+  document.getElementById("cover-letter-template-upload").addEventListener("change", uploadCoverLetterTemplate);
   ["search", "status-filter", "fit-filter", "role-filter", "remote-filter", "risk-filter", "sort-by"].forEach((id) => {
     document.getElementById(id).addEventListener("input", renderJobs);
     document.getElementById(id).addEventListener("change", renderJobs);
@@ -122,6 +123,7 @@ async function loadAll() {
     state.shortlist = shortlist;
     renderDashboard(dashboard);
     renderProfile(profile);
+    renderTemplateStatus(profile);
     renderJobs();
     renderShortlist();
   } catch (error) {
@@ -148,6 +150,16 @@ function renderDashboard(dashboard) {
 
 function renderProfile(profile) {
   profileFields.forEach((field) => setValue(`profile-${field}`, profile[toSnake(field)] || ""));
+}
+
+function renderTemplateStatus(profile) {
+  const hasDocx = Boolean(profile.cover_letter_docx_template_path);
+  setText(
+    "cover-letter-template-status",
+    hasDocx
+      ? "DOCX template uploaded — formatting-preserving generation available"
+      : "No DOCX template uploaded — standard cover-letter formatting will be used"
+  );
 }
 
 function renderJobs() {
@@ -311,6 +323,26 @@ async function uploadResume(event) {
     const result = await api.upload("/api/profile/upload", data);
     setValue("profile-resume-text", result.resume_text);
     toast("Resume text extracted");
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+async function uploadCoverLetterTemplate(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  const data = new FormData();
+  data.append("file", file);
+  data.append("template_kind", "cover_letter");
+  try {
+    const result = await api.upload("/api/profile/upload", data);
+    setValue("profile-cover-letter-template", result.cover_letter_template || "");
+    if (result.cover_letter_template_status) {
+      state.profile.cover_letter_docx_template_path = result.cover_letter_docx_template_path || "";
+      state.profile.cover_letter_template_status = result.cover_letter_template_status;
+      renderTemplateStatus(state.profile);
+    }
+    toast(result.status_message || "Cover letter template uploaded");
   } catch (error) {
     toast(error.message);
   }

@@ -1,3 +1,4 @@
+import json
 import io
 import tempfile
 import unittest
@@ -634,10 +635,12 @@ class JobAssistantTest(unittest.TestCase):
 
         self.assertEqual(master_doc.paragraphs[5].style.name, "List Bullet")
         self.assertEqual(tailored_doc.paragraphs[5].style.name, "List Bullet")
-        self.assertEqual(master_doc.paragraphs[5].text, tailored_doc.paragraphs[5].text)
+        self.assertNotEqual(master_doc.paragraphs[5].text, tailored_doc.paragraphs[5].text)
+        self.assertIn("Built Python automation", tailored_doc.paragraphs[5].text)
         self.assertEqual(master_doc.paragraphs[6].text, tailored_doc.paragraphs[6].text)
         self.assertEqual(master_doc.paragraphs[8].style.name, tailored_doc.paragraphs[8].style.name)
-        self.assertEqual(master_doc.paragraphs[8].text, tailored_doc.paragraphs[8].text)
+        self.assertNotEqual(master_doc.paragraphs[8].text, tailored_doc.paragraphs[8].text)
+        self.assertEqual(tailored_doc.paragraphs[8].text, "Skills: Python, Flask, SQL, React, dashboards, cloud")
 
         self.assertEqual(tailored_doc.tables[0].cell(1, 1).text, "Flask, React")
         self.assertEqual(tailored_doc.tables[1].cell(1, 1).text, "Computer programming diploma")
@@ -645,6 +648,137 @@ class JobAssistantTest(unittest.TestCase):
             xml = archive.read("word/document.xml").decode("utf-8", errors="ignore")
         self.assertNotIn("Suggested summary", xml)
         self.assertIn("w:hyperlink", xml)
+
+    def test_resume_without_summary_keeps_protected_paragraphs_and_changes_only_bullet_text(self):
+        self.seed_profile_for_documents(with_template=True, resume_template="no_summary")
+        profile = self.client.get("/api/profile").get_json()
+        master_path = Path(profile["resume_docx_template_path"])
+        master_before = master_path.read_bytes()
+        created = self.client.post(
+            "/api/shortlist",
+            json={
+                "company": "Northstar",
+                "title": "Software Developer",
+                "location": "Toronto",
+                "url": "https://example.com/job/no-summary",
+                "job_description": "Python Flask SQL React dashboards cloud automation",
+            },
+        ).get_json()
+        self.assertEqual(created["resume_generation_status"], "generated")
+        resume_path = Path(created["resume_docx_path"])
+        change_log = json.loads((resume_path.parent / "resume_change_log.json").read_text(encoding="utf-8"))
+        self.assertTrue(any(item.get("reason") == "Skipped summary tailoring: no existing summary section" for item in change_log["skipped"]))
+        self.assertEqual(master_before, master_path.read_bytes())
+
+        master_doc = Document(io.BytesIO(master_path.read_bytes()))
+        tailored_doc = Document(io.BytesIO(resume_path.read_bytes()))
+        self.assertEqual(len(master_doc.paragraphs), len(tailored_doc.paragraphs))
+        self.assertEqual(len(master_doc.tables), len(tailored_doc.tables))
+        self.assertEqual(master_doc.paragraphs[0].style.name, tailored_doc.paragraphs[0].style.name)
+        self.assertEqual(master_doc.paragraphs[0].text, tailored_doc.paragraphs[0].text)
+
+        protected_texts = [
+            "Terry Mak",
+            "terry@example.com | LinkedIn | GitHub",
+            "Software Developer | Northstar Labs | 2021-2025",
+            "George Brown College",
+            "Computer programming diploma | 2023",
+            "Work Experience",
+            "Education",
+            "Skills",
+            "Portfolio: example.com/portfolio",
+        ]
+        for text_value in protected_texts:
+            self.assertIn(text_value, [paragraph.text for paragraph in master_doc.paragraphs])
+            self.assertIn(text_value, [paragraph.text for paragraph in tailored_doc.paragraphs])
+
+        master_bullet = next(paragraph for paragraph in master_doc.paragraphs if paragraph.text.startswith("made Python automation"))
+        tailored_bullet = next(paragraph for paragraph in tailored_doc.paragraphs if "Built Python automation" in paragraph.text)
+        self.assertEqual(master_bullet.style.name, tailored_bullet.style.name)
+        self.assertNotEqual(master_bullet.text, tailored_bullet.text)
+        self.assertIn("Built Python automation", tailored_bullet.text)
+
+        xml = zipfile.ZipFile(resume_path).read("word/document.xml").decode("utf-8", errors="ignore")
+        self.assertNotIn("Suggested summary", xml)
+        self.assertNotIn("analysis", xml.lower())
+
+    def test_cover_letter_template_upload_and_placeholder_replacement(self):
+        self.seed_profile_for_documents(with_template=True)
+        profile = self.client.get("/api/profile").get_json()
+        master_path = self.build_cover_letter_template_fixture()
+        master_before = master_path.read_bytes()
+        payload = self.upload_cover_letter_template(master_path)
+        self.assertEqual(payload["cover_letter_template_status"], "DOCX template uploaded")
+
+        created = self.client.post(
+            "/api/shortlist",
+            json={
+                "company": "Northstar",
+                "title": "Python Developer",
+                "location": "Toronto",
+                "url": "https://example.com/job/cover-template",
+                "job_description": "Python Flask SQL React dashboards cloud automation",
+            },
+        ).get_json()
+        self.assertEqual(created["cover_letter_generation_status"], "generated")
+        cover_path = Path(created["cover_letter_docx_path"])
+        self.assertEqual(master_before, master_path.read_bytes())
+
+        master_doc = Document(io.BytesIO(master_path.read_bytes()))
+        cover_doc = Document(io.BytesIO(cover_path.read_bytes()))
+        master_text = "\n".join(paragraph.text for paragraph in master_doc.paragraphs)
+        cover_text = "\n".join(paragraph.text for paragraph in cover_doc.paragraphs)
+        self.assertIn("{{DATE}}", master_text)
+        self.assertNotIn("{{DATE}}", cover_text)
+        self.assertNotIn("{{OPENING_PARAGRAPH}}", cover_text)
+        self.assertIn("Northstar Hiring Team", cover_text)
+        self.assertIn("Sincerely", cover_text)
+        self.assertEqual(master_doc.paragraphs[0].style.name, cover_doc.paragraphs[0].style.name)
+        self.assertEqual(master_doc.paragraphs[-1].alignment, cover_doc.paragraphs[-1].alignment)
+        self.assertEqual(master_doc.paragraphs[-1].text, cover_doc.paragraphs[-1].text)
+
+    def test_cover_letter_no_template_fallback_and_validation_guards(self):
+        self.seed_profile_for_documents(with_template=True)
+        created = self.client.post(
+            "/api/shortlist",
+            json={
+                "company": "Northstar",
+                "title": "Python Developer",
+                "location": "Toronto",
+                "url": "https://example.com/job/cover-fallback",
+                "job_description": "Python Flask SQL React dashboards cloud automation",
+            },
+        ).get_json()
+        self.assertEqual(created["cover_letter_generation_status"], "generated")
+        cover_path = Path(created["cover_letter_docx_path"])
+        cover_doc = Document(io.BytesIO(cover_path.read_bytes()))
+        cover_text = "\n".join(paragraph.text for paragraph in cover_doc.paragraphs)
+        self.assertIn("Dear Northstar Hiring Team", cover_text)
+        self.assertIn("Sincerely", cover_text)
+        self.assertNotIn("EDUCATION", cover_text)
+        self.assertNotIn("SKILLS", cover_text)
+        self.assertNotIn("EXPERIENCE", cover_text)
+        self.assertNotIn("PROJECTS", cover_text)
+        self.assertLessEqual(max(len(paragraph.text) for paragraph in cover_doc.paragraphs), 400)
+        self.assertGreater(len(cover_text.split()), 120)
+        self.assertLess(len(cover_text.split()), 500)
+        self.assertNotIn("Terry Mak. Developer Intern at Northstar", cover_text)
+
+        bad_validation = grounding.validate_cover_letter_output(
+            "EDUCATION\nSKILLS\nEXPERIENCE\nPROJECTS",
+            grounding.build_candidate_evidence(self.rece_profile()),
+            self.ece_job(),
+        )
+        self.assertFalse(bad_validation["ok"])
+        self.assertTrue(any("section headings" in item for item in bad_validation["conflicting_phrases"]))
+
+        long_paragraph = "Python " * 90
+        length_validation = grounding.validate_cover_letter_output(
+            long_paragraph,
+            grounding.build_candidate_evidence(self.rece_profile()),
+            self.ece_job(),
+        )
+        self.assertFalse(length_validation["ok"])
 
     def test_pdf_only_profile_cannot_request_format_preserving_export(self):
         self.client.post(
@@ -722,7 +856,7 @@ class JobAssistantTest(unittest.TestCase):
             app_module.score_job(job, senior_only)["seniority_score"],
         )
 
-    def seed_profile_for_documents(self, with_template: bool = False):
+    def seed_profile_for_documents(self, with_template: bool = False, resume_template: str = "formatted"):
         self.client.post(
             "/api/profile",
             json={
@@ -737,10 +871,15 @@ class JobAssistantTest(unittest.TestCase):
             },
         )
         if with_template:
-            self.upload_master_resume_template()
+            if resume_template == "no_summary":
+                self.upload_resume_template(self.build_resume_without_summary_fixture())
+            else:
+                self.upload_master_resume_template()
 
     def upload_master_resume_template(self):
-        master = self.build_formatted_resume_fixture()
+        self.upload_resume_template(self.build_formatted_resume_fixture())
+
+    def upload_resume_template(self, master: Path):
         with open(master, "rb") as handle:
             response = self.client.post(
                 "/api/profile/upload",
@@ -749,6 +888,18 @@ class JobAssistantTest(unittest.TestCase):
             )
         self.assertEqual(response.status_code, 200)
         self.assertIn("resume_docx_template_path", response.get_json())
+
+    def upload_cover_letter_template(self, master: Path):
+        with open(master, "rb") as handle:
+            response = self.client.post(
+                "/api/profile/upload",
+                data={"file": (handle, "cover_letter_template.docx"), "template_kind": "cover_letter"},
+                content_type="multipart/form-data",
+            )
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertIn("cover_letter_docx_template_path", payload)
+        return payload
 
     def build_formatted_resume_fixture(self):
         path = Path(self.tmpdir.name) / "master_resume_fixture.docx"
@@ -814,6 +965,101 @@ class JobAssistantTest(unittest.TestCase):
         table.cell(0, 1).text = "Detail"
         table.cell(1, 0).text = "Certification"
         table.cell(1, 1).text = "Computer programming diploma"
+
+        doc.save(path)
+        return path
+
+    def build_resume_without_summary_fixture(self):
+        path = Path(self.tmpdir.name) / "resume_without_summary_fixture.docx"
+        doc = Document()
+        section = doc.sections[0]
+        section.top_margin = Inches(0.75)
+        section.bottom_margin = Inches(0.75)
+        section.left_margin = Inches(0.85)
+        section.right_margin = Inches(0.85)
+
+        title = doc.add_paragraph()
+        title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = title.add_run("Terry Mak")
+        run.bold = True
+        run.font.name = "Aptos"
+        run.font.size = Pt(18)
+
+        contact = doc.add_paragraph()
+        contact.add_run("terry@example.com | LinkedIn | GitHub")
+
+        experience_heading = doc.add_paragraph()
+        experience_heading.style = "Heading 1"
+        experience_heading.add_run("Work Experience")
+        experience = doc.add_paragraph()
+        experience.add_run("Software Developer").bold = True
+        experience.add_run(" | Northstar Labs | 2021-2025")
+
+        bullet1 = doc.add_paragraph(style="List Bullet")
+        bullet1.add_run("made Python automation, Flask tools, SQL reports, React interfaces, and dashboards.")
+        bullet2 = doc.add_paragraph(style="List Bullet")
+        bullet2.add_run("Maintained team documentation standards across internal projects.")
+
+        education_heading = doc.add_paragraph()
+        education_heading.style = "Heading 1"
+        education_heading.add_run("Education")
+        college = doc.add_paragraph()
+        college.add_run("George Brown College")
+        diploma = doc.add_paragraph()
+        diploma.add_run("Computer programming diploma | 2023")
+
+        skills_heading = doc.add_paragraph()
+        skills_heading.style = "Heading 1"
+        skills_heading.add_run("Skills")
+        skills = doc.add_paragraph()
+        skills.add_run("Python, Flask, SQL, React")
+
+        contact_two = doc.add_paragraph()
+        contact_two.add_run("Portfolio: example.com/portfolio")
+
+        doc.save(path)
+        return path
+
+    def build_cover_letter_template_fixture(self):
+        path = Path(self.tmpdir.name) / "cover_letter_template_fixture.docx"
+        doc = Document()
+        section = doc.sections[0]
+        section.top_margin = Inches(0.9)
+        section.bottom_margin = Inches(0.9)
+        section.left_margin = Inches(1.0)
+        section.right_margin = Inches(1.0)
+
+        heading = doc.add_paragraph()
+        heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        heading_run = heading.add_run("Terry Mak")
+        heading_run.bold = True
+        heading_run.font.name = "Aptos"
+        heading_run.font.size = Pt(18)
+
+        date_para = doc.add_paragraph()
+        date_run = date_para.add_run("{{DATE}}")
+        date_run.font.name = "Georgia"
+        date_run.font.size = Pt(11)
+
+        greeting = doc.add_paragraph()
+        greeting.add_run("Dear {{HIRING_MANAGER}},")
+
+        opening = doc.add_paragraph()
+        opening.add_run("{{OPENING_PARAGRAPH}}")
+
+        experience = doc.add_paragraph()
+        experience.add_run("{{EXPERIENCE_PARAGRAPH}}")
+
+        fit = doc.add_paragraph()
+        fit.add_run("{{FIT_PARAGRAPH}}")
+
+        closing = doc.add_paragraph()
+        closing.add_run("{{CLOSING_PARAGRAPH}}")
+
+        signature = doc.add_paragraph()
+        signature.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        signature_run = signature.add_run("Terry Mak")
+        signature_run.bold = True
 
         doc.save(path)
         return path
