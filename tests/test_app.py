@@ -544,6 +544,17 @@ class JobAssistantTest(unittest.TestCase):
             "job_description": f"Build software using {required}.",
         }
 
+    def scotiabank_job(self):
+        return {
+            "company": "Scotiabank",
+            "title": "Software Developer",
+            "location": "Toronto, ON",
+            "required_skills": "Develop and maintain software applications, write well-designed testable REST APIs, software documentation, collaboration with developers, product managers, and designers, version control and Git branching, production troubleshooting, software reliability, sprint objectives and project milestones, backend integrations, database design, cloud platforms",
+            "preferred_skills": "Node.js, Express, JavaScript, Agile, Scrum, microservice architecture, unit and integration testing",
+            "responsibilities": "Build backend integrations, support production incident troubleshooting, document release steps, and deliver project milestones with cross-functional teams.",
+            "job_description": "Develop and maintain software applications and REST APIs, collaborate with developers, product managers, and designers, support production troubleshooting, strengthen software reliability, and contribute to sprint objectives and project milestones. The role also values cloud platform work, database design, technical documentation, and backend integrations.",
+        }
+
     def test_rece_profile_does_not_generate_software_terminology(self):
         output = app_module.generate_application_materials(self.ece_job(), self.rece_profile())
         combined = "\n".join([output["resume_text"], output["cover_letter"], app_module.answers_to_text(output["short_answers"])])
@@ -756,6 +767,30 @@ class JobAssistantTest(unittest.TestCase):
         opened = Document(io.BytesIO(resume_path.read_bytes()))
         self.assertGreater(len(opened.paragraphs), 0)
 
+    def test_scotiabank_resume_tailoring_makes_meaningful_supported_edits(self):
+        self.seed_python_developer_profile()
+        self.upload_resume_template(self.build_python_developer_resume_fixture())
+
+        created = self.client.post(
+            "/api/shortlist",
+            json=self.scotiabank_job(),
+        ).get_json()
+
+        self.assertEqual(created["resume_generation_status"], "generated")
+        resume_path = Path(created["resume_docx_path"])
+        change_log = json.loads((resume_path.parent / "resume_change_log.json").read_text(encoding="utf-8"))
+        self.assertGreaterEqual(change_log["summary"]["total_applied_changes"], 3)
+        self.assertLessEqual(change_log["summary"]["total_applied_changes"], 6)
+        self.assertGreaterEqual(change_log["summary"]["total_skipped_changes"], 1)
+
+        tailored_doc = Document(io.BytesIO(resume_path.read_bytes()))
+        tailored_text = "\n".join(paragraph.text for paragraph in tailored_doc.paragraphs)
+        self.assertIn("database structures and data models", tailored_text)
+        self.assertIn("testing, validation, logging, and data-cleaning logic", tailored_text)
+        self.assertIn("collaborated with cross-functional teammates", tailored_text.lower())
+        self.assertIn("cross-functional data workflows", tailored_text.lower())
+        self.assertNotIn("saved profile", tailored_text.lower())
+
     def test_cover_letter_template_upload_and_placeholder_replacement(self):
         self.seed_profile_for_documents(with_template=True)
         profile = self.client.get("/api/profile").get_json()
@@ -790,6 +825,39 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(master_doc.paragraphs[0].style.name, cover_doc.paragraphs[0].style.name)
         self.assertEqual(master_doc.paragraphs[-1].alignment, cover_doc.paragraphs[-1].alignment)
         self.assertEqual(master_doc.paragraphs[-1].text, cover_doc.paragraphs[-1].text)
+
+    def test_scotiabank_cover_letter_template_preserves_structure_and_replaces_stale_content(self):
+        self.seed_profile_for_documents(with_template=True)
+        self.upload_resume_template(self.build_python_developer_resume_fixture())
+        master_path = self.build_software_cover_letter_fixture()
+        master_before = master_path.read_bytes()
+        payload = self.upload_cover_letter_template(master_path)
+        self.assertEqual(payload["cover_letter_template_status"], "DOCX template uploaded")
+
+        created = self.client.post(
+            "/api/shortlist",
+            json=self.scotiabank_job(),
+        ).get_json()
+        self.assertEqual(created["cover_letter_generation_status"], "generated")
+        cover_path = Path(created["cover_letter_docx_path"])
+        self.assertEqual(master_before, master_path.read_bytes())
+
+        cover_doc = Document(io.BytesIO(cover_path.read_bytes()))
+        paragraphs = [paragraph.text for paragraph in cover_doc.paragraphs if paragraph.text.strip()]
+        joined = "\n".join(paragraphs)
+        self.assertEqual(paragraphs[0], "Terry Mak")
+        self.assertIn("Scotiabank Hiring Team", joined)
+        self.assertIn("Dear Scotiabank Hiring Team,", joined)
+        self.assertIn("I'm excited to apply for the Software Developer role at Scotiabank", joined)
+        self.assertLess(paragraphs.index(next(text for text in paragraphs if text.startswith("Dear Scotiabank Hiring Team"))), paragraphs.index(next(text for text in paragraphs if text.startswith("I'm excited to apply"))))
+        self.assertNotIn("CentralSquare", joined)
+        self.assertNotIn("8/12-month", joined)
+        self.assertNotIn("saved profile", joined.lower())
+        self.assertNotIn("ATS-oriented", joined)
+        self.assertNotIn("grounded wording", joined)
+        self.assertEqual(sum(1 for text in paragraphs if text == "Sincerely,"), 1)
+        self.assertEqual(paragraphs[-2], "Sincerely,")
+        self.assertEqual(paragraphs[-1], "Terry Mak")
 
     def test_cover_letter_no_template_fallback_and_validation_guards(self):
         self.seed_profile_for_documents(with_template=True)
@@ -827,7 +895,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertTrue(any("Resume section dump detected" in item for item in bad_validation["conflicting_phrases"]))
 
         prose_validation = grounding.validate_cover_letter_output(
-            "I built Python and Flask applications backed by PostgreSQL and used validation, logging, and data-cleaning logic to improve reliability.",
+            "I built Python and Flask applications backed by SQL and used validation, logging, and data-cleaning logic to improve reliability.",
             grounding.build_candidate_evidence(self.software_profile()),
             self.software_job(),
         )
@@ -1318,6 +1386,9 @@ class JobAssistantTest(unittest.TestCase):
         closing = doc.add_paragraph()
         closing.add_run("{{CLOSING_PARAGRAPH}}")
 
+        signoff = doc.add_paragraph()
+        signoff.add_run("Sincerely,")
+
         signature = doc.add_paragraph()
         signature.alignment = WD_ALIGN_PARAGRAPH.RIGHT
         signature_run = signature.add_run("Terry Mak")
@@ -1335,6 +1406,56 @@ class JobAssistantTest(unittest.TestCase):
         doc.add_paragraph("Managed customer service duties, inventory, and merchandising for a busy store.")
         doc.add_paragraph("Sincerely,")
         doc.add_paragraph("Terry Mak")
+        doc.save(path)
+        return path
+
+    def build_software_cover_letter_fixture(self):
+        path = Path(self.tmpdir.name) / "software_cover_letter_template_fixture.docx"
+        doc = Document()
+        section = doc.sections[0]
+        section.top_margin = Inches(0.9)
+        section.bottom_margin = Inches(0.9)
+        section.left_margin = Inches(1.0)
+        section.right_margin = Inches(1.0)
+
+        heading = doc.add_paragraph()
+        heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        heading.add_run("Terry Mak")
+
+        contact = doc.add_paragraph()
+        contact.add_run("terry@example.com | Toronto, ON | linkedin.com/in/terrymak")
+
+        date_para = doc.add_paragraph()
+        date_para.add_run("May 1, 2024")
+
+        company_para = doc.add_paragraph()
+        company_para.add_run("CentralSquare")
+
+        location_para = doc.add_paragraph()
+        location_para.add_run("Toronto, Ontario")
+
+        greeting = doc.add_paragraph()
+        greeting.add_run("Dear CentralSquare Hiring Team,")
+
+        opening = doc.add_paragraph()
+        opening.add_run("I am excited to apply for the Software Developer co-op role at CentralSquare for an 8/12-month placement.")
+
+        experience = doc.add_paragraph()
+        experience.add_run("I supported profile content and ATS-oriented language for the role.")
+
+        fit = doc.add_paragraph()
+        fit.add_run("My saved profile matches the posting and I would bring grounded wording.")
+
+        closing = doc.add_paragraph()
+        closing.add_run("Thank you for your consideration. I look forward to hearing from you.")
+
+        signoff = doc.add_paragraph()
+        signoff.add_run("Sincerely,")
+
+        signature = doc.add_paragraph()
+        signature.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        signature.add_run("CentralSquare Applicant")
+
         doc.save(path)
         return path
 

@@ -1308,65 +1308,224 @@ def build_format_preserving_cover_letter(
     }
 
 
+def build_cover_letter_section_map(
+    profile: dict[str, str],
+    job: dict[str, Any],
+    focus: list[str],
+    candidate_evidence: dict[str, Any],
+) -> dict[str, str]:
+    company = text(job.get("company")) or "your team"
+    location = text(job.get("location")) or ""
+    title = text(job.get("title")) or "the role"
+    role = first_supported_role(profile, candidate_evidence) or "candidate"
+    evidence_items = select_cover_letter_evidence(profile, job, focus, candidate_evidence)
+    skill_phrase = ", ".join(focus[:4]) if focus else "the most relevant experience from my background"
+    evidence_text = evidence_items[0] if evidence_items else "My background includes practical experience that aligns with the role requirements."
+    return {
+        "date": format_cover_letter_date(date.today()),
+        "company": company,
+        "location": location,
+        "subject": f"Re: Application for {title}",
+        "greeting": f"Dear {company} Hiring Team,",
+        "opening": (
+            f"I'm excited to apply for the {title} role at {company}. My background as a {role} aligns with {skill_phrase}, "
+            f"and I'm drawn to opportunities where careful execution and practical problem-solving matter as much as technical breadth."
+        ),
+        "experience": (
+            f"In recent experience, {evidence_text} This kind of work has helped me build careful habits around practical checks, "
+            f"documentation, and clear communication with business users and teammates."
+        ),
+        "fit": (
+            f"I would bring that same focus to {company}, especially where the role values {skill_phrase}, clear communication, "
+            f"and steady attention to documented results."
+        ),
+        "closing": (
+            f"Thank you for your time and consideration. I would welcome the chance to discuss how my background can support {company} "
+            f"in the {title} role."
+        ),
+        "signoff": "Sincerely,",
+        "signature": text(profile.get("name") or ""),
+    }
+
+
+def format_cover_letter_date(value: date) -> str:
+    return value.strftime("%B %d, %Y").replace(" 0", " ")
+
+
+def classify_cover_letter_paragraph_role(paragraph: Any, index: int, total: int, profile_name: str) -> str:
+    paragraph_text = normalize_space(paragraph.text)
+    lower = paragraph_text.lower()
+    if not paragraph_text:
+        return ""
+    if "{{date}}" in lower or _looks_like_date_text(lower):
+        return "date"
+    if "{{company}}" in lower:
+        return "company"
+    if "{{location}}" in lower:
+        return "location"
+    if "{{job_title}}" in lower:
+        return "subject"
+    if "{{hiring_manager}}" in lower or lower.startswith("dear "):
+        return "greeting"
+    if "{{opening_paragraph}}" in lower:
+        return "opening"
+    if "{{experience_paragraph}}" in lower:
+        return "experience"
+    if "{{fit_paragraph}}" in lower:
+        return "fit"
+    if "{{closing_paragraph}}" in lower:
+        return "closing"
+    if lower.startswith(("sincerely", "best regards", "regards", "kind regards", "thank you", "with appreciation")):
+        return "signoff"
+    if profile_name and normalize_space(profile_name).lower() == lower:
+        return "signature"
+    if index >= max(0, total - 2) and len(paragraph_text.split()) <= 4 and not contains_contact_details(paragraph_text):
+        return "signature"
+    if index < 4 and (lower.startswith("re:") or lower.startswith("subject:") or "application" in lower):
+        return "subject"
+    return ""
+
+
+def is_cover_letter_template_paragraph_editable(paragraph: Any, index: int) -> bool:
+    paragraph_text = normalize_space(paragraph.text)
+    if not paragraph_text:
+        return False
+    style_name = getattr(getattr(paragraph, "style", None), "name", "") or ""
+    if style_name.lower().startswith("heading"):
+        return False
+    if contains_contact_details(paragraph_text):
+        return False
+    if index == 0 and len(paragraph_text.split()) <= 4 and not any(ch.isdigit() for ch in paragraph_text) and "{{" not in paragraph_text:
+        return False
+    return True
+
+
+def _looks_like_date_text(value: str) -> bool:
+    return bool(
+        re.search(r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b", value)
+        and re.search(r"\b\d{1,2},?\s+\d{4}\b", value)
+    )
+
+
+def _replacement_for_cover_letter_role(roles: dict[str, str], role: str) -> str:
+    return roles.get(role, "")
+
+
 def apply_cover_letter_template(
     document: Document,
     job: dict[str, Any],
     profile: dict[str, str],
     output: dict[str, Any],
 ) -> dict[str, list[dict[str, Any]]]:
-    paragraphs = list(iter_document_paragraphs(document))
+    paragraphs = list(document.paragraphs)
     tailoring_plan = output.get("tailoring_plan") or build_tailoring_plan(job, profile, output.get("semantic_match", {}))
     generated_sections = tailoring_plan.get("cover_letter_paragraphs") or []
     if not generated_sections:
         focus = list(output.get("supported_keywords", [])[:4])
         generated_sections = build_cover_letter_sections(profile, job, focus, build_candidate_evidence(profile))
+    section_map = build_cover_letter_section_map(profile, job, list(output.get("supported_keywords", [])[:4]), build_candidate_evidence(profile))
+    if generated_sections:
+        if len(generated_sections) > 0:
+            section_map["date"] = generated_sections[0]
+        if len(generated_sections) > 2:
+            section_map["greeting"] = generated_sections[2]
+        if len(generated_sections) > 3:
+            section_map["subject"] = generated_sections[3]
+        if len(generated_sections) > 4:
+            section_map["opening"] = generated_sections[4]
+        if len(generated_sections) > 5:
+            section_map["experience"] = generated_sections[5]
+        if len(generated_sections) > 6:
+            section_map["fit"] = generated_sections[6]
+        if len(generated_sections) > 7:
+            section_map["closing"] = generated_sections[7]
+        if len(generated_sections) > 8:
+            section_map["signoff"] = generated_sections[8]
+        if len(generated_sections) > 9:
+            section_map["signature"] = generated_sections[9]
     replacements = {
-        "{{DATE}}": date.today().isoformat(),
-        "{{COMPANY}}": text(job.get("company")) or "your team",
+        "{{DATE}}": section_map["date"],
+        "{{COMPANY}}": section_map["company"],
+        "{{LOCATION}}": section_map["location"],
         "{{JOB_TITLE}}": text(job.get("title")) or "the role",
-        "{{HIRING_MANAGER}}": f"{text(job.get('company')) or 'the company'} Hiring Team",
-        "{{OPENING_PARAGRAPH}}": generated_sections[1],
-        "{{EXPERIENCE_PARAGRAPH}}": generated_sections[2],
-        "{{FIT_PARAGRAPH}}": generated_sections[3],
-        "{{CLOSING_PARAGRAPH}}": "\n\n".join(generated_sections[4:6]),
+        "{{HIRING_MANAGER}}": f"{section_map['company']} Hiring Team",
+        "{{OPENING_PARAGRAPH}}": section_map["opening"],
+        "{{EXPERIENCE_PARAGRAPH}}": section_map["experience"],
+        "{{FIT_PARAGRAPH}}": section_map["fit"],
+        "{{CLOSING_PARAGRAPH}}": section_map["closing"],
     }
     applied: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
-    placeholder_hits = 0
+    touched: set[int] = set()
+    profile_name = text(profile.get("name") or "")
 
-    for paragraph in paragraphs:
+    for index, paragraph in enumerate(paragraphs):
         original = paragraph.text
         if not original.strip():
             continue
-        replaced = False
-        for placeholder, replacement in replacements.items():
+        replacement = original
+        for placeholder, resolved in replacements.items():
             if placeholder in original:
-                if replace_paragraph_text(paragraph, original, original.replace(placeholder, replacement)):
+                replacement = original.replace(placeholder, resolved)
+                if replace_paragraph_text(paragraph, original, replacement):
                     applied.append(
                         {
                             "kind": "placeholder",
                             "original": original,
-                            "replacement": original.replace(placeholder, replacement),
+                            "replacement": replacement,
                             "matched_job_requirement": placeholder,
                             "supporting_evidence": "",
                             "confidence": 95,
                             "validation_status": "passed",
                         }
                     )
-                    placeholder_hits += 1
-                    replaced = True
+                    touched.add(index)
+                else:
+                    skipped.append({"kind": "placeholder", "original": original, "replacement": replacement, "reason": "Paragraph text did not match."})
                 break
-        if replaced:
+
+    fixed_roles = {"date", "greeting", "signoff", "signature"}
+    preamble_roles = ["date", "company", "location", "subject"]
+    body_roles = ["opening", "experience", "fit", "closing"]
+    tail_roles = ["signoff", "signature"]
+    preamble_index = 0
+    body_index = 0
+    tail_index = 0
+    greeting_index = next(
+        (i for i, paragraph in enumerate(paragraphs) if classify_cover_letter_paragraph_role(paragraph, i, len(paragraphs), profile_name) == "greeting"),
+        None,
+    )
+    signoff_index = next(
+        (i for i, paragraph in enumerate(paragraphs) if classify_cover_letter_paragraph_role(paragraph, i, len(paragraphs), profile_name) == "signoff"),
+        None,
+    )
+
+    for index, paragraph in enumerate(paragraphs):
+        if index in touched or not is_cover_letter_template_paragraph_editable(paragraph, index):
             continue
-
-    if placeholder_hits:
-        return {"applied": applied, "skipped": skipped, "template_mode": "placeholder"}
-
-    editable_sections = generated_sections[1:5]
-    editable_paragraphs = [paragraph for paragraph in paragraphs if is_editable_cover_letter_paragraph(paragraph)]
-    for paragraph, replacement in zip(editable_paragraphs, editable_sections):
         original = paragraph.text
-        if not original.strip():
+        role = classify_cover_letter_paragraph_role(paragraph, index, len(paragraphs), profile_name)
+        if role in fixed_roles:
+            replacement = _replacement_for_cover_letter_role(section_map, role)
+        elif greeting_index is not None and index < greeting_index:
+            while preamble_index < len(preamble_roles) and not section_map.get(preamble_roles[preamble_index]):
+                preamble_index += 1
+            role = preamble_roles[preamble_index] if preamble_index < len(preamble_roles) else ""
+            replacement = _replacement_for_cover_letter_role(section_map, role)
+            preamble_index += 1
+        elif greeting_index is not None and signoff_index is not None and greeting_index < index < signoff_index:
+            while body_index < len(body_roles) and not section_map.get(body_roles[body_index]):
+                body_index += 1
+            role = body_roles[body_index] if body_index < len(body_roles) else ""
+            replacement = _replacement_for_cover_letter_role(section_map, role)
+            body_index += 1
+        else:
+            while tail_index < len(tail_roles) and not section_map.get(tail_roles[tail_index]):
+                tail_index += 1
+            role = tail_roles[tail_index] if tail_index < len(tail_roles) else ""
+            replacement = _replacement_for_cover_letter_role(section_map, role)
+            tail_index += 1
+        if not role or not replacement or normalize_space(original) == normalize_space(replacement):
             continue
         if replace_paragraph_text(paragraph, original, replacement):
             applied.append(
@@ -1383,24 +1542,29 @@ def apply_cover_letter_template(
         else:
             skipped.append({"kind": "paragraph", "original": original, "replacement": replacement, "reason": "Paragraph text did not match."})
 
-    for paragraph in editable_paragraphs[len(editable_sections):]:
-        original = paragraph.text
-        if not original.strip():
-            continue
-        if replace_paragraph_text(paragraph, original, ""):
-            applied.append(
-                {
-                    "kind": "paragraph",
-                    "original": original,
-                    "replacement": "",
-                    "matched_job_requirement": text(job.get("title")) or "",
-                    "supporting_evidence": "",
-                    "confidence": 100,
-                    "validation_status": "passed",
-                }
-            )
-        else:
-            skipped.append({"kind": "paragraph", "original": original, "replacement": "", "reason": "Paragraph text did not match."})
+    signoff_indices = [
+        index
+        for index, paragraph in enumerate(paragraphs)
+        if normalize_space(paragraph.text).lower().startswith("sincerely,")
+    ]
+    if len(signoff_indices) > 1:
+        for duplicate_index in signoff_indices[:-1]:
+            paragraph = paragraphs[duplicate_index]
+            original = paragraph.text
+            if not original.strip():
+                continue
+            if replace_paragraph_text(paragraph, original, ""):
+                applied.append(
+                    {
+                        "kind": "paragraph",
+                        "original": original,
+                        "replacement": "",
+                        "matched_job_requirement": text(job.get("title")) or "",
+                        "supporting_evidence": "",
+                        "confidence": 80,
+                        "validation_status": "passed",
+                    }
+                )
     return {"applied": applied, "skipped": skipped, "template_mode": "fallback"}
 
 
@@ -3176,38 +3340,21 @@ def build_cover_letter_sections(
     focus: list[str],
     candidate_evidence: dict[str, Any],
 ) -> list[str]:
-    company = text(job.get("company")) or "your team"
-    title = text(job.get("title")) or "the role"
-    role = first_supported_role(profile, candidate_evidence) or "candidate"
-    evidence_items = select_cover_letter_evidence(profile, job, focus, candidate_evidence)
-    skill_phrase = ", ".join(focus[:4]) if focus else "the experience saved in my profile"
-    greeting = f"Dear {company} Hiring Team,"
-    opening = (
-        f"I’m excited to apply for the {title} role at {company}. My background as a {role} aligns with the position "
-        f"through {skill_phrase}, and I’m drawn to opportunities where careful execution and practical problem-solving "
-        f"matter as much as technical breadth."
-    )
-
-    if evidence_items:
-        evidence_text = evidence_items[0]
-    else:
-        evidence_text = "My saved profile contains the relevant experience and project detail for this application."
-    experience = (
-        f"In recent experience, {evidence_text} This kind of work has helped me build careful habits around practical checks, "
-        f"documentation, and clear communication with business users and teammates."
-    )
-
-    fit = (
-        f"I would bring that same focus to {company}, especially where the role values {skill_phrase} and dependable follow-through, "
-        f"clear communication with business users or teammates, and steady attention to documented results rather than keyword-heavy claims."
-    )
-
-    closing = (
-        f"Thank you for your time and consideration. I would welcome the chance to discuss how my background can support "
-        f"{company} in the {title} role."
-    )
-    signature = f"Sincerely,\n{profile.get('name', '')}"
-    return [greeting, opening, experience, fit, closing, signature]
+    section_map = build_cover_letter_section_map(profile, job, focus, candidate_evidence)
+    employer_line = section_map["company"] if not section_map["location"] else f"{section_map['company']} - {section_map['location']}"
+    sections = [
+        section_map["date"],
+        employer_line,
+        section_map["greeting"],
+        section_map["subject"],
+        section_map["opening"],
+        section_map["experience"],
+        section_map["fit"],
+        section_map["closing"],
+        section_map["signoff"],
+        section_map["signature"],
+    ]
+    return [section for section in sections if normalize_space(section)]
 
 
 def select_cover_letter_evidence(

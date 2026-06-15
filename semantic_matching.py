@@ -180,6 +180,8 @@ def detectable_skills(content: str) -> list[str]:
         "azure",
         "api",
         "apis",
+        "rest api",
+        "rest apis",
         "dashboard",
         "dashboards",
         "automation",
@@ -187,6 +189,16 @@ def detectable_skills(content: str) -> list[str]:
         "cloud",
         "excel",
         "power bi",
+        "git",
+        "github",
+        "version control",
+        "node.js",
+        "nodejs",
+        "express",
+        "postgresql",
+        "postgres",
+        "agile",
+        "scrum",
     ]
     return [skill for skill in skills if skill in content.lower() or skill in tokens]
 

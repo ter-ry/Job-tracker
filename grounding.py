@@ -45,6 +45,16 @@ TECHNICAL_TERMS = [
     "engineering",
     "internal tools",
     "business workflows",
+    "git",
+    "github",
+    "version control",
+    "node.js",
+    "nodejs",
+    "express",
+    "rest api",
+    "rest apis",
+    "postgresql",
+    "postgres",
 ]
 
 QUALITY_METADATA_TERMS = [

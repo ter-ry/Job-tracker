@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import re
+from datetime import date
 from dataclasses import dataclass
 from typing import Any
 
-from grounding import build_candidate_evidence, normalize_space, split_sentences, useful_tokens
+from grounding import TECHNICAL_TERMS, build_candidate_evidence, contains_phrase, normalize_space, split_sentences, useful_tokens
 from semantic_matching import extract_resume_evidence, keyword_overlap, lexical_similarity
 
 
@@ -38,14 +39,14 @@ MULTI_WORD_PHRASE_STOPWORDS = {
 }
 
 TECH_CATEGORY_RULES = [
-    ("database/data requirements", ["database", "data model", "data modeling", "schema", "sql", "tables", "records"]),
-    ("testing/debugging/quality requirements", ["testing", "debug", "debugging", "validation", "quality", "reliability", "defect", "qa", "bug"]),
-    ("documentation/maintainability requirements", ["documentation", "document", "maintainability", "maintainable", "release notes", "runbook"]),
-    ("collaboration/stakeholder requirements", ["collaborat", "cross-functional", "stakeholder", "business user", "business team", "team", "communication", "partner"]),
+    ("database/data requirements", ["database", "data model", "data modeling", "schema", "sql", "tables", "records", "postgres", "postgresql"]),
+    ("testing/debugging/quality requirements", ["testing", "debug", "debugging", "validation", "quality", "reliability", "defect", "qa", "bug", "unit testing", "integration testing"]),
+    ("documentation/maintainability requirements", ["documentation", "document", "maintainability", "maintainable", "release notes", "runbook", "technical documentation"]),
+    ("collaboration/stakeholder requirements", ["collaborat", "cross-functional", "stakeholder", "business user", "business team", "team", "communication", "partner", "developers", "product managers", "designers"]),
     ("cloud/platform requirements", ["cloud", "aws", "azure", "linux", "deployment", "infrastructure", "platform"]),
-    ("methodology/process requirements", ["agile", "scrum", "kanban", "workflow", "process", "review", "iteration"]),
-    ("required technical skills", ["python", "javascript", "typescript", "flask", "react", "sql", "api", "automation"]),
-    ("preferred technical skills", ["preferred", "nice to have", "bonus", "familiarity", "exposure"]),
+    ("methodology/process requirements", ["agile", "scrum", "kanban", "workflow", "process", "review", "iteration", "sprint", "milestone"]),
+    ("required technical skills", ["python", "javascript", "typescript", "flask", "react", "sql", "api", "automation", "git", "github", "node.js", "nodejs", "express", "rest api", "rest apis"]),
+    ("preferred technical skills", ["preferred", "nice to have", "bonus", "familiarity", "exposure", "microservice", "microservices"]),
 ]
 
 CURATED_PHRASES = [
@@ -57,6 +58,14 @@ CURATED_PHRASES = [
     "technical documentation",
     "cross-functional collaboration",
     "AWS cloud services",
+    "REST APIs",
+    "version control and Git branching",
+    "production incident troubleshooting",
+    "sprint objectives and project milestones",
+    "Node.js and Express development",
+    "unit and integration testing",
+    "microservice architecture",
+    "Agile and Scrum",
 ]
 
 REWRITE_RULES = [
@@ -72,19 +81,26 @@ REWRITE_RULES = [
     {
         "category": "testing/debugging/quality requirements",
         "requires": {"testing", "debug", "validation"},
-        "patterns": [(r"validation,\s*logging,\s*and\s*data\s*cleaning", "testing, validation, logging, and data-cleaning")],
+        "patterns": [
+            (r"validation,\s*logging,\s*and\s*data\s*cleaning", "testing, validation, logging, and data-cleaning"),
+            (r"\bdebug issues\b", "debug issues and troubleshoot production behavior"),
+        ],
         "insert": "software reliability",
     },
     {
         "category": "documentation/maintainability requirements",
         "requires": {"documentation"},
-        "patterns": [(r"team documentation standards", "documentation standards")],
+        "patterns": [
+            (r"team documentation standards", "documentation standards"),
+            (r"document release steps", "document release steps and technical documentation"),
+        ],
         "insert": "documentation",
     },
     {
         "category": "collaboration/stakeholder requirements",
         "requires": {"collaborat", "cross-functional"},
         "patterns": [
+            (r"worked with cross-functional teammates to debug issues and document release steps", "Collaborated with cross-functional teammates to debug issues, document release steps, and technical documentation"),
             (r"\bworked with\b", "Collaborated with"),
             (r"\bheld weekly tutorial sessions\b", "Collaborated with cross-functional business teams through weekly tutorial sessions"),
         ],
@@ -93,7 +109,10 @@ REWRITE_RULES = [
     {
         "category": "cloud/platform requirements",
         "requires": {"aws", "cloud", "linux"},
-        "patterns": [(r"\bbackend integrations\b", "backend integrations and cloud workflows")],
+        "patterns": [
+            (r"backend integrations with real-time data", "backend integrations and REST-based data workflows with real-time data"),
+            (r"\bbackend integrations\b", "backend integrations and cloud workflows"),
+        ],
         "insert": "AWS cloud services",
     },
 ]
@@ -150,6 +169,9 @@ def extract_job_phrases(job: dict[str, Any]) -> list[dict[str, Any]]:
     for candidate in CURATED_PHRASES:
         if candidate.lower() in content.lower():
             phrases.append(candidate)
+    for term in TECHNICAL_TERMS:
+        if contains_phrase(content, term):
+            phrases.append(term)
     for chunk in re.split(r"[,;/\n]+|(?<=[.!?])\s+", content):
         clean = normalize_space(chunk.strip(" -*:"))
         if not _looks_like_phrase(clean):
@@ -345,10 +367,10 @@ def rewrite_paragraph(
             changed_parts.append("collaborated with cross-functional teams")
             rule_applied = True
         elif match["job_phrase_category"] == "documentation/maintainability requirements" and "document" in lower_original:
-            proposed = re.sub(r"\bteam documentation standards\b", "documentation standards", proposed, flags=re.I)
-            if "documentation" not in proposed.lower():
-                proposed = proposed.replace("document", "documentation", 1)
-            changed_parts.append("documentation")
+            proposed = re.sub(r"\bdocument release steps\b", "document release steps and technical documentation", proposed, flags=re.I)
+            if "technical documentation" not in proposed.lower():
+                proposed = proposed.replace("document", "document technical documentation", 1)
+            changed_parts.append("technical documentation")
             rule_applied = True
     proposed = normalize_space(proposed)
     if proposed and proposed[-1] not in ".!?":
@@ -398,32 +420,40 @@ def build_cover_letter_paragraphs(
 ) -> list[str]:
     company = normalize_space(str(job.get("company") or "your team"))
     title = normalize_space(str(job.get("title") or "the role"))
+    location = normalize_space(str(job.get("location") or ""))
     name = normalize_space(str(profile.get("name") or ""))
     concepts = [
         normalize_space(block.get("matched_job_phrase") or block.get("job_phrase") or "")
         for block in selected_blocks
         if normalize_space(block.get("matched_job_phrase") or block.get("job_phrase") or "")
     ]
-    focus = short_join(concepts[:3]) if concepts else "the supported experience saved in my profile"
+    focus = short_join(concepts[:3]) if concepts else "the most relevant experience from my background"
     evidence_sentences = [build_evidence_sentence(block) for block in selected_blocks[:2]]
     if not evidence_sentences:
-        evidence_sentences = ["My saved profile shows grounded experience that aligns with the role requirements."]
+        evidence_sentences = ["My background includes practical experience that aligns with the role requirements."]
     fit_sentence = build_fit_sentence(job, selected_blocks, candidate_evidence)
+    employer_line = company if not location else f"{company} - {location}"
+    subject = f"Re: Application for {title}"
     return [
+        date.today().strftime("%B %d, %Y").replace(" 0", " "),
+        employer_line,
         f"Dear {company} Hiring Team,",
-        f"I'm excited to apply for the {title} role at {company}. The posting stood out because it aligns with {focus} and the careful execution I have already used in real projects.",
+        subject,
+        f"I'm excited to apply for the {title} role at {company}. The posting stood out because it aligns with {focus} and the practical execution I have already used in real projects.",
         " ".join(evidence_sentences)
-        + f" These examples come from existing work experience and projects, so the application stays truthful while still giving {company} supportable ATS-oriented language.",
-        fit_sentence + f" I would bring that same focus to {company} through honest, grounded wording and dependable follow-through.",
-        f"Thank you for your consideration. I would welcome the chance to discuss how I can contribute to {company} as a {title.lower()}.\n\nSincerely,\n{name}",
+        + f" These examples come from existing work experience and projects, which lets me speak directly to the role with truthful, relevant detail.",
+        fit_sentence + f" I would bring that same focus to {company} through clear communication and dependable follow-through.",
+        f"Thank you for your consideration. I would welcome the chance to discuss how I can contribute to {company} as a {title.lower()}.",
+        "Sincerely,",
+        name,
     ]
 
 
 def build_opening_fit_sentence(selected_blocks: list[dict[str, Any]], candidate_evidence: dict[str, Any]) -> str:
     concepts = [block["matched_job_phrase"] for block in selected_blocks[:2]]
     if not concepts:
-        concepts = ["the supported experience saved in my profile"]
-    return f"My background aligns through {short_join(concepts)} and other supported evidence from my profile."
+        concepts = ["relevant experience"]
+    return f"My background aligns through {short_join(concepts)} and other practical experience from my work history."
 
 
 def build_evidence_sentence(block: dict[str, Any]) -> str:
