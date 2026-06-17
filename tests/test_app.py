@@ -1,5 +1,6 @@
 import json
 import io
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -782,6 +783,29 @@ class JobAssistantTest(unittest.TestCase):
         self.assertGreaterEqual(change_log["summary"]["total_applied_changes"], 3)
         self.assertLessEqual(change_log["summary"]["total_applied_changes"], 6)
         self.assertGreaterEqual(change_log["summary"]["total_skipped_changes"], 1)
+        self.assertTrue(
+            all(
+                re.sub(r"[^a-z0-9]+", "", item["original"].lower())
+                != re.sub(r"[^a-z0-9]+", "", item["replacement"].lower())
+                for item in change_log["applied"]
+            )
+        )
+        meaningful_applied = [
+            item
+            for item in change_log["applied"]
+            if any(
+                phrase in item["replacement"].lower()
+                for phrase in [
+                    "testing, validation, logging, and data-cleaning",
+                    "database structures and data models",
+                    "backend integrations and data workflows",
+                    "collaborated with cross-functional",
+                    "technical documentation",
+                    "software reliability",
+                ]
+            )
+        ]
+        self.assertGreaterEqual(len(meaningful_applied), 2)
 
         tailored_doc = Document(io.BytesIO(resume_path.read_bytes()))
         tailored_text = "\n".join(paragraph.text for paragraph in tailored_doc.paragraphs)
@@ -790,6 +814,16 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("collaborated with cross-functional teammates", tailored_text.lower())
         self.assertIn("cross-functional data workflows", tailored_text.lower())
         self.assertNotIn("saved profile", tailored_text.lower())
+
+    def test_controlled_rewrite_rejects_cosmetic_only_changes(self):
+        original = "Built supplier specific items and data entry workflows for operations."
+        rewritten = tailoring.controlled_rewrite(
+            original,
+            "database design",
+            evidence_text=original,
+            section="projects",
+        )
+        self.assertEqual(rewritten, original)
 
     def test_cover_letter_template_upload_and_placeholder_replacement(self):
         self.seed_profile_for_documents(with_template=True)
@@ -851,10 +885,16 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("I'm excited to apply for the Software Developer role at Scotiabank", joined)
         self.assertLess(paragraphs.index(next(text for text in paragraphs if text.startswith("Dear Scotiabank Hiring Team"))), paragraphs.index(next(text for text in paragraphs if text.startswith("I'm excited to apply"))))
         self.assertNotIn("CentralSquare", joined)
+        self.assertNotIn("Software Developer Co-op", joined)
+        self.assertNotIn("Remote - Ontario", joined)
+        self.assertNotIn("8- or 12-month term", joined)
         self.assertNotIn("8/12-month", joined)
         self.assertNotIn("saved profile", joined.lower())
         self.assertNotIn("ATS-oriented", joined)
         self.assertNotIn("grounded wording", joined)
+        self.assertTrue(any("Python" in text and ("Flask" in text or "SQL" in text or "backend" in text.lower()) for text in paragraphs))
+        date_lines = [text for text in paragraphs if re.search(r"\b[A-Z][a-z]+ \d{1,2}, \d{4}\b", text)]
+        self.assertEqual(len(date_lines), 1)
         self.assertEqual(sum(1 for text in paragraphs if text == "Sincerely,"), 1)
         self.assertEqual(paragraphs[-2], "Sincerely,")
         self.assertEqual(paragraphs[-1], "Terry Mak")

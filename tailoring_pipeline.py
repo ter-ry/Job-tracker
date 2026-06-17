@@ -5,7 +5,7 @@ from datetime import date
 from dataclasses import dataclass
 from typing import Any
 
-from grounding import TECHNICAL_TERMS, build_candidate_evidence, contains_phrase, normalize_space, split_sentences, useful_tokens
+from grounding import TECHNICAL_TERMS, build_candidate_evidence, contains_phrase, normalize_space, split_sentences, supporting_snippets, useful_tokens
 from semantic_matching import extract_resume_evidence, keyword_overlap, lexical_similarity
 
 
@@ -382,6 +382,8 @@ def rewrite_paragraph(
 
 
 def validate_rewrite(original: str, proposed: str, job_phrase: str, candidate_evidence: dict[str, Any]) -> dict[str, Any]:
+    if is_cosmetic_only_change(original, proposed):
+        return {"grounded": False, "ok": False, "reason": "cosmetic-only change"}
     original_numbers = re.findall(r"\d+(?:\.\d+)?%?", original)
     proposed_numbers = re.findall(r"\d+(?:\.\d+)?%?", proposed)
     if original_numbers != proposed_numbers:
@@ -401,6 +403,16 @@ def validate_rewrite(original: str, proposed: str, job_phrase: str, candidate_ev
         ):
             return {"grounded": False, "ok": False, "reason": "no supported job phrase added"}
     return {"grounded": True, "ok": True, "reason": ""}
+
+
+def is_cosmetic_only_change(original: str, proposed: str) -> bool:
+    original_tokens = re.findall(r"[a-z0-9]+", normalize_space(original).lower())
+    proposed_tokens = re.findall(r"[a-z0-9]+", normalize_space(proposed).lower())
+    if not original_tokens or not proposed_tokens:
+        return False
+    if original_tokens == proposed_tokens:
+        return True
+    return "".join(original_tokens) == "".join(proposed_tokens)
 
 
 def select_cover_letter_blocks(resume_change_blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -427,10 +439,24 @@ def build_cover_letter_paragraphs(
         for block in selected_blocks
         if normalize_space(block.get("matched_job_phrase") or block.get("job_phrase") or "")
     ]
+    if not concepts:
+        concepts = [skill for skill in (candidate_evidence.get("skills") or []) if normalize_space(skill)]
     focus = short_join(concepts[:3]) if concepts else "the most relevant experience from my background"
     evidence_sentences = [build_evidence_sentence(block) for block in selected_blocks[:2]]
     if not evidence_sentences:
+        evidence_sentences = [
+            snippet
+            for snippet in supporting_snippets(concepts[:4], candidate_evidence, limit=3)
+            if not (snippet.count(",") >= 3 and len(snippet.split()) < 14)
+        ]
+    if not evidence_sentences:
         evidence_sentences = ["My background includes practical experience that aligns with the role requirements."]
+    evidence_paragraph = normalize_space(
+        " ".join(evidence_sentences)
+        + " Together, these examples show the kind of real software work I have already done: improving reliability, documenting changes, and collaborating across teams while staying true to my background."
+    )
+    if len(evidence_paragraph) > 320:
+        evidence_paragraph = evidence_paragraph[:317].rstrip() + "..."
     fit_sentence = build_fit_sentence(job, selected_blocks, candidate_evidence)
     employer_line = company if not location else f"{company} - {location}"
     subject = f"Re: Application for {title}"
@@ -439,10 +465,9 @@ def build_cover_letter_paragraphs(
         employer_line,
         f"Dear {company} Hiring Team,",
         subject,
-        f"I'm excited to apply for the {title} role at {company}. The posting stood out because it aligns with {focus} and the practical execution I have already used in real projects.",
-        " ".join(evidence_sentences)
-        + f" These examples come from existing work experience and projects, which lets me speak directly to the role with truthful, relevant detail.",
-        fit_sentence + f" I would bring that same focus to {company} through clear communication and dependable follow-through.",
+        f"I'm excited to apply for the {title} role at {company}. My background lines up with {focus}, and I like work where careful delivery matters.",
+        evidence_paragraph,
+        fit_sentence + f" That combination of reliability, documentation, and collaboration is why the role at {company} feels like a strong fit.",
         f"Thank you for your consideration. I would welcome the chance to discuss how I can contribute to {company} as a {title.lower()}.",
         "Sincerely,",
         name,
@@ -471,7 +496,7 @@ def build_fit_sentence(job: dict[str, Any], selected_blocks: list[dict[str, Any]
         concepts = ["documentation", "collaboration", "quality"]
     return (
         f"I would bring the same focus to {company}, especially in work that values {short_join(concepts)}, "
-        f"clear communication, and dependable follow-through."
+        f"clear communication, and steady delivery."
     )
 
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from grounding import build_candidate_evidence, classify_supported_skills, supporting_snippets
+from grounding import build_candidate_evidence, classify_supported_skills, normalize_space, supporting_snippets
 from tailoring_pipeline import build_tailoring_plan, rewrite_paragraph
 
 
@@ -178,6 +178,8 @@ def controlled_rewrite(original: str, requirement: str, evidence_text: str = "",
             )
     if len(clean) > int(len(original) * 1.35):
         return original.strip(" -*\t")
+    if is_cosmetic_only_change(original, clean):
+        return original.strip(" -*\t")
     return clean
 
 
@@ -185,6 +187,18 @@ def changed_wording(original: str, proposed: str) -> str:
     if original.strip() == proposed.strip():
         return "No factual changes; original wording preserved."
     return "Opening verb or supported requirement phrase was lightly reordered."
+
+
+def is_cosmetic_only_change(original: str, proposed: str) -> bool:
+    original_tokens = re.findall(r"[a-z0-9]+", normalize_space(original).lower())
+    proposed_tokens = re.findall(r"[a-z0-9]+", normalize_space(proposed).lower())
+    if not original_tokens or not proposed_tokens:
+        return False
+    if original_tokens == proposed_tokens:
+        return True
+    original_compact = "".join(original_tokens)
+    proposed_compact = "".join(proposed_tokens)
+    return original_compact == proposed_compact
 
 
 def extract_terms(content: str) -> list[str]:

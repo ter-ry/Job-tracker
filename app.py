@@ -1297,6 +1297,28 @@ def build_format_preserving_cover_letter(
 
     change_log = apply_cover_letter_template(document, job, profile, output)
     document.save(cover_path)
+    validation_warning = validate_cover_letter_document(Document(cover_path), job, profile)
+    if validation_warning is not None:
+        write_cover_letter_docx(cover_path, output["cover_letter"])
+        return {
+            "status": "generated",
+            "error": "",
+            "warning": validation_warning,
+            "change_log": {
+                "master_cover_letter_path": str(template_path),
+                "output_path": str(cover_path),
+                "applied": [],
+                "skipped": [
+                    {
+                        "kind": "cover_letter_template",
+                        "original": "",
+                        "replacement": "",
+                        "reason": validation_warning,
+                    }
+                ],
+                "template_mode": "standard_validation_fallback",
+            },
+        }
     return {
         "status": "generated",
         "error": "",
@@ -1319,8 +1341,13 @@ def build_cover_letter_section_map(
     title = text(job.get("title")) or "the role"
     role = first_supported_role(profile, candidate_evidence) or "candidate"
     evidence_items = select_cover_letter_evidence(profile, job, focus, candidate_evidence)
-    skill_phrase = ", ".join(focus[:4]) if focus else "the most relevant experience from my background"
-    evidence_text = evidence_items[0] if evidence_items else "My background includes practical experience that aligns with the role requirements."
+    fallback_skills = ", ".join((candidate_evidence.get("skills") or [])[:4])
+    skill_phrase = ", ".join(focus[:4]) if focus else (fallback_skills or "the core responsibilities of the role")
+    evidence_text = (
+        evidence_items[0]
+        if evidence_items
+        else "My background includes concrete software work that I can discuss clearly and honestly."
+    )
     return {
         "date": format_cover_letter_date(date.today()),
         "company": company,
@@ -1329,11 +1356,11 @@ def build_cover_letter_section_map(
         "greeting": f"Dear {company} Hiring Team,",
         "opening": (
             f"I'm excited to apply for the {title} role at {company}. My background as a {role} aligns with {skill_phrase}, "
-            f"and I'm drawn to opportunities where careful execution and practical problem-solving matter as much as technical breadth."
+            f"and I am drawn to roles where reliability, documentation, and cross-functional collaboration matter as much as technical breadth."
         ),
         "experience": (
-            f"In recent experience, {evidence_text} This kind of work has helped me build careful habits around practical checks, "
-            f"documentation, and clear communication with business users and teammates."
+            f"In recent experience, {evidence_text} This kind of work has helped me build careful habits around validation, logging, documentation, "
+            f"and clear communication with business users and teammates."
         ),
         "fit": (
             f"I would bring that same focus to {company}, especially where the role values {skill_phrase}, clear communication, "
@@ -1484,8 +1511,8 @@ def apply_cover_letter_template(
                     skipped.append({"kind": "placeholder", "original": original, "replacement": replacement, "reason": "Paragraph text did not match."})
                 break
 
-    fixed_roles = {"date", "greeting", "signoff", "signature"}
-    preamble_roles = ["date", "company", "location", "subject"]
+    fixed_roles = {"date", "greeting", "signoff", "signature", "subject"}
+    preamble_roles = ["company", "location"]
     body_roles = ["opening", "experience", "fit", "closing"]
     tail_roles = ["signoff", "signature"]
     preamble_index = 0
@@ -1731,7 +1758,23 @@ def build_resume_change_plan(
             replacement = f"{prefix}: {remainder}"
         elif not replacement.lower().startswith("skills:"):
             replacement = f"Skills: {replacement.strip()}"
-        if normalize_space(replacement) != normalize_space(skills_context["text"]):
+        if is_cosmetic_only_change(skills_context["text"], replacement):
+            plan.append(
+                {
+                    "kind": "skills",
+                    "paragraph_type": "skills_paragraph",
+                    "section": "skills",
+                    "original": skills_context["text"],
+                    "replacement": skills_context["text"],
+                    "supporting_evidence": supporting_evidence,
+                    "matched_job_requirement": matched_job_requirement,
+                    "confidence": confidence,
+                    "validation_status": "skipped",
+                    "reason": "Cosmetic-only skill reordering was rejected.",
+                    "priority": 3,
+                }
+            )
+        elif normalize_space(replacement) != normalize_space(skills_context["text"]):
             candidate_map["skills"] = {
                 "kind": "skills",
                 "paragraph_type": "skills_paragraph",
@@ -2152,6 +2195,16 @@ def reorder_skills_text(original: str, supported_skills: list[str]) -> str:
     return f"{prefix}: {combined}" if prefix else combined
 
 
+def is_cosmetic_only_change(original: str, proposed: str) -> bool:
+    original_tokens = re.findall(r"[a-z0-9]+", normalize_space(original).lower())
+    proposed_tokens = re.findall(r"[a-z0-9]+", normalize_space(proposed).lower())
+    if not original_tokens or not proposed_tokens:
+        return False
+    if original_tokens == proposed_tokens:
+        return True
+    return "".join(original_tokens) == "".join(proposed_tokens)
+
+
 def safe_local_path(value: str) -> Path | None:
     raw = text(value)
     if not raw:
@@ -2293,6 +2346,65 @@ def detect_incompatible_cover_letter_template(document: Document) -> str | None:
         for term in INCOMPATIBLE_COVER_TEMPLATE_TERMS:
             if term in content:
                 return f"Standard cover-letter formatting was used because the uploaded template contained incompatible role-specific content: {term}."
+    return None
+
+
+def validate_cover_letter_document(document: Document, job: dict[str, Any], profile: dict[str, str]) -> str | None:
+    profile_name = normalize_space(text(profile.get("name") or ""))
+    date_count = 0
+    signoff_count = 0
+    signature_count = 0
+    stale_terms = [
+        "centralsquare",
+        "software developer co-op",
+        "remote - ontario",
+        "8- or 12-month term",
+        "8/12-month",
+        "8 or 12 month",
+        "postgraduate student",
+        "grounded wording",
+        "saved profile",
+        "ats-oriented language",
+        "truthful, relevant detail",
+    ]
+    paragraphs = list(iter_document_paragraphs(document))
+    body_paragraphs = list(document.paragraphs)
+    body_markers = ["dear ", "i'm excited", "thank you", "sincerely", "i would welcome", "role at", "experience", "documentation"]
+
+    for paragraph in paragraphs:
+        content = normalize_space(paragraph.text)
+        lower = content.lower()
+        if not content:
+            continue
+        if any(term in lower for term in stale_terms):
+            return f"Stale template content remained after replacement: {next(term for term in stale_terms if term in lower)}"
+    for index, paragraph in enumerate(body_paragraphs):
+        content = normalize_space(paragraph.text)
+        lower = content.lower()
+        if not content:
+            continue
+        if _looks_like_date_text(lower):
+            date_count += 1
+        if lower.startswith(("sincerely,", "best regards,", "regards,", "kind regards,", "thank you,", "with appreciation,")):
+            signoff_count += 1
+        if profile_name and lower == profile_name.lower() and index >= max(0, len(body_paragraphs) - 3):
+            signature_count += 1
+
+    if date_count > 1:
+        return "Duplicate date lines remained after replacement."
+    if signoff_count > 1:
+        return "Duplicate closings remained after replacement."
+    if signature_count > 1:
+        return "Duplicate signature lines remained after replacement."
+
+    for section in document.sections:
+        for paragraph in iter_container_paragraphs(section.header):
+            content = normalize_space(paragraph.text)
+            lower = content.lower()
+            if not content or contains_contact_details(content):
+                continue
+            if len(content.split()) >= 10 and any(marker in lower for marker in body_markers):
+                return "Body text leaked into the header."
     return None
 
 
