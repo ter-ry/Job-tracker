@@ -5,7 +5,7 @@ from datetime import date
 from dataclasses import dataclass
 from typing import Any
 
-from grounding import TECHNICAL_TERMS, build_candidate_evidence, contains_phrase, normalize_space, split_sentences, supporting_snippets, useful_tokens
+from grounding import TECHNICAL_TERMS, build_candidate_evidence, contains_contact_details, contains_phrase, contains_resume_section_heading, normalize_space, split_sentences, useful_tokens
 from semantic_matching import extract_resume_evidence, keyword_overlap, lexical_similarity
 
 
@@ -444,11 +444,7 @@ def build_cover_letter_paragraphs(
     focus = short_join(concepts[:3]) if concepts else "the most relevant experience from my background"
     evidence_sentences = [build_evidence_sentence(block) for block in selected_blocks[:2]]
     if not evidence_sentences:
-        evidence_sentences = [
-            snippet
-            for snippet in supporting_snippets(concepts[:4], candidate_evidence, limit=3)
-            if not (snippet.count(",") >= 3 and len(snippet.split()) < 14)
-        ]
+        evidence_sentences = cover_letter_supporting_snippets(concepts[:4], candidate_evidence, limit=3)
     if not evidence_sentences:
         evidence_sentences = ["My background includes practical experience that aligns with the role requirements."]
     evidence_paragraph = normalize_space(
@@ -487,6 +483,27 @@ def build_evidence_sentence(block: dict[str, Any]) -> str:
     if len(phrase) > 400:
         phrase = phrase[:397].rstrip() + "..."
     return f"In recent experience, I {phrase[0].lower() + phrase[1:]}" if phrase else ""
+
+
+def cover_letter_supporting_snippets(terms: list[str], evidence: dict[str, Any], limit: int = 3) -> list[str]:
+    snippets: list[str] = []
+    for section in evidence.get("sections", []):
+        if section.get("field") == "resume_text":
+            continue
+        for sentence in split_sentences(section.get("text", "")):
+            clean = normalize_space(sentence)
+            if not clean or len(clean) > 320:
+                continue
+            if contains_contact_details(clean) or contains_resume_section_heading(clean):
+                continue
+            if terms and not any(contains_phrase(clean, term) or contains_phrase(term, clean) for term in terms):
+                continue
+            if clean.count(",") >= 3 and len(clean.split()) < 14:
+                continue
+            snippets.append(clean if len(clean) <= 180 else clean[:177].rstrip() + "...")
+            if len(snippets) >= limit:
+                return snippets
+    return snippets
 
 
 def build_fit_sentence(job: dict[str, Any], selected_blocks: list[dict[str, Any]], candidate_evidence: dict[str, Any]) -> str:

@@ -771,6 +771,10 @@ class JobAssistantTest(unittest.TestCase):
     def test_scotiabank_resume_tailoring_makes_meaningful_supported_edits(self):
         self.seed_python_developer_profile()
         self.upload_resume_template(self.build_python_developer_resume_fixture())
+        profile = self.client.get("/api/profile").get_json()
+        master_path = Path(profile["resume_docx_template_path"])
+        master_doc = Document(io.BytesIO(master_path.read_bytes()))
+        master_before = master_path.read_bytes()
 
         created = self.client.post(
             "/api/shortlist",
@@ -779,6 +783,7 @@ class JobAssistantTest(unittest.TestCase):
 
         self.assertEqual(created["resume_generation_status"], "generated")
         resume_path = Path(created["resume_docx_path"])
+        self.assertEqual(master_before, master_path.read_bytes())
         change_log = json.loads((resume_path.parent / "resume_change_log.json").read_text(encoding="utf-8"))
         self.assertGreaterEqual(change_log["summary"]["total_applied_changes"], 3)
         self.assertLessEqual(change_log["summary"]["total_applied_changes"], 6)
@@ -808,6 +813,20 @@ class JobAssistantTest(unittest.TestCase):
         self.assertGreaterEqual(len(meaningful_applied), 2)
 
         tailored_doc = Document(io.BytesIO(resume_path.read_bytes()))
+        changed_paragraphs = [
+            {
+                "index": index,
+                "base": base.text,
+                "tailored": tailored.text,
+                "style": getattr(getattr(base, "style", None), "name", "") or "",
+            }
+            for index, (base, tailored) in enumerate(zip(master_doc.paragraphs, tailored_doc.paragraphs))
+            if base.text != tailored.text
+        ]
+        substantive_bullet_changes = [
+            item for item in changed_paragraphs if item["style"].startswith("List") and not tailoring.is_cosmetic_only_change(item["base"], item["tailored"])
+        ]
+        self.assertGreaterEqual(len(substantive_bullet_changes), 2)
         tailored_text = "\n".join(paragraph.text for paragraph in tailored_doc.paragraphs)
         self.assertIn("database structures and data models", tailored_text)
         self.assertIn("testing, validation, logging, and data-cleaning logic", tailored_text)
@@ -859,6 +878,35 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(master_doc.paragraphs[0].style.name, cover_doc.paragraphs[0].style.name)
         self.assertEqual(master_doc.paragraphs[-1].alignment, cover_doc.paragraphs[-1].alignment)
         self.assertEqual(master_doc.paragraphs[-1].text, cover_doc.paragraphs[-1].text)
+
+    def test_cover_letter_validation_uses_body_boundaries_for_contact_details(self):
+        evidence = grounding.build_candidate_evidence(self.software_profile())
+        header_safe = (
+            "Terry Mak\n"
+            "terry@example.com | Toronto, ON | linkedin.com/in/terrymak\n\n"
+            "June 17, 2026\n\n"
+            "Scotiabank - Toronto, ON\n\n"
+            "Dear Scotiabank Hiring Team,\n\n"
+            "I built Python Flask applications backed by SQL and documented workflows.\n\n"
+            "Sincerely,\n"
+            "Terry Mak"
+        )
+        header_validation = grounding.validate_cover_letter_output(header_safe, evidence, self.software_job())
+        self.assertTrue(header_validation["ok"])
+
+        body_leak = (
+            "Terry Mak\n"
+            "terry@example.com | Toronto, ON | linkedin.com/in/terrymak\n\n"
+            "June 17, 2026\n\n"
+            "Scotiabank - Toronto, ON\n\n"
+            "Dear Scotiabank Hiring Team,\n\n"
+            "I built Python Flask applications backed by SQL. Contact me at terry@example.com for details.\n\n"
+            "Sincerely,\n"
+            "Terry Mak"
+        )
+        body_validation = grounding.validate_cover_letter_output(body_leak, evidence, self.software_job())
+        self.assertFalse(body_validation["ok"])
+        self.assertTrue(any("Contact details detected in body paragraph" in item for item in body_validation["conflicting_phrases"]))
 
     def test_scotiabank_cover_letter_template_preserves_structure_and_replaces_stale_content(self):
         self.seed_profile_for_documents(with_template=True)

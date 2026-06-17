@@ -288,14 +288,18 @@ def validate_cover_letter_output(
     max_paragraph_chars: int = 400,
 ) -> dict[str, Any]:
     conflicts: list[str] = []
-    lower = validation_claim_text(content).lower()
     paragraphs = [paragraph.strip() for paragraph in re.split(r"\n\s*\n", content) if paragraph.strip()]
+    body_paragraphs = cover_letter_body_paragraphs(paragraphs)
+    body_text = "\n\n".join(body_paragraphs)
+    lower = validation_claim_text(body_text).lower()
 
-    for index, paragraph in enumerate(paragraphs, start=1):
+    for index, paragraph in enumerate(body_paragraphs, start=1):
         if len(paragraph) > max_paragraph_chars:
             conflicts.append(f"Paragraph {index} exceeds the configured length limit")
         issue = classify_cover_letter_paragraph_issue(paragraph, index, evidence, job)
         if issue is not None:
+            if issue.startswith("Contact details detected in paragraph "):
+                issue = issue.replace("Contact details detected in paragraph ", "Contact details detected in body paragraph ")
             conflicts.append(issue)
 
     for term in TECHNICAL_TERMS:
@@ -310,8 +314,28 @@ def validate_cover_letter_output(
         "ok": not conflicts and not empty_or_corrupted,
         "conflicting_phrases": list(dict.fromkeys(conflicts)),
         "empty_or_corrupted_evidence": empty_or_corrupted,
-        "paragraph_count": len(paragraphs),
+        "paragraph_count": len(body_paragraphs),
     }
+
+
+def cover_letter_body_paragraphs(paragraphs: list[str]) -> list[str]:
+    normalized = [paragraph.strip() for paragraph in paragraphs if paragraph.strip()]
+    if not normalized:
+        return []
+    greeting_index = next((index for index, paragraph in enumerate(normalized) if paragraph.lower().startswith("dear ")), None)
+    signoff_index = next(
+        (
+            index
+            for index, paragraph in enumerate(normalized)
+            if paragraph.lower().startswith(("sincerely", "best regards", "regards", "kind regards", "thank you", "with appreciation"))
+        ),
+        None,
+    )
+    if greeting_index is None:
+        return normalized
+    body_start = min(len(normalized), greeting_index + 1)
+    body_end = signoff_index if signoff_index is not None and signoff_index > body_start else len(normalized)
+    return normalized[body_start:body_end]
 
 
 def validation_claim_text(content: str) -> str:

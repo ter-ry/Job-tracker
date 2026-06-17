@@ -3478,6 +3478,8 @@ def select_cover_letter_evidence(
     snippets: list[str] = []
     terms = focus[:4] or []
     for section in candidate_evidence.get("sections", []):
+        if section.get("field") == "resume_text":
+            continue
         for sentence in split_sentences(section["text"]):
             clean = normalize_space(sentence)
             if not clean or len(clean) > 400:
@@ -3492,6 +3494,8 @@ def select_cover_letter_evidence(
     if not snippets:
         fallback_terms = [term for term in terms if term]
         for section in candidate_evidence.get("sections", []):
+            if section.get("field") == "resume_text":
+                continue
             for sentence in split_sentences(section["text"]):
                 clean = normalize_space(sentence)
                 if not clean or len(clean) > 400:
