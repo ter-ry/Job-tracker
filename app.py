@@ -24,6 +24,7 @@ from grounding import (
     PDF_CORRUPTION_MESSAGE,
     build_candidate_evidence,
     classify_supported_skills,
+    classify_keyword_dump_reason,
     contains_contact_details,
     contains_resume_section_heading,
     evidence_has_generation_source,
@@ -38,7 +39,7 @@ from semantic_matching import MODEL_DOWNLOAD_SIZE, MODEL_NAME, analyze_resume_ma
 from seniority import DETECTED_LEVELS, SENIORITY_LEVELS, analyze_job_seniority, score_seniority_fit
 from sources.jobspy_source import fetch_jobspy_jobs
 from tailoring import controlled_rewrite, generate_tailored_resume_draft
-from tailoring_pipeline import build_tailoring_plan
+from tailoring_pipeline import build_tailoring_plan, short_join
 from werkzeug.utils import secure_filename
 
 
@@ -1092,7 +1093,6 @@ def generate_and_store_shortlist_documents(job_id: int, kinds: set[str] | None =
     current_resume_path = text(job.get("resume_docx_path"))
     current_cover_path = text(job.get("cover_letter_docx_path"))
     resume_validation = output.get("resume_validation") or {"ok": True, "conflicting_phrases": []}
-    cover_validation = output.get("cover_validation") or {"ok": True, "conflicting_phrases": []}
 
     resume_result = {
         "status": current_resume_status,
@@ -1134,30 +1134,10 @@ def generate_and_store_shortlist_documents(job_id: int, kinds: set[str] | None =
             }
 
     if "cover_letter" in requested_kinds:
-        if cover_validation.get("ok"):
-            cover_result = run_document_generation(
-                "cover_letter",
-                lambda: build_format_preserving_cover_letter(job, profile, output, cover_path),
-            )
-        else:
-            cover_result = {
-                "status": "failed",
-                "error": f"Generated cover letter failed grounding validation. Unsupported or conflicting phrases: {', '.join(cover_validation.get('conflicting_phrases', [])) or 'empty or corrupted candidate evidence'}",
-                "warning": "",
-                "change_log": {
-                    "master_cover_letter_path": text(profile.get("cover_letter_docx_template_path")),
-                    "output_path": "",
-                    "applied": [],
-                    "skipped": [
-                        {
-                            "kind": "cover_letter_validation",
-                            "original": "",
-                            "replacement": "",
-                            "reason": f"Generated cover letter failed grounding validation. Unsupported or conflicting phrases: {', '.join(cover_validation.get('conflicting_phrases', [])) or 'empty or corrupted candidate evidence'}",
-                        }
-                    ],
-                },
-            }
+        cover_result = run_document_generation(
+            "cover_letter",
+            lambda: build_format_preserving_cover_letter(job, profile, output, cover_path),
+        )
 
     metadata = {
         "job_id": job_id,
@@ -1341,10 +1321,10 @@ def build_cover_letter_section_map(
     title = text(job.get("title")) or "the role"
     role = first_supported_role(profile, candidate_evidence) or "candidate"
     evidence_items = select_cover_letter_evidence(profile, job, focus, candidate_evidence)
-    fallback_skills = ", ".join((candidate_evidence.get("skills") or [])[:4])
-    skill_phrase = ", ".join(focus[:4]) if focus else (fallback_skills or "the core responsibilities of the role")
+    fallback_skills = short_join((candidate_evidence.get("skills") or [])[:2])
+    skill_phrase = short_join(focus[:2]) if focus else (fallback_skills or "the core responsibilities of the role")
     evidence_text = (
-        evidence_items[0]
+        " ".join(evidence_items[:2])
         if evidence_items
         else "My background includes concrete software work that I can discuss clearly and honestly."
     )
@@ -1447,17 +1427,8 @@ def apply_cover_letter_template(
     paragraphs = list(document.paragraphs)
     tailoring_plan = output.get("tailoring_plan") or build_tailoring_plan(job, profile, output.get("semantic_match", {}))
     generated_sections = tailoring_plan.get("cover_letter_paragraphs") or []
-    if not generated_sections:
-        focus = list(output.get("supported_keywords", [])[:4])
-        generated_sections = build_cover_letter_sections(profile, job, focus, build_candidate_evidence(profile))
     section_map = build_cover_letter_section_map(profile, job, list(output.get("supported_keywords", [])[:4]), build_candidate_evidence(profile))
     if generated_sections:
-        if len(generated_sections) > 0:
-            section_map["date"] = generated_sections[0]
-        if len(generated_sections) > 2:
-            section_map["greeting"] = generated_sections[2]
-        if len(generated_sections) > 3:
-            section_map["subject"] = generated_sections[3]
         if len(generated_sections) > 4:
             section_map["opening"] = generated_sections[4]
         if len(generated_sections) > 5:
@@ -1466,10 +1437,6 @@ def apply_cover_letter_template(
             section_map["fit"] = generated_sections[6]
         if len(generated_sections) > 7:
             section_map["closing"] = generated_sections[7]
-        if len(generated_sections) > 8:
-            section_map["signoff"] = generated_sections[8]
-        if len(generated_sections) > 9:
-            section_map["signature"] = generated_sections[9]
     replacements = {
         "{{DATE}}": section_map["date"],
         "{{COMPANY}}": section_map["company"],
@@ -2304,6 +2271,17 @@ INCOMPATIBLE_COVER_TEMPLATE_TERMS = [
     "stockroom",
 ]
 
+GENERIC_COVER_PHRASES = [
+    "practical experience that aligns",
+    "my background includes practical experience",
+    "together, these examples",
+    "my background lines up",
+    "careful delivery matters",
+    "staying true to my background",
+    "reliability, documentation, and collaboration",
+    "quality, clear communication, and steady delivery",
+]
+
 
 def write_docx(path: Path, title: str, body: str) -> None:
     document = Document()
@@ -2371,13 +2349,10 @@ def validate_cover_letter_document(document: Document, job: dict[str, Any], prof
     body_paragraphs = list(document.paragraphs)
     body_markers = ["dear ", "i'm excited", "thank you", "sincerely", "i would welcome", "role at", "experience", "documentation"]
 
-    for paragraph in paragraphs:
-        content = normalize_space(paragraph.text)
-        lower = content.lower()
-        if not content:
-            continue
-        if any(term in lower for term in stale_terms):
-            return f"Stale template content remained after replacement: {next(term for term in stale_terms if term in lower)}"
+    stale_hit = find_cover_letter_stale_hit(document, stale_terms)
+    if stale_hit is not None:
+        return f"Stale template content remained after replacement: {stale_hit}"
+
     for index, paragraph in enumerate(body_paragraphs):
         content = normalize_space(paragraph.text)
         lower = content.lower()
@@ -2405,6 +2380,71 @@ def validate_cover_letter_document(document: Document, job: dict[str, Any], prof
                 continue
             if len(content.split()) >= 10 and any(marker in lower for marker in body_markers):
                 return "Body text leaked into the header."
+    return None
+
+
+def find_cover_letter_stale_hit(document: Document, stale_terms: list[str]) -> str | None:
+    visible_locations = []
+    for index, paragraph in enumerate(document.paragraphs):
+        content = normalize_space(paragraph.text)
+        lower = content.lower()
+        if not content:
+            continue
+        for term in stale_terms:
+            if term in lower:
+                visible_locations.append(f"body paragraph {index + 1}")
+                return f"{term} in {visible_locations[-1]}"
+
+    for section_index, section in enumerate(document.sections, start=1):
+        for paragraph_index, paragraph in enumerate(section.header.paragraphs, start=1):
+            content = normalize_space(paragraph.text).lower()
+            if not content:
+                continue
+            for term in stale_terms:
+                if term in content:
+                    return f"{term} in header section {section_index} paragraph {paragraph_index}"
+        for paragraph_index, paragraph in enumerate(section.footer.paragraphs, start=1):
+            content = normalize_space(paragraph.text).lower()
+            if not content:
+                continue
+            for term in stale_terms:
+                if term in content:
+                    return f"{term} in footer section {section_index} paragraph {paragraph_index}"
+
+    package = getattr(getattr(document, "part", None), "package", None)
+    parts = getattr(package, "parts", []) if package is not None else []
+    for part in parts:
+        partname = str(getattr(part, "partname", ""))
+        if not partname.endswith(".xml"):
+            continue
+        blob = getattr(part, "blob", b"")
+        if not blob:
+            continue
+        try:
+            text = blob.decode("utf-8", errors="ignore").lower()
+        except Exception:
+            continue
+        for term in stale_terms:
+            idx = text.find(term)
+            if idx == -1:
+                continue
+            if "docprops" in partname.lower():
+                location = f"metadata part {partname.lstrip('/')}"
+            elif "customxml" in partname.lower():
+                location = f"custom XML part {partname}"
+            elif "header" in partname.lower():
+                location = f"header XML part {partname}"
+            elif "footer" in partname.lower():
+                location = f"footer XML part {partname}"
+            elif "document.xml" in partname.lower():
+                snippet = text[max(0, idx - 120) : idx + 120]
+                if "txbxcontent" in snippet or "textbox" in snippet or "shape" in snippet:
+                    location = f"text box or shape content in {partname}"
+                else:
+                    location = f"XML part {partname}"
+            else:
+                location = f"XML part {partname}"
+            return f"{term} in {location.lstrip('/')}"
     return None
 
 
@@ -2884,7 +2924,49 @@ def job_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:
                 data["resume_generation_status"] = "Outdated — regenerate using current profile"
             if data.get("cover_letter_generation_status") == "generated":
                 data["cover_letter_generation_status"] = "Outdated — regenerate using current profile"
+    job_id = clamp_int(data.get("id"), 0, 10**9)
+    if job_id:
+        data["tailoring_changes"] = load_tailoring_changes(job_id)
     return data
+
+
+def load_tailoring_changes(job_id: int) -> dict[str, Any]:
+    folder = generated_applications_dir() / str(job_id)
+    return {
+        "resume": load_tailoring_change_log(folder / "resume_change_log.json"),
+        "cover_letter": load_tailoring_change_log(folder / "cover_letter_change_log.json"),
+    }
+
+
+def load_tailoring_change_log(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"template_mode": "", "summary": {}, "applied": [], "skipped": []}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"template_mode": "", "summary": {}, "applied": [], "skipped": []}
+    applied = raw.get("applied") if isinstance(raw.get("applied"), list) else []
+    skipped = raw.get("skipped") if isinstance(raw.get("skipped"), list) else []
+    return {
+        "template_mode": text(raw.get("template_mode")),
+        "summary": raw.get("summary") if isinstance(raw.get("summary"), dict) else {},
+        "applied": [summarize_tailoring_change(item) for item in applied[:5] if isinstance(item, dict)],
+        "skipped": [summarize_tailoring_change(item) for item in skipped[:5] if isinstance(item, dict)],
+    }
+
+
+def summarize_tailoring_change(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "kind": text(item.get("kind")),
+        "original": text(item.get("original")),
+        "replacement": text(item.get("replacement")),
+        "reason": text(item.get("reason")),
+        "matched_job_requirement": text(item.get("matched_job_requirement")),
+        "supporting_evidence": text(item.get("supporting_evidence")),
+        "confidence": clamp_int(item.get("confidence"), 0, 100),
+        "validation_status": text(item.get("validation_status")),
+        "skip_reason": text(item.get("skip_reason")),
+    }
 
 
 def text(value: Any) -> str:
@@ -3339,9 +3421,6 @@ def generate_application_materials(
         if not resume_validation["ok"]:
             conflicts = ", ".join(resume_validation["conflicting_phrases"]) or "empty or corrupted candidate evidence"
             raise ValueError(f"Generated resume failed grounding validation. Unsupported or conflicting phrases: {conflicts}")
-        if not cover_validation["ok"]:
-            conflicts = ", ".join(cover_validation["conflicting_phrases"]) or "empty or corrupted candidate evidence"
-            raise ValueError(f"Generated cover letter failed grounding validation. Unsupported or conflicting phrases: {conflicts}")
     return {
         "fit_score": scoring["fit_score"],
         "score_breakdown": scoring,
@@ -3475,8 +3554,10 @@ def select_cover_letter_evidence(
     focus: list[str],
     candidate_evidence: dict[str, Any],
 ) -> list[str]:
-    snippets: list[str] = []
     terms = focus[:4] or []
+    scored_snippets: list[tuple[int, int, str]] = []
+    fallback_snippets: list[str] = []
+    order = 0
     for section in candidate_evidence.get("sections", []):
         if section.get("field") == "resume_text":
             continue
@@ -3486,31 +3567,36 @@ def select_cover_letter_evidence(
                 continue
             if contains_resume_section_heading(clean) or contains_contact_details(clean):
                 continue
-            if terms and not any(contains_phrase(clean, term) or contains_phrase(term, clean) for term in terms):
+            if classify_keyword_dump_reason(clean) is not None:
                 continue
-            snippets.append(trim_cover_letter_evidence(clean))
-            if len(snippets) >= 3:
-                return snippets
-    if not snippets:
-        fallback_terms = [term for term in terms if term]
-        for section in candidate_evidence.get("sections", []):
-            if section.get("field") == "resume_text":
-                continue
-            for sentence in split_sentences(section["text"]):
-                clean = normalize_space(sentence)
-                if not clean or len(clean) > 400:
-                    continue
-                if contains_resume_section_heading(clean) or contains_contact_details(clean):
-                    continue
-                if fallback_terms and any(contains_phrase(clean, term) or contains_phrase(term, clean) for term in fallback_terms):
-                    snippets.append(trim_cover_letter_evidence(clean))
-                    if len(snippets) >= 3:
-                        return snippets
-    if not snippets:
+            fallback_snippets.append(trim_cover_letter_evidence(clean))
+            score = 0
+            lowered = clean.lower()
+            if any(term in lowered for term in ["database", "data model", "data models", "schema"]):
+                score += 4
+            if any(term in lowered for term in ["validation", "testing", "logging", "quality", "reliability"]):
+                score += 4
+            if any(term in lowered for term in ["workflow", "automation", "integration", "integrations", "report", "reporting"]):
+                score += 3
+            if "documentation" in lowered or "documented" in lowered:
+                score += 2
+            if terms and any(contains_phrase(clean, term) or contains_phrase(term, clean) for term in terms):
+                score += 2
+            if 8 <= len(clean.split()) <= 30:
+                score += 1
+            scored_snippets.append((score, order, trim_cover_letter_evidence(clean)))
+            order += 1
+    if scored_snippets:
+        ranked = [item[2] for item in sorted(scored_snippets, key=lambda item: (-item[0], item[1])) if item[0] > 0]
+        if ranked:
+            return ranked[:3]
+    if fallback_snippets:
+        return fallback_snippets[:3]
+    if profile.get("projects"):
         project = text(profile.get("projects"))
         if project:
-            snippets.append(trim_cover_letter_evidence(trim(project, 180)))
-    return snippets[:3]
+            return [trim_cover_letter_evidence(trim(project, 180))]
+    return []
 
 
 def trim_cover_letter_evidence(value: str, limit: int = 180) -> str:

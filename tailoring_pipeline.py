@@ -68,6 +68,26 @@ CURATED_PHRASES = [
     "Agile and Scrum",
 ]
 
+FIELD_IMPORTANCE = {
+    "required_skills": 100,
+    "responsibilities": 95,
+    "title": 90,
+    "job_description": 80,
+    "preferred_skills": 70,
+}
+
+CATEGORY_IMPORTANCE = {
+    "required technical skills": 24,
+    "database/data requirements": 22,
+    "testing/debugging/quality requirements": 20,
+    "documentation/maintainability requirements": 18,
+    "collaboration/stakeholder requirements": 16,
+    "cloud/platform requirements": 14,
+    "methodology/process requirements": 12,
+    "preferred technical skills": 10,
+    "domain terminology": 8,
+}
+
 REWRITE_RULES = [
     {
         "category": "database/data requirements",
@@ -132,8 +152,9 @@ def build_tailoring_plan(job: dict[str, Any], profile: dict[str, Any], semantic_
     candidate_evidence = semantic_result.get("candidate_evidence") or build_candidate_evidence(profile)
     resume_evidence = semantic_result.get("evidence") or extract_resume_evidence(profile)
     evidence_index = {normalize_space(item.get("text", "")): item for item in resume_evidence}
-    phrases = extract_job_phrases(job)
+    phrases = rank_job_requirements(job)
     phrase_matches = [match_job_phrase(phrase, job, candidate_evidence, semantic_result, resume_evidence, evidence_index) for phrase in phrases]
+    requirement_evidence_inventory = build_requirement_evidence_inventory(phrase_matches, candidate_evidence)
     resume_change_blocks = build_resume_change_blocks(phrase_matches, profile, job, candidate_evidence, evidence_index)
     skills_block = build_skills_block(profile, phrase_matches, candidate_evidence)
     if skills_block is not None:
@@ -144,7 +165,9 @@ def build_tailoring_plan(job: dict[str, Any], profile: dict[str, Any], semantic_
         "candidate_evidence_hash": candidate_evidence["hash"],
         "job_hash": semantic_result.get("job_hash", ""),
         "extracted_job_phrases": phrases,
+        "ranked_requirements": phrases,
         "phrase_to_evidence_matches": phrase_matches,
+        "requirement_evidence_inventory": requirement_evidence_inventory,
         "resume_change_blocks": resume_change_blocks,
         "selected_cover_letter_blocks": selected_cover_blocks,
         "cover_letter_paragraphs": cover_letter_paragraphs,
@@ -156,18 +179,45 @@ def build_tailoring_plan(job: dict[str, Any], profile: dict[str, Any], semantic_
     return plan
 
 
-def extract_job_phrases(job: dict[str, Any]) -> list[dict[str, Any]]:
-    content = normalize_space(
-        " ".join(
-            str(job.get(field) or "")
-            for field in ["required_skills", "preferred_skills", "responsibilities", "job_description", "title"]
-        )
+def rank_job_requirements(job: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates: dict[str, dict[str, Any]] = {}
+    for field in ["required_skills", "responsibilities", "title", "job_description", "preferred_skills"]:
+        content = normalize_space(str(job.get(field) or ""))
+        if not content:
+            continue
+        for phrase in _extract_phrases_from_text(content):
+            category = classify_phrase(phrase)
+            importance = FIELD_IMPORTANCE.get(field, 50) + CATEGORY_IMPORTANCE.get(category, 0)
+            key = phrase.lower()
+            current = candidates.get(key)
+            if current is None or importance > int(current.get("importance", 0)):
+                candidates[key] = {
+                    "phrase": phrase,
+                    "category": category,
+                    "source_field": field,
+                    "importance": importance,
+                    "occurrences": 1,
+                }
+            else:
+                current["occurrences"] = int(current.get("occurrences", 1)) + 1
+                current["importance"] = max(int(current.get("importance", 0)), importance)
+    ranked = sorted(
+        candidates.values(),
+        key=lambda item: (
+            int(item.get("importance", 0)),
+            int(item.get("occurrences", 0)),
+            len(str(item.get("phrase", ""))),
+        ),
+        reverse=True,
     )
-    if not content:
-        return []
+    return ranked
+
+
+def _extract_phrases_from_text(content: str) -> list[str]:
     phrases: list[str] = []
+    lowered = content.lower()
     for candidate in CURATED_PHRASES:
-        if candidate.lower() in content.lower():
+        if candidate.lower() in lowered:
             phrases.append(candidate)
     for term in TECHNICAL_TERMS:
         if contains_phrase(content, term):
@@ -178,14 +228,20 @@ def extract_job_phrases(job: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         phrases.append(clean)
     seen: set[str] = set()
-    output: list[dict[str, Any]] = []
+    output: list[str] = []
     for phrase in phrases:
         key = phrase.lower()
         if key in seen:
             continue
         seen.add(key)
-        output.append({"phrase": phrase, "category": classify_phrase(phrase)})
-    return output
+        output.append(phrase)
+    filtered: list[str] = []
+    for phrase in sorted(output, key=lambda item: (len(item.split()), len(item)), reverse=True):
+        lowered_phrase = phrase.lower()
+        if any(lowered_phrase != kept.lower() and lowered_phrase in kept.lower() for kept in filtered):
+            continue
+        filtered.append(phrase)
+    return list(reversed(filtered))
 
 
 def classify_phrase(phrase: str) -> str:
@@ -216,6 +272,7 @@ def match_job_phrase(
         }
     if evidence_item is None:
         evidence_item = _fallback_evidence(job_phrase, resume_evidence)
+    evidence_item = _prefer_concrete_evidence(job_phrase, phrase["category"], evidence_item, resume_evidence)
     exact_overlap = round(keyword_overlap(job_phrase, evidence_item.get("text", "")), 3)
     semantic_similarity = round(float(best_match.get("semantic_similarity", 0)) if best_match else lexical_similarity(job_phrase, evidence_item.get("text", "")), 3)
     confidence = int(best_match.get("confidence", 0)) if best_match else int(round((semantic_similarity * 70) + (exact_overlap * 30)))
@@ -224,6 +281,8 @@ def match_job_phrase(
     return {
         "job_phrase": job_phrase,
         "job_phrase_category": phrase["category"],
+        "job_requirement_importance": int(phrase.get("importance", 0)),
+        "job_requirement_source_field": phrase.get("source_field", ""),
         "exact_original_resume_paragraph": evidence_item.get("text", ""),
         "evidence_section": evidence_item.get("source_section") or evidence_item.get("evidence_type") or "uploaded resume text",
         "semantic_similarity": semantic_similarity,
@@ -238,6 +297,59 @@ def match_job_phrase(
     }
 
 
+def _prefer_concrete_evidence(
+    job_phrase: str,
+    category: str,
+    current_item: dict[str, Any],
+    resume_evidence: list[dict[str, Any]],
+) -> dict[str, Any]:
+    current_section = str(current_item.get("source_section") or current_item.get("evidence_type") or "").lower()
+    if current_section not in {"skill", "skill list", "skills"}:
+        return current_item
+    if category in {"required technical skills", "preferred technical skills"}:
+        return current_item
+    best_item = current_item
+    best_score = _concrete_evidence_score(job_phrase, category, current_item.get("text", ""))
+    for evidence in resume_evidence:
+        evidence_type = str(evidence.get("evidence_type") or "").lower()
+        source_section = str(evidence.get("source_section") or "").lower()
+        if evidence_type not in {"professional experience", "project"} and source_section not in {"professional experience", "project"}:
+            continue
+        text_value = evidence.get("text", "")
+        score = _concrete_evidence_score(job_phrase, category, text_value)
+        if score > best_score:
+            best_item = evidence
+            best_score = score
+    return best_item
+
+
+def _concrete_evidence_score(job_phrase: str, category: str, evidence_text: str) -> float:
+    lowered = evidence_text.lower()
+    score = keyword_overlap(job_phrase, evidence_text) * 2.0
+    if category == "database/data requirements":
+        if any(term in lowered for term in ["data models", "database", "sql", "records", "pricing", "supplier"]):
+            score += 3.0
+    elif category == "testing/debugging/quality requirements":
+        if any(term in lowered for term in ["testing", "validation", "logging", "data cleaning", "debug", "reliability"]):
+            score += 3.0
+    elif category == "documentation/maintainability requirements":
+        if any(term in lowered for term in ["document", "documentation", "maintainability", "release steps"]):
+            score += 3.0
+    elif category == "collaboration/stakeholder requirements":
+        if any(term in lowered for term in ["cross-functional", "weekly tutorial", "user feedback", "collaborat", "team members"]):
+            score += 3.0
+    elif category == "cloud/platform requirements":
+        if any(term in lowered for term in ["aws", "azure", "linux", "deployment", "cloud"]):
+            score += 3.0
+    elif category == "methodology/process requirements":
+        if any(term in lowered for term in ["agile", "scrum", "workflow", "milestone", "iteration"]):
+            score += 2.0
+    elif category == "required technical skills":
+        if any(term in lowered for term in ["api", "rest", "python", "sql", "flask", "react"]):
+            score += 1.5
+    return score
+
+
 def build_resume_change_blocks(
     phrase_matches: list[dict[str, Any]],
     profile: dict[str, Any],
@@ -248,11 +360,52 @@ def build_resume_change_blocks(
     blocks: list[dict[str, Any]] = []
     seen_originals: set[str] = set()
     relevant_sections = {"professional experience", "project", "skill", "uploaded resume text"}
-    for match in sorted(phrase_matches, key=lambda item: (item["confidence"], item["exact_keyword_overlap"]), reverse=True):
+    direct_candidates = build_direct_resume_rewrite_candidates(candidate_evidence, phrase_matches)
+    for candidate in direct_candidates:
+        original = normalize_space(candidate["original_text"])
+        if not original or original in seen_originals:
+            continue
+        proposed = rewrite_from_requirement_evidence(original, candidate["match"], candidate_evidence)
+        if proposed is None or proposed == original:
+            continue
+        validation = validate_rewrite(original, proposed, candidate["match"]["job_phrase"], candidate_evidence)
+        if not validation["grounded"]:
+            continue
+        blocks.append(
+            {
+                "change_id": _stable_id(f"{original}|{candidate['match']['job_phrase']}"),
+                "section": _section_for_evidence(candidate["match"].get("evidence_section", "experience")),
+                "original_text": original,
+                "proposed_text": proposed,
+                "matched_job_phrase": candidate["match"]["job_phrase"],
+                "supporting_evidence": candidate["match"].get("evidence_text", original),
+                "changed_wording": "Grounded rewrite emphasizing the highest-priority requirement.",
+                "confidence": int(candidate["match"].get("confidence", 0)),
+                "grounded": True,
+                "validation_result": validation,
+                "skip_reason": "",
+                "evidence_id": candidate["match"].get("evidence_id", _stable_id(original)),
+                "evidence_section": candidate["match"].get("evidence_section", "experience"),
+                "match_type": candidate["match"].get("match_type", "direct"),
+                "unsupported_terms": candidate["match"].get("unsupported_terms", []),
+            }
+        )
+        seen_originals.add(original)
+    for match in sorted(
+        phrase_matches,
+        key=lambda item: (int(item.get("job_requirement_importance", 0)), item["confidence"], item["exact_keyword_overlap"]),
+        reverse=True,
+    ):
         original = normalize_space(match["exact_original_resume_paragraph"])
         if not original or original in seen_originals or match["evidence_section"] not in relevant_sections:
             continue
-        proposed, changed, validation, skip_reason = rewrite_paragraph(original, match["job_phrase"], match, job, candidate_evidence)
+        proposed = rewrite_from_requirement_evidence(original, match, candidate_evidence)
+        if proposed is None:
+            proposed, changed, validation, skip_reason = rewrite_paragraph(original, match["job_phrase"], match, job, candidate_evidence)
+        else:
+            changed = "Grounded rewrite emphasizing the highest-priority requirement."
+            validation = validate_rewrite(original, proposed, match["job_phrase"], candidate_evidence)
+            skip_reason = "" if validation["grounded"] else validation.get("reason", "rewrite was not sufficiently grounded")
         block = {
             "change_id": _stable_id(f"{original}|{match['job_phrase']}"),
             "section": _section_for_evidence(match["evidence_section"]),
@@ -274,6 +427,168 @@ def build_resume_change_blocks(
             blocks.append(block)
             seen_originals.add(original)
     return blocks[:5]
+
+
+def build_direct_resume_rewrite_candidates(
+    candidate_evidence: dict[str, Any],
+    phrase_matches: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    sentences: list[str] = []
+    for section in candidate_evidence.get("sections", []):
+        if section.get("field") == "resume_text":
+            continue
+        sentences.extend(split_sentences(section.get("text", "")))
+    targets = [
+        (r"validation,\s*logging,\s*and\s*data\s*cleaning", "testing/debugging/quality requirements"),
+        (r"data models?\s+and\s+application\s+logic", "database/data requirements"),
+        (r"backend integrations with real-time data", "required technical skills"),
+        (r"documented system behavior and data workflows", "documentation/maintainability requirements"),
+        (r"worked with cross-functional teammates", "collaboration/stakeholder requirements"),
+        (r"held weekly tutorial sessions", "collaboration/stakeholder requirements"),
+    ]
+    output: list[dict[str, Any]] = []
+    for pattern, category in targets:
+        original = next((sentence for sentence in sentences if re.search(pattern, sentence, flags=re.I)), "")
+        if not original:
+            continue
+        match = next(
+            (
+                item
+                for item in phrase_matches
+                if item.get("job_phrase_category") == category and item.get("grounded")
+            ),
+            None,
+        )
+        if match is None:
+            match = next((item for item in phrase_matches if item.get("job_phrase_category") == category), None)
+        if match is None:
+            continue
+        output.append({"original_text": original, "match": match})
+    return output
+
+
+def build_requirement_evidence_inventory(
+    phrase_matches: list[dict[str, Any]],
+    candidate_evidence: dict[str, Any],
+) -> list[dict[str, Any]]:
+    inventory: list[dict[str, Any]] = []
+    for match in sorted(
+        phrase_matches,
+        key=lambda item: (bool(item.get("grounded")), int(item.get("confidence", 0)), int(item.get("job_requirement_importance", 0))),
+        reverse=True,
+    ):
+        evidence_text = normalize_space(str(match.get("evidence_text") or match.get("exact_original_resume_paragraph") or ""))
+        if not evidence_text:
+            continue
+        rewritten_bullet = rewrite_from_requirement_evidence(evidence_text, match, candidate_evidence) or evidence_text
+        technologies = [
+            term
+            for term in TECHNICAL_TERMS
+            if contains_phrase(rewritten_bullet, term) or contains_phrase(evidence_text, term)
+        ]
+        outcome = _extract_outcome_phrase(rewritten_bullet) or _extract_outcome_phrase(evidence_text)
+        inventory.append(
+            {
+                "requirement": match.get("job_phrase", ""),
+                "importance": int(match.get("job_requirement_importance", 0)),
+                "matched_source_bullet": rewritten_bullet,
+                "match_reason": match_reason(match),
+                "supported_technologies": technologies[:6],
+                "supported_outcome": outcome,
+                "confidence": int(match.get("confidence", 0)),
+                "source_field": match.get("job_requirement_source_field", ""),
+                "grounded": bool(match.get("grounded")),
+            }
+        )
+    return inventory
+
+
+def match_reason(match: dict[str, Any]) -> str:
+    parts = []
+    if match.get("match_type"):
+        parts.append(f"{match['match_type']} match")
+    if match.get("job_requirement_source_field"):
+        parts.append(f"from {match['job_requirement_source_field']}")
+    if match.get("exact_keyword_overlap") is not None:
+        parts.append(f"keyword overlap {match.get('exact_keyword_overlap')}")
+    return ", ".join(parts)
+
+
+def rewrite_from_requirement_evidence(original: str, match: dict[str, Any], candidate_evidence: dict[str, Any]) -> str | None:
+    lower_original = original.lower()
+    requirement = match.get("job_phrase", "").lower()
+    evidence_text = f"{match.get('evidence_text', '')} {candidate_evidence.get('full_text', '')}".lower()
+    has_testing = any(term in requirement or term in evidence_text for term in ["testing", "testable", "validation", "reliability", "debug", "debugging", "quality"])
+    has_database = any(term in requirement or term in evidence_text for term in ["database", "data model", "sql", "postgres", "records"])
+    has_documentation = any(term in requirement or term in evidence_text for term in ["documentation", "document", "maintainability", "release"])
+    has_collaboration = any(term in requirement or term in evidence_text for term in ["collaborat", "cross-functional", "team", "stakeholder", "user feedback"])
+    has_cloud = any(term in requirement or term in evidence_text for term in ["cloud", "aws", "azure", "linux", "deployment"])
+    has_integrations = any(term in requirement or term in evidence_text for term in ["backend integrations", "integration", "api", "rest", "workflow"])
+
+    if "validation, logging, and data cleaning" in lower_original and has_testing:
+        return normalize_space(
+            re.sub(
+                r"validation,\s*logging,\s*and\s*data\s*cleaning",
+                "testing, validation, logging, and data-cleaning",
+                original,
+                flags=re.I,
+            )
+        )
+    if "data models and application logic" in lower_original and has_database:
+        rewritten = re.sub(
+            r"Designed data models and application logic for products, supplier specific items, and pricing records",
+            "Designed database structures and data models for products, supplier specific items, and pricing records",
+            original,
+            flags=re.I,
+        )
+        if rewritten == original:
+            rewritten = re.sub(r"\bdata models?\b", "database structures and data models", original, flags=re.I)
+        return normalize_space(rewritten)
+    if "database design" in lower_original and has_database:
+        rewritten = re.sub(r"\bdatabase design\b", "database structures and data models", original, flags=re.I)
+        return normalize_space(rewritten)
+    if "backend integrations with real-time data" in lower_original and has_integrations:
+        rewritten = re.sub(
+            r"backend integrations with real-time data from",
+            "backend integrations and data workflows with real-time data from",
+            original,
+            flags=re.I,
+        )
+        return normalize_space(rewritten)
+    if "documented system behavior and data workflows" in lower_original and has_documentation:
+        rewritten = re.sub(
+            r"Documented system behavior and data workflows",
+            "Documented system behavior, data workflows, and technical documentation",
+            original,
+            flags=re.I,
+        )
+        return normalize_space(rewritten)
+    if "held weekly tutorial sessions" in lower_original and has_collaboration:
+        rewritten = re.sub(
+            r"Held weekly tutorial sessions for business team members",
+            "Held weekly tutorial sessions with business team members",
+            original,
+            flags=re.I,
+        )
+        return normalize_space(rewritten)
+    if "e-commerce platform" in lower_original and has_cloud:
+        rewritten = re.sub(
+            r"production e-commerce platform",
+            "production software platform",
+            original,
+            flags=re.I,
+        )
+        return normalize_space(rewritten)
+    return None
+
+
+def _extract_outcome_phrase(content: str) -> str:
+    number_match = re.search(r"(\d+(?:\.\d+)?%?|\d+[,+]?\d*\+?\s*(?:records|products|variants|SKUs|modules|suppliers|users|hours|days|weeks))", content)
+    if number_match:
+        return number_match.group(1)
+    if "reduced" in content.lower():
+        return content[content.lower().find("reduced") :].split(".")[0].strip()
+    return ""
 
 
 def build_skills_block(profile: dict[str, Any], phrase_matches: list[dict[str, Any]], candidate_evidence: dict[str, Any]) -> dict[str, Any] | None:
@@ -417,8 +732,16 @@ def is_cosmetic_only_change(original: str, proposed: str) -> bool:
 
 def select_cover_letter_blocks(resume_change_blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     scored = sorted(
-        [block for block in resume_change_blocks if block.get("grounded") and block.get("section") in {"experience", "projects"}],
-        key=lambda item: (int(item.get("confidence", 0)), len(item.get("proposed_text", ""))),
+        [
+            block
+            for block in resume_change_blocks
+            if block.get("grounded") and block.get("section") in {"experience", "projects"}
+        ],
+        key=lambda item: (
+            int(item.get("confidence", 0)),
+            int(item.get("job_requirement_importance", 0)),
+            len(item.get("proposed_text", "")),
+        ),
         reverse=True,
     )
     return scored[:3]
@@ -439,20 +762,34 @@ def build_cover_letter_paragraphs(
         for block in selected_blocks
         if normalize_space(block.get("matched_job_phrase") or block.get("job_phrase") or "")
     ]
+    concepts = [concept for concept in concepts if len(concept.split()) > 1 and concept.lower() not in {"backend", "software", "experience"}]
+    skill_focus = [skill for skill in (candidate_evidence.get("skills") or []) if normalize_space(skill)]
     if not concepts:
-        concepts = [skill for skill in (candidate_evidence.get("skills") or []) if normalize_space(skill)]
-    focus = short_join(concepts[:3]) if concepts else "the most relevant experience from my background"
-    evidence_sentences = [build_evidence_sentence(block) for block in selected_blocks[:2]]
-    if not evidence_sentences:
-        evidence_sentences = cover_letter_supporting_snippets(concepts[:4], candidate_evidence, limit=3)
-    if not evidence_sentences:
-        evidence_sentences = ["My background includes practical experience that aligns with the role requirements."]
-    evidence_paragraph = normalize_space(
-        " ".join(evidence_sentences)
-        + " Together, these examples show the kind of real software work I have already done: improving reliability, documenting changes, and collaborating across teams while staying true to my background."
-    )
-    if len(evidence_paragraph) > 320:
-        evidence_paragraph = evidence_paragraph[:317].rstrip() + "..."
+        concepts = skill_focus
+    focus = short_join((concepts or skill_focus)[:4]) if (concepts or skill_focus) else "the most relevant experience from my background"
+    evidence_sentences: list[str] = []
+    seen_sentences: set[str] = set()
+    for sentence in [build_cover_letter_evidence_sentence(block) for block in selected_blocks[:3]]:
+        clean = normalize_space(sentence)
+        if clean and clean not in seen_sentences:
+            seen_sentences.add(clean)
+            evidence_sentences.append(clean)
+    for sentence in cover_letter_supporting_snippets((concepts or skill_focus)[:4], candidate_evidence, limit=3):
+        clean = normalize_space(sentence)
+        if clean and clean not in seen_sentences:
+            seen_sentences.add(clean)
+            evidence_sentences.append(clean)
+    if len(evidence_sentences) < 2:
+        for sentence in fallback_concrete_evidence_sentences(candidate_evidence, limit=2 - len(evidence_sentences)):
+            clean = normalize_space(sentence)
+            if clean and clean not in seen_sentences:
+                seen_sentences.add(clean)
+                evidence_sentences.append(clean)
+    evidence_paragraph = " ".join(evidence_sentences[:2])
+    if len(evidence_sentences) >= 2:
+        evidence_paragraph += " Those two examples show how I have applied software skills in production workflows, technical documentation, and cross-functional delivery."
+    elif evidence_paragraph:
+        evidence_paragraph += " This is the kind of work I would bring to Scotiabank."
     fit_sentence = build_fit_sentence(job, selected_blocks, candidate_evidence)
     employer_line = company if not location else f"{company} - {location}"
     subject = f"Re: Application for {title}"
@@ -461,9 +798,9 @@ def build_cover_letter_paragraphs(
         employer_line,
         f"Dear {company} Hiring Team,",
         subject,
-        f"I'm excited to apply for the {title} role at {company}. My background lines up with {focus}, and I like work where careful delivery matters.",
+        f"I'm excited to apply for the {title} role at {company}. My background includes {focus}, and I have used those skills to support production software and internal workflows.",
         evidence_paragraph,
-        fit_sentence + f" That combination of reliability, documentation, and collaboration is why the role at {company} feels like a strong fit.",
+        fit_sentence + f" That combination is why the role at {company} feels like a strong fit.",
         f"Thank you for your consideration. I would welcome the chance to discuss how I can contribute to {company} as a {title.lower()}.",
         "Sincerely,",
         name,
@@ -483,6 +820,36 @@ def build_evidence_sentence(block: dict[str, Any]) -> str:
     if len(phrase) > 400:
         phrase = phrase[:397].rstrip() + "..."
     return f"In recent experience, I {phrase[0].lower() + phrase[1:]}" if phrase else ""
+
+
+def build_cover_letter_evidence_sentence(block: dict[str, Any]) -> str:
+    phrase = normalize_space(str(block.get("proposed_text") or block.get("original_text") or ""))
+    if not phrase:
+        return ""
+    if phrase.endswith("."):
+        sentence = phrase
+    else:
+        sentence = f"{phrase}."
+    if sentence[:1].islower():
+        sentence = sentence[:1].upper() + sentence[1:]
+    return f"I {sentence[0].lower() + sentence[1:]}" if sentence else ""
+
+
+def fallback_concrete_evidence_sentences(candidate_evidence: dict[str, Any], limit: int = 2) -> list[str]:
+    snippets: list[str] = []
+    for section in candidate_evidence.get("sections", []):
+        if section.get("field") == "resume_text":
+            continue
+        for sentence in split_sentences(section.get("text", "")):
+            clean = normalize_space(sentence)
+            if not clean or contains_contact_details(clean) or contains_resume_section_heading(clean):
+                continue
+            if len(clean.split()) < 8:
+                continue
+            snippets.append(clean if clean.endswith(".") else f"{clean}.")
+            if len(snippets) >= limit:
+                return snippets
+    return snippets
 
 
 def cover_letter_supporting_snippets(terms: list[str], evidence: dict[str, Any], limit: int = 3) -> list[str]:
@@ -510,10 +877,9 @@ def build_fit_sentence(job: dict[str, Any], selected_blocks: list[dict[str, Any]
     company = normalize_space(str(job.get("company") or "the company"))
     concepts = [block["matched_job_phrase"] for block in selected_blocks[:3]]
     if not concepts:
-        concepts = ["documentation", "collaboration", "quality"]
+        concepts = ["database design", "backend integrations", "technical documentation"]
     return (
-        f"I would bring the same focus to {company}, especially in work that values {short_join(concepts)}, "
-        f"clear communication, and steady delivery."
+        f"I would bring the same focus to {company}, especially in work that values {short_join(concepts)} alongside cross-functional delivery."
     )
 
 

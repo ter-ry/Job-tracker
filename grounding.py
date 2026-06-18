@@ -437,12 +437,33 @@ def classify_cover_letter_paragraph_issue(paragraph: str, paragraph_index: int, 
         return f"Resume section dump detected in paragraph {paragraph_index}"
     if contains_contact_details(paragraph):
         return f"Contact details detected in paragraph {paragraph_index}"
+    generic_reason = classify_generic_cover_letter_language(paragraph)
+    if generic_reason is not None:
+        return f"Generic cover-letter language detected: {generic_reason} in paragraph {paragraph_index}"
     dump_reason = classify_keyword_dump_reason(paragraph)
     if dump_reason is not None:
         return f"{dump_reason} in paragraph {paragraph_index}"
     template_reason = classify_unrelated_template_claim(paragraph, evidence, job)
     if template_reason is not None:
         return f"Unrelated template claim detected: {template_reason} in paragraph {paragraph_index}"
+    return None
+
+
+def classify_generic_cover_letter_language(paragraph: str) -> str | None:
+    lowered = paragraph.lower()
+    generic_phrases = [
+        "practical experience that aligns",
+        "my background includes practical experience",
+        "together, these examples",
+        "my background lines up",
+        "careful delivery matters",
+        "staying true to my background",
+        "reliability, documentation, and collaboration",
+        "quality, clear communication, and steady delivery",
+    ]
+    for phrase in generic_phrases:
+        if phrase in lowered:
+            return phrase
     return None
 
 

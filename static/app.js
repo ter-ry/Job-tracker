@@ -840,6 +840,48 @@ function renderShortlist() {
   container.innerHTML = state.shortlist.map(renderShortlistCard).join("");
 }
 
+function renderTailoringChanges(job) {
+  const changes = job.tailoring_changes || {};
+  const resume = changes.resume || {};
+  const cover = changes.cover_letter || {};
+  const renderEntries = (label, changeLog) => {
+    const applied = Array.isArray(changeLog.applied) ? changeLog.applied : [];
+    const summary = changeLog.summary || {};
+    const templateMode = changeLog.template_mode ? `<span class="muted">${escapeHtml(changeLog.template_mode)}</span>` : "";
+    if (!applied.length) {
+      return `<div><strong>${escapeHtml(label)}</strong>${templateMode ? ` ${templateMode}` : ""}<p class="muted">No applied changes recorded yet.</p></div>`;
+    }
+    const items = applied
+      .slice(0, 3)
+      .map(
+        (item) => `
+          <li>
+            <strong>${escapeHtml(item.matched_job_requirement || item.kind || "Tailored change")}</strong>
+            <div>${escapeHtml(item.replacement || item.original || "")}</div>
+            ${item.supporting_evidence ? `<div class="muted">${escapeHtml(item.supporting_evidence)}</div>` : ""}
+          </li>
+        `,
+      )
+      .join("");
+    const appliedCount = Number(summary.total_applied_changes || applied.length || 0);
+    return `
+      <div>
+        <strong>${escapeHtml(label)}</strong> ${templateMode} <span class="muted">${appliedCount} applied change${appliedCount === 1 ? "" : "s"}</span>
+        <ul class="warning-list">${items}</ul>
+      </div>
+    `;
+  };
+  return `
+    <details class="score-details" open>
+      <summary>Tailoring changes</summary>
+      <div class="note-list">
+        ${renderEntries("Resume", resume)}
+        ${renderEntries("Cover letter", cover)}
+      </div>
+    </details>
+  `;
+}
+
 function renderShortlistCard(job) {
   const resumeReady = job.resume_generation_status === "generated";
   const coverReady = job.cover_letter_generation_status === "generated";
@@ -855,6 +897,7 @@ function renderShortlistCard(job) {
           <p>${scorePill(job.fit_score)} <span class="muted">${miniBreakdown(job)}</span></p>
           <p class="muted">Resume: ${escapeHtml(job.resume_generation_status || "pending")} · Cover letter: ${escapeHtml(job.cover_letter_generation_status || "pending")}</p>
           ${error}
+          ${renderTailoringChanges(job)}
         </div>
       </div>
       <div class="row-actions">

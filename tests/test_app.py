@@ -11,6 +11,7 @@ import app as app_module
 import grounding
 import semantic_matching
 import seniority
+import tailoring_pipeline
 import tailoring
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -834,6 +835,31 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("cross-functional data workflows", tailored_text.lower())
         self.assertNotIn("saved profile", tailored_text.lower())
 
+    def test_scotiabank_requirements_rank_and_map_to_grounded_evidence(self):
+        self.seed_python_developer_profile()
+        self.upload_resume_template(self.build_python_developer_resume_fixture())
+        profile = self.client.get("/api/profile").get_json()
+        job = self.scotiabank_job()
+        match = semantic_matching.analyze_resume_match(job, profile, cache_dir=None, use_semantic=False)
+        plan = tailoring_pipeline.build_tailoring_plan(job, profile, match)
+
+        ranked = plan["ranked_requirements"]
+        self.assertGreaterEqual(len(ranked), 8)
+        self.assertEqual(ranked[0]["source_field"], "required_skills")
+        self.assertTrue(any("database" in item["phrase"].lower() for item in ranked[:5]))
+        self.assertTrue(any("testing" in item["phrase"].lower() or "document" in item["phrase"].lower() for item in ranked[:8]))
+
+        inventory = plan["requirement_evidence_inventory"]
+        self.assertGreaterEqual(len(inventory), 5)
+        top_match = inventory[0]
+        self.assertIn("requirement", top_match)
+        self.assertIn("matched_source_bullet", top_match)
+        self.assertIn("match_reason", top_match)
+        self.assertIn("supported_technologies", top_match)
+        self.assertIn("supported_outcome", top_match)
+        self.assertGreaterEqual(top_match["confidence"], 40)
+        self.assertTrue(any("database structures" in item["matched_source_bullet"].lower() or "validation" in item["matched_source_bullet"].lower() for item in inventory))
+
     def test_controlled_rewrite_rejects_cosmetic_only_changes(self):
         original = "Built supplier specific items and data entry workflows for operations."
         rewritten = tailoring.controlled_rewrite(
@@ -921,6 +947,9 @@ class JobAssistantTest(unittest.TestCase):
             json=self.scotiabank_job(),
         ).get_json()
         self.assertEqual(created["cover_letter_generation_status"], "generated")
+        self.assertIn("tailoring_changes", created)
+        self.assertGreaterEqual(len(created["tailoring_changes"]["resume"]["applied"]), 1)
+        self.assertGreaterEqual(len(created["tailoring_changes"]["cover_letter"]["applied"]), 1)
         cover_path = Path(created["cover_letter_docx_path"])
         self.assertEqual(master_before, master_path.read_bytes())
 
@@ -940,12 +969,41 @@ class JobAssistantTest(unittest.TestCase):
         self.assertNotIn("saved profile", joined.lower())
         self.assertNotIn("ATS-oriented", joined)
         self.assertNotIn("grounded wording", joined)
-        self.assertTrue(any("Python" in text and ("Flask" in text or "SQL" in text or "backend" in text.lower()) for text in paragraphs))
+        self.assertNotIn("practical experience that aligns", joined.lower())
+        self.assertNotIn("together, these examples", joined.lower())
+        self.assertTrue(
+            sum(
+                1
+                for phrase in [
+                    "validation, logging, and data-cleaning",
+                    "database structures and data models",
+                    "backend integrations and data workflows",
+                    "technical documentation",
+                ]
+                if phrase in joined.lower()
+            )
+            >= 2
+        )
         date_lines = [text for text in paragraphs if re.search(r"\b[A-Z][a-z]+ \d{1,2}, \d{4}\b", text)]
         self.assertEqual(len(date_lines), 1)
         self.assertEqual(sum(1 for text in paragraphs if text == "Sincerely,"), 1)
         self.assertEqual(paragraphs[-2], "Sincerely,")
         self.assertEqual(paragraphs[-1], "Terry Mak")
+
+    def test_cover_letter_validation_reports_hidden_metadata_location(self):
+        source = self.build_cover_letter_template_fixture()
+        hidden = Path(self.tmpdir.name) / "cover_letter_template_hidden_metadata.docx"
+        with zipfile.ZipFile(source, "r") as zin, zipfile.ZipFile(hidden, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+                if item.filename == "docProps/core.xml":
+                    data = data.replace(b"python-docx", b"python-docx CentralSquare")
+                zout.writestr(item, data)
+
+        doc = Document(io.BytesIO(hidden.read_bytes()))
+        warning = app_module.validate_cover_letter_document(doc, self.software_job(), {"name": "Terry Mak"})
+        self.assertIsNotNone(warning)
+        self.assertIn("metadata part docProps/core.xml", warning)
 
     def test_cover_letter_no_template_fallback_and_validation_guards(self):
         self.seed_profile_for_documents(with_template=True)
