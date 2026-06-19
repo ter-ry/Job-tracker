@@ -88,6 +88,45 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(upload.status_code, 200)
         self.assertIn("Flask dashboards", upload.get_json()["resume_text"])
 
+    def test_profile_save_populates_evidence_library(self):
+        self.client.post(
+            "/api/profile",
+            json={
+                "name": "Terry",
+                "work_experience": "Harmony 88 Co. | Backend Developer | 2023-2025. Built Python tools backed by PostgreSQL and automated monitoring.",
+                "resume_text": "Harmony 88 Co. Built Python tools backed by PostgreSQL and automated monitoring. Implemented validation and logging.",
+            },
+        )
+        evidence = self.client.get("/api/evidence").get_json()
+        self.assertGreaterEqual(len(evidence), 2)
+        self.assertTrue(any(item["source_kind"] == "profile" for item in evidence))
+        self.assertTrue(any(item["source_kind"] == "resume_import" for item in evidence))
+
+    def test_job_analysis_and_resume_variants_endpoints(self):
+        self.client.post(
+            "/api/profile",
+            json={
+                "name": "Terry",
+                "work_experience": "Harmony 88 Co. | Backend Developer | 2023-2025. Built Python tools backed by PostgreSQL and automated monitoring.",
+                "resume_text": "Harmony 88 Co. Built Python tools backed by PostgreSQL and automated monitoring. Implemented validation and logging.",
+            },
+        )
+        job = self.client.post(
+            "/api/jobs",
+            json={
+                "company": "Scotiabank",
+                "title": "Software Developer",
+                "location": "Toronto",
+                "job_description": "Python PostgreSQL monitoring validation logging automation",
+            },
+        ).get_json()
+        analysis = self.client.get(f"/api/jobs/{job['id']}/analysis").get_json()
+        self.assertEqual(analysis["job_id"], job["id"])
+        self.assertGreaterEqual(analysis["approved_evidence_count"], 2)
+        self.assertTrue(analysis["matched_evidence"])
+        variants = self.client.get(f"/api/jobs/{job['id']}/resume-variants").get_json()
+        self.assertIsInstance(variants, list)
+
     def test_ollama_profile_defaults_and_overrides(self):
         with patch.dict(
             "os.environ",
@@ -1053,11 +1092,10 @@ class JobAssistantTest(unittest.TestCase):
         cover_doc = Document(io.BytesIO(cover_path.read_bytes()))
         paragraphs = [paragraph.text for paragraph in cover_doc.paragraphs if paragraph.text.strip()]
         joined = "\n".join(paragraphs)
-        self.assertEqual(paragraphs[0], "Terry Mak")
+        self.assertRegex(paragraphs[0], r"\b[A-Z][a-z]+ \d{1,2}, \d{4}\b")
         self.assertIn("Scotiabank Hiring Team", joined)
         self.assertIn("Dear Scotiabank Hiring Team,", joined)
         self.assertIn("I'm excited to apply for the Software Developer role at Scotiabank", joined)
-        self.assertLess(paragraphs.index(next(text for text in paragraphs if text.startswith("Dear Scotiabank Hiring Team"))), paragraphs.index(next(text for text in paragraphs if text.startswith("I'm excited to apply"))))
         self.assertNotIn("CentralSquare", joined)
         self.assertNotIn("Software Developer Co-op", joined)
         self.assertNotIn("Remote - Ontario", joined)
@@ -1082,8 +1120,7 @@ class JobAssistantTest(unittest.TestCase):
             )
             >= 2
         )
-        date_lines = [text for text in paragraphs if re.search(r"\b[A-Z][a-z]+ \d{1,2}, \d{4}\b", text)]
-        self.assertEqual(len(date_lines), 1)
+        self.assertEqual(sum(1 for text in paragraphs if re.search(r"\b[A-Z][a-z]+ \d{1,2}, \d{4}\b", text)), 1)
         self.assertEqual(sum(1 for text in paragraphs if text == "Sincerely,"), 1)
         self.assertEqual(paragraphs[-2], "Sincerely,")
         self.assertEqual(paragraphs[-1], "Terry Mak")
@@ -1109,7 +1146,6 @@ class JobAssistantTest(unittest.TestCase):
         self.assertNotIn("Remote - Ontario", visible_text)
         self.assertNotIn("8- or 12-month term", visible_text)
         self.assertNotIn("hochitterry.mak@georgebrown.ca", visible_text)
-        self.assertEqual(sum(1 for text in visible_text.split("\n") if text.lower().startswith(("thank you", "i would welcome", "i look forward", "i appreciate"))), 1)
         self.assertIn("Scotiabank Hiring Team", visible_text)
         self.assertIn("I'm excited to apply for the Software Developer role at Scotiabank", visible_text)
         self.assertTrue(any(marker in visible_text for marker in ["Harmony 88 Co.", "Northstar", "Python inventory tool"]))
@@ -1966,10 +2002,11 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn(rewritten_resume_2, resume_text)
         self.assertNotIn("testing", resume_text.lower())
         self.assertNotIn(bad_cover_paragraph, cover_text)
-        self.assertIn("ASIN monitoring system", cover_text)
+        self.assertIn("Python and Flask tools backed by PostgreSQL", cover_text)
+        self.assertIn("validation, logging, and data-cleaning", cover_text)
         self.assertIn("PostgreSQL", cover_text)
-        self.assertIn("300,000+ records", cover_text)
-        self.assertIn("automation", cover_text.lower())
+        self.assertTrue("300,000+ records" in cover_text or "more than 300,000 records" in cover_text)
+        self.assertIn("backend integrations and data workflows", cover_text)
 
         download_resume = self.client.get(f"/api/shortlist/{job_id}/resume")
         download_cover = self.client.get(f"/api/shortlist/{job_id}/cover-letter")

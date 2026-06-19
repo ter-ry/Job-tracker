@@ -141,3 +141,42 @@ def build_ollama_health_report(config: OllamaConfig) -> dict[str, Any]:
     report["failure_reason"] = f"Model {config.model} is not installed."
     report["summary"] = f"{report['failure_reason']} Run `{report['pull_command']}`."
     return report
+
+
+def request_json_completion(config: OllamaConfig, prompt: str, system: str = "") -> dict[str, Any]:
+    if not config.enabled:
+        return {"ok": False, "error": "Ollama is disabled.", "data": {}}
+    url = urljoin(config.base_url.rstrip("/") + "/", "api/generate")
+    payload = {
+        "model": config.model,
+        "prompt": prompt,
+        "system": system,
+        "stream": False,
+        "format": "json",
+        "options": {
+            "num_predict": config.max_output_tokens,
+        },
+    }
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=config.timeout_seconds) as response:
+            raw = response.read().decode("utf-8")
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "data": {}}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"ok": False, "error": "Ollama returned invalid JSON.", "data": {}}
+    text = _text(parsed.get("response")) if isinstance(parsed, dict) else ""
+    if not text:
+        return {"ok": False, "error": "Ollama returned an empty response.", "data": {}}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return {"ok": False, "error": "Ollama response was not valid JSON.", "data": {}, "raw": text}
+    return {"ok": True, "error": "", "data": data, "raw": text}

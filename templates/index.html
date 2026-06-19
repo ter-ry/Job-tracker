@@ -306,6 +306,10 @@
             <p class="muted helper">Install the model manually with <code>ollama pull qwen3:4b</code>. Health checks stay local and generation falls back safely if Ollama is unavailable.</p>
             <div id="ollama-health-status" class="muted helper" aria-live="polite"></div>
           </fieldset>
+          <section class="panel nested-panel">
+            <div class="panel-header"><h3>Evidence library</h3></div>
+            <div id="evidence-library" class="generated-output empty">Saved evidence will appear here.</div>
+          </section>
           <label>Extracted resume/profile text<textarea id="profile-resume-text" rows="8"></textarea></label>
           <label>Base cover letter template<textarea id="profile-cover-letter-template" rows="6"></textarea></label>
         </form>

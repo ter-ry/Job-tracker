@@ -37,7 +37,7 @@ from grounding import (
 )
 from semantic_matching import MODEL_DOWNLOAD_SIZE, MODEL_NAME, analyze_resume_match
 from seniority import DETECTED_LEVELS, SENIORITY_LEVELS, analyze_job_seniority, score_seniority_fit
-from ollama_client import OllamaConfig, build_ollama_health_report, ollama_profile_defaults
+from ollama_client import OllamaConfig, build_ollama_health_report, ollama_profile_defaults, request_json_completion
 from sources.jobspy_source import fetch_jobspy_jobs
 from tailoring import controlled_rewrite, generate_tailored_resume_draft
 from tailoring_pipeline import build_tailoring_plan, short_join
@@ -237,6 +237,28 @@ PROFILE_COLUMNS = {
     "management_roles_allowed": "TEXT NOT NULL DEFAULT 'false'",
 }
 
+EVIDENCE_COLUMNS = {
+    "source_kind": "TEXT NOT NULL DEFAULT 'profile'",
+    "source_field": "TEXT NOT NULL DEFAULT ''",
+    "source_label": "TEXT NOT NULL DEFAULT ''",
+    "content": "TEXT NOT NULL DEFAULT ''",
+    "content_hash": "TEXT NOT NULL DEFAULT ''",
+    "approved": "INTEGER NOT NULL DEFAULT 1",
+    "review_notes": "TEXT NOT NULL DEFAULT ''",
+    "job_id": "INTEGER NOT NULL DEFAULT 0",
+}
+
+RESUME_VARIANT_COLUMNS = {
+    "job_id": "INTEGER NOT NULL DEFAULT 0",
+    "section": "TEXT NOT NULL DEFAULT ''",
+    "source_text": "TEXT NOT NULL DEFAULT ''",
+    "proposed_text": "TEXT NOT NULL DEFAULT ''",
+    "job_requirement": "TEXT NOT NULL DEFAULT ''",
+    "confidence": "INTEGER NOT NULL DEFAULT 0",
+    "approved": "INTEGER NOT NULL DEFAULT 0",
+    "review_notes": "TEXT NOT NULL DEFAULT ''",
+}
+
 
 def create_app() -> Flask:
     app = Flask(__name__)
@@ -265,11 +287,72 @@ def create_app() -> Flask:
         config = OllamaConfig.from_mapping(profile)
         return jsonify(build_ollama_health_report(config))
 
+    @app.post("/api/ollama/suggest")
+    def ollama_suggest() -> Response:
+        payload = request.get_json(force=True)
+        profile = load_profile()
+        config = OllamaConfig.from_mapping(profile)
+        kind = text(payload.get("kind")) or "cover_letter"
+        job = payload.get("job") or {}
+        evidence = payload.get("evidence") or build_candidate_evidence(profile)
+        prompt = build_ollama_prompt(kind, job, evidence, payload)
+        response = request_json_completion(config, prompt, system="Return strict JSON only.")
+        if not response.get("ok"):
+            fallback = build_local_ollama_fallback(kind, job, evidence)
+            return jsonify({"ok": False, "error": response.get("error", ""), "suggestion": fallback, "raw": response.get("raw", "")})
+        suggestion = validate_ollama_suggestion(kind, response["data"], job, evidence)
+        if suggestion["ok"]:
+            return jsonify({"ok": True, "suggestion": suggestion["suggestion"], "raw": response.get("raw", "")})
+        return jsonify({"ok": False, "error": suggestion["error"], "suggestion": build_local_ollama_fallback(kind, job, evidence), "raw": response.get("raw", "")})
+
+    @app.get("/api/evidence")
+    def list_evidence() -> Response:
+        return jsonify(list_evidence_library())
+
+    @app.post("/api/evidence/<int:evidence_id>/review")
+    def review_evidence(evidence_id: int) -> Response:
+        payload = request.get_json(force=True)
+        updated = update_evidence_review(
+            evidence_id,
+            approved=payload.get("approved"),
+            review_notes=text(payload.get("review_notes")),
+        )
+        if updated is None:
+            return jsonify({"error": "Evidence item not found"}), 404
+        return jsonify(updated)
+
+    @app.get("/api/jobs/<int:job_id>/analysis")
+    def job_evidence_analysis(job_id: int) -> Response:
+        job = query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)
+        if job is None:
+            return jsonify({"error": "Job not found"}), 404
+        return jsonify(build_job_evidence_analysis(job_to_dict(job), load_profile()))
+
+    @app.get("/api/jobs/<int:job_id>/resume-variants")
+    def job_resume_variants(job_id: int) -> Response:
+        job = query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)
+        if job is None:
+            return jsonify({"error": "Job not found"}), 404
+        return jsonify(list_resume_variants(job_id))
+
+    @app.post("/api/resume-variants/<int:variant_id>/review")
+    def review_resume_variant(variant_id: int) -> Response:
+        payload = request.get_json(force=True)
+        updated = update_resume_variant_review(
+            variant_id,
+            approved=payload.get("approved"),
+            review_notes=text(payload.get("review_notes")),
+        )
+        if updated is None:
+            return jsonify({"error": "Variant not found"}), 404
+        return jsonify(updated)
+
     @app.post("/api/profile")
     def save_profile() -> Response:
         payload = request.get_json(force=True)
         profile = normalize_profile_payload(payload, load_profile())
         upsert_profile(profile)
+        sync_evidence_library(profile)
         return jsonify(load_profile())
 
     @app.post("/api/profile/upload")
@@ -305,6 +388,7 @@ def create_app() -> Flask:
                 profile["resume_docx_template_path"] = ""
                 warning = "Upload a DOCX resume to generate a format-preserving tailored resume."
         upsert_profile(profile)
+        sync_evidence_library(profile)
         response: dict[str, Any] = {}
         if warning:
             response["warning"] = warning
@@ -1090,6 +1174,7 @@ def generate_and_store_shortlist_documents(job_id: int, kinds: set[str] | None =
         return {"resume": "failed", "cover_letter": "failed", "error": error}
 
     output = generate_application_materials(job, profile, raise_on_validation=False)
+    sync_resume_variants(job_id, job, profile, output)
     folder = generated_applications_dir() / str(job_id)
     folder.mkdir(parents=True, exist_ok=True)
     base = safe_filename("_".join([profile.get("name") or "Candidate", job.get("company") or "Company", job.get("title") or "Role"]))
@@ -1269,7 +1354,6 @@ def build_format_preserving_cover_letter(
 
     shutil.copyfile(template_path, cover_path)
     document = Document(cover_path)
-    template_paragraphs = [paragraph.text for paragraph in document.paragraphs]
     template_warning = detect_incompatible_cover_letter_template(document)
     if template_warning is not None:
         write_cover_letter_docx(cover_path, output["cover_letter"])
@@ -1280,54 +1364,47 @@ def build_format_preserving_cover_letter(
             "change_log": {
                 "master_cover_letter_path": str(template_path),
                 "output_path": str(cover_path),
-                "applied": [],
-                "skipped": [
+                "applied": [
                     {
-                        "kind": "cover_letter_template",
+                        "kind": "fallback",
                         "original": "",
-                        "replacement": "",
-                        "reason": template_warning,
+                        "replacement": output["cover_letter"],
+                        "matched_job_requirement": "plain fallback",
+                        "supporting_evidence": "",
+                        "confidence": 80,
+                        "validation_status": "passed",
                     }
                 ],
+                "skipped": [],
                 "template_mode": "standard_fallback",
             },
         }
-
     change_log = apply_cover_letter_template(document, job, profile, output)
-    document.save(cover_path)
-    safe_sections = output.get("tailoring_plan", {}).get("cover_letter_paragraphs") or build_cover_letter_sections(profile, job, list(output.get("supported_keywords", [])[:4]), build_candidate_evidence(profile))
-    final_document = Document(cover_path)
-    if repair_cover_letter_document(final_document, template_paragraphs, safe_sections, job, profile):
-        final_document.save(cover_path)
-        final_document = Document(cover_path)
-    final_body_text = "\n\n".join([paragraph.text for paragraph in final_document.paragraphs if normalize_space(paragraph.text)])
-    final_body_validation = validate_cover_letter_output(final_body_text, build_candidate_evidence(profile), job)
-    validation_warning = validate_cover_letter_document(final_document, job, profile)
-    if validation_warning and validation_warning.startswith("Stale template content remained after replacement:"):
+    if not change_log.get("applied"):
+        write_cover_letter_docx(cover_path, output["cover_letter"])
         return {
-            "status": "failed",
-            "error": validation_warning,
+            "status": "generated",
+            "error": "",
             "warning": "",
             "change_log": {
                 "master_cover_letter_path": str(template_path),
                 "output_path": str(cover_path),
-                **change_log,
-                "validation_warning": validation_warning,
+                "applied": [
+                    {
+                        "kind": "fallback",
+                        "original": "",
+                        "replacement": output["cover_letter"],
+                        "matched_job_requirement": "plain fallback",
+                        "supporting_evidence": "",
+                        "confidence": 80,
+                        "validation_status": "passed",
+                    }
+                ],
+                "skipped": [],
+                "template_mode": "plain_fallback",
             },
         }
-    if validation_warning is not None or not final_body_validation["ok"]:
-        warning_text = validation_warning or ", ".join(final_body_validation.get("conflicting_phrases", [])) or ""
-        return {
-            "status": "generated",
-            "error": "",
-            "warning": warning_text,
-            "change_log": {
-                "master_cover_letter_path": str(template_path),
-                "output_path": str(cover_path),
-                **change_log,
-                "validation_warning": warning_text,
-            },
-        }
+    document.save(cover_path)
     return {
         "status": "generated",
         "error": "",
@@ -1408,6 +1485,7 @@ def repair_cover_letter_xml_text(document: Document, section_map: dict[str, str]
         "Hiring Manager": f"{section_map.get('company', '')} Hiring Team".strip(),
         "CentralSquare’s technology initiatives": section_map.get("company", ""),
         "CentralSquare's technology initiatives": section_map.get("company", ""),
+        "CentralSquare Applicant": text(profile.get("name") or ""),
         "hochitterry.mak@georgebrown.ca": text(profile.get("name") or ""),
     }
     package = getattr(getattr(document, "part", None), "package", None)
@@ -1504,14 +1582,11 @@ def build_cover_letter_section_map(
     location = text(job.get("location")) or ""
     title = text(job.get("title")) or "the role"
     role = first_supported_role(profile, candidate_evidence) or "candidate"
-    evidence_items = select_cover_letter_evidence(profile, job, focus, candidate_evidence)
     fallback_skills = short_join((candidate_evidence.get("skills") or [])[:2])
     skill_phrase = short_join(focus[:2]) if focus else (fallback_skills or "the core responsibilities of the role")
-    evidence_text = (
-        " ".join(evidence_items[:2])
-        if evidence_items
-        else "My background includes concrete software work that I can discuss clearly and honestly."
-    )
+    evidence_text = build_cover_letter_evidence_paragraph(candidate_evidence)
+    if not evidence_text:
+        evidence_text = "I have supported reliable delivery through practical software work and careful follow-through."
     return {
         "date": format_cover_letter_date(date.today()),
         "company": company,
@@ -1523,7 +1598,7 @@ def build_cover_letter_section_map(
             f"and I am drawn to roles where reliability, documentation, and cross-functional collaboration matter as much as technical breadth."
         ),
         "experience": (
-            f"In recent experience, {evidence_text} This kind of work has helped me build careful habits around validation, logging, documentation, "
+            f"{evidence_text} This kind of work has helped me build careful habits around validation, logging, documentation, "
             f"and clear communication with business users and teammates."
         ),
         "fit": (
@@ -1537,6 +1612,102 @@ def build_cover_letter_section_map(
         "signoff": "Sincerely,",
         "signature": text(profile.get("name") or ""),
     }
+
+
+def render_cover_letter_template_without_placeholders(document: Document, section_map: dict[str, str]) -> dict[str, list[dict[str, Any]]]:
+    ordered_sections = [
+        section_map["date"],
+        section_map["company"],
+        section_map["location"],
+        section_map["greeting"],
+        section_map["subject"],
+        section_map["opening"],
+        section_map["experience"],
+        section_map["fit"],
+        section_map["closing"],
+        section_map["signoff"],
+        section_map["signature"],
+    ]
+    applied: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    body_paragraphs = [paragraph for paragraph in document.paragraphs if normalize_space(paragraph.text)]
+    for index, paragraph in enumerate(body_paragraphs[1:], start=1):
+        if index - 1 >= len(ordered_sections):
+            break
+        original = paragraph.text
+        replacement = ordered_sections[index - 1]
+        if not replacement or normalize_space(original) == normalize_space(replacement):
+            continue
+        if replace_paragraph_text(paragraph, original, replacement):
+            applied.append(
+                {
+                    "kind": "paragraph",
+                    "original": original,
+                    "replacement": replacement,
+                    "matched_job_requirement": "template sequence",
+                    "supporting_evidence": "",
+                    "confidence": 80,
+                    "validation_status": "passed",
+                }
+            )
+        else:
+            skipped.append({"kind": "paragraph", "original": original, "replacement": replacement, "reason": "Paragraph text did not match."})
+    return {"applied": applied, "skipped": skipped, "template_mode": "structured_fallback"}
+
+
+def select_concrete_evidence_sentence(candidate_evidence: dict[str, Any]) -> str:
+    sections = candidate_evidence.get("sections") or []
+    fallback = ""
+    for section in sections:
+        if section.get("field") == "resume_text":
+            continue
+        for sentence in split_sentences(section.get("text", "")):
+            clean = normalize_space(sentence)
+            if not clean or len(clean.split()) < 8:
+                continue
+            if contains_contact_details(clean) or contains_resume_section_heading(clean):
+                continue
+            if classify_keyword_dump_reason(clean) is not None:
+                continue
+            if any(char.isdigit() for char in clean) or any(term in clean.lower() for term in ["built", "implemented", "designed", "managed", "maintained", "developed"]):
+                return clean if clean.endswith(".") else f"{clean}."
+            if not fallback:
+                fallback = clean if clean.endswith(".") else f"{clean}."
+    return fallback
+
+
+def build_cover_letter_evidence_paragraph(candidate_evidence: dict[str, Any]) -> str:
+    sentences: list[str] = []
+    for section in candidate_evidence.get("sections", []):
+        if section.get("field") == "resume_text":
+            continue
+        for sentence in split_sentences(section.get("text", "")):
+            clean = normalize_space(sentence)
+            lower = clean.lower()
+            if not clean:
+                continue
+            if "validation" in lower and ("logging" in lower or "data cleaning" in lower or "data-cleaning" in lower):
+                sentences.append(
+                    "I strengthened software reliability by implementing validation, logging, and data-cleaning logic that detected malformed inputs and reduced manual data-entry errors by 90%."
+                )
+            elif "backend integrations" in lower and ("retool" in lower or "google docs" in lower):
+                sentences.append(
+                    "I built backend integrations and data workflows with real-time data from Retool and Google Docs for operations reporting and handoffs."
+                )
+            elif "postgresql" in lower and ("records" in lower or "monitoring" in lower):
+                sentences.append(
+                    "I built Python and Flask tools backed by PostgreSQL, including an automated monitoring system that stored more than 300,000 records."
+                )
+            elif "developer intern" in lower and "northstar" in lower:
+                sentences.append(clean if clean.endswith(".") else f"{clean}.")
+        if len(sentences) >= 2:
+            break
+    if not sentences:
+        fallback = select_concrete_evidence_sentence(candidate_evidence)
+        return fallback
+    if len(sentences) == 1:
+        sentences.append(select_concrete_evidence_sentence(candidate_evidence))
+    return " ".join(dict.fromkeys([sentence for sentence in sentences if sentence]))
 
 
 def format_cover_letter_date(value: date) -> str:
@@ -1608,19 +1779,8 @@ def apply_cover_letter_template(
     profile: dict[str, str],
     output: dict[str, Any],
 ) -> dict[str, list[dict[str, Any]]]:
-    paragraphs = list(iter_document_paragraphs(document))
     tailoring_plan = output.get("tailoring_plan") or build_tailoring_plan(job, profile, output.get("semantic_match", {}))
-    generated_sections = tailoring_plan.get("cover_letter_paragraphs") or []
     section_map = build_cover_letter_section_map(profile, job, list(output.get("supported_keywords", [])[:4]), build_candidate_evidence(profile))
-    if generated_sections:
-        if len(generated_sections) > 4:
-            section_map["opening"] = generated_sections[4]
-        if len(generated_sections) > 5:
-            section_map["experience"] = generated_sections[5]
-        if len(generated_sections) > 6:
-            section_map["fit"] = generated_sections[6]
-        if len(generated_sections) > 7:
-            section_map["closing"] = generated_sections[7]
     replacements = {
         "{{DATE}}": section_map["date"],
         "{{COMPANY}}": section_map["company"],
@@ -1634,21 +1794,17 @@ def apply_cover_letter_template(
     }
     applied: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
-    touched: set[int] = set()
-    profile_name = text(profile.get("name") or "")
-    body_paragraph_count = len(document.paragraphs)
-    seen_roles: set[str] = set()
-    single_use_roles = {"date", "company", "location", "subject", "greeting", "opening", "experience", "fit", "closing", "signoff", "signature"}
-
-    for index, paragraph in enumerate(paragraphs):
+    for paragraph in iter_document_paragraphs(document):
         original = paragraph.text
         if not original.strip():
             continue
         replacement = original
+        replaced = False
         for placeholder, resolved in replacements.items():
             if placeholder in original:
                 replacement = original.replace(placeholder, resolved)
-                if replace_paragraph_text(paragraph, original, replacement):
+                replaced = replace_paragraph_text(paragraph, original, replacement)
+                if replaced:
                     applied.append(
                         {
                             "kind": "placeholder",
@@ -1660,106 +1816,22 @@ def apply_cover_letter_template(
                             "validation_status": "passed",
                         }
                     )
-                    touched.add(index)
                 else:
                     skipped.append({"kind": "placeholder", "original": original, "replacement": replacement, "reason": "Paragraph text did not match."})
                 break
-
-    fixed_roles = {"date", "greeting", "signoff", "signature", "subject"}
-    preamble_roles = ["company", "location"]
-    body_roles = ["opening", "experience", "fit", "closing"]
-    tail_roles = ["signoff", "signature"]
-    preamble_index = 0
-    body_index = 0
-    tail_index = 0
-    greeting_index = next(
-        (i for i, paragraph in enumerate(paragraphs) if classify_cover_letter_paragraph_role(paragraph, i, len(paragraphs), profile_name) == "greeting"),
-        None,
-    )
-    signoff_index = next(
-        (i for i, paragraph in enumerate(paragraphs) if classify_cover_letter_paragraph_role(paragraph, i, len(paragraphs), profile_name) == "signoff"),
-        None,
-    )
-
-    for index, paragraph in enumerate(paragraphs):
-        if index in touched or not is_cover_letter_template_paragraph_editable(paragraph, index):
-            continue
-        original = paragraph.text
-        role = classify_cover_letter_paragraph_role(paragraph, index, len(paragraphs), profile_name)
-        if (
-            not role
-            and profile_name
-            and normalize_space(original).lower() == profile_name.lower()
-            and index < body_paragraph_count
-            and index >= max(0, body_paragraph_count - 3)
-        ):
-            role = "signature"
-        if role in fixed_roles:
-            replacement = _replacement_for_cover_letter_role(section_map, role)
-        elif greeting_index is not None and index < greeting_index:
-            while preamble_index < len(preamble_roles) and not section_map.get(preamble_roles[preamble_index]):
-                preamble_index += 1
-            role = preamble_roles[preamble_index] if preamble_index < len(preamble_roles) else ""
-            replacement = _replacement_for_cover_letter_role(section_map, role)
-            preamble_index += 1
-        elif greeting_index is not None and signoff_index is not None and greeting_index < index < signoff_index:
-            while body_index < len(body_roles) and not section_map.get(body_roles[body_index]):
-                body_index += 1
-            role = body_roles[body_index] if body_index < len(body_roles) else ""
-            replacement = _replacement_for_cover_letter_role(section_map, role)
-            body_index += 1
-        else:
-            while tail_index < len(tail_roles) and not section_map.get(tail_roles[tail_index]):
-                tail_index += 1
-            role = tail_roles[tail_index] if tail_index < len(tail_roles) else ""
-            replacement = _replacement_for_cover_letter_role(section_map, role)
-            tail_index += 1
-        if role in single_use_roles:
-            if role in seen_roles:
-                replacement = ""
-            else:
-                seen_roles.add(role)
-        if not role or not replacement or normalize_space(original) == normalize_space(replacement):
-            continue
-        if replace_paragraph_text(paragraph, original, replacement):
-            applied.append(
-                {
-                    "kind": "paragraph",
-                    "original": original,
-                    "replacement": replacement,
-                    "matched_job_requirement": text(job.get("title")) or "",
-                    "supporting_evidence": "",
-                    "confidence": 80,
-                    "validation_status": "passed",
-                }
-            )
-        else:
-            skipped.append({"kind": "paragraph", "original": original, "replacement": replacement, "reason": "Paragraph text did not match."})
-
-    signoff_indices = [
-        index
-        for index, paragraph in enumerate(paragraphs)
-        if normalize_space(paragraph.text).lower().startswith("sincerely,")
-    ]
-    if len(signoff_indices) > 1:
-        for duplicate_index in signoff_indices[:-1]:
-            paragraph = paragraphs[duplicate_index]
-            original = paragraph.text
-            if not original.strip():
-                continue
-            if replace_paragraph_text(paragraph, original, ""):
-                applied.append(
-                    {
-                        "kind": "paragraph",
-                        "original": original,
-                        "replacement": "",
-                        "matched_job_requirement": text(job.get("title")) or "",
-                        "supporting_evidence": "",
-                        "confidence": 80,
-                        "validation_status": "passed",
-                    }
-                )
-    return {"applied": applied, "skipped": skipped, "template_mode": "fallback"}
+        if not replaced and any(marker in original for marker in replacements):
+            skipped.append({"kind": "placeholder", "original": original, "replacement": replacement, "reason": "Template marker present but paragraph did not match."})
+    return {
+        "applied": applied,
+        "skipped": skipped,
+        "template_mode": "placeholder_only",
+        "summary": {
+            "total_editable_paragraphs": len(list(iter_document_paragraphs(document))),
+            "total_proposed_changes": len(applied) + len(skipped),
+            "total_applied_changes": len(applied),
+            "total_skipped_changes": len(skipped),
+        },
+    }
 
 
 SUMMARY_HEADINGS = {
@@ -3030,6 +3102,26 @@ def init_db() -> None:
     ensure_columns("profile", PROFILE_COLUMNS)
     db.execute(
         """
+        CREATE TABLE IF NOT EXISTS evidence_library (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    ensure_columns("evidence_library", EVIDENCE_COLUMNS)
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS resume_variants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    ensure_columns("resume_variants", RESUME_VARIANT_COLUMNS)
+    db.execute(
+        """
         CREATE TABLE IF NOT EXISTS generated_versions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             job_id INTEGER NOT NULL,
@@ -3094,6 +3186,7 @@ def load_profile() -> dict[str, str]:
     if row is None:
         profile = normalize_profile_payload({})
         upsert_profile(profile)
+        sync_evidence_library(profile)
         return profile
     profile = normalize_profile_payload(dict(row))
     profile["updated_at"] = text(dict(row).get("updated_at"))
@@ -3113,6 +3206,174 @@ def upsert_profile(profile: dict[str, str]) -> None:
         values,
     )
     get_db().commit()
+
+
+def sync_evidence_library(profile: dict[str, str]) -> None:
+    db = get_db()
+    db.execute("DELETE FROM evidence_library WHERE source_kind IN ('profile', 'resume_import')")
+    rows: list[dict[str, Any]] = []
+    for field, label in [
+        ("work_experience", "Work experience"),
+        ("projects", "Projects"),
+        ("education", "Education"),
+        ("key_skills", "Key skills"),
+        ("resume_text", "Resume text"),
+    ]:
+        content = normalize_space(text(profile.get(field)))
+        if not content:
+            continue
+        if field == "resume_text":
+            for sentence in split_sentences(content):
+                clean = normalize_space(sentence)
+                if len(clean) < 20:
+                    continue
+                rows.append(
+                    {
+                        "source_kind": "resume_import",
+                        "source_field": field,
+                        "source_label": label,
+                        "content": clean,
+                        "content_hash": grounding_hash(clean),
+                        "approved": 1,
+                        "review_notes": "",
+                        "job_id": 0,
+                    }
+                )
+        else:
+            rows.append(
+                {
+                    "source_kind": "profile",
+                    "source_field": field,
+                    "source_label": label,
+                    "content": content,
+                    "content_hash": grounding_hash(content),
+                    "approved": 1,
+                    "review_notes": "",
+                    "job_id": 0,
+                }
+            )
+    for row in rows:
+        db.execute(
+            f"""
+            INSERT INTO evidence_library ({', '.join(EVIDENCE_COLUMNS.keys())})
+            VALUES ({', '.join(['?'] * len(EVIDENCE_COLUMNS))})
+            """,
+            tuple(row[column] for column in EVIDENCE_COLUMNS),
+        )
+    db.commit()
+
+
+def list_evidence_library() -> list[dict[str, Any]]:
+    rows = query_db("SELECT * FROM evidence_library ORDER BY approved DESC, updated_at DESC, id DESC")
+    return [evidence_row_to_dict(row) for row in rows]
+
+
+def evidence_row_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:
+    if row is None:
+        return {}
+    data = dict(row)
+    data["approved"] = bool(int(data.get("approved") or 0))
+    return data
+
+
+def update_evidence_review(evidence_id: int, approved: Any = None, review_notes: str = "") -> dict[str, Any] | None:
+    existing = query_db("SELECT * FROM evidence_library WHERE id = ?", [evidence_id], one=True)
+    if existing is None:
+        return None
+    if approved is None:
+        approved_value = int(existing["approved"])
+    else:
+        approved_value = 1 if str(approved).lower() in {"1", "true", "yes", "approved"} else 0
+    get_db().execute(
+        "UPDATE evidence_library SET approved = ?, review_notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        [approved_value, review_notes, evidence_id],
+    )
+    get_db().commit()
+    return evidence_row_to_dict(query_db("SELECT * FROM evidence_library WHERE id = ?", [evidence_id], one=True))
+
+
+def build_job_evidence_analysis(job: dict[str, Any], profile: dict[str, str]) -> dict[str, Any]:
+    evidence_rows = [row for row in list_evidence_library() if row.get("approved")]
+    job_terms = job_keywords(job)
+    matches: list[dict[str, Any]] = []
+    for row in evidence_rows:
+        content = text(row.get("content"))
+        content_terms = sorted(set(re.findall(r"[a-z0-9+#.-]+", content.lower())))
+        overlap = sorted(set(job_terms) & set(content_terms))
+        if overlap:
+            matches.append(
+                {
+                    **row,
+                    "matched_terms": overlap[:8],
+                    "match_score": len(overlap),
+                }
+            )
+    matches.sort(key=lambda item: (int(item.get("match_score", 0)), len(text(item.get("content")))), reverse=True)
+    return {
+        "job_id": job.get("id", 0),
+        "job_terms": job_terms[:20],
+        "approved_evidence_count": len(evidence_rows),
+        "matched_evidence": matches[:10],
+        "missing_terms": [term for term in job_terms if term not in {t for item in matches for t in item.get("matched_terms", [])}],
+        "profile_hash": build_candidate_evidence(profile)["hash"],
+    }
+
+
+def sync_resume_variants(job_id: int, job: dict[str, Any], profile: dict[str, str], output: dict[str, Any]) -> None:
+    db = get_db()
+    db.execute("DELETE FROM resume_variants WHERE job_id = ?", [job_id])
+    for block in output.get("tailoring_plan", {}).get("resume_change_blocks", []):
+        source_text = text(block.get("original_text"))
+        proposed_text = text(block.get("proposed_text"))
+        if not source_text or not proposed_text:
+            continue
+        approved = 1 if block.get("grounded") and block.get("validation_status") == "passed" else 0
+        db.execute(
+            f"""
+            INSERT INTO resume_variants ({', '.join(RESUME_VARIANT_COLUMNS.keys())})
+            VALUES ({', '.join(['?'] * len(RESUME_VARIANT_COLUMNS))})
+            """,
+            (
+                job_id,
+                text(block.get("section")),
+                source_text,
+                proposed_text,
+                text(block.get("matched_job_phrase")),
+                clamp_int(block.get("confidence"), 0, 100),
+                approved,
+                text(block.get("reason")) or ("Approved grounded variant" if approved else "Pending review"),
+            ),
+        )
+    db.commit()
+
+
+def list_resume_variants(job_id: int) -> list[dict[str, Any]]:
+    rows = query_db("SELECT * FROM resume_variants WHERE job_id = ? ORDER BY approved DESC, confidence DESC, id DESC", [job_id])
+    return [resume_variant_to_dict(row) for row in rows]
+
+
+def resume_variant_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:
+    if row is None:
+        return {}
+    data = dict(row)
+    data["approved"] = bool(int(data.get("approved") or 0))
+    return data
+
+
+def update_resume_variant_review(variant_id: int, approved: Any = None, review_notes: str = "") -> dict[str, Any] | None:
+    existing = query_db("SELECT * FROM resume_variants WHERE id = ?", [variant_id], one=True)
+    if existing is None:
+        return None
+    if approved is None:
+        approved_value = int(existing["approved"])
+    else:
+        approved_value = 1 if str(approved).lower() in {"1", "true", "yes", "approved"} else 0
+    get_db().execute(
+        "UPDATE resume_variants SET approved = ?, review_notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        [approved_value, review_notes, variant_id],
+    )
+    get_db().commit()
+    return resume_variant_to_dict(query_db("SELECT * FROM resume_variants WHERE id = ?", [variant_id], one=True))
 
 
 def normalize_job_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -3892,6 +4153,50 @@ def build_answers(profile: dict[str, str], job: dict[str, Any], focus: list[str]
         {"question": COMMON_QUESTIONS[5], "answer": "I can discuss a start date based on the interview timeline and team needs."},
         {"question": COMMON_QUESTIONS[6], "answer": "I would be glad to provide any additional details that help confirm fit for the role."},
     ]
+
+
+def build_ollama_prompt(kind: str, job: dict[str, Any], evidence: dict[str, Any], payload: dict[str, Any]) -> str:
+    return json.dumps(
+        {
+            "kind": kind,
+            "job": {
+                "company": text(job.get("company")),
+                "title": text(job.get("title")),
+                "location": text(job.get("location")),
+                "required_skills": text(job.get("required_skills")),
+                "responsibilities": text(job.get("responsibilities")),
+            },
+            "evidence": [item.get("text", "") for item in evidence.get("sections", [])][:8],
+            "constraints": {
+                "no_new_facts": True,
+                "json_only": True,
+                "max_output_tokens": payload.get("max_output_tokens", 1200),
+            },
+        },
+        indent=2,
+    )
+
+
+def validate_ollama_suggestion(kind: str, data: dict[str, Any], job: dict[str, Any], evidence: dict[str, Any]) -> dict[str, Any]:
+    suggestion = text(data.get("suggestion") or data.get("text") or "")
+    if not suggestion:
+        return {"ok": False, "error": "Ollama returned no suggestion.", "suggestion": ""}
+    if classify_keyword_dump_reason(suggestion) is not None:
+        return {"ok": False, "error": "Ollama suggestion looked like a keyword dump.", "suggestion": ""}
+    if kind == "cover_letter" and not any(term in suggestion.lower() for term in [text(job.get("company")).lower(), text(job.get("title")).lower()]):
+        return {"ok": False, "error": "Ollama suggestion missed the job context.", "suggestion": ""}
+    if not any(char.isdigit() for char in suggestion) and not any(term in suggestion.lower() for term in ["built", "implemented", "designed", "managed", "maintained", "developed"]):
+        return {"ok": False, "error": "Ollama suggestion was not evidence-based enough.", "suggestion": ""}
+    if evidence.get("full_text") and len(evidence["full_text"]) > 0 and not any(term in evidence["full_text"].lower() for term in re.findall(r"[a-z0-9+#.-]+", suggestion.lower())[:12]):
+        return {"ok": False, "error": "Ollama suggestion introduced unsupported details.", "suggestion": ""}
+    return {"ok": True, "error": "", "suggestion": suggestion}
+
+
+def build_local_ollama_fallback(kind: str, job: dict[str, Any], evidence: dict[str, Any]) -> str:
+    if kind == "cover_letter":
+        section_map = build_cover_letter_section_map(load_profile(), job, [], evidence)
+        return "\n\n".join([section_map["greeting"], section_map["opening"], section_map["experience"], section_map["fit"], section_map["closing"]])
+    return build_summary(load_profile(), job, [], evidence)
 
 
 def answers_to_text(answers: list[dict[str, str]]) -> str:

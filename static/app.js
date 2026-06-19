@@ -1,6 +1,7 @@
 const state = {
   jobs: [],
   profile: {},
+  evidence: [],
   generatedText: "",
   activeJobId: "",
   discoveryResults: [],
@@ -118,20 +119,23 @@ document.addEventListener("DOMContentLoaded", () => {
 
 async function loadAll() {
   try {
-    const [jobs, dashboard, profile, ollamaHealth] = await Promise.all([
+    const [jobs, dashboard, profile, ollamaHealth, evidence] = await Promise.all([
       api.get("/api/jobs"),
       api.get("/api/dashboard"),
       api.get("/api/profile"),
       api.get("/api/ollama/health").catch((error) => ({ status: "error", summary: error.message })),
+      api.get("/api/evidence").catch(() => []),
     ]);
     const shortlist = await api.get("/api/shortlist");
     state.jobs = jobs;
     state.profile = profile;
+    state.evidence = evidence;
     state.shortlist = shortlist;
     renderDashboard(dashboard);
     renderProfile(profile);
     renderTemplateStatus(profile);
     renderOllamaHealth(ollamaHealth);
+    renderEvidenceLibrary(evidence);
     renderJobs();
     renderShortlist();
   } catch (error) {
@@ -187,6 +191,37 @@ function renderOllamaHealth(report) {
     report.pull_command ? `Pull: ${report.pull_command}` : "",
   ].filter(Boolean);
   element.textContent = parts.join(" | ");
+}
+
+function renderEvidenceLibrary(items) {
+  const element = document.getElementById("evidence-library");
+  if (!element) return;
+  if (!Array.isArray(items) || !items.length) {
+    element.classList.add("empty");
+    element.textContent = "Saved evidence will appear here.";
+    return;
+  }
+  element.classList.remove("empty");
+  element.innerHTML = `
+    <div class="review-list">
+      ${items
+        .slice(0, 12)
+        .map(
+          (item) => `
+            <div class="match-item">
+              <strong>${escapeHtml(item.source_label || item.source_field || "Evidence")}</strong>
+              <p>${escapeHtml(item.content || "")}</p>
+              <div class="actions compact">
+                <button class="button small ghost" type="button" onclick="reviewEvidence(${item.id}, true)">Approve</button>
+                <button class="button small ghost danger" type="button" onclick="reviewEvidence(${item.id}, false)">Reject</button>
+              </div>
+              <span class="muted">${item.approved ? "Approved" : "Pending"} · ${escapeHtml(item.review_notes || "")}</span>
+            </div>
+          `
+        )
+        .join("")}
+    </div>
+  `;
 }
 
 function renderJobs() {
@@ -340,7 +375,20 @@ async function saveProfile(event) {
     } catch (healthError) {
       renderOllamaHealth({ status: "error", summary: healthError.message, failure_reason: healthError.message });
     }
+    state.evidence = await api.get("/api/evidence").catch(() => state.evidence);
+    renderEvidenceLibrary(state.evidence);
     toast("Profile saved");
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+async function reviewEvidence(id, approved) {
+  try {
+    await api.send(`/api/evidence/${id}/review`, "POST", { approved, review_notes: approved ? "Approved for matching" : "Rejected for matching" });
+    state.evidence = await api.get("/api/evidence");
+    renderEvidenceLibrary(state.evidence);
+    toast("Evidence updated");
   } catch (error) {
     toast(error.message);
   }
