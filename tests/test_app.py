@@ -9,6 +9,7 @@ import zipfile
 
 import app as app_module
 import grounding
+import ollama_client
 import semantic_matching
 import seniority
 import tailoring_pipeline
@@ -42,6 +43,20 @@ class FakeEmbeddingBackend:
         return vectors
 
 
+class FakeUrlopenResponse:
+    def __init__(self, body: dict[str, object]):
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self):
+        return json.dumps(self.body).encode("utf-8")
+
+
 class JobAssistantTest(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -72,6 +87,89 @@ class JobAssistantTest(unittest.TestCase):
         )
         self.assertEqual(upload.status_code, 200)
         self.assertIn("Flask dashboards", upload.get_json()["resume_text"])
+
+    def test_ollama_profile_defaults_and_overrides(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "OLLAMA_ENABLED": "true",
+                "OLLAMA_BASE_URL": "http://ollama.local:11434",
+                "OLLAMA_MODEL": "llama3.1:8b",
+                "OLLAMA_TIMEOUT_SECONDS": "45",
+                "OLLAMA_MAX_OUTPUT_TOKENS": "777",
+                "OLLAMA_MAX_PROMPT_CHARS": "11111",
+            },
+            clear=False,
+        ):
+            config = ollama_client.OllamaConfig.from_mapping({})
+        self.assertTrue(config.enabled)
+        self.assertEqual(config.base_url, "http://ollama.local:11434")
+        self.assertEqual(config.model, "llama3.1:8b")
+        self.assertEqual(config.timeout_seconds, 45)
+        self.assertEqual(config.max_output_tokens, 777)
+        self.assertEqual(config.max_prompt_chars, 11111)
+
+    def test_ollama_health_reports_available_model(self):
+        with patch.object(ollama_client.urllib.request, "urlopen", return_value=FakeUrlopenResponse({"models": [{"name": "qwen3:4b"}]})):
+            report = ollama_client.build_ollama_health_report(
+                ollama_client.OllamaConfig(
+                    enabled=True,
+                    base_url="http://127.0.0.1:11434",
+                    model="qwen3:4b",
+                    timeout_seconds=1,
+                    max_output_tokens=1200,
+                    max_prompt_chars=24000,
+                )
+            )
+        self.assertTrue(report["reachable"])
+        self.assertTrue(report["model_available"])
+        self.assertEqual(report["status"], "ok")
+
+    def test_ollama_health_reports_missing_model(self):
+        with patch.object(ollama_client.urllib.request, "urlopen", return_value=FakeUrlopenResponse({"models": [{"name": "another-model"}]})):
+            report = ollama_client.build_ollama_health_report(
+                ollama_client.OllamaConfig(
+                    enabled=True,
+                    base_url="http://127.0.0.1:11434",
+                    model="qwen3:4b",
+                    timeout_seconds=1,
+                    max_output_tokens=1200,
+                    max_prompt_chars=24000,
+                )
+            )
+        self.assertTrue(report["reachable"])
+        self.assertFalse(report["model_available"])
+        self.assertEqual(report["status"], "missing_model")
+        self.assertIn("ollama pull qwen3:4b", report["summary"])
+
+    def test_ollama_health_reports_timeout_and_disabled_state(self):
+        with patch.object(ollama_client.urllib.request, "urlopen", side_effect=TimeoutError):
+            report = ollama_client.build_ollama_health_report(
+                ollama_client.OllamaConfig(
+                    enabled=True,
+                    base_url="http://127.0.0.1:11434",
+                    model="qwen3:4b",
+                    timeout_seconds=1,
+                    max_output_tokens=1200,
+                    max_prompt_chars=24000,
+                )
+            )
+        self.assertEqual(report["status"], "timeout")
+        self.assertFalse(report["reachable"])
+        self.assertFalse(report["model_available"])
+
+        disabled = ollama_client.build_ollama_health_report(
+            ollama_client.OllamaConfig(
+                enabled=False,
+                base_url="http://127.0.0.1:11434",
+                model="qwen3:4b",
+                timeout_seconds=1,
+                max_output_tokens=1200,
+                max_prompt_chars=24000,
+            )
+        )
+        self.assertEqual(disabled["status"], "disabled")
+        self.assertFalse(disabled["reachable"])
 
     def test_job_create_scores_and_dashboard(self):
         self.seed_profile_for_documents(with_template=True)

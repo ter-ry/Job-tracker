@@ -37,6 +37,7 @@ from grounding import (
 )
 from semantic_matching import MODEL_DOWNLOAD_SIZE, MODEL_NAME, analyze_resume_match
 from seniority import DETECTED_LEVELS, SENIORITY_LEVELS, analyze_job_seniority, score_seniority_fit
+from ollama_client import OllamaConfig, build_ollama_health_report, ollama_profile_defaults
 from sources.jobspy_source import fetch_jobspy_jobs
 from tailoring import controlled_rewrite, generate_tailored_resume_draft
 from tailoring_pipeline import build_tailoring_plan, short_join
@@ -224,6 +225,12 @@ PROFILE_COLUMNS = {
     "cover_letter_template": "TEXT NOT NULL DEFAULT ''",
     "cover_letter_docx_template_path": "TEXT NOT NULL DEFAULT ''",
     "cover_letter_template_status": "TEXT NOT NULL DEFAULT ''",
+    "ollama_enabled": "TEXT NOT NULL DEFAULT 'false'",
+    "ollama_base_url": "TEXT NOT NULL DEFAULT 'http://127.0.0.1:11434'",
+    "ollama_model": "TEXT NOT NULL DEFAULT 'qwen3:4b'",
+    "ollama_timeout_seconds": "TEXT NOT NULL DEFAULT '120'",
+    "ollama_max_output_tokens": "TEXT NOT NULL DEFAULT '1200'",
+    "ollama_max_prompt_chars": "TEXT NOT NULL DEFAULT '24000'",
     "target_seniority_levels": "TEXT NOT NULL DEFAULT 'entry_level,junior,intermediate'",
     "maximum_required_years": "TEXT NOT NULL DEFAULT '3'",
     "willing_to_apply_to_stretch_roles": "TEXT NOT NULL DEFAULT 'true'",
@@ -251,6 +258,12 @@ def create_app() -> Flask:
     @app.get("/api/profile")
     def get_profile() -> Response:
         return jsonify(load_profile())
+
+    @app.get("/api/ollama/health")
+    def ollama_health() -> Response:
+        profile = load_profile()
+        config = OllamaConfig.from_mapping(profile)
+        return jsonify(build_ollama_health_report(config))
 
     @app.post("/api/profile")
     def save_profile() -> Response:
@@ -3063,6 +3076,10 @@ def normalize_profile_payload(payload: dict[str, Any], existing: dict[str, str] 
     profile["maximum_required_years"] = text(payload.get("maximum_required_years")) or "3"
     profile["willing_to_apply_to_stretch_roles"] = normalize_bool_text(payload.get("willing_to_apply_to_stretch_roles"), True)
     profile["management_roles_allowed"] = normalize_bool_text(payload.get("management_roles_allowed"), False)
+    ollama_defaults = ollama_profile_defaults()
+    for field, default_value in ollama_defaults.items():
+        if not profile.get(field):
+            profile[field] = default_value
     if "resume_docx_template_path" not in payload and existing.get("resume_docx_template_path"):
         profile["resume_docx_template_path"] = text(existing.get("resume_docx_template_path"))
     if "cover_letter_docx_template_path" not in payload and existing.get("cover_letter_docx_template_path"):

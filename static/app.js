@@ -51,6 +51,12 @@ const profileFields = [
   "work-experience",
   "resume-text",
   "cover-letter-template",
+  "ollama-enabled",
+  "ollama-base-url",
+  "ollama-model",
+  "ollama-timeout-seconds",
+  "ollama-max-output-tokens",
+  "ollama-max-prompt-chars",
   "target-seniority-levels",
   "maximum-required-years",
   "willing-to-apply-to-stretch-roles",
@@ -112,10 +118,11 @@ document.addEventListener("DOMContentLoaded", () => {
 
 async function loadAll() {
   try {
-    const [jobs, dashboard, profile] = await Promise.all([
+    const [jobs, dashboard, profile, ollamaHealth] = await Promise.all([
       api.get("/api/jobs"),
       api.get("/api/dashboard"),
       api.get("/api/profile"),
+      api.get("/api/ollama/health").catch((error) => ({ status: "error", summary: error.message })),
     ]);
     const shortlist = await api.get("/api/shortlist");
     state.jobs = jobs;
@@ -124,6 +131,7 @@ async function loadAll() {
     renderDashboard(dashboard);
     renderProfile(profile);
     renderTemplateStatus(profile);
+    renderOllamaHealth(ollamaHealth);
     renderJobs();
     renderShortlist();
   } catch (error) {
@@ -160,6 +168,25 @@ function renderTemplateStatus(profile) {
       ? "DOCX template uploaded — formatting-preserving generation available"
       : "No DOCX template uploaded — standard cover-letter formatting will be used"
   );
+}
+
+function renderOllamaHealth(report) {
+  const element = document.getElementById("ollama-health-status");
+  if (!element) return;
+  if (!report) {
+    element.textContent = "Ollama health has not been checked yet.";
+    return;
+  }
+  const parts = [
+    report.summary || `Status: ${report.status || "unknown"}`,
+    report.enabled ? `Model: ${report.model_name || ""}` : "Disabled",
+    report.base_url ? `URL: ${report.base_url}` : "",
+    report.reachable ? "Reachable" : "",
+    report.model_available ? "Model available" : "",
+    report.failure_reason ? `Reason: ${report.failure_reason}` : "",
+    report.pull_command ? `Pull: ${report.pull_command}` : "",
+  ].filter(Boolean);
+  element.textContent = parts.join(" | ");
 }
 
 function renderJobs() {
@@ -308,6 +335,11 @@ async function saveProfile(event) {
   event.preventDefault();
   try {
     state.profile = await api.send("/api/profile", "POST", getProfilePayload());
+    try {
+      renderOllamaHealth(await api.get("/api/ollama/health"));
+    } catch (healthError) {
+      renderOllamaHealth({ status: "error", summary: healthError.message, failure_reason: healthError.message });
+    }
     toast("Profile saved");
   } catch (error) {
     toast(error.message);
