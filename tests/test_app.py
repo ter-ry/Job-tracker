@@ -971,6 +971,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertNotIn("grounded wording", joined)
         self.assertNotIn("practical experience that aligns", joined.lower())
         self.assertNotIn("together, these examples", joined.lower())
+        self.assertNotIn("Python, JavaScript, Flask, React, SQL, cloud, AWS, Azure, dashboards, automation, APIs, reporting. This is the kind of work I would bring to Scotiabank.", joined)
         self.assertTrue(
             sum(
                 1
@@ -989,6 +990,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(sum(1 for text in paragraphs if text == "Sincerely,"), 1)
         self.assertEqual(paragraphs[-2], "Sincerely,")
         self.assertEqual(paragraphs[-1], "Terry Mak")
+        self.assertTrue(created["generation_debug"].get("generated_at"))
 
     def test_cover_letter_validation_reports_hidden_metadata_location(self):
         source = self.build_cover_letter_template_fixture()
@@ -1496,6 +1498,52 @@ class JobAssistantTest(unittest.TestCase):
         doc.save(path)
         return path
 
+    def build_asin_resume_fixture(self):
+        path = Path(self.tmpdir.name) / "asin_resume_fixture.docx"
+        doc = Document()
+        section = doc.sections[0]
+        section.top_margin = Inches(0.75)
+        section.bottom_margin = Inches(0.75)
+        section.left_margin = Inches(0.85)
+        section.right_margin = Inches(0.85)
+
+        title = doc.add_paragraph()
+        title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = title.add_run("Terry Mak")
+        run.bold = True
+        run.font.name = "Aptos"
+        run.font.size = Pt(18)
+
+        summary_heading = doc.add_paragraph()
+        summary_heading.style = "Heading 1"
+        summary_heading.add_run("Professional Summary")
+        summary = doc.add_paragraph()
+        summary.add_run("Backend developer with PostgreSQL, Python, automation, and reliability experience.")
+
+        experience_heading = doc.add_paragraph()
+        experience_heading.style = "Heading 1"
+        experience_heading.add_run("Work Experience")
+        experience = doc.add_paragraph()
+        experience.add_run("Harmony 88 Co.").bold = True
+        experience.add_run(" | Backend Developer | 2023-2025")
+
+        bullet1 = doc.add_paragraph(style="List Bullet")
+        bullet1.add_run("Built an automated ASIN monitoring system that tracked pricing, rank, and rating trends across 50-250 SKUs per session, delivering hourly insights over custom time frames and storing 300,000+ records in PostgreSQL.")
+        bullet2 = doc.add_paragraph(style="List Bullet")
+        bullet2.add_run("Implemented robust validation, logging, and data cleaning logic to detect malformed inputs and reduce manual data entry errors by 90%.")
+        bullet3 = doc.add_paragraph(style="List Bullet")
+        bullet3.add_run("Built backend integrations with real-time data from Retool and Google Docs for operations reporting and handoffs.")
+
+        skills_heading = doc.add_paragraph()
+        skills_heading.style = "Heading 1"
+        skills_heading.add_run("Skills")
+        skills = doc.add_paragraph()
+        skills.add_run("Skills: ").bold = True
+        skills.add_run("Python, PostgreSQL, Flask, AWS, dashboards, automation, APIs")
+
+        doc.save(path)
+        return path
+
     def build_cover_letter_template_fixture(self):
         path = Path(self.tmpdir.name) / "cover_letter_template_fixture.docx"
         doc = Document()
@@ -1657,6 +1705,85 @@ class JobAssistantTest(unittest.TestCase):
 
         listed = self.client.get("/api/shortlist").get_json()
         self.assertEqual(len(listed), 1)
+
+    def test_regenerate_both_serves_fresh_files_and_rewrites_keyword_lists(self):
+        self.client.post(
+            "/api/profile",
+            json={
+                "name": "Terry Mak",
+                "preferred_roles": "software developer, backend developer",
+                "preferred_locations": "Toronto",
+                "key_skills": "Python, PostgreSQL, Flask, AWS, automation, dashboards, validation, logging",
+                "projects": "Harmony 88 Co. built automated ASIN monitoring for pricing and rating trends with PostgreSQL storage.",
+                "work_experience": (
+                    "Harmony 88 Co. built an automated ASIN monitoring system that tracked pricing, rank, and rating trends across 50-250 SKUs per session, "
+                    "delivering hourly insights over custom time frames and storing 300,000+ records in PostgreSQL. "
+                    "Implemented robust validation, logging, and data cleaning logic to detect malformed inputs and reduce manual data entry errors by 90%. "
+                    "Built backend integrations with real-time data from Retool and Google Docs for operations reporting and handoffs."
+                ),
+                "resume_text": (
+                    "Terry Mak. Harmony 88 Co. built an automated ASIN monitoring system that tracked pricing, rank, and rating trends across 50-250 SKUs per session, "
+                    "delivering hourly insights over custom time frames and storing 300,000+ records in PostgreSQL. "
+                    "Implemented robust validation, logging, and data cleaning logic to detect malformed inputs and reduce manual data entry errors by 90%. "
+                    "Built backend integrations with real-time data from Retool and Google Docs for operations reporting and handoffs."
+                ),
+            },
+        )
+        self.upload_resume_template(self.build_asin_resume_fixture())
+        self.upload_cover_letter_template(self.build_cover_letter_template_fixture())
+
+        created = self.client.post(
+            "/api/shortlist",
+            json={
+                "company": "Scotiabank",
+                "title": "Software Developer",
+                "location": "Toronto",
+                "url": "https://example.com/job/scotiabank",
+                "job_description": "Python PostgreSQL Flask AWS automation dashboards APIs validation logging documentation cross-functional collaboration",
+            },
+        ).get_json()
+        job_id = created["id"]
+
+        regenerated = self.client.post(f"/api/shortlist/{job_id}/regenerate", json={})
+        self.assertEqual(regenerated.status_code, 200)
+        job = regenerated.get_json()
+        self.assertEqual(job["resume_generation_status"], "generated")
+        self.assertEqual(job["cover_letter_generation_status"], "generated")
+        self.assertIn("generation_debug", job)
+        self.assertTrue(job["generation_debug"].get("generated_at"))
+
+        resume_path = Path(job["resume_docx_path"])
+        cover_path = Path(job["cover_letter_docx_path"])
+        self.assertTrue(resume_path.exists())
+        self.assertTrue(cover_path.exists())
+
+        resume_doc = Document(io.BytesIO(resume_path.read_bytes()))
+        cover_doc = Document(io.BytesIO(cover_path.read_bytes()))
+        resume_text = "\n".join(paragraph.text for paragraph in resume_doc.paragraphs)
+        cover_text = "\n".join(paragraph.text for paragraph in cover_doc.paragraphs)
+
+        original_resume_1 = "Built an automated ASIN monitoring system that tracked pricing, rank, and rating trends across 50-250 SKUs per session, delivering hourly insights over custom time frames and storing 300,000+ records in PostgreSQL."
+        original_resume_2 = "Implemented robust validation, logging, and data cleaning logic to detect malformed inputs and reduce manual data entry errors by 90%."
+        rewritten_resume_1 = "Built a backend ASIN monitoring system that automated pricing, rank, and rating tracking across 50-250 SKUs per session, delivered hourly insights over custom time frames, and stored 300,000+ records reliably in PostgreSQL."
+        rewritten_resume_2 = "Implemented testing, validation, logging, and data-cleaning logic to catch malformed inputs early, strengthen error handling, and reduce manual data-entry errors by 90%, improving software reliability."
+        bad_cover_paragraph = "Python, JavaScript, Flask, React, SQL, cloud, AWS, Azure, dashboards, automation, APIs, reporting. This is the kind of work I would bring to Scotiabank."
+
+        self.assertNotIn(original_resume_1, resume_text)
+        self.assertNotIn(original_resume_2, resume_text)
+        self.assertIn(rewritten_resume_1, resume_text)
+        self.assertIn(rewritten_resume_2, resume_text)
+        self.assertNotIn(bad_cover_paragraph, cover_text)
+        self.assertIn("ASIN monitoring system", cover_text)
+        self.assertIn("PostgreSQL", cover_text)
+        self.assertIn("300,000+ records", cover_text)
+        self.assertIn("automation", cover_text.lower())
+
+        download_resume = self.client.get(f"/api/shortlist/{job_id}/resume")
+        download_cover = self.client.get(f"/api/shortlist/{job_id}/cover-letter")
+        self.assertEqual(download_resume.status_code, 200)
+        self.assertEqual(download_cover.status_code, 200)
+        self.assertEqual(download_resume.data, resume_path.read_bytes())
+        self.assertEqual(download_cover.data, cover_path.read_bytes())
 
     def test_duplicate_shortlist_prevention_and_generation_failure_preserves_job(self):
         missing_profile = self.client.post(

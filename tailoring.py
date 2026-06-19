@@ -141,6 +141,7 @@ def controlled_rewrite(original: str, requirement: str, evidence_text: str = "",
     lowered = clean.lower()
     requirement_lower = requirement.lower()
     evidence_lower = evidence_text.lower()
+    specific_rewrite_applied = False
     for old, new in ACTION_VERBS.items():
         if lowered.startswith(old):
             clean = new + clean[len(old) :]
@@ -167,7 +168,9 @@ def controlled_rewrite(original: str, requirement: str, evidence_text: str = "",
         )
     if "team documentation standards" in lowered and "documentation" in requirement_lower:
         clean = re.sub(r"team documentation standards", "documentation standards", clean, flags=re.I)
-    if "python" in requirement_lower and "python" not in lowered and "python" in evidence_lower:
+    if clean != original:
+        specific_rewrite_applied = True
+    if not specific_rewrite_applied and "python" in requirement_lower and "python" not in lowered and "python" in evidence_lower:
         if re.search(r"\b(validation|testing|automation|logging|documentation)\b", clean, re.I):
             clean = re.sub(
                 r"^(Implemented|Built|Designed|Created|Developed|Supported|Maintained)\b",

@@ -1080,8 +1080,9 @@ def generate_and_store_shortlist_documents(job_id: int, kinds: set[str] | None =
     folder = generated_applications_dir() / str(job_id)
     folder.mkdir(parents=True, exist_ok=True)
     base = safe_filename("_".join([profile.get("name") or "Candidate", job.get("company") or "Company", job.get("title") or "Role"]))
-    resume_name = safe_filename(f"{base}_Resume.docx")
-    cover_name = safe_filename(f"{base}_Cover_Letter.docx")
+    generation_token = f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    resume_name = safe_filename(f"{base}_{generation_token}_Resume.docx")
+    cover_name = safe_filename(f"{base}_{generation_token}_Cover_Letter.docx")
     resume_path = folder / resume_name
     cover_path = folder / cover_name
 
@@ -1144,11 +1145,14 @@ def generate_and_store_shortlist_documents(job_id: int, kinds: set[str] | None =
         "company": job.get("company"),
         "title": job.get("title"),
         "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "generation_token": generation_token,
         "matched_keywords": output.get("matched_keywords", []),
         "salary_source": job.get("salary_source"),
         "fit_score": job.get("fit_score"),
         "resume_template_path": profile.get("resume_docx_template_path", ""),
         "cover_letter_template_path": profile.get("cover_letter_docx_template_path", ""),
+        "job_hash": output.get("job_hash", ""),
+        "candidate_evidence_hash": output.get("candidate_evidence_hash", ""),
     }
     (folder / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     (folder / "resume.txt").write_text(output["resume_text"], encoding="utf-8")
@@ -1159,8 +1163,8 @@ def generate_and_store_shortlist_documents(job_id: int, kinds: set[str] | None =
     cover_status = cover_result["status"] if "cover_letter" in requested_kinds else current_cover_status
     resume_error = resume_result["error"] if "resume" in requested_kinds else current_resume_error
     cover_error = cover_result["error"] if "cover_letter" in requested_kinds else current_cover_error
-    resume_warning = resume_result.get("warning", "") if "resume" in requested_kinds else ""
-    cover_warning = cover_result.get("warning", "") if "cover_letter" in requested_kinds else current_cover_warning
+    resume_warning = text(resume_result.get("warning")) if "resume" in requested_kinds else ""
+    cover_warning = text(cover_result.get("warning")) if "cover_letter" in requested_kinds else current_cover_warning
     update_generation_status(
         job_id,
         resume_status,
@@ -1252,6 +1256,7 @@ def build_format_preserving_cover_letter(
 
     shutil.copyfile(template_path, cover_path)
     document = Document(cover_path)
+    template_paragraphs = [paragraph.text for paragraph in document.paragraphs]
     template_warning = detect_incompatible_cover_letter_template(document)
     if template_warning is not None:
         write_cover_letter_docx(cover_path, output["cover_letter"])
@@ -1277,26 +1282,25 @@ def build_format_preserving_cover_letter(
 
     change_log = apply_cover_letter_template(document, job, profile, output)
     document.save(cover_path)
-    validation_warning = validate_cover_letter_document(Document(cover_path), job, profile)
-    if validation_warning is not None:
-        write_cover_letter_docx(cover_path, output["cover_letter"])
+    safe_sections = output.get("tailoring_plan", {}).get("cover_letter_paragraphs") or build_cover_letter_sections(profile, job, list(output.get("supported_keywords", [])[:4]), build_candidate_evidence(profile))
+    final_document = Document(cover_path)
+    if repair_cover_letter_document(final_document, template_paragraphs, safe_sections):
+        final_document.save(cover_path)
+        final_document = Document(cover_path)
+    final_body_text = "\n\n".join([paragraph.text for paragraph in final_document.paragraphs if normalize_space(paragraph.text)])
+    final_body_validation = validate_cover_letter_output(final_body_text, build_candidate_evidence(profile), job)
+    validation_warning = validate_cover_letter_document(final_document, job, profile)
+    if validation_warning is not None or not final_body_validation["ok"]:
+        warning_text = validation_warning or ", ".join(final_body_validation.get("conflicting_phrases", [])) or ""
         return {
             "status": "generated",
             "error": "",
-            "warning": validation_warning,
+            "warning": warning_text,
             "change_log": {
                 "master_cover_letter_path": str(template_path),
                 "output_path": str(cover_path),
-                "applied": [],
-                "skipped": [
-                    {
-                        "kind": "cover_letter_template",
-                        "original": "",
-                        "replacement": "",
-                        "reason": validation_warning,
-                    }
-                ],
-                "template_mode": "standard_validation_fallback",
+                **change_log,
+                "validation_warning": warning_text,
             },
         }
     return {
@@ -1308,6 +1312,27 @@ def build_format_preserving_cover_letter(
             **change_log,
         },
     }
+
+
+def repair_cover_letter_document(document: Document, template_paragraphs: list[str], safe_sections: list[str]) -> bool:
+    repaired = False
+    paragraphs = list(document.paragraphs)
+    for index, paragraph in enumerate(paragraphs):
+        text_value = normalize_space(paragraph.text)
+        if not text_value:
+            continue
+        if classify_keyword_dump_reason(text_value) is None:
+            continue
+        safe_replacement = safe_sections[index] if index < len(safe_sections) else ""
+        if safe_replacement and classify_keyword_dump_reason(safe_replacement) is None and normalize_space(safe_replacement) != text_value:
+            if replace_paragraph_exact(paragraph, paragraph.text, safe_replacement):
+                repaired = True
+                continue
+        original_template = template_paragraphs[index] if index < len(template_paragraphs) else ""
+        if original_template and normalize_space(original_template) != text_value:
+            if replace_paragraph_exact(paragraph, paragraph.text, original_template):
+                repaired = True
+    return repaired
 
 
 def build_cover_letter_section_map(
@@ -2927,6 +2952,7 @@ def job_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:
     job_id = clamp_int(data.get("id"), 0, 10**9)
     if job_id:
         data["tailoring_changes"] = load_tailoring_changes(job_id)
+        data["generation_debug"] = load_generation_debug(job_id)
     return data
 
 
@@ -2952,6 +2978,21 @@ def load_tailoring_change_log(path: Path) -> dict[str, Any]:
         "summary": raw.get("summary") if isinstance(raw.get("summary"), dict) else {},
         "applied": [summarize_tailoring_change(item) for item in applied[:5] if isinstance(item, dict)],
         "skipped": [summarize_tailoring_change(item) for item in skipped[:5] if isinstance(item, dict)],
+    }
+
+
+def load_generation_debug(job_id: int) -> dict[str, Any]:
+    metadata_path = generated_applications_dir() / str(job_id) / "metadata.json"
+    if not metadata_path.exists():
+        return {}
+    try:
+        raw = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {
+        "generated_at": text(raw.get("generated_at")),
+        "generation_token": text(raw.get("generation_token")),
+        "job_hash": text(raw.get("job_hash")),
     }
 
 
