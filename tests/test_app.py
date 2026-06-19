@@ -752,7 +752,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("Software Developer | Northstar Labs | 2021-2025", tailored_text)
         self.assertIn("Computer programming diploma | 2023", tailored_text)
         self.assertIn("validation, logging", tailored_text.lower())
-        self.assertIn("testing, validation, logging, and data-cleaning logic", tailored_text)
+        self.assertIn("Strengthened software reliability by implementing validation, logging, and data-cleaning logic that detected malformed inputs and reduced manual data-entry errors by 90%.", tailored_text)
         self.assertIn("database structures and data models", tailored_text)
         self.assertIn("cross-functional data workflows using Retool and Google Docs", tailored_text)
 
@@ -762,7 +762,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("collaboration", skills_line.lower())
 
         bullet_texts = [paragraph.text for paragraph in tailored_doc.paragraphs if getattr(getattr(paragraph, "style", None), "name", "").startswith("List")]
-        self.assertTrue(any("testing, validation, logging, and data-cleaning" in text for text in bullet_texts))
+        self.assertTrue(any("Strengthened software reliability by implementing validation, logging, and data-cleaning logic that detected malformed inputs and reduced manual data-entry errors by 90%." in text for text in bullet_texts))
         self.assertTrue(any("database structures and data models" in text for text in bullet_texts))
         self.assertTrue(any("cross-functional data workflows using Retool and Google Docs" in text for text in bullet_texts))
 
@@ -802,12 +802,11 @@ class JobAssistantTest(unittest.TestCase):
             if any(
                 phrase in item["replacement"].lower()
                 for phrase in [
-                    "testing, validation, logging, and data-cleaning",
+                    "strengthened software reliability by implementing validation, logging, and data-cleaning logic",
                     "database structures and data models",
                     "backend integrations and data workflows",
                     "collaborated with cross-functional",
                     "technical documentation",
-                    "software reliability",
                 ]
             )
         ]
@@ -830,7 +829,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertGreaterEqual(len(substantive_bullet_changes), 2)
         tailored_text = "\n".join(paragraph.text for paragraph in tailored_doc.paragraphs)
         self.assertIn("database structures and data models", tailored_text)
-        self.assertIn("testing, validation, logging, and data-cleaning logic", tailored_text)
+        self.assertIn("Strengthened software reliability by implementing validation, logging, and data-cleaning logic that detected malformed inputs and reduced manual data-entry errors by 90%.", tailored_text)
         self.assertIn("collaborated with cross-functional teammates", tailored_text.lower())
         self.assertIn("cross-functional data workflows", tailored_text.lower())
         self.assertNotIn("saved profile", tailored_text.lower())
@@ -991,6 +990,38 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(paragraphs[-2], "Sincerely,")
         self.assertEqual(paragraphs[-1], "Terry Mak")
         self.assertTrue(created["generation_debug"].get("generated_at"))
+
+    def test_scotiabank_cover_letter_rewrites_all_visible_template_content(self):
+        self.seed_profile_for_documents(with_template=True)
+        self.upload_resume_template(self.build_python_developer_resume_fixture())
+        master_path = self.build_centralsquare_cover_letter_fixture()
+        self.upload_cover_letter_template(master_path)
+
+        created = self.client.post(
+            "/api/shortlist",
+            json=self.scotiabank_job(),
+        ).get_json()
+        cover_path = Path(created["cover_letter_docx_path"])
+        cover_doc = Document(io.BytesIO(cover_path.read_bytes()))
+        visible_text = "\n".join(paragraph.text for paragraph in app_module.iter_document_paragraphs(cover_doc) if paragraph.text.strip())
+
+        self.assertEqual(created["cover_letter_generation_status"], "generated")
+        self.assertNotIn("CentralSquare", visible_text)
+        self.assertNotIn("Software Developer Co-op", visible_text)
+        self.assertNotIn("Remote - Ontario", visible_text)
+        self.assertNotIn("8- or 12-month term", visible_text)
+        self.assertNotIn("hochitterry.mak@georgebrown.ca", visible_text)
+        self.assertEqual(sum(1 for text in visible_text.split("\n") if text.lower().startswith(("thank you", "i would welcome", "i look forward", "i appreciate"))), 1)
+        self.assertIn("Scotiabank Hiring Team", visible_text)
+        self.assertIn("I'm excited to apply for the Software Developer role at Scotiabank", visible_text)
+        self.assertTrue(any(marker in visible_text for marker in ["Harmony 88 Co.", "Northstar", "Python inventory tool"]))
+        self.assertIn("backend integrations and data workflows", visible_text)
+        self.assertIn("Retool and Google Docs", visible_text)
+        self.assertIsNone(app_module.validate_cover_letter_document(cover_doc, self.scotiabank_job(), {"name": "Terry Mak"}))
+
+        downloaded = self.client.get(f"/api/shortlist/{created['id']}/cover-letter")
+        self.assertEqual(downloaded.status_code, 200)
+        self.assertEqual(downloaded.data, cover_path.read_bytes())
 
     def test_cover_letter_validation_reports_hidden_metadata_location(self):
         source = self.build_cover_letter_template_fixture()
@@ -1653,6 +1684,69 @@ class JobAssistantTest(unittest.TestCase):
         doc.save(path)
         return path
 
+    def build_centralsquare_cover_letter_fixture(self):
+        path = Path(self.tmpdir.name) / "centralsquare_cover_letter_template_fixture.docx"
+        doc = Document()
+        section = doc.sections[0]
+        section.top_margin = Inches(0.9)
+        section.bottom_margin = Inches(0.9)
+        section.left_margin = Inches(1.0)
+        section.right_margin = Inches(1.0)
+
+        header = section.header.paragraphs[0]
+        header.text = "hochitterry.mak@georgebrown.ca | CentralSquare Technologies"
+
+        footer = section.footer.paragraphs[0]
+        footer.text = "CentralSquare Technologies | Remote - Ontario"
+
+        heading = doc.add_paragraph()
+        heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        heading.add_run("Terry Mak")
+
+        contact = doc.add_paragraph()
+        contact.add_run("hochitterry.mak@georgebrown.ca | Toronto, Ontario")
+
+        date_para = doc.add_paragraph()
+        date_para.add_run("May 1, 2024")
+
+        company_para = doc.add_paragraph()
+        company_para.add_run("CentralSquare")
+
+        location_para = doc.add_paragraph()
+        location_para.add_run("Remote - Ontario")
+
+        greeting = doc.add_paragraph()
+        greeting.add_run("Dear Hiring Manager,")
+
+        subject = doc.add_paragraph()
+        subject.add_run("Re: Software Developer Co-op – Remote, Ontario")
+
+        opening = doc.add_paragraph()
+        opening.add_run("I am excited to apply for the Software Developer Co-op role at CentralSquare for an 8- or 12-month term.")
+
+        table = doc.add_table(rows=1, cols=2)
+        table.cell(0, 0).text = "CentralSquare Technologies"
+        table.cell(0, 1).text = "CentralSquare's technology initiatives"
+
+        experience = doc.add_paragraph()
+        experience.add_run("I supported profile content and ATS-oriented language for the role.")
+
+        fit = doc.add_paragraph()
+        fit.add_run("My saved profile matches the posting and I would bring grounded wording.")
+
+        closing = doc.add_paragraph()
+        closing.add_run("Thank you for your consideration. I look forward to hearing from you.")
+
+        signoff = doc.add_paragraph()
+        signoff.add_run("Sincerely,")
+
+        signature = doc.add_paragraph()
+        signature.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        signature.add_run("CentralSquare Applicant")
+
+        doc.save(path)
+        return path
+
     def add_hyperlink(self, paragraph, url, text):
         r_id = paragraph.part.relate_to(url, RT.HYPERLINK, is_external=True)
         hyperlink = OxmlElement("w:hyperlink")
@@ -1765,13 +1859,14 @@ class JobAssistantTest(unittest.TestCase):
         original_resume_1 = "Built an automated ASIN monitoring system that tracked pricing, rank, and rating trends across 50-250 SKUs per session, delivering hourly insights over custom time frames and storing 300,000+ records in PostgreSQL."
         original_resume_2 = "Implemented robust validation, logging, and data cleaning logic to detect malformed inputs and reduce manual data entry errors by 90%."
         rewritten_resume_1 = "Built a backend ASIN monitoring system that automated pricing, rank, and rating tracking across 50-250 SKUs per session, delivered hourly insights over custom time frames, and stored 300,000+ records reliably in PostgreSQL."
-        rewritten_resume_2 = "Implemented testing, validation, logging, and data-cleaning logic to catch malformed inputs early, strengthen error handling, and reduce manual data-entry errors by 90%, improving software reliability."
+        rewritten_resume_2 = "Strengthened software reliability by implementing validation, logging, and data-cleaning logic that detected malformed inputs and reduced manual data-entry errors by 90%."
         bad_cover_paragraph = "Python, JavaScript, Flask, React, SQL, cloud, AWS, Azure, dashboards, automation, APIs, reporting. This is the kind of work I would bring to Scotiabank."
 
         self.assertNotIn(original_resume_1, resume_text)
         self.assertNotIn(original_resume_2, resume_text)
         self.assertIn(rewritten_resume_1, resume_text)
         self.assertIn(rewritten_resume_2, resume_text)
+        self.assertNotIn("testing", resume_text.lower())
         self.assertNotIn(bad_cover_paragraph, cover_text)
         self.assertIn("ASIN monitoring system", cover_text)
         self.assertIn("PostgreSQL", cover_text)

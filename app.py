@@ -1284,12 +1284,24 @@ def build_format_preserving_cover_letter(
     document.save(cover_path)
     safe_sections = output.get("tailoring_plan", {}).get("cover_letter_paragraphs") or build_cover_letter_sections(profile, job, list(output.get("supported_keywords", [])[:4]), build_candidate_evidence(profile))
     final_document = Document(cover_path)
-    if repair_cover_letter_document(final_document, template_paragraphs, safe_sections):
+    if repair_cover_letter_document(final_document, template_paragraphs, safe_sections, job, profile):
         final_document.save(cover_path)
         final_document = Document(cover_path)
     final_body_text = "\n\n".join([paragraph.text for paragraph in final_document.paragraphs if normalize_space(paragraph.text)])
     final_body_validation = validate_cover_letter_output(final_body_text, build_candidate_evidence(profile), job)
     validation_warning = validate_cover_letter_document(final_document, job, profile)
+    if validation_warning and validation_warning.startswith("Stale template content remained after replacement:"):
+        return {
+            "status": "failed",
+            "error": validation_warning,
+            "warning": "",
+            "change_log": {
+                "master_cover_letter_path": str(template_path),
+                "output_path": str(cover_path),
+                **change_log,
+                "validation_warning": validation_warning,
+            },
+        }
     if validation_warning is not None or not final_body_validation["ok"]:
         warning_text = validation_warning or ", ".join(final_body_validation.get("conflicting_phrases", [])) or ""
         return {
@@ -1314,14 +1326,21 @@ def build_format_preserving_cover_letter(
     }
 
 
-def repair_cover_letter_document(document: Document, template_paragraphs: list[str], safe_sections: list[str]) -> bool:
+def repair_cover_letter_document(
+    document: Document,
+    template_paragraphs: list[str],
+    safe_sections: list[str],
+    job: dict[str, Any],
+    profile: dict[str, str],
+) -> bool:
     repaired = False
-    paragraphs = list(document.paragraphs)
+    paragraphs = list(iter_document_paragraphs(document))
+    section_map = build_cover_letter_section_map(profile, job, [], build_candidate_evidence(profile))
     for index, paragraph in enumerate(paragraphs):
         text_value = normalize_space(paragraph.text)
         if not text_value:
             continue
-        if classify_keyword_dump_reason(text_value) is None:
+        if classify_keyword_dump_reason(text_value) is None and not _cover_letter_stale_visible_text(text_value):
             continue
         safe_replacement = safe_sections[index] if index < len(safe_sections) else ""
         if safe_replacement and classify_keyword_dump_reason(safe_replacement) is None and normalize_space(safe_replacement) != text_value:
@@ -1332,6 +1351,133 @@ def repair_cover_letter_document(document: Document, template_paragraphs: list[s
         if original_template and normalize_space(original_template) != text_value:
             if replace_paragraph_exact(paragraph, paragraph.text, original_template):
                 repaired = True
+                continue
+        if contains_contact_details(text_value) and replace_paragraph_exact(paragraph, paragraph.text, text(profile.get("name") or "")):
+            repaired = True
+            continue
+        if _cover_letter_stale_visible_text(text_value) and replace_paragraph_exact(paragraph, paragraph.text, ""):
+            repaired = True
+    if repair_cover_letter_xml_text(document, section_map, job, profile):
+        repaired = True
+    if dedupe_cover_letter_roles(document, job, profile):
+        repaired = True
+    if ensure_cover_letter_signature(document, profile):
+        repaired = True
+    if dedupe_cover_letter_body_roles(document, profile):
+        repaired = True
+    return repaired
+
+
+def repair_cover_letter_xml_text(document: Document, section_map: dict[str, str], job: dict[str, Any], profile: dict[str, str]) -> bool:
+    repaired = False
+    job_title = text(job.get("title")) or "the role"
+    replacements = {
+        "{{DATE}}": section_map.get("date", ""),
+        "{{COMPANY}}": section_map.get("company", ""),
+        "{{LOCATION}}": section_map.get("location", ""),
+        "{{JOB_TITLE}}": job_title,
+        "{{HIRING_MANAGER}}": f"{section_map.get('company', '')} Hiring Team".strip(),
+        "{{OPENING_PARAGRAPH}}": section_map.get("opening", ""),
+        "{{EXPERIENCE_PARAGRAPH}}": section_map.get("experience", ""),
+        "{{FIT_PARAGRAPH}}": section_map.get("fit", ""),
+        "{{CLOSING_PARAGRAPH}}": section_map.get("closing", ""),
+        "CentralSquare Technologies": section_map.get("company", ""),
+        "CentralSquare": section_map.get("company", ""),
+        "Software Developer Co-op": job_title,
+        "software developer co-op": job_title,
+        "Remote - Ontario": section_map.get("location", ""),
+        "Remote, Ontario": section_map.get("location", ""),
+        "Remote – Ontario": section_map.get("location", ""),
+        "Remote — Ontario": section_map.get("location", ""),
+        "8- or 12-month term": "",
+        "8/12-month placement": "",
+        "8/12-month": "",
+        "Hiring Manager": f"{section_map.get('company', '')} Hiring Team".strip(),
+        "CentralSquare’s technology initiatives": section_map.get("company", ""),
+        "CentralSquare's technology initiatives": section_map.get("company", ""),
+        "hochitterry.mak@georgebrown.ca": text(profile.get("name") or ""),
+    }
+    package = getattr(getattr(document, "part", None), "package", None)
+    for part in getattr(package, "parts", []) if package is not None else []:
+        partname = str(getattr(part, "partname", "")).lower()
+        if not partname.endswith(".xml"):
+            continue
+        if not any(marker in partname for marker in ["/word/document.xml", "/word/header", "/word/footer"]):
+            continue
+        element = getattr(part, "element", None)
+        if element is None:
+            continue
+        for text_node in element.xpath(".//w:t"):
+            current = text_node.text or ""
+            updated = current
+            for old, new in replacements.items():
+                if old and old in updated:
+                    updated = updated.replace(old, new)
+            if updated != current:
+                text_node.text = updated
+                repaired = True
+    return repaired
+
+
+def dedupe_cover_letter_roles(document: Document, job: dict[str, Any], profile: dict[str, str]) -> bool:
+    repaired = False
+    profile_name = text(profile.get("name") or "")
+    paragraphs = list(iter_document_paragraphs(document))
+    body_paragraph_count = len(document.paragraphs)
+    seen_roles: set[str] = set()
+    single_use_roles = {"date", "company", "location", "subject", "greeting", "opening", "experience", "fit", "closing", "signoff", "signature"}
+    for index, paragraph in enumerate(paragraphs):
+        text_value = normalize_space(paragraph.text)
+        if not text_value:
+            continue
+        role = classify_cover_letter_paragraph_role(paragraph, index, len(paragraphs), profile_name)
+        if (
+            not role
+            and profile_name
+            and text_value.lower() == profile_name.lower()
+            and index < body_paragraph_count
+            and index >= max(0, body_paragraph_count - 3)
+        ):
+            role = "signature"
+        if role in single_use_roles:
+            if role in seen_roles:
+                if replace_paragraph_exact(paragraph, paragraph.text, ""):
+                    repaired = True
+                continue
+                seen_roles.add(role)
+    return repaired
+
+
+def ensure_cover_letter_signature(document: Document, profile: dict[str, str]) -> bool:
+    profile_name = text(profile.get("name") or "")
+    if not profile_name:
+        return False
+    paragraphs = list(document.paragraphs)
+    if not paragraphs:
+        return False
+    last_paragraph = paragraphs[-1]
+    if normalize_space(last_paragraph.text):
+        return False
+    return replace_paragraph_exact(last_paragraph, last_paragraph.text, profile_name)
+
+
+def dedupe_cover_letter_body_roles(document: Document, profile: dict[str, str]) -> bool:
+    repaired = False
+    profile_name = text(profile.get("name") or "")
+    paragraphs = list(document.paragraphs)
+    seen_roles: set[str] = set()
+    single_use_roles = {"date", "company", "location", "subject", "greeting", "opening", "experience", "fit", "closing", "signoff", "signature"}
+    for index, paragraph in enumerate(paragraphs):
+        text_value = normalize_space(paragraph.text)
+        if not text_value:
+            continue
+        role = classify_cover_letter_paragraph_role(paragraph, index, len(paragraphs), profile_name)
+        if role in single_use_roles:
+            if role in seen_roles:
+                if replace_paragraph_exact(paragraph, paragraph.text, ""):
+                    repaired = True
+                continue
+            seen_roles.add(role)
     return repaired
 
 
@@ -1407,9 +1553,11 @@ def classify_cover_letter_paragraph_role(paragraph: Any, index: int, total: int,
         return "fit"
     if "{{closing_paragraph}}" in lower:
         return "closing"
-    if lower.startswith(("sincerely", "best regards", "regards", "kind regards", "thank you", "with appreciation")):
+    if lower.startswith(("thank you", "i would welcome", "i look forward", "i appreciate")):
+        return "closing"
+    if lower.startswith(("sincerely", "best regards", "regards", "kind regards", "with appreciation")):
         return "signoff"
-    if profile_name and normalize_space(profile_name).lower() == lower:
+    if profile_name and normalize_space(profile_name).lower() == lower and index >= max(0, total - 3):
         return "signature"
     if index >= max(0, total - 2) and len(paragraph_text.split()) <= 4 and not contains_contact_details(paragraph_text):
         return "signature"
@@ -1424,8 +1572,6 @@ def is_cover_letter_template_paragraph_editable(paragraph: Any, index: int) -> b
         return False
     style_name = getattr(getattr(paragraph, "style", None), "name", "") or ""
     if style_name.lower().startswith("heading"):
-        return False
-    if contains_contact_details(paragraph_text):
         return False
     if index == 0 and len(paragraph_text.split()) <= 4 and not any(ch.isdigit() for ch in paragraph_text) and "{{" not in paragraph_text:
         return False
@@ -1449,7 +1595,7 @@ def apply_cover_letter_template(
     profile: dict[str, str],
     output: dict[str, Any],
 ) -> dict[str, list[dict[str, Any]]]:
-    paragraphs = list(document.paragraphs)
+    paragraphs = list(iter_document_paragraphs(document))
     tailoring_plan = output.get("tailoring_plan") or build_tailoring_plan(job, profile, output.get("semantic_match", {}))
     generated_sections = tailoring_plan.get("cover_letter_paragraphs") or []
     section_map = build_cover_letter_section_map(profile, job, list(output.get("supported_keywords", [])[:4]), build_candidate_evidence(profile))
@@ -1477,6 +1623,9 @@ def apply_cover_letter_template(
     skipped: list[dict[str, Any]] = []
     touched: set[int] = set()
     profile_name = text(profile.get("name") or "")
+    body_paragraph_count = len(document.paragraphs)
+    seen_roles: set[str] = set()
+    single_use_roles = {"date", "company", "location", "subject", "greeting", "opening", "experience", "fit", "closing", "signoff", "signature"}
 
     for index, paragraph in enumerate(paragraphs):
         original = paragraph.text
@@ -1524,6 +1673,14 @@ def apply_cover_letter_template(
             continue
         original = paragraph.text
         role = classify_cover_letter_paragraph_role(paragraph, index, len(paragraphs), profile_name)
+        if (
+            not role
+            and profile_name
+            and normalize_space(original).lower() == profile_name.lower()
+            and index < body_paragraph_count
+            and index >= max(0, body_paragraph_count - 3)
+        ):
+            role = "signature"
         if role in fixed_roles:
             replacement = _replacement_for_cover_letter_role(section_map, role)
         elif greeting_index is not None and index < greeting_index:
@@ -1544,6 +1701,11 @@ def apply_cover_letter_template(
             role = tail_roles[tail_index] if tail_index < len(tail_roles) else ""
             replacement = _replacement_for_cover_letter_role(section_map, role)
             tail_index += 1
+        if role in single_use_roles:
+            if role in seen_roles:
+                replacement = ""
+            else:
+                seen_roles.add(role)
         if not role or not replacement or normalize_space(original) == normalize_space(replacement):
             continue
         if replace_paragraph_text(paragraph, original, replacement):
@@ -2355,18 +2517,24 @@ def detect_incompatible_cover_letter_template(document: Document) -> str | None:
 def validate_cover_letter_document(document: Document, job: dict[str, Any], profile: dict[str, str]) -> str | None:
     profile_name = normalize_space(text(profile.get("name") or ""))
     date_count = 0
+    greeting_count = 0
+    closing_count = 0
     signoff_count = 0
     signature_count = 0
     stale_terms = [
         "centralsquare",
+        "centralsquare technologies",
         "software developer co-op",
         "remote - ontario",
         "8- or 12-month term",
         "8/12-month",
         "8 or 12 month",
+        "hiring manager",
+        "central square's technology initiatives",
         "postgraduate student",
         "grounded wording",
         "saved profile",
+        "hochitterry.mak@georgebrown.ca",
         "ats-oriented language",
         "truthful, relevant detail",
     ]
@@ -2385,13 +2553,21 @@ def validate_cover_letter_document(document: Document, job: dict[str, Any], prof
             continue
         if _looks_like_date_text(lower):
             date_count += 1
-        if lower.startswith(("sincerely,", "best regards,", "regards,", "kind regards,", "thank you,", "with appreciation,")):
+        if lower.startswith("dear "):
+            greeting_count += 1
+        if lower.startswith(("thank you", "i would welcome", "i look forward", "i appreciate")):
+            closing_count += 1
+        if lower.startswith(("sincerely,", "best regards,", "regards,", "kind regards,", "with appreciation,")):
             signoff_count += 1
         if profile_name and lower == profile_name.lower() and index >= max(0, len(body_paragraphs) - 3):
             signature_count += 1
 
     if date_count > 1:
         return "Duplicate date lines remained after replacement."
+    if greeting_count > 1:
+        return "Duplicate greetings remained after replacement."
+    if closing_count > 1:
+        return "Duplicate closings remained after replacement."
     if signoff_count > 1:
         return "Duplicate closings remained after replacement."
     if signature_count > 1:
@@ -2471,6 +2647,26 @@ def find_cover_letter_stale_hit(document: Document, stale_terms: list[str]) -> s
                 location = f"XML part {partname}"
             return f"{term} in {location.lstrip('/')}"
     return None
+
+
+def _cover_letter_stale_visible_text(content: str) -> bool:
+    lower = normalize_space(content).lower()
+    if not lower:
+        return False
+    stale_terms = [
+        "centralsquare",
+        "centralsquare technologies",
+        "software developer co-op",
+        "remote - ontario",
+        "remote, ontario",
+        "8- or 12-month term",
+        "8/12-month",
+        "8 or 12 month",
+        "hiring manager",
+        "central square's technology initiatives",
+        "hochitterry.mak@georgebrown.ca",
+    ]
+    return any(term in lower for term in stale_terms)
 
 
 def safe_filename(value: str) -> str:

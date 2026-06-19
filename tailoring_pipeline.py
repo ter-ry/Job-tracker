@@ -667,7 +667,7 @@ def rewrite_paragraph(
         ),
         (
             r"implemented\s+robust\s+validation,\s+logging,\s+and\s+data\s+cleaning\s+logic\s+to\s+detect\s+malformed\s+inputs\s+and\s+reduce\s+manual\s+data\s+entry\s+errors\s+by\s+90%\.?",
-            "Implemented testing, validation, logging, and data-cleaning logic to catch malformed inputs early, strengthen error handling, and reduce manual data-entry errors by 90%, improving software reliability.",
+            "Strengthened software reliability by implementing validation, logging, and data-cleaning logic that detected malformed inputs and reduced manual data-entry errors by 90%.",
         ),
     ]
     for pattern, replacement in specific_rewrites:
@@ -723,7 +723,7 @@ def validate_rewrite(original: str, proposed: str, job_phrase: str, candidate_ev
         return {"grounded": False, "ok": False, "reason": "metrics or numbers changed"}
     allowed_scotiabank_rewrites = {
         "Built a backend ASIN monitoring system that automated pricing, rank, and rating tracking across 50-250 SKUs per session, delivered hourly insights over custom time frames, and stored 300,000+ records reliably in PostgreSQL.",
-        "Implemented testing, validation, logging, and data-cleaning logic to catch malformed inputs early, strengthen error handling, and reduce manual data-entry errors by 90%, improving software reliability.",
+        "Strengthened software reliability by implementing validation, logging, and data-cleaning logic that detected malformed inputs and reduced manual data-entry errors by 90%.",
     }
     if proposed in allowed_scotiabank_rewrites:
         return {"grounded": True, "ok": True, "reason": ""}
@@ -811,7 +811,7 @@ def build_cover_letter_paragraphs(
                 evidence_sentences.append(clean)
     evidence_paragraph = " ".join(evidence_sentences[:2])
     if len(evidence_sentences) >= 2:
-        evidence_paragraph += " Those two examples show how I have applied software skills in production workflows, technical documentation, and cross-functional delivery."
+        evidence_paragraph += " Those two examples show how I have applied software skills in production workflows, technical documentation, and reliable delivery."
     fit_sentence = build_fit_sentence(job, selected_blocks, candidate_evidence)
     employer_line = company if not location else f"{company} - {location}"
     subject = f"Re: Application for {title}"
