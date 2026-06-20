@@ -805,17 +805,17 @@ def build_cover_letter_paragraphs(
         for section in candidate_evidence.get("sections", [])
         if section.get("field") != "resume_text"
     ).lower()
-    if "validation" in full_evidence_text and ("logging" in full_evidence_text or "data cleaning" in full_evidence_text or "data-cleaning" in full_evidence_text):
+    if "postgresql" in full_evidence_text and ("records" in full_evidence_text or "monitoring" in full_evidence_text):
         add_sentence(
-            "I strengthened software reliability by implementing validation, logging, and data-cleaning logic that detected malformed inputs and reduced manual data-entry errors by 90%."
+            "At Harmony 88 Co., I built Python and Flask tools backed by PostgreSQL, including an automated monitoring system that stored more than 300,000 records."
         )
     if "backend integrations" in full_evidence_text and ("retool" in full_evidence_text or "google docs" in full_evidence_text):
         add_sentence(
             "I built backend integrations and data workflows with real-time data from Retool and Google Docs for operations reporting and handoffs."
         )
-    if "postgresql" in full_evidence_text and ("records" in full_evidence_text or "monitoring" in full_evidence_text):
+    if "validation" in full_evidence_text and ("logging" in full_evidence_text or "data cleaning" in full_evidence_text or "data-cleaning" in full_evidence_text):
         add_sentence(
-            "I built Python and Flask tools backed by PostgreSQL, including an automated monitoring system that stored more than 300,000 records."
+            "I strengthened software reliability by implementing validation, logging, and data-cleaning logic that detected malformed inputs and reduced manual data-entry errors by 90%."
         )
     if "harmony 88" in full_evidence_text or "northstar" in full_evidence_text:
         harmony_sentence = next(

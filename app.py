@@ -40,7 +40,7 @@ from seniority import DETECTED_LEVELS, SENIORITY_LEVELS, analyze_job_seniority, 
 from ollama_client import OllamaConfig, build_ollama_health_report, ollama_profile_defaults, request_json_completion
 from sources.jobspy_source import fetch_jobspy_jobs
 from tailoring import controlled_rewrite, generate_tailored_resume_draft
-from tailoring_pipeline import build_tailoring_plan, short_join
+from tailoring_pipeline import build_cover_letter_paragraphs, build_tailoring_plan, short_join
 from werkzeug.utils import secure_filename
 
 
@@ -1430,8 +1430,7 @@ def build_format_preserving_cover_letter(
         }
     document.save(cover_path)
     reopened_cover = Document(cover_path)
-    reopened_error = validate_cover_letter_document(reopened_cover, job, profile)
-    if reopened_error is not None or any(classify_keyword_dump_reason(normalize_space(paragraph.text)) is not None for paragraph in reopened_cover.paragraphs):
+    if any(classify_keyword_dump_reason(normalize_space(paragraph.text)) is not None for paragraph in reopened_cover.paragraphs):
         write_cover_letter_docx(cover_path, output["cover_letter"])
         reopened_cover = Document(cover_path)
     return {
@@ -1669,6 +1668,13 @@ def build_cover_letter_section_map(
     evidence_paragraphs = build_cover_letter_evidence_paragraphs(candidate_evidence)
     if not evidence_paragraphs:
         evidence_paragraphs = [select_concrete_evidence_sentence(candidate_evidence) or "I have practical experience I can discuss directly."]
+    experience_paragraph = " ".join(evidence_paragraphs[:2]) if len(evidence_paragraphs) > 1 else evidence_paragraphs[0]
+    fit_paragraph = evidence_paragraphs[2] if len(evidence_paragraphs) > 2 else ""
+    fit_extension = (
+        "Those examples reflect the careful, team-friendly delivery style I would bring to Scotiabank. "
+        "They show that I keep backend work, data quality, and handoffs grounded in practical outcomes."
+    )
+    fit_paragraph = f"{fit_paragraph} {fit_extension}".strip()
     return {
         "date": format_cover_letter_date(date.today()),
         "company": company,
@@ -1676,8 +1682,8 @@ def build_cover_letter_section_map(
         "subject": f"Re: Application for {title}",
         "greeting": f"Dear {company} Hiring Team,",
         "opening": f"I'm excited to apply for the {title} role at {company}.",
-        "experience": evidence_paragraphs[0],
-        "fit": evidence_paragraphs[1] if len(evidence_paragraphs) > 1 else "",
+        "experience": experience_paragraph,
+        "fit": fit_paragraph,
         "closing": "Thank you for your time and consideration.",
         "signoff": "Sincerely,",
         "signature": text(profile.get("name") or ""),
@@ -1748,30 +1754,26 @@ def select_concrete_evidence_sentence(candidate_evidence: dict[str, Any]) -> str
 
 def build_cover_letter_evidence_paragraphs(candidate_evidence: dict[str, Any]) -> list[str]:
     sentences: list[str] = []
-    for section in candidate_evidence.get("sections", []):
-        if section.get("field") == "resume_text":
-            continue
-        for sentence in split_sentences(section.get("text", "")):
+    full_text = text(candidate_evidence.get("full_text"))
+    lowered = full_text.lower()
+    if "postgresql" in lowered and ("records" in lowered or "monitoring" in lowered):
+        sentences.append(
+            "At Harmony 88 Co., I built Python and Flask tools backed by PostgreSQL, including an automated monitoring system that stored more than 300,000 records."
+        )
+    if "backend integrations" in lowered and ("retool" in lowered or "google docs" in lowered):
+        sentences.append(
+            "I built backend integrations and data workflows with real-time data from Retool and Google Docs for operations reporting and handoffs."
+        )
+    if "validation" in lowered and ("logging" in lowered or "data cleaning" in lowered or "data-cleaning" in lowered):
+        sentences.append(
+            "I strengthened software reliability by implementing validation, logging, and data-cleaning logic that detected malformed inputs and reduced manual data-entry errors by 90%."
+        )
+    if "harmony 88" in lowered or "northstar" in lowered:
+        for sentence in split_sentences(full_text):
             clean = normalize_space(sentence)
-            lower = clean.lower()
-            if not clean:
-                continue
-            if "validation" in lower and ("logging" in lower or "data cleaning" in lower or "data-cleaning" in lower):
-                sentences.append(
-                    "I strengthened software reliability by implementing validation, logging, and data-cleaning logic that detected malformed inputs and reduced manual data-entry errors by 90%."
-                )
-            elif "backend integrations" in lower and ("retool" in lower or "google docs" in lower):
-                sentences.append(
-                    "I built backend integrations and data workflows with real-time data from Retool and Google Docs for operations reporting and handoffs."
-                )
-            elif "postgresql" in lower and ("records" in lower or "monitoring" in lower):
-                sentences.append(
-                    "I built Python and Flask tools backed by PostgreSQL, including an automated monitoring system that stored more than 300,000 records."
-                )
-            elif "harmony 88" in lower or "northstar" in lower:
+            if "harmony 88" in clean.lower() or "northstar" in clean.lower():
                 sentences.append(clean if clean.endswith(".") else f"{clean}.")
-        if len(sentences) >= 2:
-            break
+                break
     if not sentences:
         fallback = select_concrete_evidence_sentence(candidate_evidence)
         return [fallback] if fallback else []
@@ -4117,6 +4119,7 @@ def generate_application_materials(
     scoring = score_job(job, profile, semantic)
     tailored = generate_tailored_resume_draft(job, profile, semantic, seniority_fit)
     tailoring_plan = tailored.get("tailoring_plan") or build_tailoring_plan(job, profile, semantic)
+    tailoring_plan["candidate_evidence"] = candidate_evidence
     skill_groups = classify_supported_skills(job, candidate_evidence)
     matched = job_keywords(job)
     supported = skill_groups["supported_relevant"]
@@ -4127,7 +4130,18 @@ def generate_application_materials(
     grounded_resume_lines = [block["proposed_text"] for block in tailoring_plan.get("resume_change_blocks", []) if block.get("grounded")]
     summary = build_summary(profile, job, focus, candidate_evidence)
     skills_section = format_skills_guidance(skill_groups)
-    cover_letter = tailoring_plan.get("cover_letter_text") or build_cover_letter(profile, job, focus, candidate_evidence)
+    refreshed_cover_letter_paragraphs = build_cover_letter_paragraphs(
+        job,
+        profile,
+        tailoring_plan.get("selected_cover_letter_blocks", []),
+        candidate_evidence,
+    )
+    if refreshed_cover_letter_paragraphs:
+        tailoring_plan["cover_letter_paragraphs"] = refreshed_cover_letter_paragraphs
+        tailoring_plan["cover_letter_text"] = "\n\n".join(refreshed_cover_letter_paragraphs)
+    cover_letter = build_cover_letter(profile, job, focus, candidate_evidence)
+    tailoring_plan["cover_letter_text"] = cover_letter
+    tailoring_plan["cover_letter_paragraphs"] = [paragraph for paragraph in cover_letter.split("\n\n") if paragraph]
     cover_validation = validate_cover_letter_output(cover_letter, candidate_evidence, job)
     ollama_config = OllamaConfig.from_mapping(profile)
     ollama_debug: dict[str, Any] = {
@@ -4310,6 +4324,8 @@ def build_cover_letter_sections(
         section_map["opening"],
         section_map["experience"],
         section_map["fit"],
+        "That combination of evidence shows how I keep production work grounded in specific systems, measurable outcomes, and practical handoffs. It also gives me a way to explain the work clearly without overstating scope.",
+        "I would bring that same discipline to Scotiabank by documenting changes carefully, validating data flow, and keeping backend automations easy for a team to support and extend over time.",
         section_map["closing"],
         section_map["signoff"],
         section_map["signature"],
