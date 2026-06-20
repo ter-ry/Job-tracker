@@ -1664,26 +1664,59 @@ def build_cover_letter_section_map(
     company = text(job.get("company")) or "your team"
     location = text(job.get("location")) or ""
     title = text(job.get("title")) or "the role"
-    role = first_supported_role(profile, candidate_evidence) or "candidate"
+    job_text = " ".join(
+        [
+            text(job.get("title")),
+            text(job.get("required_skills")),
+            text(job.get("preferred_skills")),
+            text(job.get("responsibilities")),
+            text(job.get("job_description")),
+        ]
+    ).lower()
+    evidence_text = text(candidate_evidence.get("full_text")).lower()
+    software_focused = any(term in job_text or term in evidence_text for term in ["python", "flask", "sql", "backend", "automation", "postgresql", "api", "software developer", "developer"])
     evidence_paragraphs = build_cover_letter_evidence_paragraphs(candidate_evidence)
     if not evidence_paragraphs:
         evidence_paragraphs = [select_concrete_evidence_sentence(candidate_evidence) or "I have practical experience I can discuss directly."]
-    experience_paragraph = " ".join(evidence_paragraphs[:2]) if len(evidence_paragraphs) > 1 else evidence_paragraphs[0]
-    fit_paragraph = evidence_paragraphs[2] if len(evidence_paragraphs) > 2 else ""
-    fit_extension = (
-        "Those examples reflect the careful, team-friendly delivery style I would bring to Scotiabank. "
-        "They show that I keep backend work, data quality, and handoffs grounded in practical outcomes."
-    )
-    fit_paragraph = f"{fit_paragraph} {fit_extension}".strip()
+    concrete_example = evidence_paragraphs[0]
+    supporting_example = evidence_paragraphs[1] if len(evidence_paragraphs) > 1 else ""
     return {
         "date": format_cover_letter_date(date.today()),
         "company": company,
         "location": location,
         "subject": f"Re: Application for {title}",
         "greeting": f"Dear {company} Hiring Team,",
-        "opening": f"I'm excited to apply for the {title} role at {company}.",
-        "experience": experience_paragraph,
-        "fit": fit_paragraph,
+        "opening": (
+            (
+                f"I'm excited to apply for the {title} role at {company}. "
+                f"The role feels like a strong match for the Python, Flask, SQL, and automation work I have done in production settings, especially when delivery has to stay practical, reliable, and easy for a team to support. "
+                "I am drawn to work where the code has to be useful to the people who maintain it, not just correct on paper."
+            )
+            if software_focused
+            else (
+                f"I'm excited to apply for the {title} role at {company}. "
+                "The role feels like a strong match for the experience I have built in settings where careful support, communication, and dependable follow-through matter. "
+                "I like work where the details make the day-to-day experience better for the team."
+            )
+        ),
+        "experience": (
+            (
+                "In recent work, I have focused on backend tools that move data cleanly between systems and make reporting easier to trust. "
+                "I like work that combines application logic, data quality, and documentation because those pieces matter after the first release as much as they do on day one. "
+                "It also helps keep handoffs straightforward for the next person who touches the code."
+            )
+            if software_focused
+            else (
+                "In recent work, I have focused on practical work that keeps tasks organized and makes it easier for others to rely on the result. "
+                "I like roles that combine attention to detail, documentation, and consistent communication. "
+                "It helps me stay steady and useful when priorities shift."
+            )
+        ),
+        "fit": (
+            f"{concrete_example} "
+            f"{supporting_example if supporting_example else ('That kind of work taught me how to keep software dependable when teams need clear data, predictable behavior, and straightforward handoffs.' if software_focused else 'That kind of work taught me how to support people, communicate clearly, and keep details organized.')} "
+            f"I would bring that same care to the work at {company}. That matters in real work, day to day."
+        ),
         "closing": "Thank you for your time and consideration.",
         "signoff": "Sincerely,",
         "signature": text(profile.get("name") or ""),
@@ -4324,8 +4357,6 @@ def build_cover_letter_sections(
         section_map["opening"],
         section_map["experience"],
         section_map["fit"],
-        "That combination of evidence shows how I keep production work grounded in specific systems, measurable outcomes, and practical handoffs. It also gives me a way to explain the work clearly without overstating scope.",
-        "I would bring that same discipline to Scotiabank by documenting changes carefully, validating data flow, and keeping backend automations easy for a team to support and extend over time.",
         section_map["closing"],
         section_map["signoff"],
         section_map["signature"],

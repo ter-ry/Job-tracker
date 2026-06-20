@@ -781,6 +781,17 @@ def build_cover_letter_paragraphs(
     title = normalize_space(str(job.get("title") or "the role"))
     location = normalize_space(str(job.get("location") or ""))
     name = normalize_space(str(profile.get("name") or ""))
+    job_text = " ".join(
+        [
+            normalize_space(str(job.get("title") or "")),
+            normalize_space(str(job.get("required_skills") or "")),
+            normalize_space(str(job.get("preferred_skills") or "")),
+            normalize_space(str(job.get("responsibilities") or "")),
+            normalize_space(str(job.get("job_description") or "")),
+        ]
+    ).lower()
+    evidence_text = normalize_space(str(candidate_evidence.get("full_text") or "")).lower()
+    software_focused = any(term in job_text or term in evidence_text for term in ["python", "flask", "sql", "backend", "automation", "postgresql", "api", "software developer", "developer"])
     concepts = [
         normalize_space(block.get("matched_job_phrase") or block.get("job_phrase") or "")
         for block in selected_blocks
@@ -790,7 +801,6 @@ def build_cover_letter_paragraphs(
     skill_focus = [skill for skill in (candidate_evidence.get("skills") or []) if normalize_space(skill)]
     if not concepts:
         concepts = skill_focus
-    focus = short_join((concepts or skill_focus)[:4]) if (concepts or skill_focus) else "the most relevant experience from my background"
     evidence_sentences: list[str] = []
     seen_sentences: set[str] = set()
 
@@ -809,13 +819,13 @@ def build_cover_letter_paragraphs(
         add_sentence(
             "At Harmony 88 Co., I built Python and Flask tools backed by PostgreSQL, including an automated monitoring system that stored more than 300,000 records."
         )
-    if "backend integrations" in full_evidence_text and ("retool" in full_evidence_text or "google docs" in full_evidence_text):
-        add_sentence(
-            "I built backend integrations and data workflows with real-time data from Retool and Google Docs for operations reporting and handoffs."
-        )
     if "validation" in full_evidence_text and ("logging" in full_evidence_text or "data cleaning" in full_evidence_text or "data-cleaning" in full_evidence_text):
         add_sentence(
             "I strengthened software reliability by implementing validation, logging, and data-cleaning logic that detected malformed inputs and reduced manual data-entry errors by 90%."
+        )
+    if "backend integrations" in full_evidence_text and ("retool" in full_evidence_text or "google docs" in full_evidence_text):
+        add_sentence(
+            "I built backend integrations and data workflows with real-time data from Retool and Google Docs for operations reporting and handoffs."
         )
     if "harmony 88" in full_evidence_text or "northstar" in full_evidence_text:
         harmony_sentence = next(
@@ -830,35 +840,6 @@ def build_cover_letter_paragraphs(
         )
         if harmony_sentence:
             add_sentence(harmony_sentence if harmony_sentence.endswith(".") else f"{harmony_sentence}.")
-    if len(evidence_sentences) < 3:
-        for sentence in [build_cover_letter_evidence_sentence(block) for block in selected_blocks[:3]]:
-            add_sentence(sentence)
-    for section in candidate_evidence.get("sections", []):
-        if section.get("field") == "resume_text":
-            continue
-        for sentence in split_sentences(section.get("text", "")):
-            clean = normalize_space(sentence)
-            lower = clean.lower()
-            if not clean:
-                continue
-            if "validation" in lower and ("logging" in lower or "data cleaning" in lower or "data-cleaning" in lower):
-                add_sentence(
-                    "I strengthened software reliability by implementing validation, logging, and data-cleaning logic that detected malformed inputs and reduced manual data-entry errors by 90%."
-                )
-            elif "backend integrations" in lower and ("retool" in lower or "google docs" in lower):
-                add_sentence(
-                    "I built backend integrations and data workflows with real-time data from Retool and Google Docs for operations reporting and handoffs."
-                )
-            elif "postgresql" in lower and ("records" in lower or "monitoring" in lower):
-                add_sentence(
-                    "I built Python and Flask tools backed by PostgreSQL, including an automated monitoring system that stored more than 300,000 records."
-                )
-            elif "harmony 88" in lower or "northstar" in lower:
-                add_sentence(clean if clean.endswith(".") else f"{clean}.")
-            if len(evidence_sentences) >= 4:
-                break
-        if len(evidence_sentences) >= 4:
-            break
     if len(evidence_sentences) < 2:
         for sentence in cover_letter_supporting_snippets((concepts or skill_focus)[:4], candidate_evidence, limit=3):
             clean = normalize_space(sentence)
@@ -871,10 +852,39 @@ def build_cover_letter_paragraphs(
             if clean and clean not in seen_sentences:
                 seen_sentences.add(clean)
                 evidence_sentences.append(clean)
-    evidence_paragraph = " ".join(evidence_sentences[:3])
-    if len(evidence_sentences) >= 2:
-        evidence_paragraph += " Those examples show how I have applied software skills in production workflows, technical documentation, and reliable delivery."
-    fit_sentence = build_fit_sentence(job, selected_blocks, candidate_evidence)
+    concrete_example = evidence_sentences[0] if evidence_sentences else "I have practical experience I can discuss directly."
+    supporting_example = evidence_sentences[1] if len(evidence_sentences) > 1 else ""
+    opening_paragraph = (
+        (
+            f"I'm excited to apply for the {title} role at {company}. "
+            f"The position feels like a strong match for the Python, Flask, SQL, and automation work I have done in production settings, especially when delivery has to stay practical, reliable, and easy for a team to support. "
+            "I am drawn to work where the code has to be useful to the people who maintain it, not just correct on paper."
+        )
+        if software_focused
+        else (
+            f"I'm excited to apply for the {title} role at {company}. "
+            "The position feels like a strong match for the experience I have built in settings where careful support, communication, and dependable follow-through matter. "
+            "I like work where the details make the day-to-day experience better for the team."
+        )
+    )
+    experience_paragraph = (
+        (
+            "In recent work, I have focused on backend tools that move data cleanly between systems and make reporting easier to trust. "
+            "I like work that combines application logic, data quality, and documentation because those pieces matter after the first release as much as they do on day one. "
+            "It also helps keep handoffs straightforward for the next person who touches the code."
+        )
+        if software_focused
+        else (
+            "In recent work, I have focused on practical work that keeps tasks organized and makes it easier for others to rely on the result. "
+            "I like roles that combine attention to detail, documentation, and consistent communication. "
+            "It helps me stay steady and useful when priorities shift."
+        )
+    )
+    fit_paragraph = (
+        f"{concrete_example} "
+        f"{supporting_example if supporting_example else ('That kind of work taught me how to keep software dependable when teams need clear data, predictable behavior, and straightforward handoffs.' if software_focused else 'That kind of work taught me how to support people, communicate clearly, and keep details organized.')} "
+        f"I would bring that same care to the work at {company}. That matters in real work, day to day."
+    )
     employer_line = company if not location else f"{company} - {location}"
     subject = f"Re: Application for {title}"
     return [
@@ -882,9 +892,9 @@ def build_cover_letter_paragraphs(
         employer_line,
         f"Dear {company} Hiring Team,",
         subject,
-        f"I'm excited to apply for the {title} role at {company}. My background includes {focus}, and I have used those skills to support production software and internal workflows.",
-        evidence_paragraph,
-        fit_sentence + f" That combination is why the role at {company} feels like a strong fit.",
+        opening_paragraph,
+        experience_paragraph,
+        fit_paragraph,
         f"Thank you for your consideration. I would welcome the chance to discuss how I can contribute to {company} as a {title.lower()}.",
         "Sincerely,",
         name,

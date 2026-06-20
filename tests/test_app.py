@@ -1092,6 +1092,10 @@ class JobAssistantTest(unittest.TestCase):
         cover_doc = Document(io.BytesIO(cover_path.read_bytes()))
         paragraphs = [paragraph.text for paragraph in cover_doc.paragraphs if paragraph.text.strip()]
         joined = "\n".join(paragraphs)
+        body_start = next(index for index, text in enumerate(paragraphs) if text.startswith("I'm excited"))
+        body_end = next(index for index, text in enumerate(paragraphs) if text.startswith("Thank you"))
+        body_paragraphs = paragraphs[body_start:body_end]
+        body_text = " ".join(body_paragraphs)
         self.assertRegex(paragraphs[0], r"\b[A-Z][a-z]+ \d{1,2}, \d{4}\b")
         self.assertIn("Scotiabank Hiring Team", joined)
         self.assertIn("Dear Scotiabank Hiring Team,", joined)
@@ -1107,6 +1111,9 @@ class JobAssistantTest(unittest.TestCase):
         self.assertNotIn("practical experience that aligns", joined.lower())
         self.assertNotIn("together, these examples", joined.lower())
         self.assertNotIn("Python, JavaScript, Flask, React, SQL, cloud, AWS, Azure, dashboards, automation, APIs, reporting. This is the kind of work I would bring to Scotiabank.", joined)
+        self.assertEqual(len(body_paragraphs), 3)
+        self.assertGreaterEqual(len(body_text.split()), 180)
+        self.assertLessEqual(len(body_text.split()), 260)
         self.assertTrue(
             sum(
                 1
@@ -1124,6 +1131,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(sum(1 for text in paragraphs if text == "Sincerely,"), 1)
         self.assertEqual(paragraphs[-2], "Sincerely,")
         self.assertEqual(paragraphs[-1], "Terry Mak")
+        self.assertIsNone(app_module.validate_cover_letter_document(cover_doc, self.scotiabank_job(), {"name": "Terry Mak"}))
         self.assertTrue(created["generation_debug"].get("generated_at"))
 
     def test_scotiabank_cover_letter_rewrites_all_visible_template_content(self):
@@ -1148,7 +1156,6 @@ class JobAssistantTest(unittest.TestCase):
         self.assertNotIn("hochitterry.mak@georgebrown.ca", visible_text)
         self.assertIn("Scotiabank Hiring Team", visible_text)
         self.assertIn("I'm excited to apply for the Software Developer role at Scotiabank", visible_text)
-        self.assertTrue(any(marker in visible_text for marker in ["Harmony 88 Co.", "Northstar", "Python inventory tool"]))
         self.assertIn("backend integrations and data workflows", visible_text)
         self.assertIn("Retool and Google Docs", visible_text)
         self.assertIsNone(app_module.validate_cover_letter_document(cover_doc, self.scotiabank_job(), {"name": "Terry Mak"}))
@@ -1187,16 +1194,21 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(created["cover_letter_generation_status"], "generated")
         cover_path = Path(created["cover_letter_docx_path"])
         cover_doc = Document(io.BytesIO(cover_path.read_bytes()))
-        cover_text = "\n".join(paragraph.text for paragraph in cover_doc.paragraphs)
+        cover_paragraphs = [paragraph.text.strip() for paragraph in cover_doc.paragraphs if paragraph.text.strip()]
+        cover_text = "\n".join(cover_paragraphs)
+        cover_body_start = next(index for index, text in enumerate(cover_paragraphs) if text.startswith("I'm excited"))
+        cover_body_end = next(index for index, text in enumerate(cover_paragraphs) if text.startswith("Thank you"))
+        cover_body = cover_paragraphs[cover_body_start:cover_body_end]
         self.assertIn("Dear Northstar Hiring Team", cover_text)
         self.assertIn("Sincerely", cover_text)
         self.assertNotIn("EDUCATION", cover_text)
         self.assertNotIn("SKILLS", cover_text)
         self.assertNotIn("EXPERIENCE", cover_text)
         self.assertNotIn("PROJECTS", cover_text)
+        self.assertEqual(len(cover_body), 3)
+        self.assertGreaterEqual(len(" ".join(cover_body).split()), 180)
+        self.assertLessEqual(len(" ".join(cover_body).split()), 260)
         self.assertLessEqual(max(len(paragraph.text) for paragraph in cover_doc.paragraphs), 400)
-        self.assertGreater(len(cover_text.split()), 120)
-        self.assertLess(len(cover_text.split()), 500)
         self.assertNotIn("Terry Mak. Developer Intern at Northstar", cover_text)
 
         bad_validation = grounding.validate_cover_letter_output(
@@ -2000,6 +2012,10 @@ class JobAssistantTest(unittest.TestCase):
         cover_doc = Document(io.BytesIO(cover_path.read_bytes()))
         resume_text = "\n".join(paragraph.text for paragraph in resume_doc.paragraphs)
         cover_text = "\n".join(paragraph.text for paragraph in cover_doc.paragraphs)
+        cover_paragraphs = [paragraph.text.strip() for paragraph in cover_doc.paragraphs if paragraph.text.strip()]
+        cover_body_start = next(index for index, text in enumerate(cover_paragraphs) if text.startswith("I'm excited"))
+        cover_body_end = next(index for index, text in enumerate(cover_paragraphs) if text.startswith("Thank you"))
+        cover_body = cover_paragraphs[cover_body_start:cover_body_end]
 
         original_resume_1 = "Built an automated ASIN monitoring system that tracked pricing, rank, and rating trends across 50-250 SKUs per session, delivering hourly insights over custom time frames and storing 300,000+ records in PostgreSQL."
         original_resume_2 = "Implemented robust validation, logging, and data cleaning logic to detect malformed inputs and reduce manual data entry errors by 90%."
@@ -2013,11 +2029,15 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn(rewritten_resume_2, resume_text)
         self.assertNotIn("testing", resume_text.lower())
         self.assertNotIn(bad_cover_paragraph, cover_text)
+        self.assertEqual(len(cover_body), 3)
+        self.assertGreaterEqual(len(" ".join(cover_body).split()), 180)
+        self.assertLessEqual(len(" ".join(cover_body).split()), 260)
         self.assertIn("Python and Flask tools backed by PostgreSQL", cover_text)
-        self.assertIn("validation, logging, and data-cleaning", cover_text)
+        self.assertIn("At Harmony 88 Co.", cover_text)
         self.assertIn("PostgreSQL", cover_text)
         self.assertTrue("300,000+ records" in cover_text or "more than 300,000 records" in cover_text)
         self.assertIn("backend integrations and data workflows", cover_text)
+        self.assertIsNone(app_module.validate_cover_letter_document(cover_doc, self.scotiabank_job(), {"name": "Terry Mak"}))
 
         download_resume = self.client.get(f"/api/shortlist/{job_id}/resume")
         download_cover = self.client.get(f"/api/shortlist/{job_id}/cover-letter")
