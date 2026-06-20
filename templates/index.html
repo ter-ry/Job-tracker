@@ -28,7 +28,7 @@
             <div class="panel-header"><h2>Live job discovery</h2></div>
             <div class="grid two">
               <label>Keywords<input id="discovery-keywords" required placeholder="software developer"></label>
-              <label>Location<input id="discovery-location" placeholder="Toronto, Ontario"></label>
+              <label>Search area<input id="discovery-location" placeholder="Toronto, Ontario"></label>
               <label>Distance<input id="discovery-distance" type="number" min="0" step="1" placeholder="50 km"></label>
               <label>Remote preference
                 <select id="discovery-remote-preference">
@@ -81,6 +81,7 @@
               <div>
                 <h2>Discovery results</h2>
                 <p id="discovery-active-state" class="muted helper">Search results will appear here.</p>
+                <p id="discovery-distance-origin" class="muted helper">Distance calculated from: not configured.</p>
               </div>
               <div class="actions compact discovery-toolbar-actions">
                 <label class="toolbar-select">
@@ -326,7 +327,12 @@
             <label>Name<input id="profile-name"></label>
             <label>Email<input id="profile-email" type="email"></label>
             <label>Phone<input id="profile-phone"></label>
-            <label>Location<input id="profile-location"></label>
+            <label>Home postal code or location<input id="profile-location"></label>
+            <p class="muted helper">Use a postal code for the most reliable distance filtering. A full address is optional and is used only to calculate distance locally.</p>
+            <div class="actions compact">
+              <button class="button ghost" type="button" id="profile-test-location">Test and save location</button>
+            </div>
+            <p id="profile-location-status" class="muted helper" aria-live="polite"></p>
             <label>Preferred roles<input id="profile-preferred-roles"></label>
             <label>Preferred locations<input id="profile-preferred-locations"></label>
             <label>Target seniority

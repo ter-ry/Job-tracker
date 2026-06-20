@@ -112,6 +112,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("copy-output").addEventListener("click", copyOutput);
   document.getElementById("extract-description").addEventListener("click", extractDescription);
   document.getElementById("extract-url").addEventListener("click", extractUrl);
+  document.getElementById("profile-test-location").addEventListener("click", testAndSaveLocation);
   document.getElementById("resume-upload").addEventListener("change", uploadResume);
   document.getElementById("cover-letter-template-upload").addEventListener("change", uploadCoverLetterTemplate);
   document.getElementById("discovery-view-cards").addEventListener("click", () => setDiscoveryView("cards"));
@@ -204,6 +205,7 @@ function renderDashboard(dashboard) {
 
 function renderProfile(profile) {
   profileFields.forEach((field) => setValue(`profile-${field}`, profile[toSnake(field)] || ""));
+  renderProfileLocationStatus(profile);
 }
 
 function renderTemplateStatus(profile) {
@@ -214,6 +216,34 @@ function renderTemplateStatus(profile) {
       ? "DOCX template uploaded — formatting-preserving generation available"
       : "No DOCX template uploaded — standard cover-letter formatting will be used"
   );
+}
+
+function hasDiscoveryOrigin() {
+  const profile = state.profile || {};
+  return Boolean(profile.home_location_normalized && profile.home_location_latitude && profile.home_location_longitude && ["saved", "cached"].includes(String(profile.home_location_status || "").toLowerCase()));
+}
+
+function renderProfileLocationStatus(profile) {
+  const element = document.getElementById("profile-location-status");
+  if (!element) return;
+  const status = String(profile.home_location_status || "").toLowerCase();
+  if (!profile.location) {
+    element.textContent = "No home location saved yet.";
+    return;
+  }
+  if (status === "failed") {
+    element.textContent = `Location could not be geocoded: ${profile.home_location_error || "unknown error"}`;
+    return;
+  }
+  if (status === "missing") {
+    element.textContent = "No home location saved yet.";
+    return;
+  }
+  const precision = profile.home_location_precision || "approximate";
+  const normalized = profile.home_location_normalized || profile.location;
+  const confidence = profile.home_location_confidence ? `, confidence ${profile.home_location_confidence}%` : "";
+  const geocodedAt = profile.home_location_geocoded_at ? ` · checked ${profile.home_location_geocoded_at}` : "";
+  element.innerHTML = `Location saved: ${escapeHtml(normalized)} — ${escapeHtml(precision)}${confidence}${geocodedAt}`;
 }
 
 function renderOllamaHealth(report) {
@@ -408,8 +438,7 @@ async function saveJob(event) {
   }
 }
 
-async function saveProfile(event) {
-  event.preventDefault();
+async function submitProfileSave(successMessage = "Profile saved") {
   try {
     state.profile = await api.send("/api/profile", "POST", getProfilePayload());
     try {
@@ -419,10 +448,22 @@ async function saveProfile(event) {
     }
     state.evidence = await api.get("/api/evidence").catch(() => state.evidence);
     renderEvidenceLibrary(state.evidence);
-    toast("Profile saved");
+    renderProfileLocationStatus(state.profile);
+    renderDiscoveryResults(state.discoveryMeta || {});
+    toast(successMessage);
   } catch (error) {
     toast(error.message);
   }
+}
+
+async function saveProfile(event) {
+  event.preventDefault();
+  await submitProfileSave("Profile saved");
+}
+
+async function testAndSaveLocation(event) {
+  event.preventDefault();
+  await submitProfileSave("Location tested and saved");
 }
 
 async function reviewEvidence(id, approved) {
@@ -1069,9 +1110,13 @@ function renderDiscoveryResults(result) {
   const visibleCount = jobs.length;
   const totalCount = Number(result.total || state.discoveryMeta.total || state.discoveryResults.length || 0);
   document.getElementById("discovery-active-state").textContent = describeDiscoveryState(prefs, visibleCount, totalCount);
+  renderDiscoveryOriginSummary();
   let body = state.discoveryView === "table" ? renderDiscoveryTable(jobs) : renderDiscoveryCards(jobs);
   if (visibleCount === 0 && totalCount > 0) {
     body = "<p>No jobs are visible with the current filters. Clear filters to show the fetched results.</p>";
+  }
+  if (!hasDiscoveryOrigin() && Number(prefs.filters?.max_distance || 0) > 0) {
+    body = "<p>Distance filter unavailable - save a postal code or location in Profile.</p>" + body;
   }
   const rawSummary = renderDiscoveryDiagnostics(diagnostics, visibleCount, totalCount);
   container.innerHTML = `
@@ -1085,12 +1130,26 @@ function renderDiscoveryResults(result) {
   `;
 }
 
+function renderDiscoveryOriginSummary() {
+  const element = document.getElementById("discovery-distance-origin");
+  if (!element) return;
+  const profile = state.profile || {};
+  if (!hasDiscoveryOrigin()) {
+    element.textContent = "Distance calculated from: not configured. Save a home postal code or location in Profile.";
+    return;
+  }
+  const normalized = profile.home_location_normalized || profile.location || "saved location";
+  const precision = profile.home_location_precision || "approximate";
+  element.textContent = `Distance calculated from: ${normalized} (${precision})`;
+}
+
 function renderDiscoveryDiagnostics(diagnostics, visibleCount, totalCount) {
   if (!diagnostics || !Object.keys(diagnostics).length) return "";
   const details = [];
   const searchCriteria = diagnostics.search_criteria || state.discoverySearchCriteria || {};
   const sourceCounts = diagnostics.source_counts || {};
   const sourceErrors = diagnostics.source_errors || {};
+  const origin = diagnostics.saved_origin || {};
   const fetched = Number(diagnostics.raw_jobs_returned || totalCount || 0);
   const hiddenByLocalFilters = Math.max(0, Number(totalCount || 0) - Number(visibleCount || 0));
   const capReached = diagnostics.cap_reached ? "Yes" : "No";
@@ -1102,17 +1161,28 @@ function renderDiscoveryDiagnostics(diagnostics, visibleCount, totalCount) {
     searchCriteria.per_source_cap ? `per-source cap=${searchCriteria.per_source_cap}` : "",
     searchCriteria.total_cap ? `total cap=${searchCriteria.total_cap}` : "",
     searchCriteria.remote_preference ? `remote=${searchCriteria.remote_preference}` : "",
+    searchCriteria.distance ? `radius=${searchCriteria.distance}` : "",
   ].filter(Boolean).join("; "))}</li>`);
+  details.push(`<li><strong>Origin:</strong> ${escapeHtml([
+    origin.original_input ? `input=${origin.original_input}` : "",
+    origin.normalized ? `normalized=${origin.normalized}` : "",
+    diagnostics.origin_geocode_status ? `status=${diagnostics.origin_geocode_status}` : "",
+    diagnostics.origin_precision ? `precision=${diagnostics.origin_precision}` : "",
+  ].filter(Boolean).join("; ") || "not configured")}</li>`);
   details.push(`<li><strong>Raw fetched:</strong> ${fetched}</li>`);
   details.push(`<li><strong>Visible after local filters:</strong> ${Number(visibleCount || 0)}</li>`);
   details.push(`<li><strong>Hidden by local filters:</strong> ${hiddenByLocalFilters}</li>`);
   details.push(`<li><strong>Duplicates removed:</strong> ${Number(diagnostics.duplicates_removed || 0)}</li>`);
   details.push(`<li><strong>Cap reached:</strong> ${capReached}</li>`);
+  details.push(`<li><strong>Geocoding:</strong> success ${Number(diagnostics.jobs_geocoded_successfully || 0)} | cached ${Number(diagnostics.jobs_using_cached_coordinates || 0)} | unknown ${Number(diagnostics.jobs_with_unknown_distance || 0)} | radius excluded ${Number(diagnostics.jobs_excluded_by_radius || 0)}</li>`);
   if (Object.keys(sourceCounts).length) {
     details.push(`<li><strong>By source:</strong> ${escapeHtml(Object.entries(sourceCounts).map(([source, count]) => `${sourceLabel(source)}=${count}`).join(" | "))}</li>`);
   }
   if (Object.keys(sourceErrors).length) {
     details.push(`<li><strong>Source errors:</strong> ${escapeHtml(Object.entries(sourceErrors).map(([source, message]) => `${sourceLabel(source)}=${message}`).join(" | "))}</li>`);
+  }
+  if (Array.isArray(diagnostics.geocoding_errors) && diagnostics.geocoding_errors.length) {
+    details.push(`<li><strong>Geocoding errors:</strong> ${escapeHtml(diagnostics.geocoding_errors.join(" | "))}</li>`);
   }
   if (totalCount > 0 && visibleCount === 0) {
     details.push("<li><strong>Local filters:</strong> Jobs were fetched, but the current local filters hide all visible results.</li>");
@@ -1122,39 +1192,6 @@ function renderDiscoveryDiagnostics(diagnostics, visibleCount, totalCount) {
       <summary>Discovery diagnostics</summary>
       <ul class="score-breakdown-list">${details.join("")}</ul>
     </details>
-  `;
-}
-
-function renderDiscoveryCard(job, index) {
-  const applicationUrl = job.application_url && job.application_url !== job.url ? job.application_url : "";
-  const warnings = job.warnings?.length
-    ? `<div class="warning-list">${job.warnings.map((warning) => `<span>${escapeHtml(warning)}</span>`).join("")}</div>`
-    : "";
-  const savedStatus = String(job.saved_job_status || job.status || "").toLowerCase();
-  const alreadySaved = Boolean(job.already_saved || savedStatus);
-  const buttonLabel = alreadySaved && savedStatus !== "shortlisted" ? "Add to shortlist again" : alreadySaved ? "Shortlisted" : "Save to shortlist";
-  const buttonDisabled = alreadySaved && savedStatus === "shortlisted" ? "disabled" : "";
-  const saved = alreadySaved ? `<span class="risk low">${escapeHtml(job.saved_job_status || job.status || "Saved")}</span>` : "";
-  return `
-    <section class="discovery-card" data-index="${index}">
-      <div class="discovery-card-main">
-        <div>
-          <h3>${escapeHtml(job.title || "Untitled role")}</h3>
-          <p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(job.location || "Location unavailable")}</p>
-          <p class="muted">${escapeHtml(job.source || "JobSpy")} · ${escapeHtml(job.remote_type || "Remote unspecified")} · ${escapeHtml(job.salary || "Salary unavailable")} · Posted ${escapeHtml(job.posted_date || "unknown")}</p>
-          <p class="muted">Description: ${job.description_available ? "Yes" : "No"}</p>
-        </div>
-        <div>${scorePill(job.fit_score)}${saved}</div>
-      </div>
-      ${warnings}
-      <div class="mini-breakdown">${miniBreakdown(job)}</div>
-      <div class="row-actions">
-        <button class="button small" type="button" onclick="saveDiscoveryJob(${index})" ${buttonDisabled}>${buttonLabel}</button>
-        <button class="button small ghost" type="button" onclick="hideDiscoveryJob(${index})">Ignore</button>
-        ${job.url ? `<a class="button small ghost" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open job</a>` : ""}
-        ${applicationUrl ? `<a class="button small ghost" href="${escapeAttribute(applicationUrl)}" target="_blank" rel="noreferrer">Application</a>` : ""}
-      </div>
-    </section>
   `;
 }
 
@@ -1203,7 +1240,7 @@ function renderDiscoveryRow(job, index) {
         ${renderDiscoveryWhy(job)}
       </td>
       <td>${escapeHtml(job.company || "Unknown company")}</td>
-      <td>${escapeHtml(job.location || "Location unavailable")}</td>
+      <td>${escapeHtml(job.location || "Location unavailable")}<br><span class="muted">${escapeHtml(job.normalized_location || "")}</span></td>
       <td>${escapeHtml(distanceBadge(job))}</td>
       <td>${escapeHtml(job.salary || "Salary unavailable")}</td>
       <td>${escapeHtml(job.posted_date || "Unknown")}</td>
@@ -1239,8 +1276,9 @@ function renderDiscoveryCard(job, index) {
       <div class="discovery-card-main">
         <div>
           <h3>${escapeHtml(job.title || "Untitled role")}</h3>
-          <p><strong>${escapeHtml(job.company || "Unknown company")}</strong> Â· ${escapeHtml(job.location || "Location unavailable")}</p>
-          <p class="muted">${escapeHtml(job.source || "JobSpy")} Â· ${escapeHtml(job.work_arrangement || job.remote_type || "Remote unspecified")} Â· ${escapeHtml(job.salary || "Salary unavailable")} Â· Posted ${escapeHtml(job.posted_date || "unknown")}</p>
+          <p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(job.location || "Location unavailable")}</p>
+          <p class="muted">${escapeHtml(job.source || "JobSpy")} · ${escapeHtml(job.work_arrangement || job.remote_type || "Remote unspecified")} · ${escapeHtml(job.salary || "Salary unavailable")} · Posted ${escapeHtml(job.posted_date || "unknown")}</p>
+          <p class="muted">Normalized location: ${escapeHtml(job.normalized_location || "Unavailable")} · ${escapeHtml(distanceBadge(job))}</p>
           <div class="badge-row">
             ${badge("Distance", distanceBadge(job))}
             ${badge("Salary", job.salary || "Unavailable")}
@@ -1275,7 +1313,7 @@ function distanceBadge(job) {
   if (job.distance_label === "remote") return "Remote";
   if (job.distance_km === undefined || job.distance_km === null) return "Unknown";
   if (Number(job.distance_km) >= 9999) return "Unknown";
-  return `${Number(job.distance_km)} km`;
+  return job.distance_note ? `${job.distance_note} · ${Number(job.distance_km)} km` : `${Number(job.distance_km)} km`;
 }
 
 function describeDiscoveryState(preferences, visibleCount, totalCount) {

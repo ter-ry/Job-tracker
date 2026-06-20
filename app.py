@@ -10,6 +10,7 @@ import shutil
 import sqlite3
 import urllib.error
 import urllib.request
+from urllib.parse import urlencode
 import zipfile
 import uuid
 from datetime import date, datetime, timedelta
@@ -72,6 +73,38 @@ DISCOVERY_DATE_WINDOWS = {
     "14d": 14,
     "30d": 30,
     "any": 0,
+}
+
+CANADIAN_POSTAL_CODE_RE = re.compile(r"^[ABCEGHJ-NPRSTV-Z]\d[ABCEGHJ-NPRSTV-Z][ ]?\d[ABCEGHJ-NPRSTV-Z]\d$", re.I)
+CANADIAN_POSTAL_CODE_EXTRACT_RE = re.compile(r"\b([ABCEGHJ-NPRSTV-Z]\d[ABCEGHJ-NPRSTV-Z][ ]?\d[ABCEGHJ-NPRSTV-Z]\d)\b", re.I)
+PROVINCE_LOOKUP = {
+    "ontario": "Ontario",
+    "on": "Ontario",
+    "quebec": "Quebec",
+    "qc": "Quebec",
+    "british columbia": "British Columbia",
+    "bc": "British Columbia",
+    "alberta": "Alberta",
+    "ab": "Alberta",
+    "manitoba": "Manitoba",
+    "mb": "Manitoba",
+    "saskatchewan": "Saskatchewan",
+    "sk": "Saskatchewan",
+    "nova scotia": "Nova Scotia",
+    "ns": "Nova Scotia",
+    "new brunswick": "New Brunswick",
+    "nb": "New Brunswick",
+    "newfoundland and labrador": "Newfoundland and Labrador",
+    "nl": "Newfoundland and Labrador",
+    "pei": "Prince Edward Island",
+    "prince edward island": "Prince Edward Island",
+    "pe": "Prince Edward Island",
+    "yukon": "Yukon",
+    "yt": "Yukon",
+    "northwest territories": "Northwest Territories",
+    "nt": "Northwest Territories",
+    "nunavut": "Nunavut",
+    "nu": "Nunavut",
 }
 
 DISCOVERY_SEARCH_DEPTHS = {
@@ -246,6 +279,17 @@ PROFILE_COLUMNS = {
     "email": "TEXT NOT NULL DEFAULT ''",
     "phone": "TEXT NOT NULL DEFAULT ''",
     "location": "TEXT NOT NULL DEFAULT ''",
+    "home_location_original": "TEXT NOT NULL DEFAULT ''",
+    "home_location_normalized": "TEXT NOT NULL DEFAULT ''",
+    "home_location_query": "TEXT NOT NULL DEFAULT ''",
+    "home_location_latitude": "TEXT NOT NULL DEFAULT ''",
+    "home_location_longitude": "TEXT NOT NULL DEFAULT ''",
+    "home_location_provider": "TEXT NOT NULL DEFAULT ''",
+    "home_location_confidence": "TEXT NOT NULL DEFAULT ''",
+    "home_location_precision": "TEXT NOT NULL DEFAULT ''",
+    "home_location_geocoded_at": "TEXT NOT NULL DEFAULT ''",
+    "home_location_status": "TEXT NOT NULL DEFAULT ''",
+    "home_location_error": "TEXT NOT NULL DEFAULT ''",
     "preferred_roles": "TEXT NOT NULL DEFAULT ''",
     "preferred_locations": "TEXT NOT NULL DEFAULT ''",
     "work_authorization": "TEXT NOT NULL DEFAULT ''",
@@ -384,9 +428,15 @@ def create_app() -> Flask:
     def save_profile() -> Response:
         payload = request.get_json(force=True)
         profile = normalize_profile_payload(payload, load_profile())
+        try:
+            profile, location_result = geocode_profile_home_location(profile)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         upsert_profile(profile)
         sync_evidence_library(profile)
-        return jsonify(load_profile())
+        saved = load_profile()
+        saved["location_result"] = location_result
+        return jsonify(saved)
 
     @app.post("/api/profile/upload")
     def upload_profile_file() -> Response:
@@ -691,6 +741,9 @@ def create_app() -> Flask:
         search_key = discovery_search_signature(payload)
         stored_preferences = load_discovery_preferences(search_key)
         preferences = stored_preferences or discovery_preferences_payload({})
+        profile = load_profile()
+        provider = get_geocoding_provider()
+        origin = profile_home_location(profile)
 
         fetched = fetch_jobspy_jobs(
             keywords=keywords,
@@ -709,10 +762,22 @@ def create_app() -> Flask:
         seen_keys: set[str] = set()
         jobs: list[dict[str, Any]] = []
         duplicates = 0
-        profile = load_profile()
+        geocoding_success = 0
+        geocoding_cached = 0
+        geocoding_unknown = 0
+        geocoding_errors: list[str] = []
         for raw_job in raw_jobs:
             payload_job = jobspy_result_to_job_payload(raw_job)
             clean = normalize_job_payload(payload_job)
+            clean, geocode_result = geocode_discovery_job(clean, profile, origin, provider)
+            if geocode_result.get("ok"):
+                geocoding_success += 1
+            if geocode_result.get("cached"):
+                geocoding_cached += 1
+            if not geocode_result.get("ok"):
+                geocoding_errors.append(text(geocode_result.get("error")))
+            if clean.get("distance_label") == "unknown":
+                geocoding_unknown += 1
             clean = enrich_discovery_job(clean, profile, {"weights": preferences.get("weights", {}), "remote_rule": preferences.get("sort", {}).get("remote_rule")})
             clean["source_job_id"] = text(raw_job.get("source_job_id"))
             clean["posted_date"] = text(raw_job.get("posted_date"))
@@ -749,12 +814,21 @@ def create_app() -> Flask:
 
         diagnostics = {
             "search_criteria": search,
+            "saved_origin": origin,
+            "origin_geocode_status": origin.get("status"),
+            "origin_precision": origin.get("precision"),
+            "origin_available": discovery_origin_available(profile),
+            "jobs_geocoded_successfully": geocoding_success,
+            "jobs_using_cached_coordinates": geocoding_cached,
+            "jobs_with_unknown_distance": geocoding_unknown,
+            "jobs_excluded_by_radius": 0,
             "source_counts": source_counts,
             "source_errors": fetched.get("errors", {}),
             "duplicates_removed": duplicates,
             "raw_jobs_returned": len(raw_jobs),
             "displayed_jobs": min(len(jobs), search["total_cap"]),
             "cap_reached": len(jobs) > search["total_cap"],
+            "geocoding_errors": geocoding_errors,
         }
         save_discovery_search_run(search_key, search, diagnostics, raw_jobs)
         if jobs:
@@ -1357,12 +1431,12 @@ def generate_and_store_shortlist_documents(job_id: int, kinds: set[str] | None =
         "candidate_evidence_hash": output.get("candidate_evidence_hash", ""),
         "generation_debug": generation_debug,
     }
-    (folder / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-    (folder / "generation_debug.json").write_text(json.dumps(generation_debug, indent=2), encoding="utf-8")
+    (folder / "metadata.json").write_text(dumps_json(metadata, indent=2), encoding="utf-8")
+    (folder / "generation_debug.json").write_text(dumps_json(generation_debug, indent=2), encoding="utf-8")
     (folder / "resume.txt").write_text(output["resume_text"], encoding="utf-8")
     (folder / "cover_letter.txt").write_text(output["cover_letter"], encoding="utf-8")
-    (folder / "resume_change_log.json").write_text(json.dumps(resume_result["change_log"], indent=2), encoding="utf-8")
-    (folder / "cover_letter_change_log.json").write_text(json.dumps(cover_result["change_log"], indent=2), encoding="utf-8")
+    (folder / "resume_change_log.json").write_text(dumps_json(resume_result["change_log"], indent=2), encoding="utf-8")
+    (folder / "cover_letter_change_log.json").write_text(dumps_json(cover_result["change_log"], indent=2), encoding="utf-8")
     resume_status = resume_result["status"] if "resume" in requested_kinds else current_resume_status
     cover_status = cover_result["status"] if "cover_letter" in requested_kinds else current_cover_status
     resume_error = resume_result["error"] if "resume" in requested_kinds else current_resume_error
@@ -3314,7 +3388,7 @@ def discovery_search_signature(payload: dict[str, Any]) -> str:
         "per_source_cap": search["per_source_cap"],
         "total_cap": search["total_cap"],
     }
-    return grounding_hash(json.dumps(relevant, sort_keys=True))
+    return grounding_hash(dumps_json(relevant, sort_keys=True))
 
 
 def load_discovery_preferences(search_key: str) -> dict[str, Any]:
@@ -3335,7 +3409,7 @@ def save_discovery_preferences(search_key: str, preferences: dict[str, Any]) -> 
         VALUES (?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(search_key) DO UPDATE SET preferences_json = excluded.preferences_json, updated_at = CURRENT_TIMESTAMP
         """,
-        [search_key, json.dumps(preferences, sort_keys=True)],
+        [search_key, dumps_json(preferences, sort_keys=True)],
     )
     get_db().commit()
 
@@ -3388,7 +3462,7 @@ def save_discovery_search_run(search_key: str, search_json: dict[str, Any], meta
             raw_jobs_json = excluded.raw_jobs_json,
             updated_at = CURRENT_TIMESTAMP
         """,
-        [search_key, json.dumps(search_json, sort_keys=True), json.dumps(metadata_json, sort_keys=True), json.dumps(raw_jobs)],
+        [search_key, dumps_json(search_json, sort_keys=True), dumps_json(metadata_json, sort_keys=True), dumps_json(raw_jobs, sort_keys=True)],
     )
     get_db().commit()
 
@@ -3407,6 +3481,450 @@ def load_discovery_search_run(search_key: str) -> dict[str, Any]:
     }
 
 
+def normalize_canadian_postal_code(value: str) -> str:
+    compact = re.sub(r"[^A-Za-z0-9]", "", normalize_space(value)).upper()
+    if len(compact) != 6:
+        return ""
+    candidate = f"{compact[:3]} {compact[3:]}"
+    return candidate if CANADIAN_POSTAL_CODE_RE.match(candidate) else ""
+
+
+def extract_canadian_postal_code(value: str) -> str:
+    match = CANADIAN_POSTAL_CODE_EXTRACT_RE.search(normalize_space(value).upper())
+    return normalize_canadian_postal_code(match.group(1)) if match else ""
+
+
+def infer_province_from_text(value: str) -> str:
+    lowered = normalize_space(value).lower()
+    for key, province in PROVINCE_LOOKUP.items():
+        if re.search(rf"\b{re.escape(key)}\b", lowered):
+            return province
+    return ""
+
+
+def classify_location_input(value: str) -> str:
+    raw = normalize_space(value)
+    if not raw:
+        return "empty"
+    postal = extract_canadian_postal_code(raw)
+    if postal:
+        compact = re.sub(r"[^A-Za-z0-9]", "", raw).upper()
+        if compact == postal.replace(" ", ""):
+            return "postal_code"
+        return "street_address"
+    lowered = raw.lower()
+    if infer_province_from_text(raw):
+        return "province"
+    if "," in raw or " " in raw:
+        if any(token in lowered for token in ["st ", "street", "ave", "avenue", "rd ", "road", "blvd", "drive", "dr ", "suite", "unit"]):
+            return "street_address"
+    return "city"
+
+
+def build_location_lookup_candidates(raw_value: str, profile: dict[str, str] | None = None) -> list[dict[str, Any]]:
+    raw = normalize_space(raw_value)
+    if not raw:
+        return []
+    province = infer_province_from_text(raw) or infer_province_from_text(text((profile or {}).get("preferred_locations"))) or "Ontario"
+    postal = extract_canadian_postal_code(raw)
+    kind = classify_location_input(raw)
+    candidates: list[dict[str, Any]] = []
+    if postal:
+        normalized_postal = normalize_canadian_postal_code(postal)
+        if kind == "street_address":
+            candidates.append(
+                {
+                    "query": f"{raw}, Canada",
+                    "normalized_query": raw,
+                    "precision": "street address",
+                    "confidence": 90,
+                    "used_postal_fallback": False,
+                }
+            )
+            candidates.append(
+                {
+                    "query": f"{normalized_postal}, Canada",
+                    "normalized_query": f"{normalized_postal}, Canada",
+                    "precision": "postal code",
+                    "confidence": 95,
+                    "used_postal_fallback": True,
+                }
+            )
+        else:
+            candidates.append(
+                {
+                    "query": f"{normalized_postal}, Canada",
+                    "normalized_query": f"{normalized_postal}, Canada",
+                    "precision": "postal code",
+                    "confidence": 95,
+                    "used_postal_fallback": False,
+                }
+            )
+    elif kind == "province":
+        candidates.append(
+            {
+                "query": f"{province}, Canada",
+                "normalized_query": f"{province}, Canada",
+                "precision": "approximate",
+                "confidence": 45,
+                "used_postal_fallback": False,
+            }
+        )
+    elif raw.lower() == "toronto":
+        candidates.append(
+            {
+                "query": "Toronto, Ontario, Canada",
+                "normalized_query": "Toronto, Ontario, Canada",
+                "precision": "city",
+                "confidence": 75,
+                "used_postal_fallback": False,
+            }
+        )
+    else:
+        city = raw.split(",")[0].strip()
+        if city and city.lower() == "toronto":
+            city = "Toronto"
+        normalized_query = f"{raw}, Canada" if "," not in raw else f"{raw}"
+        if city and city.lower() == "toronto" and "ontario" not in raw.lower():
+            normalized_query = "Toronto, Ontario, Canada"
+            candidates.append(
+                {
+                    "query": normalized_query,
+                    "normalized_query": normalized_query,
+                    "precision": "city",
+                    "confidence": 75,
+                    "used_postal_fallback": False,
+                }
+            )
+        else:
+            candidates.append(
+                {
+                    "query": normalized_query,
+                    "normalized_query": normalized_query,
+                    "precision": "approximate",
+                    "confidence": 60,
+                    "used_postal_fallback": False,
+                }
+            )
+        if raw.lower() != normalized_query.lower():
+            candidates.append(
+                {
+                    "query": f"{province}, Canada" if kind == "province" else f"{raw.split(',')[0].strip()}, Canada",
+                    "normalized_query": f"{province}, Canada" if kind == "province" else f"{raw.split(',')[0].strip()}, Canada",
+                    "precision": "approximate" if kind != "city" else "city",
+                    "confidence": 55 if kind != "city" else 70,
+                    "used_postal_fallback": False,
+                }
+            )
+    return candidates
+
+
+def geocoding_cache_key(lookup_type: str, query_text: str, normalized_query: str) -> str:
+    payload = {"lookup_type": lookup_type, "query_text": normalize_space(query_text).lower(), "normalized_query": normalize_space(normalized_query).lower()}
+    return grounding_hash(dumps_json(payload, sort_keys=True))
+
+
+def load_geocoding_cache(cache_key: str) -> dict[str, Any] | None:
+    if not cache_key:
+        return None
+    row = query_db("SELECT * FROM geocoding_cache WHERE cache_key = ?", [cache_key], one=True)
+    if row is None:
+        return None
+    return {
+        "cache_key": cache_key,
+        "lookup_type": text(row["lookup_type"]),
+        "query_text": text(row["query_text"]),
+        "normalized_query": text(row["normalized_query"]),
+        "provider": text(row["provider"]),
+        "success": bool(int(row["success"] or 0)),
+        "result": parse_json_object(row["result_json"]),
+    }
+
+
+def save_geocoding_cache(cache_key: str, lookup_type: str, query_text: str, normalized_query: str, provider: str, result: dict[str, Any], success: bool) -> None:
+    if not cache_key:
+        return
+    get_db().execute(
+        """
+        INSERT INTO geocoding_cache (cache_key, lookup_type, query_text, normalized_query, provider, result_json, success, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(cache_key) DO UPDATE SET
+            lookup_type = excluded.lookup_type,
+            query_text = excluded.query_text,
+            normalized_query = excluded.normalized_query,
+            provider = excluded.provider,
+            result_json = excluded.result_json,
+            success = excluded.success,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        [cache_key, lookup_type, query_text, normalized_query, provider, dumps_json(result, sort_keys=True), 1 if success else 0],
+    )
+    get_db().commit()
+
+
+class GeocodingProvider:
+    name = "base"
+
+    def geocode(self, query: str, *, country: str = "Canada") -> dict[str, Any]:
+        raise NotImplementedError
+
+
+class NominatimGeocodingProvider(GeocodingProvider):
+    name = "nominatim"
+
+    def geocode(self, query: str, *, country: str = "Canada") -> dict[str, Any]:
+        params = {"format": "jsonv2", "limit": 5, "q": query}
+        if country.lower() == "canada":
+            params["countrycodes"] = "ca"
+        url = f"https://nominatim.openstreetmap.org/search?{urlencode(params)}"
+        request_obj = urllib.request.Request(url, headers={"User-Agent": "Job Tracker/1.0 (local geocoding)"})
+        with urllib.request.urlopen(request_obj, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if not isinstance(payload, list) or not payload:
+            raise ValueError("No geocoding match found")
+        match = payload[0]
+        return {
+            "latitude": float(match.get("lat")),
+            "longitude": float(match.get("lon")),
+            "display_name": text(match.get("display_name")),
+            "raw": match,
+        }
+
+
+def get_geocoding_provider() -> GeocodingProvider:
+    return NominatimGeocodingProvider()
+
+
+def geocode_location_value(raw_value: str, *, lookup_type: str, profile: dict[str, str] | None = None, provider: GeocodingProvider | None = None) -> dict[str, Any]:
+    profile = profile or {}
+    provider = provider or get_geocoding_provider()
+    raw = normalize_space(raw_value)
+    if not raw:
+        return {
+            "ok": False,
+            "status": "missing",
+            "original_input": "",
+            "normalized_query": "",
+            "latitude": "",
+            "longitude": "",
+            "provider": provider.name,
+            "confidence": 0,
+            "precision": "",
+            "geocoded_at": "",
+            "error": "",
+            "used_fallback": False,
+            "cached": False,
+        }
+
+    candidates = build_location_lookup_candidates(raw, profile)
+    if not candidates:
+        return {
+            "ok": False,
+            "status": "missing",
+            "original_input": raw,
+            "normalized_query": "",
+            "latitude": "",
+            "longitude": "",
+            "provider": provider.name,
+            "confidence": 0,
+            "precision": "",
+            "geocoded_at": "",
+            "error": "No location candidate could be constructed.",
+            "used_fallback": False,
+            "cached": False,
+        }
+
+    errors: list[str] = []
+    for candidate in candidates:
+        cache_key = geocoding_cache_key(lookup_type, candidate["query"], candidate["normalized_query"])
+        cached = load_geocoding_cache(cache_key)
+        if cached is not None:
+            cached_result = dict(cached["result"])
+            cached_result.update(
+                {
+                    "ok": cached["success"],
+                    "status": "cached" if cached["success"] else "failed",
+                    "original_input": raw,
+                    "normalized_query": text(cached_result.get("normalized_query") or candidate["normalized_query"]),
+                    "provider": text(cached_result.get("provider") or cached["provider"] or provider.name),
+                    "cached": True,
+                }
+            )
+            if cached_result.get("ok"):
+                return cached_result
+            errors.append(text(cached_result.get("error")) or "Cached geocoding failure.")
+            continue
+        try:
+            lookup = provider.geocode(candidate["query"], country="Canada")
+            latitude = lookup.get("latitude")
+            longitude = lookup.get("longitude")
+            if latitude in [None, ""] or longitude in [None, ""]:
+                raise ValueError("No geocoding coordinates returned.")
+            result = {
+                "ok": True,
+                "status": "saved",
+                "original_input": raw,
+                "normalized_query": candidate["normalized_query"],
+                "latitude": float(latitude),
+                "longitude": float(longitude),
+                "provider": provider.name,
+                "confidence": int(candidate["confidence"]),
+                "precision": candidate["precision"],
+                "geocoded_at": datetime.now().isoformat(timespec="seconds"),
+                "error": "",
+                "used_fallback": bool(candidate["used_postal_fallback"]),
+                "display_name": text(lookup.get("display_name")),
+                "cached": False,
+            }
+            save_geocoding_cache(cache_key, lookup_type, candidate["query"], candidate["normalized_query"], provider.name, result, True)
+            return result
+        except Exception as exc:
+            error_message = f"{type(exc).__name__}: {exc}"
+            failure = {
+                "ok": False,
+                "status": "failed",
+                "original_input": raw,
+                "normalized_query": candidate["normalized_query"],
+                "latitude": "",
+                "longitude": "",
+                "provider": provider.name,
+                "confidence": 0,
+                "precision": candidate["precision"],
+                "geocoded_at": datetime.now().isoformat(timespec="seconds"),
+                "error": error_message,
+                "used_fallback": bool(candidate["used_postal_fallback"]),
+                "cached": False,
+            }
+            save_geocoding_cache(cache_key, lookup_type, candidate["query"], candidate["normalized_query"], provider.name, failure, False)
+            errors.append(error_message)
+    return {
+        "ok": False,
+        "status": "failed",
+        "original_input": raw,
+        "normalized_query": candidates[-1]["normalized_query"],
+        "latitude": "",
+        "longitude": "",
+        "provider": provider.name,
+        "confidence": 0,
+        "precision": candidates[-1]["precision"],
+        "geocoded_at": datetime.now().isoformat(timespec="seconds"),
+        "error": "; ".join(dict.fromkeys(errors)) if errors else "Location could not be geocoded.",
+        "used_fallback": bool(candidates[-1]["used_postal_fallback"]),
+        "cached": False,
+    }
+
+
+def geocode_discovery_job(job: dict[str, Any], profile: dict[str, str], origin: dict[str, Any], provider: GeocodingProvider | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+    provider = provider or get_geocoding_provider()
+    raw_location = text(job.get("location"))
+    geocode = geocode_location_value(raw_location, lookup_type="job", profile=profile, provider=provider)
+    job["location_original"] = raw_location
+    job["normalized_location"] = text(geocode.get("normalized_query")) or raw_location
+    job["location_provider"] = text(geocode.get("provider"))
+    job["location_confidence"] = clamp_int(geocode.get("confidence"), 0, 100)
+    job["location_precision"] = text(geocode.get("precision"))
+    job["location_geocoded_at"] = text(geocode.get("geocoded_at"))
+    job["location_geocoding_error"] = text(geocode.get("error"))
+    job["location_cached"] = bool(geocode.get("cached"))
+    job["location_geocode_status"] = text(geocode.get("status"))
+    job["location_latitude"] = geocode.get("latitude")
+    job["location_longitude"] = geocode.get("longitude")
+    distance = location_distance_snapshot(origin, raw_location, text(job.get("remote_type")), "remote_after_local", geocode)
+    job["distance_km"] = distance["distance_km"]
+    job["distance_confidence"] = distance["confidence"]
+    job["distance_label"] = distance["distance_label"]
+    job["distance_note"] = distance.get("distance_note", "")
+    job["distance_origin_label"] = distance.get("origin_label", "")
+    job["distance_cached"] = bool(geocode.get("cached"))
+    return job, geocode
+
+
+def profile_home_location(profile: dict[str, str]) -> dict[str, Any]:
+    normalized = text(profile.get("home_location_normalized")) or text(profile.get("location"))
+    lat = profile.get("home_location_latitude")
+    lon = profile.get("home_location_longitude")
+    status = text(profile.get("home_location_status"))
+    return {
+        "input": text(profile.get("home_location_original") or profile.get("location")),
+        "normalized": normalized,
+        "latitude": float(lat) if text(lat) else None,
+        "longitude": float(lon) if text(lon) else None,
+        "provider": text(profile.get("home_location_provider")),
+        "confidence": clamp_int(profile.get("home_location_confidence"), 0, 100),
+        "precision": text(profile.get("home_location_precision")),
+        "geocoded_at": text(profile.get("home_location_geocoded_at")),
+        "status": status or ("saved" if normalized else "missing"),
+        "error": text(profile.get("home_location_error")),
+    }
+
+
+def discovery_origin_available(profile: dict[str, str]) -> bool:
+    origin = profile_home_location(profile)
+    return origin["latitude"] is not None and origin["longitude"] is not None and origin["status"] in {"saved", "cached"}
+
+
+def looks_like_invalid_postal_code(raw_value: str) -> bool:
+    raw = normalize_space(raw_value)
+    compact = re.sub(r"[^A-Za-z0-9]", "", raw)
+    if len(compact) > 7 or len(compact) < 5:
+        return False
+    if not any(char.isalpha() for char in compact) or not any(char.isdigit() for char in compact):
+        return False
+    return extract_canadian_postal_code(raw) == ""
+
+
+def geocode_profile_home_location(profile: dict[str, str], provider: GeocodingProvider | None = None) -> tuple[dict[str, str], dict[str, Any]]:
+    raw = text(profile.get("location"))
+    if raw and looks_like_invalid_postal_code(raw):
+        raise ValueError("Invalid Canadian postal code. Use a format like M5V 2T6.")
+
+    if not raw:
+        profile.update(
+            {
+                "home_location_original": "",
+                "home_location_normalized": "",
+                "home_location_query": "",
+                "home_location_latitude": "",
+                "home_location_longitude": "",
+                "home_location_provider": "",
+                "home_location_confidence": "",
+                "home_location_precision": "",
+                "home_location_geocoded_at": "",
+                "home_location_status": "missing",
+                "home_location_error": "",
+            }
+        )
+        return profile, {
+            "ok": False,
+            "status": "missing",
+            "message": "Location not configured.",
+            "display": "",
+        }
+
+    result = geocode_location_value(raw, lookup_type="profile", profile=profile, provider=provider)
+    profile.update(
+        {
+            "home_location_original": raw,
+            "home_location_normalized": text(result.get("normalized_query")),
+            "home_location_query": text(result.get("normalized_query")),
+            "home_location_latitude": text(result.get("latitude")),
+            "home_location_longitude": text(result.get("longitude")),
+            "home_location_provider": text(result.get("provider")),
+            "home_location_confidence": str(clamp_int(result.get("confidence"), 0, 100)) if result.get("ok") else "",
+            "home_location_precision": text(result.get("precision")),
+            "home_location_geocoded_at": text(result.get("geocoded_at")),
+            "home_location_status": text(result.get("status")),
+            "home_location_error": text(result.get("error")),
+        }
+    )
+    display = text(result.get("normalized_query")) or raw
+    message = (
+        f"Location saved: {display} — {text(result.get('precision')) or 'unknown'}"
+        + (f", {text(result.get('status'))}." if text(result.get("status")) else ".")
+    )
+    return profile, {"ok": bool(result.get("ok")), "status": text(result.get("status")), "message": message, "display": display, "precision": text(result.get("precision")), "result": result}
+
+
 def discovery_city_coordinates(location: str) -> tuple[float, float] | None:
     lowered = normalize_space(location).lower()
     if not lowered:
@@ -3415,6 +3933,52 @@ def discovery_city_coordinates(location: str) -> tuple[float, float] | None:
         if key != "remote" and key in lowered:
             return coords
     return None
+
+
+def location_distance_snapshot(
+    origin: dict[str, Any] | None,
+    job_location: str,
+    remote_type: str = "",
+    remote_rule: str = "remote_after_local",
+    job_record: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    origin = origin or {}
+    job_record = job_record or {}
+    job_loc = normalize_space(job_location)
+    remote = normalize_space(remote_type).lower()
+    if "remote" in remote or "remote" in job_loc.lower():
+        if remote_rule == "remote_zero":
+            return {"distance_km": 0, "confidence": 95, "distance_label": "remote", "distance_note": "Remote", "origin_label": text(origin.get("normalized"))}
+        if remote_rule == "remote_first":
+            return {"distance_km": -1, "confidence": 95, "distance_label": "remote", "distance_note": "Remote", "origin_label": text(origin.get("normalized"))}
+        return {"distance_km": 9999, "confidence": 95, "distance_label": "remote", "distance_note": "Remote", "origin_label": text(origin.get("normalized"))}
+    if not origin.get("latitude") or not origin.get("longitude"):
+        return {"distance_km": 9999, "confidence": 0, "distance_label": "unknown", "distance_note": "Distance unavailable", "origin_label": text(origin.get("normalized"))}
+    job_lat = job_record.get("latitude")
+    job_lon = job_record.get("longitude")
+    if job_lat in [None, ""] or job_lon in [None, ""]:
+        return {"distance_km": 9999, "confidence": 0, "distance_label": "unknown", "distance_note": "Distance unavailable", "origin_label": text(origin.get("normalized"))}
+    job_precision = text(job_record.get("precision"))
+    origin_precision = text(origin.get("precision"))
+    if job_precision in {"province", "unknown"}:
+        return {"distance_km": 9999, "confidence": 20, "distance_label": "unknown", "distance_note": "Distance unavailable", "origin_label": text(origin.get("normalized"))}
+    if origin_precision in {"province", "unknown"}:
+        return {"distance_km": 9999, "confidence": 20, "distance_label": "unknown", "distance_note": "Distance unavailable", "origin_label": text(origin.get("normalized"))}
+    try:
+        distance_km = haversine_distance_km((float(origin["latitude"]), float(origin["longitude"])), (float(job_lat), float(job_lon)))
+    except Exception:
+        return {"distance_km": 9999, "confidence": 0, "distance_label": "unknown", "distance_note": "Distance unavailable", "origin_label": text(origin.get("normalized"))}
+    confidence = min(clamp_int(origin.get("confidence"), 0, 100), clamp_int(job_record.get("confidence"), 0, 100))
+    if "city" in {origin_precision, job_precision}:
+        confidence = min(confidence or 75, 78)
+    if "street address" in {origin_precision, job_precision} or "postal code" in {origin_precision, job_precision}:
+        confidence = max(confidence, 85)
+    distance_label = "approximate"
+    origin_label = text(origin.get("normalized")) or text(origin.get("input"))
+    distance_note = f"Approx. distance from {origin_label or 'saved origin'}"
+    if origin_precision == "city" and origin_label:
+        distance_note = f"Approx. distance from {origin_label} city centre"
+    return {"distance_km": distance_km, "confidence": confidence or 70, "distance_label": distance_label, "distance_note": distance_note, "origin_label": origin_label}
 
 
 def haversine_distance_km(origin: tuple[float, float], destination: tuple[float, float]) -> int:
@@ -3597,10 +4161,19 @@ def discovery_score_breakdown(job: dict[str, Any], profile: dict[str, str], sett
     seniority_fit = clamp_int(score_seniority_fit(profile, analyze_job_seniority(job)).get("score", 0), 0, 100)
     salary_snapshot = normalize_salary_snapshot(job)
     salary_score = discovery_salary_score({**job, **salary_snapshot}, profile)
-    home_location = text(profile.get("location")) or text(profile.get("preferred_locations")) or ""
+    origin = profile_home_location(profile)
     distance_rule = normalize_choice(settings.get("remote_rule") or settings.get("remote_distance_rule"), DISCOVERY_REMOTE_DISTANCE_RULES) or "remote_after_local"
-    distance_snapshot = approximate_distance_from_home(text(job.get("location")), home_location, text(job.get("remote_type")), distance_rule)
+    job_location_record = {
+        "latitude": job.get("location_latitude"),
+        "longitude": job.get("location_longitude"),
+        "confidence": job.get("location_confidence"),
+        "precision": text(job.get("location_precision")),
+        "normalized": text(job.get("normalized_location")) or text(job.get("location")),
+        "input": text(job.get("location")),
+    }
+    distance_snapshot = location_distance_snapshot(origin, text(job.get("location")), text(job.get("remote_type")), distance_rule, job_location_record)
     distance_score = discovery_distance_score(distance_snapshot["distance_km"], text(job.get("remote_type")), distance_rule)
+    unknown_location_penalty = 4 if distance_snapshot["distance_km"] >= 9999 and not "remote" in text(job.get("remote_type")).lower() else 0
     recency_score = discovery_recency_score(job)
     source_score = discovery_source_quality_score(job)
     data_quality_score, missing_fields = discovery_completion_score(job)
@@ -3617,6 +4190,7 @@ def discovery_score_breakdown(job: dict[str, Any], profile: dict[str, str], sett
         + source_score * (weights["source_quality"] / 100)
         - excluded_penalty
         - missing_penalty
+        - unknown_location_penalty
     )
     components = [
         {"label": "Skill match", "score": round(skill_match * weights["skill_match"] / 100), "max": weights["skill_match"]},
@@ -3632,7 +4206,7 @@ def discovery_score_breakdown(job: dict[str, Any], profile: dict[str, str], sett
         penalties.append({"label": "Missing data", "items": missing_fields, "points": missing_penalty})
     if penalty_terms:
         penalties.append({"label": "Excluded keywords", "items": penalty_terms, "points": excluded_penalty})
-    if distance_snapshot["distance_km"] >= 9999 and not "remote" in text(job.get("remote_type")).lower():
+    if unknown_location_penalty:
         penalties.append({"label": "Unknown location", "items": ["location unknown"], "points": 4})
     return {
         "overall_score": clamp_int(total, 0, 100),
@@ -3984,6 +4558,31 @@ def init_db() -> None:
             "raw_jobs_json": "TEXT NOT NULL DEFAULT '[]'",
         },
     )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS geocoding_cache (
+            cache_key TEXT PRIMARY KEY,
+            lookup_type TEXT NOT NULL DEFAULT '',
+            query_text TEXT NOT NULL DEFAULT '',
+            normalized_query TEXT NOT NULL DEFAULT '',
+            provider TEXT NOT NULL DEFAULT '',
+            result_json TEXT NOT NULL DEFAULT '{}',
+            success INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    ensure_columns(
+        "geocoding_cache",
+        {
+            "lookup_type": "TEXT NOT NULL DEFAULT ''",
+            "query_text": "TEXT NOT NULL DEFAULT ''",
+            "normalized_query": "TEXT NOT NULL DEFAULT ''",
+            "provider": "TEXT NOT NULL DEFAULT ''",
+            "result_json": "TEXT NOT NULL DEFAULT '{}'",
+            "success": "INTEGER NOT NULL DEFAULT 0",
+        },
+    )
     db.commit()
 
 
@@ -4000,6 +4599,19 @@ def query_db(query: str, args: list[Any] | None = None, one: bool = False) -> An
     rows = cursor.fetchall()
     cursor.close()
     return (rows[0] if rows else None) if one else rows
+
+
+def json_value_default(value: Any) -> Any:
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    return text(value)
+
+
+def dumps_json(value: Any, **kwargs: Any) -> str:
+    kwargs.setdefault("default", json_value_default)
+    return json.dumps(value, **kwargs)
 
 
 def normalize_profile_payload(payload: dict[str, Any], existing: dict[str, str] | None = None) -> dict[str, str]:
@@ -4354,7 +4966,7 @@ def normalize_job_payload(payload: dict[str, Any]) -> dict[str, Any]:
     for key, value in scoring.items():
         if key.endswith("_score") or key == "fit_score":
             clean[key] = value
-    clean["score_breakdown"] = json.dumps(scoring["breakdown"])
+    clean["score_breakdown"] = dumps_json(scoring["breakdown"], sort_keys=True)
     return clean
 
 

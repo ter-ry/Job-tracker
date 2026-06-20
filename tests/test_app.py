@@ -3,6 +3,7 @@ import io
 import re
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 import zipfile
@@ -55,6 +56,23 @@ class FakeUrlopenResponse:
 
     def read(self):
         return json.dumps(self.body).encode("utf-8")
+
+
+class FakeGeocodingProvider:
+    name = "fake"
+
+    def __init__(self, responses: dict[str, dict[str, object]]):
+        self.responses = responses
+        self.calls: list[tuple[str, str]] = []
+
+    def geocode(self, query: str, *, country: str = "Canada") -> dict[str, object]:
+        self.calls.append((query, country))
+        if query not in self.responses:
+            raise ValueError(f"No geocoding match for {query}")
+        response = self.responses[query]
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 class JobAssistantTest(unittest.TestCase):
@@ -288,6 +306,158 @@ class JobAssistantTest(unittest.TestCase):
         response = self.client.post("/api/discovery/jobspy", json={"location": "Toronto"})
         self.assertEqual(response.status_code, 400)
         self.assertIn("Keywords are required", response.get_json()["error"])
+
+    def test_canadian_postal_code_normalization_and_cached_profile_geocoding(self):
+        self.assertEqual(app_module.normalize_canadian_postal_code("m5v2t6"), "M5V 2T6")
+        self.assertEqual(app_module.extract_canadian_postal_code("Suite 400, M5V 2T6"), "M5V 2T6")
+        provider = FakeGeocodingProvider(
+            {
+                "M5V 2T6, Canada": {
+                    "ok": True,
+                    "status": "saved",
+                    "latitude": 43.6426,
+                    "longitude": -79.3871,
+                    "provider": "fake",
+                    "confidence": 95,
+                    "precision": "postal code",
+                    "geocoded_at": "2026-06-20T10:00:00",
+                    "normalized_query": "M5V 2T6, Canada",
+                    "error": "",
+                }
+            }
+        )
+        with app_module.app.app_context():
+            app_module.init_db()
+            profile, first = app_module.geocode_profile_home_location({"location": "m5v2t6"}, provider)
+            self.assertTrue(first["ok"])
+            self.assertEqual(profile["home_location_normalized"], "M5V 2T6, Canada")
+            self.assertEqual(profile["home_location_precision"], "postal code")
+            self.assertEqual(len(provider.calls), 1)
+
+            cached_profile, second = app_module.geocode_profile_home_location(profile, provider)
+            self.assertTrue(second["ok"])
+            self.assertEqual(cached_profile["home_location_normalized"], "M5V 2T6, Canada")
+            self.assertEqual(len(provider.calls), 1)
+
+    def test_invalid_canadian_postal_code_is_rejected(self):
+        response = self.client.post("/api/profile", json={"location": "M5V2T"})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Invalid Canadian postal code", response.get_json()["error"])
+
+    def test_toronto_city_and_job_distance_metadata_are_geocoded(self):
+        provider = FakeGeocodingProvider(
+            {
+                "Toronto, Ontario, Canada": {
+                    "latitude": 43.6532,
+                    "longitude": -79.3832,
+                    "display_name": "Toronto, Ontario, Canada",
+                    "ok": True,
+                    "status": "saved",
+                    "provider": "fake",
+                    "confidence": 80,
+                    "precision": "city",
+                    "geocoded_at": "2026-06-20T10:00:00",
+                    "normalized_query": "Toronto, Ontario, Canada",
+                    "error": "",
+                },
+                "M5V 2T6, Canada": {
+                    "latitude": 43.6426,
+                    "longitude": -79.3871,
+                    "display_name": "M5V 2T6, Canada",
+                    "ok": True,
+                    "status": "saved",
+                    "provider": "fake",
+                    "confidence": 95,
+                    "precision": "postal code",
+                    "geocoded_at": "2026-06-20T10:00:00",
+                    "normalized_query": "M5V 2T6, Canada",
+                    "error": "",
+                },
+            }
+        )
+        with patch.object(app_module, "get_geocoding_provider", return_value=provider):
+            profile_response = self.client.post("/api/profile", json={"location": "Toronto"})
+        self.assertEqual(profile_response.status_code, 200)
+        profile = profile_response.get_json()
+        self.assertEqual(profile["home_location_normalized"], "Toronto, Ontario, Canada")
+        self.assertEqual(profile["home_location_precision"], "city")
+        self.assertEqual(profile["location_result"]["status"], "saved")
+
+        fake = {
+            "jobs": [
+                {
+                    "source_job_id": "job-1",
+                    "title": "Software Developer",
+                    "company": "Northstar",
+                    "location": "M5V2T6",
+                    "source": "linkedin",
+                    "job_url": "https://example.com/job/1",
+                    "description": "Python SQL APIs",
+                    "posted_date": date(2026, 6, 19),
+                }
+            ],
+            "errors": {},
+            "source_counts": {"linkedin": 1},
+        }
+        with patch.object(app_module, "get_geocoding_provider", return_value=provider), patch.object(app_module, "fetch_jobspy_jobs", return_value=fake):
+            response = self.client.post(
+                "/api/discovery/jobspy",
+                json={"keywords": "software developer", "location": "Toronto", "enabled_sources": ["linkedin"]},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertEqual(body["total"], 1)
+        job = body["jobs"][0]
+        self.assertEqual(job["normalized_location"], "M5V 2T6, Canada")
+        self.assertEqual(job["distance_label"], "approximate")
+        self.assertTrue(job["distance_note"].startswith("Approx. distance from Toronto, Ontario, Canada"))
+        self.assertGreaterEqual(job["distance_km"], 0)
+
+    def test_discovery_jobspy_accepts_date_objects_in_raw_payloads(self):
+        provider = FakeGeocodingProvider(
+            {
+                "Toronto, Ontario, Canada": {
+                    "latitude": 43.6532,
+                    "longitude": -79.3832,
+                    "display_name": "Toronto, Ontario, Canada",
+                    "ok": True,
+                    "status": "saved",
+                    "provider": "fake",
+                    "confidence": 80,
+                    "precision": "city",
+                    "geocoded_at": "2026-06-20T10:00:00",
+                    "normalized_query": "Toronto, Ontario, Canada",
+                    "error": "",
+                }
+            }
+        )
+        fake = {
+            "jobs": [
+                {
+                    "source_job_id": "job-serial",
+                    "title": "Backend Developer",
+                    "company": "SerialCo",
+                    "location": "Toronto",
+                    "source": "linkedin",
+                    "job_url": "https://example.com/job/serial",
+                    "description": "Python Flask SQL",
+                    "posted_date": date(2026, 6, 19),
+                }
+            ],
+            "errors": {},
+            "source_counts": {"linkedin": 1},
+        }
+        with patch.object(app_module, "get_geocoding_provider", return_value=provider), patch.object(app_module, "fetch_jobspy_jobs", return_value=fake):
+            response = self.client.post(
+                "/api/discovery/jobspy",
+                json={"keywords": "backend developer", "location": "Toronto", "enabled_sources": ["linkedin"]},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertEqual(body["jobs"][0]["posted_date"], "2026-06-19")
+        self.assertEqual(body["visible_total"], 1)
 
     def test_jobspy_discovery_scores_saved_profile_and_handles_missing_fields(self):
         self.client.post(
