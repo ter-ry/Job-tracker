@@ -72,6 +72,100 @@
               <label><input type="checkbox" name="discovery-source" value="google"> Google Jobs</label>
               <label><input type="checkbox" name="discovery-source" value="zip_recruiter"> ZipRecruiter</label>
             </fieldset>
+            <details class="settings-block" open>
+              <summary>Discovery sorting and filters</summary>
+              <div class="grid three">
+                <label>Primary sort
+                  <select id="discovery-sort-field">
+                    <option value="overall_score">Overall score</option>
+                    <option value="salary">Salary</option>
+                    <option value="distance">Distance</option>
+                    <option value="posted_date">Posted date</option>
+                    <option value="company">Company</option>
+                    <option value="title">Job title</option>
+                    <option value="source">Source</option>
+                    <option value="work_arrangement">Work arrangement</option>
+                    <option value="seniority">Experience level</option>
+                    <option value="match_score">Match score</option>
+                    <option value="deadline">Deadline</option>
+                  </select>
+                </label>
+                <label>Direction
+                  <select id="discovery-sort-direction">
+                    <option value="desc">Descending</option>
+                    <option value="asc">Ascending</option>
+                  </select>
+                </label>
+                <label>Secondary sort
+                  <select id="discovery-secondary-sort-field">
+                    <option value="">None</option>
+                    <option value="overall_score">Overall score</option>
+                    <option value="salary">Salary</option>
+                    <option value="distance">Distance</option>
+                    <option value="posted_date">Posted date</option>
+                    <option value="company">Company</option>
+                    <option value="title">Job title</option>
+                    <option value="source">Source</option>
+                    <option value="work_arrangement">Work arrangement</option>
+                    <option value="seniority">Experience level</option>
+                    <option value="match_score">Match score</option>
+                    <option value="deadline">Deadline</option>
+                  </select>
+                </label>
+                <label>Secondary direction
+                  <select id="discovery-secondary-sort-direction">
+                    <option value="asc">Ascending</option>
+                    <option value="desc">Descending</option>
+                  </select>
+                </label>
+                <label>Unknown salary
+                  <select id="discovery-unknown-salary-position">
+                    <option value="last">After known salaries</option>
+                    <option value="first">Before known salaries</option>
+                  </select>
+                </label>
+                <label>Remote distance rule
+                  <select id="discovery-remote-rule">
+                    <option value="remote_after_local">Remote after local jobs</option>
+                    <option value="remote_first">Remote first</option>
+                    <option value="remote_zero">Remote as zero distance</option>
+                  </select>
+                </label>
+              </div>
+              <div class="grid three">
+                <label>Salary minimum<input id="discovery-filter-salary-min" type="number" min="0" step="1000" placeholder="70000"></label>
+                <label>Max distance<input id="discovery-filter-max-distance" type="number" min="0" step="1" placeholder="50"></label>
+                <label>Minimum overall score<input id="discovery-filter-overall-score-min" type="number" min="0" max="100" step="1" placeholder="70"></label>
+                <label>Posted within
+                  <select id="discovery-filter-posted-within">
+                    <option value="">Any time</option>
+                    <option value="1">1 day</option>
+                    <option value="3">3 days</option>
+                    <option value="7">7 days</option>
+                    <option value="14">14 days</option>
+                    <option value="30">30 days</option>
+                  </select>
+                </label>
+                <label>Remote / hybrid / on-site
+                  <select id="discovery-filter-remote">
+                    <option value="">Any</option>
+                    <option value="Remote">Remote</option>
+                    <option value="Hybrid">Hybrid</option>
+                    <option value="On-site">On-site</option>
+                  </select>
+                </label>
+                <label>Source<input id="discovery-filter-source" placeholder="LinkedIn"></label>
+                <label>Job field<input id="discovery-filter-job-field" placeholder="software, support, analyst"></label>
+                <label>Seniority<input id="discovery-filter-seniority" placeholder="junior"></label>
+                <label>Company<input id="discovery-filter-company" placeholder="Scotiabank"></label>
+                <label>Title keywords<input id="discovery-filter-title-keywords" placeholder="developer"></label>
+              </div>
+              <div class="grid two">
+                <label class="checkline"><input id="discovery-filter-known-salary" type="checkbox"> Known salary only</label>
+                <label class="checkline"><input id="discovery-filter-known-location" type="checkbox"> Known location only</label>
+                <label class="checkline"><input id="discovery-filter-exact-date" type="checkbox"> Exact date only</label>
+              </div>
+            </details>
             <div id="discovery-status" class="muted helper" aria-live="polite"></div>
             <div class="actions">
               <button class="button" type="submit" id="discovery-submit">Search live jobs</button>
@@ -88,7 +182,14 @@
           </form>
         </section>
         <section class="panel">
-          <div class="panel-header"><h2>Discovery results</h2></div>
+          <div class="panel-header">
+            <h2>Discovery results</h2>
+            <div class="actions compact">
+              <button class="button ghost small" type="button" id="discovery-view-cards">Cards</button>
+              <button class="button ghost small" type="button" id="discovery-view-table">Table</button>
+            </div>
+          </div>
+          <p id="discovery-active-state" class="muted helper">Sort and filter state will appear here.</p>
           <div id="discovery-results" class="generated-output empty">Search results will appear here.</div>
         </section>
       </section>

@@ -449,6 +449,47 @@ th {
   font-size: 0.75rem;
 }
 
+.badge-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.badge {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+  border-radius: 999px;
+  background: var(--soft);
+  color: var(--ink);
+  padding: 4px 9px;
+  font-size: 0.76rem;
+}
+
+.badge strong {
+  color: var(--accent-dark);
+}
+
+.table-sort {
+  all: unset;
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+  text-transform: inherit;
+}
+
+.discovery-table-wrap table {
+  min-width: 1180px;
+}
+
+.score-breakdown-list {
+  display: grid;
+  gap: 6px;
+  margin: 8px 0 0;
+  padding-left: 18px;
+}
+
 .risk {
   display: inline-flex;
   border-radius: 999px;

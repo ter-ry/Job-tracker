@@ -53,6 +53,18 @@ GENERATED_APPLICATIONS_DIRNAME = "generated_applications"
 SEMANTIC_CACHE_DIRNAME = "semantic_cache"
 RESTORABLE_SHORTLIST_STATUSES = {"Archived", "Rejected", "Saved", "Drafting"}
 
+DISCOVERY_SCORE_WEIGHTS = {
+    "skill_match": 35,
+    "role_fit": 20,
+    "seniority_fit": 10,
+    "salary": 10,
+    "distance_work_arrangement": 10,
+    "recency": 10,
+    "source_quality": 5,
+}
+
+DISCOVERY_REMOTE_DISTANCE_RULES = {"remote_first", "remote_after_local", "remote_zero"}
+
 STATUSES = ["Saved", "shortlisted", "Drafting", "Applied", "Interview", "Offer", "Rejected", "Archived"]
 
 ROLE_TYPES = [
@@ -164,8 +176,12 @@ JOB_COLUMNS = {
     "url": "TEXT NOT NULL DEFAULT ''",
     "source": "TEXT NOT NULL DEFAULT ''",
     "salary": "TEXT NOT NULL DEFAULT ''",
+    "salary_original_text": "TEXT NOT NULL DEFAULT ''",
+    "salary_midpoint": "INTEGER NOT NULL DEFAULT 0",
+    "salary_listed": "INTEGER NOT NULL DEFAULT 0",
     "deadline": "TEXT NOT NULL DEFAULT ''",
     "fit_score": "INTEGER NOT NULL DEFAULT 0",
+    "overall_score": "INTEGER NOT NULL DEFAULT 0",
     "status": "TEXT NOT NULL DEFAULT 'Saved'",
     "notes": "TEXT NOT NULL DEFAULT ''",
     "date_added": "TEXT NOT NULL DEFAULT ''",
@@ -174,6 +190,8 @@ JOB_COLUMNS = {
     "remote_type": "TEXT NOT NULL DEFAULT ''",
     "role_type": "TEXT NOT NULL DEFAULT ''",
     "seniority_level": "TEXT NOT NULL DEFAULT ''",
+    "distance_km": "INTEGER NOT NULL DEFAULT 0",
+    "distance_confidence": "INTEGER NOT NULL DEFAULT 0",
     "required_skills": "TEXT NOT NULL DEFAULT ''",
     "preferred_skills": "TEXT NOT NULL DEFAULT ''",
     "responsibilities": "TEXT NOT NULL DEFAULT ''",
@@ -626,6 +644,19 @@ def create_app() -> Flask:
             }
         )
 
+    @app.get("/api/discovery/preferences")
+    def discovery_preferences_get() -> Response:
+        search_key = text(request.args.get("search_key"))
+        return jsonify({"search_key": search_key, "preferences": load_discovery_preferences(search_key)})
+
+    @app.post("/api/discovery/preferences")
+    def discovery_preferences_set() -> Response:
+        payload = request.get_json(force=True)
+        search_key = text(payload.get("search_key")) or discovery_search_signature(payload)
+        preferences = discovery_preferences_payload(payload.get("preferences") if isinstance(payload.get("preferences"), dict) else payload)
+        save_discovery_preferences(search_key, preferences)
+        return jsonify({"search_key": search_key, "preferences": preferences})
+
     @app.post("/api/discovery/jobspy")
     def discovery_jobspy() -> Response:
         payload = request.get_json(force=True)
@@ -633,6 +664,44 @@ def create_app() -> Flask:
         if not keywords:
             return jsonify({"error": "Keywords are required"}), 400
 
+        search_key = discovery_search_signature(payload)
+        stored_preferences = load_discovery_preferences(search_key)
+        request_preferences = discovery_preferences_payload(payload)
+        preference_override_keys = {
+            "sort",
+            "filters",
+            "sort_field",
+            "sort_direction",
+            "secondary_sort",
+            "secondary_sort_field",
+            "secondary_sort_direction",
+            "unknown_salary_position",
+            "remote_rule",
+            "remote_distance_rule",
+            "salary_min",
+            "max_distance",
+            "overall_score_min",
+            "posted_within",
+            "remote_type",
+            "source",
+            "job_field",
+            "seniority",
+            "known_salary_only",
+            "known_location_only",
+            "exact_date_only",
+            "company",
+            "title_keywords",
+            "weights",
+        }
+        has_explicit_preferences = any(key in payload for key in preference_override_keys)
+        if has_explicit_preferences:
+            preferences = {
+                "sort": {**stored_preferences.get("sort", {}), **request_preferences.get("sort", {})},
+                "filters": {**stored_preferences.get("filters", {}), **request_preferences.get("filters", {})},
+                "weights": {**stored_preferences.get("weights", {}), **request_preferences.get("weights", {})},
+            }
+        else:
+            preferences = stored_preferences or request_preferences
         location = text(payload.get("location"))
         enabled_sources = normalize_discovery_sources(payload.get("enabled_sources"))
         results_wanted = clamp_int_default(payload.get("results_wanted"), 10, 1, 25)
@@ -658,9 +727,11 @@ def create_app() -> Flask:
         seen_keys: set[str] = set()
         jobs: list[dict[str, Any]] = []
         duplicates = 0
+        profile = load_profile()
         for raw_job in fetched.get("jobs", []):
             payload_job = jobspy_result_to_job_payload(raw_job)
             clean = normalize_job_payload(payload_job)
+            clean = enrich_discovery_job(clean, profile, {"weights": preferences["weights"], "remote_rule": preferences["sort"].get("remote_rule")})
             clean["source_job_id"] = text(raw_job.get("source_job_id"))
             clean["posted_date"] = text(raw_job.get("posted_date"))
             clean["description_available"] = bool(clean.get("job_description"))
@@ -694,7 +765,16 @@ def create_app() -> Flask:
                 if source in source_counts:
                     source_counts[source] += 1
 
-        jobs.sort(key=lambda job: int(job.get("fit_score") or 0), reverse=True)
+        jobs = sort_discovery_jobs(
+            jobs,
+            preferences["sort"].get("field") or "overall_score",
+            preferences["sort"].get("direction") or "desc",
+            preferences["sort"].get("secondary_field") or "",
+            preferences["sort"].get("secondary_direction") or "asc",
+            preferences["sort"].get("remote_rule") or "remote_after_local",
+            preferences["sort"].get("unknown_salary_position") or "last",
+        )
+        save_discovery_preferences(search_key, preferences)
         return jsonify(
             {
                 "jobs": jobs,
@@ -702,6 +782,8 @@ def create_app() -> Flask:
                 "source_counts": source_counts,
                 "total": len(jobs),
                 "duplicates": duplicates,
+                "search_key": search_key,
+                "preferences": preferences,
             }
         )
 
@@ -985,6 +1067,7 @@ def jobspy_result_to_job_payload(job: dict[str, Any]) -> dict[str, Any]:
     source = text(job.get("source"))
     description = text(job.get("description"))
     role_type = text(job.get("job_type"))
+    salary_text = text(job.get("salary_text") or job.get("salary"))
     salary = determine_salary(
         {
             "title": text(job.get("title")),
@@ -996,10 +1079,11 @@ def jobspy_result_to_job_payload(job: dict[str, Any]) -> dict[str, Any]:
             "salary_max": job.get("salary_max"),
             "salary_interval": job.get("salary_interval"),
             "salary_currency": job.get("salary_currency"),
-            "salary_text": job.get("salary_text"),
+            "salary_text": salary_text,
             "job_description": description,
         }
     )
+    salary_listed = salary["salary_source"] not in {"estimated", "missing"}
     return {
         "company": text(job.get("company")) or "Unknown company",
         "title": text(job.get("title")) or "Untitled role",
@@ -1008,12 +1092,15 @@ def jobspy_result_to_job_payload(job: dict[str, Any]) -> dict[str, Any]:
         "application_url": text(job.get("application_url")) or text(job.get("job_url")),
         "source": source.title() if source else "JobSpy",
         "salary": salary["salary_text"],
+        "salary_original_text": salary_text or salary["salary_text"],
         "salary_min": salary["salary_min"],
         "salary_max": salary["salary_max"],
+        "salary_midpoint": int(round((salary["salary_min"] + salary["salary_max"]) / 2)) if salary["salary_min"] or salary["salary_max"] else 0,
         "salary_interval": salary["salary_interval"],
         "salary_currency": salary["salary_currency"],
         "salary_source": salary["salary_source"],
         "salary_confidence": salary["salary_confidence"],
+        "salary_listed": int(salary_listed),
         "remote_type": text(job.get("remote_type")),
         "role_type": map_jobspy_role_type(role_type),
         "seniority_level": text(job.get("experience_requirement")),
@@ -3189,6 +3276,541 @@ def salary_range_label(minimum: float, maximum: float, interval: str, currency: 
     return f"{left}-{right} {cadence}" if minimum != maximum else f"{left} {cadence}"
 
 
+DISCOVERY_CITY_COORDS = {
+    "toronto": (43.6532, -79.3832),
+    "mississauga": (43.589, -79.6441),
+    "brampton": (43.7315, -79.7624),
+    "markham": (43.8561, -79.337),
+    "scarborough": (43.7764, -79.2318),
+    "north york": (43.7615, -79.4111),
+    "gta": (43.6532, -79.3832),
+    "hamilton": (43.2557, -79.8711),
+    "oakville": (43.4675, -79.6877),
+    "burlington": (43.3255, -79.799),
+    "waterloo": (43.4643, -80.5204),
+    "kitchener": (43.4516, -80.4925),
+    "london": (42.9849, -81.2453),
+    "ottawa": (45.4215, -75.6972),
+    "montreal": (45.5017, -73.5673),
+    "quebec city": (46.8139, -71.208),
+    "winnipeg": (49.8951, -97.1384),
+    "calgary": (51.0447, -114.0719),
+    "edmonton": (53.5461, -113.4938),
+    "vancouver": (49.2827, -123.1207),
+    "victoria": (48.4284, -123.3656),
+    "halifax": (44.6488, -63.5752),
+    "remote": (0.0, 0.0),
+}
+
+
+def discovery_search_signature(payload: dict[str, Any]) -> str:
+    relevant = {
+        "keywords": text(payload.get("keywords")),
+        "location": text(payload.get("location")),
+        "distance": clamp_int_default(payload.get("distance"), 50, 0, 500),
+        "remote_preference": normalize_choice(payload.get("remote_preference"), DISCOVERY_REMOTE_DISTANCE_RULES | {"remote", "hybrid", "on-site"}),
+        "job_type": normalize_choice(payload.get("job_type"), {"fulltime", "parttime", "contract", "internship"}),
+        "results_wanted": clamp_int_default(payload.get("results_wanted"), 10, 1, 25),
+        "hours_old": clamp_int_default(payload.get("hours_old"), 168, 1, 24 * 30),
+        "enabled_sources": normalize_discovery_sources(payload.get("enabled_sources")),
+        "country_indeed": text(payload.get("country_indeed")),
+    }
+    return grounding_hash(json.dumps(relevant, sort_keys=True))
+
+
+def load_discovery_preferences(search_key: str) -> dict[str, Any]:
+    if not search_key:
+        return {}
+    row = query_db("SELECT preferences_json FROM discovery_preferences WHERE search_key = ?", [search_key], one=True)
+    if row is None:
+        return {}
+    return parse_json_object(text(row["preferences_json"]))
+
+
+def save_discovery_preferences(search_key: str, preferences: dict[str, Any]) -> None:
+    if not search_key:
+        return
+    get_db().execute(
+        """
+        INSERT INTO discovery_preferences (search_key, preferences_json, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(search_key) DO UPDATE SET preferences_json = excluded.preferences_json, updated_at = CURRENT_TIMESTAMP
+        """,
+        [search_key, json.dumps(preferences, sort_keys=True)],
+    )
+    get_db().commit()
+
+
+def discovery_city_coordinates(location: str) -> tuple[float, float] | None:
+    lowered = normalize_space(location).lower()
+    if not lowered:
+        return None
+    for key, coords in DISCOVERY_CITY_COORDS.items():
+        if key != "remote" and key in lowered:
+            return coords
+    return None
+
+
+def haversine_distance_km(origin: tuple[float, float], destination: tuple[float, float]) -> int:
+    from math import asin, cos, radians, sin, sqrt
+
+    lat1, lon1 = origin
+    lat2, lon2 = destination
+    if (lat1, lon1) == (0.0, 0.0) or (lat2, lon2) == (0.0, 0.0):
+        return 0
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+    return int(round(6371 * 2 * asin(min(1, sqrt(a)))))
+
+
+def approximate_distance_from_home(job_location: str, home_location: str, remote_type: str = "", remote_rule: str = "remote_after_local") -> dict[str, Any]:
+    job_loc = normalize_space(job_location)
+    home_loc = normalize_space(home_location)
+    remote = normalize_space(remote_type).lower()
+    if "remote" in remote or "remote" in job_loc.lower():
+        if remote_rule == "remote_zero":
+            return {"distance_km": 0, "confidence": 95, "distance_label": "remote"}
+        if remote_rule == "remote_first":
+            return {"distance_km": -1, "confidence": 95, "distance_label": "remote"}
+        return {"distance_km": 9999, "confidence": 95, "distance_label": "remote"}
+    if not job_loc or not home_loc:
+        return {"distance_km": 9999, "confidence": 0, "distance_label": "unknown"}
+    if job_loc.lower() == home_loc.lower():
+        return {"distance_km": 0, "confidence": 100, "distance_label": "local"}
+    job_coords = discovery_city_coordinates(job_loc)
+    home_coords = discovery_city_coordinates(home_loc)
+    if job_coords and home_coords:
+        return {"distance_km": haversine_distance_km(home_coords, job_coords), "confidence": 88, "distance_label": "approximate"}
+    home_tokens = set(re.findall(r"[a-z0-9]+", home_loc.lower()))
+    job_tokens = set(re.findall(r"[a-z0-9]+", job_loc.lower()))
+    overlap = len(home_tokens & job_tokens)
+    if overlap:
+        return {"distance_km": 0, "confidence": 70, "distance_label": "approximate"}
+    return {"distance_km": 9999, "confidence": 25, "distance_label": "unknown"}
+
+
+def normalize_salary_snapshot(job: dict[str, Any]) -> dict[str, Any]:
+    salary_min = clamp_int(job.get("salary_min"), 0, 1_000_000)
+    salary_max = clamp_int(job.get("salary_max"), 0, 1_000_000)
+    salary_midpoint = clamp_int(job.get("salary_midpoint"), 0, 1_000_000)
+    if not salary_midpoint and (salary_min or salary_max):
+        salary_midpoint = int(round((salary_min + salary_max) / 2))
+    return {
+        "salary_original_text": text(job.get("salary_original_text") or job.get("salary") or job.get("salary_text")),
+        "salary_min": salary_min,
+        "salary_max": salary_max,
+        "salary_midpoint": salary_midpoint,
+        "salary_interval": text(job.get("salary_interval")),
+        "salary_currency": text(job.get("salary_currency")) or "CAD",
+        "salary_source": text(job.get("salary_source")) or "missing",
+        "salary_confidence": clamp_int(job.get("salary_confidence"), 0, 100),
+        "salary_listed": bool(text(job.get("salary_source")) and text(job.get("salary_source")) != "estimated" and text(job.get("salary_source")) != "missing"),
+    }
+
+
+def discovery_salary_score(job: dict[str, Any], profile: dict[str, str]) -> int:
+    salary_min = clamp_int(job.get("salary_min"), 0, 1_000_000)
+    salary_max = clamp_int(job.get("salary_max"), 0, 1_000_000)
+    source = text(job.get("salary_source"))
+    confidence = clamp_int(job.get("salary_confidence"), 0, 100)
+    if not salary_max:
+        return 45 if text(job.get("salary")) else 38
+    target = desired_min_salary(profile)
+    midpoint = clamp_int(job.get("salary_midpoint"), 0, 1_000_000) or int(round((salary_min + salary_max) / 2))
+    score = 50
+    if midpoint >= target:
+        score += 22
+    if salary_min >= target:
+        score += 10
+    if salary_max >= target + 15000:
+        score += 8
+    if source == "estimated":
+        score -= 10
+    if confidence < 60:
+        score -= 6
+    return clamp_int(score, 0, 100)
+
+
+def discovery_recency_score(job: dict[str, Any]) -> int:
+    posted = text(job.get("posted_date"))
+    if not posted:
+        return 42
+    try:
+        days = max(0, (date.today() - parse_date(posted)).days)
+    except Exception:
+        return 42
+    if days <= 1:
+        return 100
+    if days <= 3:
+        return 92
+    if days <= 7:
+        return 84
+    if days <= 14:
+        return 72
+    if days <= 30:
+        return 58
+    return 35
+
+
+def discovery_source_quality_score(job: dict[str, Any]) -> int:
+    source = text(job.get("source")).lower()
+    score = {
+        "linkedin": 90,
+        "indeed": 82,
+        "google": 76,
+        "zip_recruiter": 74,
+    }.get(source, 65)
+    if text(job.get("job_description")):
+        score += 6
+    if text(job.get("application_url")) and text(job.get("application_url")) != text(job.get("url")):
+        score += 4
+    if text(job.get("posted_date")):
+        score += 2
+    return clamp_int(score, 0, 100)
+
+
+def discovery_completion_score(job: dict[str, Any]) -> tuple[int, list[str]]:
+    missing = []
+    score = 100
+    if not text(job.get("location")):
+        score -= 12
+        missing.append("location")
+    if not text(job.get("salary")):
+        score -= 8
+        missing.append("salary")
+    if not text(job.get("posted_date")):
+        score -= 8
+        missing.append("posted date")
+    if not text(job.get("job_description")):
+        score -= 6
+        missing.append("description")
+    return clamp_int(score, 0, 100), missing
+
+
+def discovery_distance_score(distance_km: int, remote_type: str, remote_rule: str = "remote_after_local") -> int:
+    remote = normalize_space(remote_type).lower()
+    if "remote" in remote:
+        return 100 if remote_rule == "remote_zero" else (92 if remote_rule == "remote_first" else 72)
+    if distance_km <= 5:
+        return 100
+    if distance_km <= 25:
+        return 90
+    if distance_km <= 50:
+        return 82
+    if distance_km <= 100:
+        return 72
+    if distance_km <= 250:
+        return 58
+    if distance_km >= 9999:
+        return 24
+    return 48
+
+
+def discovery_work_arrangement_label(remote_type: str) -> str:
+    lowered = normalize_space(remote_type).lower()
+    if "remote" in lowered:
+        return "Remote"
+    if "hybrid" in lowered:
+        return "Hybrid"
+    if "on-site" in lowered or "onsite" in lowered:
+        return "On-site"
+    return "Unknown"
+
+
+def discovery_score_breakdown(job: dict[str, Any], profile: dict[str, str], settings: dict[str, Any] | None = None) -> dict[str, Any]:
+    settings = settings or {}
+    weights = {**DISCOVERY_SCORE_WEIGHTS, **parse_json_object(settings.get("weights"))}
+    semantic = analyze_resume_match(job, profile, cache_dir=semantic_cache_dir(), use_semantic=False)
+    skill_match = clamp_int(max(
+        semantic.get("scores", {}).get("required_skills", 0),
+        semantic.get("scores", {}).get("preferred_skills", 0),
+        len(keyword_hits(" ".join([text(job.get("title")), text(job.get("job_description")), text(job.get("required_skills")), text(job.get("preferred_skills"))]).lower(), REWARD_KEYWORDS)) * 7,
+    ), 0, 100)
+    role_fit = clamp_int(max(semantic.get("scores", {}).get("role_title", 0), 40 + len(keyword_hits(text(job.get("title")), ROLE_KEYWORDS)) * 8), 0, 100)
+    seniority_fit = clamp_int(score_seniority_fit(profile, analyze_job_seniority(job)).get("score", 0), 0, 100)
+    salary_snapshot = normalize_salary_snapshot(job)
+    salary_score = discovery_salary_score({**job, **salary_snapshot}, profile)
+    home_location = text(profile.get("location")) or text(profile.get("preferred_locations")) or ""
+    distance_rule = normalize_choice(settings.get("remote_rule") or settings.get("remote_distance_rule"), DISCOVERY_REMOTE_DISTANCE_RULES) or "remote_after_local"
+    distance_snapshot = approximate_distance_from_home(text(job.get("location")), home_location, text(job.get("remote_type")), distance_rule)
+    distance_score = discovery_distance_score(distance_snapshot["distance_km"], text(job.get("remote_type")), distance_rule)
+    recency_score = discovery_recency_score(job)
+    source_score = discovery_source_quality_score(job)
+    data_quality_score, missing_fields = discovery_completion_score(job)
+    penalty_terms = keyword_hits(" ".join([text(job.get("title")), text(job.get("job_description")), text(job.get("responsibilities"))]).lower(), PENALTY_KEYWORDS)
+    excluded_penalty = len(penalty_terms) * 6
+    missing_penalty = len(missing_fields) * 4
+    total = round(
+        skill_match * (weights["skill_match"] / 100)
+        + role_fit * (weights["role_fit"] / 100)
+        + seniority_fit * (weights["seniority_fit"] / 100)
+        + salary_score * (weights["salary"] / 100)
+        + max(distance_score, 0) * (weights["distance_work_arrangement"] / 100)
+        + recency_score * (weights["recency"] / 100)
+        + source_score * (weights["source_quality"] / 100)
+        - excluded_penalty
+        - missing_penalty
+    )
+    components = [
+        {"label": "Skill match", "score": round(skill_match * weights["skill_match"] / 100), "max": weights["skill_match"]},
+        {"label": "Role fit", "score": round(role_fit * weights["role_fit"] / 100), "max": weights["role_fit"]},
+        {"label": "Seniority fit", "score": round(seniority_fit * weights["seniority_fit"] / 100), "max": weights["seniority_fit"]},
+        {"label": "Salary", "score": round(salary_score * weights["salary"] / 100), "max": weights["salary"]},
+        {"label": "Distance/work arrangement", "score": round(distance_score * weights["distance_work_arrangement"] / 100), "max": weights["distance_work_arrangement"]},
+        {"label": "Recency", "score": round(recency_score * weights["recency"] / 100), "max": weights["recency"]},
+        {"label": "Data quality", "score": round(source_score * weights["source_quality"] / 100), "max": weights["source_quality"]},
+    ]
+    penalties = []
+    if missing_fields:
+        penalties.append({"label": "Missing data", "items": missing_fields, "points": missing_penalty})
+    if penalty_terms:
+        penalties.append({"label": "Excluded keywords", "items": penalty_terms, "points": excluded_penalty})
+    if distance_snapshot["distance_km"] >= 9999 and not "remote" in text(job.get("remote_type")).lower():
+        penalties.append({"label": "Unknown location", "items": ["location unknown"], "points": 4})
+    return {
+        "overall_score": clamp_int(total, 0, 100),
+        "components": components,
+        "penalties": penalties,
+        "weights": weights,
+        "salary": salary_snapshot,
+        "distance": distance_snapshot,
+        "recency": {"posted_date": text(job.get("posted_date")), "score": recency_score},
+        "source_quality": source_score,
+        "data_quality": data_quality_score,
+        "skill_match": skill_match,
+        "role_fit": role_fit,
+        "seniority_fit": seniority_fit,
+        "salary_score": salary_score,
+        "distance_score": distance_score,
+        "recency_score": recency_score,
+        "source_score": source_score,
+        "missing_fields": missing_fields,
+        "excluded_keywords": penalty_terms,
+        "remote_rule": distance_rule,
+        "semantic_model": semantic.get("model", "keyword-fallback"),
+        "semantic_model_available": semantic.get("model_available", False),
+        "semantic_scores": semantic.get("scores", {}),
+    }
+
+
+def enrich_discovery_job(job: dict[str, Any], profile: dict[str, str], settings: dict[str, Any] | None = None) -> dict[str, Any]:
+    salary_snapshot = normalize_salary_snapshot(job)
+    scoring = discovery_score_breakdown({**job, **salary_snapshot}, profile, settings)
+    remote_label = discovery_work_arrangement_label(text(job.get("remote_type")))
+    enriched = {
+        **job,
+        **salary_snapshot,
+        "distance_km": scoring["distance"]["distance_km"],
+        "distance_confidence": scoring["distance"]["confidence"],
+        "distance_label": scoring["distance"]["distance_label"],
+        "overall_score": scoring["overall_score"],
+        "match_score": scoring["skill_match"],
+        "score_breakdown": {
+            "overall_score": scoring["overall_score"],
+            "weights": scoring["weights"],
+            "components": scoring["components"],
+            "penalties": scoring["penalties"],
+            "salary": scoring["salary"],
+            "distance": scoring["distance"],
+            "recency": scoring["recency"],
+            "source_quality": scoring["source_quality"],
+            "data_quality": scoring["data_quality"],
+            "skill_match": scoring["skill_match"],
+            "role_fit": scoring["role_fit"],
+            "seniority_fit": scoring["seniority_fit"],
+            "salary_score": scoring["salary_score"],
+            "distance_score": scoring["distance_score"],
+            "recency_score": scoring["recency_score"],
+            "source_score": scoring["source_score"],
+            "missing_fields": scoring["missing_fields"],
+            "excluded_keywords": scoring["excluded_keywords"],
+            "remote_rule": scoring["remote_rule"],
+            "semantic_model": scoring["semantic_model"],
+            "semantic_model_available": scoring["semantic_model_available"],
+            "semantic_scores": scoring["semantic_scores"],
+        },
+        "work_arrangement": remote_label,
+        "posted_date_sort": text(job.get("posted_date")) or "9999-12-31",
+        "distance_sort": scoring["distance"]["distance_km"],
+    }
+    if "salary_listed" not in enriched:
+        enriched["salary_listed"] = int(salary_snapshot["salary_listed"])
+    return enriched
+
+
+def discovery_sort_value(job: dict[str, Any], field: str, direction: str = "desc", remote_rule: str = "remote_after_local", unknown_salary_position: str = "last") -> tuple[Any, ...]:
+    field = normalize_space(field or "overall_score")
+    direction = "asc" if str(direction).lower() == "asc" else "desc"
+    salary_known = 1 if int(job.get("salary_listed") or 0) else 0
+    salary_value = clamp_int(job.get("salary_midpoint") or job.get("salary_max") or job.get("salary_min"), 0, 1_000_000)
+    distance_value = clamp_int(job.get("distance_km"), 0, 9999)
+    remote_label = discovery_work_arrangement_label(text(job.get("remote_type")))
+    if field == "salary":
+        missing_marker = 1 if not salary_known else 0
+        if direction == "desc":
+            return (missing_marker, -salary_value, normalize_space(text(job.get("company"))).lower(), normalize_space(text(job.get("title"))).lower())
+        if missing_marker:
+            return ((-1 if unknown_salary_position == "first" else 1), 0, normalize_space(text(job.get("company"))).lower(), normalize_space(text(job.get("title"))).lower())
+        return (0, salary_value, normalize_space(text(job.get("company"))).lower(), normalize_space(text(job.get("title"))).lower())
+    if field == "distance":
+        if remote_label == "Remote":
+            if remote_rule == "remote_first":
+                distance_value = -1
+            elif remote_rule == "remote_zero":
+                distance_value = 0
+            else:
+                distance_value = 9999
+        unknown_location = 1 if distance_value >= 9999 and remote_label != "Remote" else 0
+        location_conf = clamp_int(job.get("distance_confidence"), 0, 100)
+        return (
+            unknown_location,
+            distance_value if direction == "asc" else -distance_value,
+            -location_conf,
+            normalize_space(text(job.get("company"))).lower(),
+            normalize_space(text(job.get("title"))).lower(),
+        )
+    if field == "posted_date":
+        posted = text(job.get("posted_date")) or "9999-12-31"
+        return (posted if direction == "asc" else "".join(chr(255 - ord(ch)) for ch in posted), normalize_space(text(job.get("company"))).lower(), normalize_space(text(job.get("title"))).lower())
+    if field == "company":
+        return (normalize_space(text(job.get("company"))).lower(), normalize_space(text(job.get("title"))).lower())
+    if field == "title":
+        return (normalize_space(text(job.get("title"))).lower(), normalize_space(text(job.get("company"))).lower())
+    if field == "source":
+        return (normalize_space(text(job.get("source"))).lower(), normalize_space(text(job.get("company"))).lower())
+    if field == "work_arrangement":
+        order = {"Remote": 0, "Hybrid": 1, "On-site": 2, "Unknown": 3}
+        return (order.get(remote_label, 3), normalize_space(text(job.get("company"))).lower())
+    if field == "seniority":
+        return (normalize_space(text(job.get("seniority_level"))).lower(), normalize_space(text(job.get("company"))).lower())
+    if field in {"match_score", "overall_score", "score"}:
+        score_value = clamp_int(job.get("match_score") if field == "match_score" else job.get("overall_score"), 0, 100)
+        return ((-score_value if direction == "desc" else score_value), normalize_space(text(job.get("company"))).lower(), normalize_space(text(job.get("title"))).lower())
+    if field == "deadline":
+        deadline = text(job.get("deadline")) or "9999-12-31"
+        return (deadline if direction == "asc" else "".join(chr(255 - ord(ch)) for ch in deadline), normalize_space(text(job.get("company"))).lower())
+    return ((-clamp_int(job.get("overall_score"), 0, 100) if direction == "desc" else clamp_int(job.get("overall_score"), 0, 100)), normalize_space(text(job.get("company"))).lower(), normalize_space(text(job.get("title"))).lower())
+
+
+def sort_discovery_jobs(
+    jobs: list[dict[str, Any]],
+    sort_field: str,
+    sort_direction: str = "desc",
+    secondary_field: str = "",
+    secondary_direction: str = "asc",
+    remote_rule: str = "remote_after_local",
+    unknown_salary_position: str = "last",
+) -> list[dict[str, Any]]:
+    primary = normalize_space(sort_field or "overall_score")
+    secondary = normalize_space(secondary_field)
+    primary_direction = "asc" if str(sort_direction).lower() == "asc" else "desc"
+    secondary_direction = "asc" if str(secondary_direction).lower() == "asc" else "desc"
+    ordered = list(jobs)
+    if secondary:
+        ordered.sort(key=lambda job: discovery_sort_value(job, secondary, secondary_direction, remote_rule, unknown_salary_position))
+    ordered.sort(key=lambda job: discovery_sort_value(job, primary, primary_direction, remote_rule, unknown_salary_position))
+    return ordered
+
+
+def discovery_preferences_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    def as_bool(value: Any) -> bool:
+        return text(value).lower() in {"1", "true", "yes", "on", "allowed"}
+
+    sort_payload = parse_json_object(payload.get("sort")) if isinstance(payload.get("sort"), dict) else parse_json_object(payload.get("sort"))
+    secondary_payload = parse_json_object(payload.get("secondary_sort")) if isinstance(payload.get("secondary_sort"), dict) else parse_json_object(payload.get("secondary_sort"))
+    filters_payload = parse_json_object(payload.get("filters")) if isinstance(payload.get("filters"), dict) else parse_json_object(payload.get("filters"))
+    weights_payload = parse_json_object(payload.get("weights")) if isinstance(payload.get("weights"), dict) else parse_json_object(payload.get("weights"))
+    preferences = {
+        "sort": {
+            "field": normalize_space(text(sort_payload.get("field") or payload.get("sort_field") or payload.get("primary_sort_field") or "overall_score")),
+            "direction": "asc" if text(sort_payload.get("direction") or payload.get("sort_direction") or payload.get("primary_sort_direction")).lower() == "asc" else "desc",
+            "secondary_field": normalize_space(text(secondary_payload.get("field") or payload.get("secondary_sort_field") or "")),
+            "secondary_direction": "asc" if text(secondary_payload.get("direction") or payload.get("secondary_sort_direction") or "asc").lower() == "asc" else "desc",
+            "unknown_salary_position": normalize_choice(
+                sort_payload.get("unknown_salary_position") or payload.get("unknown_salary_position"),
+                {"first", "last"},
+            )
+            or "last",
+            "remote_rule": normalize_choice(
+                sort_payload.get("remote_rule") or payload.get("remote_rule") or payload.get("remote_distance_rule"),
+                DISCOVERY_REMOTE_DISTANCE_RULES,
+            )
+            or "remote_after_local",
+        },
+        "filters": {
+            "salary_min": clamp_int_default(filters_payload.get("salary_min") or payload.get("salary_min"), 0, 0, 1_000_000),
+            "max_distance": clamp_int_default(filters_payload.get("max_distance") or payload.get("max_distance"), 0, 0, 10_000),
+            "overall_score_min": clamp_int_default(filters_payload.get("overall_score_min") or payload.get("overall_score_min"), 0, 0, 100),
+            "posted_within": clamp_int_default(filters_payload.get("posted_within") or payload.get("posted_within"), 0, 0, 3650),
+            "remote_type": normalize_space(text(filters_payload.get("remote_type") or payload.get("remote_type") or "")),
+            "source": normalize_space(text(filters_payload.get("source") or payload.get("source") or "")),
+            "job_field": normalize_space(text(filters_payload.get("job_field") or payload.get("job_field") or "")),
+            "seniority": normalize_space(text(filters_payload.get("seniority") or payload.get("seniority") or "")),
+            "known_salary_only": as_bool(filters_payload.get("known_salary_only") if "known_salary_only" in filters_payload else payload.get("known_salary_only")),
+            "known_location_only": as_bool(filters_payload.get("known_location_only") if "known_location_only" in filters_payload else payload.get("known_location_only")),
+            "exact_date_only": as_bool(filters_payload.get("exact_date_only") if "exact_date_only" in filters_payload else payload.get("exact_date_only")),
+            "company": normalize_space(text(filters_payload.get("company") or payload.get("company") or "")),
+            "title_keywords": normalize_space(text(filters_payload.get("title_keywords") or payload.get("title_keywords") or "")),
+        },
+        "weights": {
+            key: clamp_int_default(weights_payload.get(key) or payload.get(key), default, 0, 100)
+            for key, default in DISCOVERY_SCORE_WEIGHTS.items()
+        },
+    }
+    return preferences
+
+
+def apply_discovery_filters(job: dict[str, Any], filters: dict[str, Any]) -> bool:
+    filters = filters or {}
+    if clamp_int_default(filters.get("salary_min"), 0, 0, 1_000_000) and clamp_int(job.get("salary_max"), 0, 1_000_000) < clamp_int_default(filters.get("salary_min"), 0, 0, 1_000_000):
+        return False
+    if clamp_int_default(filters.get("max_distance"), 0, 0, 10_000) and clamp_int(job.get("distance_km"), 0, 9999) > clamp_int_default(filters.get("max_distance"), 0, 0, 10_000):
+        return False
+    if clamp_int_default(filters.get("overall_score_min"), 0, 0, 100) and clamp_int(job.get("overall_score"), 0, 100) < clamp_int_default(filters.get("overall_score_min"), 0, 0, 100):
+        return False
+    if text(filters.get("posted_within")):
+        posted = text(job.get("posted_date"))
+        if not posted:
+            return False
+        try:
+            days = (date.today() - parse_date(posted)).days
+        except Exception:
+            days = 9999
+        if days > clamp_int_default(filters.get("posted_within"), 9999, 0, 3650):
+            return False
+    remote_filter = normalize_space(text(filters.get("remote_type") or filters.get("remote") or filters.get("work_arrangement"))).lower()
+    if remote_filter and remote_filter != "any":
+        job_remote = text(job.get("remote_type")).lower()
+        job_arrangement = text(job.get("work_arrangement")).lower()
+        if remote_filter not in job_remote and remote_filter not in job_arrangement:
+            return False
+    source = normalize_space(text(filters.get("source")))
+    if source and source.lower() != "any" and source.lower() != text(job.get("source")).lower():
+        return False
+    job_field = normalize_space(text(filters.get("job_field"))).lower()
+    if job_field and job_field != "any":
+        content = " ".join([text(job.get("title")), text(job.get("job_description")), text(job.get("required_skills")), text(job.get("preferred_skills"))]).lower()
+        if job_field not in content:
+            return False
+    seniority = normalize_space(text(filters.get("seniority"))).lower()
+    if seniority and seniority != "any" and seniority not in text(job.get("seniority_level")).lower():
+        return False
+    if filters.get("known_salary_only") and not int(job.get("salary_listed") or 0):
+        return False
+    if filters.get("known_location_only") and not text(job.get("location")):
+        return False
+    if filters.get("exact_date_only") and not text(job.get("posted_date")):
+        return False
+    company = normalize_space(text(filters.get("company"))).lower()
+    if company and company not in text(job.get("company")).lower():
+        return False
+    title_keywords = normalize_space(text(filters.get("title_keywords"))).lower()
+    if title_keywords and title_keywords not in text(job.get("title")).lower():
+        return False
+    return True
+
+
 def get_db() -> sqlite3.Connection:
     if "db" not in g:
         DATA_DIR.mkdir(exist_ok=True)
@@ -3259,6 +3881,21 @@ def init_db() -> None:
             "profile_hash": "TEXT NOT NULL DEFAULT ''",
             "job_hash": "TEXT NOT NULL DEFAULT ''",
             "status": "TEXT NOT NULL DEFAULT 'current'",
+        },
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS discovery_preferences (
+            search_key TEXT PRIMARY KEY,
+            preferences_json TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    ensure_columns(
+        "discovery_preferences",
+        {
+            "preferences_json": "TEXT NOT NULL DEFAULT '{}'",
         },
     )
     db.commit()
@@ -3613,6 +4250,9 @@ def normalize_job_payload(payload: dict[str, Any]) -> dict[str, Any]:
     for field in ["salary_min", "salary_max", "salary_interval", "salary_currency", "salary_source", "salary_confidence"]:
         clean[field] = salary[field]
     clean["salary"] = salary["salary_text"]
+    clean["salary_original_text"] = text(payload.get("salary_original_text") or payload.get("salary") or salary["salary_text"])
+    clean["salary_midpoint"] = int(round((clean["salary_min"] + clean["salary_max"]) / 2)) if clean["salary_min"] or clean["salary_max"] else 0
+    clean["salary_listed"] = 0 if clean["salary_source"] in {"estimated", "missing"} else 1
 
     scoring = score_job(
         {

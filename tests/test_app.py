@@ -317,7 +317,8 @@ class JobAssistantTest(unittest.TestCase):
         job = body["jobs"][0]
         self.assertEqual(job["company"], "Unknown company")
         self.assertGreaterEqual(job["fit_score"], 70)
-        self.assertIn("matched_keywords", job["score_breakdown"])
+        self.assertIn("components", job["score_breakdown"])
+        self.assertIn("overall_score", job["score_breakdown"])
         self.assertTrue(job["description_available"])
 
     def test_jobspy_discovery_keeps_source_errors_and_counts(self):
@@ -425,6 +426,195 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(saved.get_json()["title"], "Cloud Support Analyst")
         self.assertTrue(second["jobs"][0]["already_saved"])
         self.assertEqual(second["duplicates"], 1)
+
+    def test_discovery_salary_normalization_and_hourly_conversion(self):
+        salary = app_module.determine_salary(
+            {
+                "salary_text": "$30 an hour",
+                "job_description": "Hourly support work",
+            }
+        )
+        self.assertEqual(salary["salary_interval"], "hourly")
+        self.assertEqual(salary["salary_min"], 62400)
+        self.assertEqual(salary["salary_max"], 62400)
+
+    def test_discovery_salary_sorting_keeps_unknowns_after_known_when_requested(self):
+        jobs = [
+            {
+                "company": "KnownCo",
+                "title": "Role A",
+                "salary_min": 90000,
+                "salary_max": 100000,
+                "salary_midpoint": 95000,
+                "salary_listed": 1,
+                "distance_km": 10,
+                "distance_confidence": 80,
+                "overall_score": 82,
+            },
+            {
+                "company": "UnknownCo",
+                "title": "Role B",
+                "salary_min": 0,
+                "salary_max": 0,
+                "salary_midpoint": 0,
+                "salary_listed": 0,
+                "distance_km": 10,
+                "distance_confidence": 80,
+                "overall_score": 91,
+            },
+        ]
+        ordered = app_module.sort_discovery_jobs(jobs, "salary", "asc", unknown_salary_position="last")
+        self.assertEqual(ordered[0]["company"], "KnownCo")
+        self.assertEqual(ordered[1]["company"], "UnknownCo")
+        ordered_first = app_module.sort_discovery_jobs(jobs, "salary", "asc", unknown_salary_position="first")
+        self.assertEqual(ordered_first[0]["company"], "UnknownCo")
+
+    def test_discovery_distance_remote_and_unknown_location_ordering(self):
+        jobs = [
+            {
+                "company": "LocalCo",
+                "title": "Role A",
+                "distance_km": 5,
+                "distance_confidence": 90,
+                "remote_type": "",
+                "overall_score": 70,
+            },
+            {
+                "company": "RemoteCo",
+                "title": "Role B",
+                "distance_km": 9999,
+                "distance_confidence": 95,
+                "remote_type": "Remote",
+                "overall_score": 70,
+            },
+            {
+                "company": "UnknownCo",
+                "title": "Role C",
+                "distance_km": 9999,
+                "distance_confidence": 10,
+                "remote_type": "",
+                "overall_score": 70,
+            },
+        ]
+        remote_first = app_module.sort_discovery_jobs(jobs, "distance", "asc", remote_rule="remote_first")
+        self.assertEqual(remote_first[0]["company"], "RemoteCo")
+        remote_after_local = app_module.sort_discovery_jobs(jobs, "distance", "asc", remote_rule="remote_after_local")
+        self.assertEqual(remote_after_local[-1]["company"], "UnknownCo")
+
+    def test_discovery_newest_first_and_multi_key_sorting(self):
+        jobs = [
+            {"company": "B", "title": "Role", "posted_date": "2026-06-18", "overall_score": 80},
+            {"company": "A", "title": "Role", "posted_date": "2026-06-19", "overall_score": 80},
+            {"company": "C", "title": "Role", "posted_date": "2026-06-17", "overall_score": 90},
+        ]
+        ordered = app_module.sort_discovery_jobs(jobs, "posted_date", "desc", secondary_field="company", secondary_direction="asc")
+        self.assertEqual([job["company"] for job in ordered], ["A", "B", "C"])
+
+    def test_discovery_overall_score_and_explanation_totals(self):
+        profile = {
+            "location": "Toronto",
+            "preferred_locations": "Toronto",
+            "preferred_roles": "software developer",
+            "key_skills": "Python, Flask, React, SQL",
+            "resume_text": "Built Python Flask React SQL tools.",
+        }
+        job = {
+            "company": "GroundedCo",
+            "title": "Software Developer",
+            "location": "Toronto",
+            "remote_type": "Hybrid",
+            "salary_min": 90000,
+            "salary_max": 100000,
+            "salary_midpoint": 95000,
+            "salary_source": "structured",
+            "salary_confidence": 95,
+            "salary": "CAD $90,000-$100,000",
+            "salary_listed": 1,
+            "job_description": "Python Flask React SQL automation dashboards",
+            "required_skills": "Python, SQL",
+            "preferred_skills": "React",
+            "responsibilities": "Build and maintain internal tools.",
+            "posted_date": "2026-06-19",
+        }
+        breakdown = app_module.discovery_score_breakdown(job, profile)
+        self.assertGreaterEqual(breakdown["overall_score"], 0)
+        self.assertLessEqual(breakdown["overall_score"], 100)
+        component_total = sum(item["score"] for item in breakdown["components"])
+        penalty_total = sum(item["points"] for item in breakdown["penalties"])
+        self.assertEqual(component_total - penalty_total, breakdown["overall_score"])
+
+    def test_discovery_filters_before_sorting(self):
+        jobs = [
+            {"company": "SkipCo", "title": "Role A", "salary_max": 60000, "distance_km": 5, "overall_score": 90, "remote_type": "Remote", "posted_date": "2026-06-19"},
+            {"company": "KeepCo", "title": "Role B", "salary_max": 90000, "distance_km": 10, "overall_score": 85, "remote_type": "Hybrid", "posted_date": "2026-06-19"},
+            {"company": "LowerCo", "title": "Role C", "salary_max": 95000, "distance_km": 50, "overall_score": 60, "remote_type": "Hybrid", "posted_date": "2026-06-19"},
+        ]
+        filters = {"salary_min": 80000, "overall_score_min": 70, "remote_type": "Hybrid"}
+        filtered = [job for job in jobs if app_module.apply_discovery_filters(job, filters)]
+        ordered = app_module.sort_discovery_jobs(filtered, "salary", "desc")
+        self.assertEqual([job["company"] for job in ordered], ["KeepCo"])
+
+    def test_discovery_saved_search_sort_preferences_persist(self):
+        search = {
+            "keywords": "software developer",
+            "location": "Toronto",
+            "distance": 50,
+            "results_wanted": 10,
+            "hours_old": 168,
+            "enabled_sources": ["linkedin"],
+            "sort": {"field": "salary", "direction": "asc", "secondary_field": "posted_date", "secondary_direction": "desc", "unknown_salary_position": "last", "remote_rule": "remote_after_local"},
+            "filters": {"salary_min": 0, "max_distance": 0, "overall_score_min": 0, "posted_within": 0},
+        }
+        search_key = app_module.discovery_search_signature(search)
+        self.client.post(
+            "/api/discovery/preferences",
+            json={"search_key": search_key, "preferences": app_module.discovery_preferences_payload(search)},
+        )
+        response = self.client.get(f"/api/discovery/preferences?search_key={search_key}")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["preferences"]["sort"]["field"], "salary")
+
+        fake = {
+            "jobs": [
+                {
+                    "source_job_id": "1",
+                    "title": "Role A",
+                    "company": "A",
+                    "location": "Toronto",
+                    "source": "linkedin",
+                    "job_url": "https://example.com/a",
+                    "salary_text": "$120,000",
+                    "salary_min": 120000,
+                    "salary_max": 120000,
+                    "salary_interval": "yearly",
+                    "salary_currency": "CAD",
+                    "posted_date": "2026-06-18",
+                },
+                {
+                    "source_job_id": "2",
+                    "title": "Role B",
+                    "company": "B",
+                    "location": "Toronto",
+                    "source": "linkedin",
+                    "job_url": "https://example.com/b",
+                    "salary_text": "$80,000",
+                    "salary_min": 80000,
+                    "salary_max": 80000,
+                    "salary_interval": "yearly",
+                    "salary_currency": "CAD",
+                    "posted_date": "2026-06-19",
+                },
+            ],
+            "errors": {},
+            "source_counts": {"linkedin": 2},
+        }
+        with patch.object(app_module, "fetch_jobspy_jobs", return_value=fake):
+            result = self.client.post(
+                "/api/discovery/jobspy",
+                json={"keywords": "software developer", "location": "Toronto", "enabled_sources": ["linkedin"]},
+            ).get_json()
+        self.assertEqual(result["preferences"]["sort"]["field"], "salary")
+        self.assertEqual(result["jobs"][0]["company"], "B")
 
     def test_salary_extraction_from_structured_fields(self):
         salary = app_module.determine_salary(

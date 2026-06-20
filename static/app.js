@@ -5,6 +5,10 @@ const state = {
   generatedText: "",
   activeJobId: "",
   discoveryResults: [],
+  discoveryPreferences: {},
+  discoverySearchKey: "",
+  discoveryMeta: {},
+  discoveryView: "cards",
   shortlist: [],
 };
 
@@ -110,9 +114,36 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("extract-url").addEventListener("click", extractUrl);
   document.getElementById("resume-upload").addEventListener("change", uploadResume);
   document.getElementById("cover-letter-template-upload").addEventListener("change", uploadCoverLetterTemplate);
+  document.getElementById("discovery-view-cards").addEventListener("click", () => setDiscoveryView("cards"));
+  document.getElementById("discovery-view-table").addEventListener("click", () => setDiscoveryView("table"));
   ["search", "status-filter", "fit-filter", "role-filter", "remote-filter", "risk-filter", "sort-by"].forEach((id) => {
     document.getElementById(id).addEventListener("input", renderJobs);
     document.getElementById(id).addEventListener("change", renderJobs);
+  });
+  [
+    "discovery-sort-field",
+    "discovery-sort-direction",
+    "discovery-secondary-sort-field",
+    "discovery-secondary-sort-direction",
+    "discovery-unknown-salary-position",
+    "discovery-remote-rule",
+    "discovery-filter-salary-min",
+    "discovery-filter-max-distance",
+    "discovery-filter-overall-score-min",
+    "discovery-filter-posted-within",
+    "discovery-filter-remote",
+    "discovery-filter-source",
+    "discovery-filter-job-field",
+    "discovery-filter-seniority",
+    "discovery-filter-known-salary",
+    "discovery-filter-known-location",
+    "discovery-filter-exact-date",
+    "discovery-filter-company",
+    "discovery-filter-title-keywords",
+  ].forEach((id) => {
+    const element = document.getElementById(id);
+    element.addEventListener("input", handleDiscoveryControlsChanged);
+    element.addEventListener("change", handleDiscoveryControlsChanged);
   });
   loadAll();
 });
@@ -789,6 +820,81 @@ async function saveEditedVersion(kind, elementId) {
   }
 }
 
+function discoveryFieldDefaultDirection(field) {
+  return ["overall_score", "salary", "distance", "posted_date", "match_score", "deadline"].includes(field) ? "desc" : "asc";
+}
+
+function discoveryPreferencesFromControls() {
+  return {
+    sort: {
+      field: value("discovery-sort-field") || "overall_score",
+      direction: value("discovery-sort-direction") || "desc",
+      secondary_field: value("discovery-secondary-sort-field") || "",
+      secondary_direction: value("discovery-secondary-sort-direction") || "asc",
+      unknown_salary_position: value("discovery-unknown-salary-position") || "last",
+      remote_rule: value("discovery-remote-rule") || "remote_after_local",
+    },
+    filters: {
+      salary_min: value("discovery-filter-salary-min"),
+      max_distance: value("discovery-filter-max-distance"),
+      overall_score_min: value("discovery-filter-overall-score-min"),
+      posted_within: value("discovery-filter-posted-within"),
+      remote_type: value("discovery-filter-remote"),
+      source: value("discovery-filter-source"),
+      job_field: value("discovery-filter-job-field"),
+      seniority: value("discovery-filter-seniority"),
+      known_salary_only: checked("discovery-filter-known-salary"),
+      known_location_only: checked("discovery-filter-known-location"),
+      exact_date_only: checked("discovery-filter-exact-date"),
+      company: value("discovery-filter-company"),
+      title_keywords: value("discovery-filter-title-keywords"),
+    },
+  };
+}
+
+function applyDiscoveryPreferencesToControls(preferences = {}) {
+  const sort = preferences.sort || {};
+  const filters = preferences.filters || {};
+  setValue("discovery-sort-field", sort.field || "overall_score");
+  setValue("discovery-sort-direction", sort.direction || discoveryFieldDefaultDirection(sort.field || "overall_score"));
+  setValue("discovery-secondary-sort-field", sort.secondary_field || "");
+  setValue("discovery-secondary-sort-direction", sort.secondary_direction || "asc");
+  setValue("discovery-unknown-salary-position", sort.unknown_salary_position || "last");
+  setValue("discovery-remote-rule", sort.remote_rule || "remote_after_local");
+  setValue("discovery-filter-salary-min", filters.salary_min || "");
+  setValue("discovery-filter-max-distance", filters.max_distance || "");
+  setValue("discovery-filter-overall-score-min", filters.overall_score_min || "");
+  setValue("discovery-filter-posted-within", filters.posted_within || "");
+  setValue("discovery-filter-remote", filters.remote_type || "");
+  setValue("discovery-filter-source", filters.source || "");
+  setValue("discovery-filter-job-field", filters.job_field || "");
+  setValue("discovery-filter-seniority", filters.seniority || "");
+  setChecked("discovery-filter-known-salary", Boolean(filters.known_salary_only));
+  setChecked("discovery-filter-known-location", Boolean(filters.known_location_only));
+  setChecked("discovery-filter-exact-date", Boolean(filters.exact_date_only));
+  setValue("discovery-filter-company", filters.company || "");
+  setValue("discovery-filter-title-keywords", filters.title_keywords || "");
+}
+
+function persistDiscoveryPreferences() {
+  if (!state.discoverySearchKey) return Promise.resolve();
+  return api.send("/api/discovery/preferences", "POST", {
+    search_key: state.discoverySearchKey,
+    preferences: discoveryPreferencesFromControls(),
+  }).catch(() => null);
+}
+
+function handleDiscoveryControlsChanged() {
+  state.discoveryPreferences = discoveryPreferencesFromControls();
+  if (state.discoverySearchKey) persistDiscoveryPreferences();
+  renderDiscoveryResults(state.discoveryMeta || {});
+}
+
+function setDiscoveryView(view) {
+  state.discoveryView = view === "table" ? "table" : "cards";
+  renderDiscoveryResults(state.discoveryMeta || {});
+}
+
 async function searchDiscovery(event) {
   event.preventDefault();
   const button = document.getElementById("discovery-submit");
@@ -797,6 +903,7 @@ async function searchDiscovery(event) {
   button.disabled = true;
   status.textContent = `Searching ${sources.map(sourceLabel).join(", ")}...`;
   try {
+    state.discoveryPreferences = discoveryPreferencesFromControls();
     const result = await api.send("/api/discovery/jobspy", "POST", {
       keywords: value("discovery-keywords"),
       location: value("discovery-location"),
@@ -807,9 +914,20 @@ async function searchDiscovery(event) {
       hours_old: value("discovery-hours-old"),
       country_indeed: value("discovery-country-indeed"),
       enabled_sources: sources,
+      sort: state.discoveryPreferences.sort,
+      filters: state.discoveryPreferences.filters,
     });
     state.discoveryResults = result.jobs || [];
-    renderDiscoveryResults(result);
+    state.discoverySearchKey = result.search_key || "";
+    state.discoveryPreferences = result.preferences || state.discoveryPreferences;
+    applyDiscoveryPreferencesToControls(state.discoveryPreferences);
+    state.discoveryMeta = {
+      total: result.total || 0,
+      duplicates: result.duplicates || 0,
+      source_counts: result.source_counts || {},
+      errors: result.errors || {},
+    };
+    renderDiscoveryResults(state.discoveryMeta);
     status.textContent = result.total ? `Found ${result.total} live jobs.` : "No selected source returned jobs.";
   } catch (error) {
     toast(error.message);
@@ -835,20 +953,25 @@ function sourceLabel(source) {
 function renderDiscoveryResults(result) {
   const container = document.getElementById("discovery-results");
   container.classList.remove("empty");
-  const counts = result.source_counts || {};
-  const errors = result.errors || {};
+  const counts = result.source_counts || state.discoveryMeta.source_counts || {};
+  const errors = result.errors || state.discoveryMeta.errors || {};
   const countText = Object.keys(counts).map((source) => `${sourceLabel(source)}: ${counts[source]}`).join(" | ");
   const errorText = Object.keys(errors).length
     ? `<div class="discovery-errors">${Object.entries(errors).map(([source, message]) => `<p><strong>${escapeHtml(sourceLabel(source))}:</strong> ${escapeHtml(message)}</p>`).join("")}</div>`
     : "";
-  const jobs = state.discoveryResults.map((job, index) => ({ job, index })).filter((item) => !item.job.hidden);
+  const prefs = state.discoveryPreferences || discoveryPreferencesFromControls();
+  const jobs = applyDiscoveryClientFiltersAndSort(state.discoveryResults || [], prefs);
+  const visibleCount = jobs.length;
+  const totalCount = Number(result.total || state.discoveryResults.length || 0);
+  document.getElementById("discovery-active-state").textContent = describeDiscoveryState(prefs, visibleCount, totalCount);
+  const body = state.discoveryView === "table" ? renderDiscoveryTable(jobs) : renderDiscoveryCards(jobs);
   container.innerHTML = `
     <div class="discovery-summary">
-      <p><strong>${Number(result.total || 0)}</strong> results | <strong>${Number(result.duplicates || 0)}</strong> duplicates</p>
+      <p><strong>${totalCount}</strong> results | <strong>${Number(result.duplicates || state.discoveryMeta.duplicates || 0)}</strong> duplicates | <strong>${visibleCount}</strong> visible</p>
       <p class="muted">${escapeHtml(countText || "No source counts returned")}</p>
       ${errorText}
     </div>
-    ${jobs.length ? jobs.map((item) => renderDiscoveryCard(item.job, item.index)).join("") : "<p>No live jobs are available from the selected sources.</p>"}
+    ${body}
   `;
 }
 
@@ -883,6 +1006,300 @@ function renderDiscoveryCard(job, index) {
       </div>
     </section>
   `;
+}
+
+function renderDiscoveryCards(jobs) {
+  if (!jobs.length) return "<p>No live jobs are available from the selected sources.</p>";
+  return jobs.map((job, index) => renderDiscoveryCard(job, index)).join("");
+}
+
+function renderDiscoveryTable(jobs) {
+  if (!jobs.length) return "<p>No live jobs are available from the selected sources.</p>";
+  const headers = [
+    ["title", "Title"],
+    ["company", "Company"],
+    ["location", "Location"],
+    ["distance", "Distance"],
+    ["salary", "Salary"],
+    ["posted_date", "Posted date"],
+    ["work_arrangement", "Work arrangement"],
+    ["overall_score", "Overall score"],
+    ["source", "Source"],
+  ];
+  return `
+    <div class="table-wrap discovery-table-wrap">
+      <table>
+        <thead>
+          <tr>
+            ${headers
+              .map(([field, label]) => `<th><button class="table-sort" type="button" onclick="setDiscoverySort('${field}')">${escapeHtml(label)}</button></th>`)
+              .join("")}
+          </tr>
+        </thead>
+        <tbody>
+          ${jobs.map((job, index) => renderDiscoveryRow(job, index)).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderDiscoveryRow(job, index) {
+  const applicationUrl = job.application_url && job.application_url !== job.url ? job.application_url : "";
+  return `
+    <tr>
+      <td>
+        <strong>${escapeHtml(job.title || "Untitled role")}</strong>
+        ${renderDiscoveryWhy(job)}
+      </td>
+      <td>${escapeHtml(job.company || "Unknown company")}</td>
+      <td>${escapeHtml(job.location || "Location unavailable")}</td>
+      <td>${escapeHtml(distanceBadge(job))}</td>
+      <td>${escapeHtml(job.salary || "Salary unavailable")}</td>
+      <td>${escapeHtml(job.posted_date || "Unknown")}</td>
+      <td>${escapeHtml(job.work_arrangement || job.remote_type || "Unknown")}</td>
+      <td>${scorePill(job.overall_score || job.fit_score || 0)}</td>
+      <td>${escapeHtml(job.source || "JobSpy")}</td>
+    </tr>
+    <tr>
+      <td colspan="9">
+        <div class="row-actions">
+          <button class="button small" type="button" onclick="saveDiscoveryJob(${index})">Save to shortlist</button>
+          <button class="button small ghost" type="button" onclick="hideDiscoveryJob(${index})">Ignore</button>
+          ${job.url ? `<a class="button small ghost" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open job</a>` : ""}
+          ${applicationUrl ? `<a class="button small ghost" href="${escapeAttribute(applicationUrl)}" target="_blank" rel="noreferrer">Application</a>` : ""}
+        </div>
+      </td>
+    </tr>
+  `;
+}
+
+function renderDiscoveryCard(job, index) {
+  const applicationUrl = job.application_url && job.application_url !== job.url ? job.application_url : "";
+  const warnings = job.warnings?.length
+    ? `<div class="warning-list">${job.warnings.map((warning) => `<span>${escapeHtml(warning)}</span>`).join("")}</div>`
+    : "";
+  const savedStatus = String(job.saved_job_status || job.status || "").toLowerCase();
+  const alreadySaved = Boolean(job.already_saved || savedStatus);
+  const buttonLabel = alreadySaved && savedStatus !== "shortlisted" ? "Add to shortlist again" : alreadySaved ? "Shortlisted" : "Save to shortlist";
+  const buttonDisabled = alreadySaved && savedStatus === "shortlisted" ? "disabled" : "";
+  const saved = alreadySaved ? `<span class="risk low">${escapeHtml(job.saved_job_status || job.status || "Saved")}</span>` : "";
+  return `
+    <section class="discovery-card" data-index="${index}">
+      <div class="discovery-card-main">
+        <div>
+          <h3>${escapeHtml(job.title || "Untitled role")}</h3>
+          <p><strong>${escapeHtml(job.company || "Unknown company")}</strong> Â· ${escapeHtml(job.location || "Location unavailable")}</p>
+          <p class="muted">${escapeHtml(job.source || "JobSpy")} Â· ${escapeHtml(job.work_arrangement || job.remote_type || "Remote unspecified")} Â· ${escapeHtml(job.salary || "Salary unavailable")} Â· Posted ${escapeHtml(job.posted_date || "unknown")}</p>
+          <div class="badge-row">
+            ${badge("Distance", distanceBadge(job))}
+            ${badge("Salary", job.salary || "Unavailable")}
+            ${badge("Score", Number(job.overall_score || job.fit_score || 0))}
+            ${badge("Match", Number(job.match_score || 0))}
+            ${badge("Source", job.source || "JobSpy")}
+            ${badge("Posted", job.posted_date || "Unknown")}
+            ${badge("Work", job.work_arrangement || job.remote_type || "Unknown")}
+          </div>
+        </div>
+        <div>${scorePill(job.overall_score || job.fit_score || 0)}${saved}</div>
+      </div>
+      ${warnings}
+      <div class="mini-breakdown">${miniBreakdown(job)}</div>
+      ${renderDiscoveryWhy(job)}
+      <div class="row-actions">
+        <button class="button small" type="button" onclick="saveDiscoveryJob(${index})" ${buttonDisabled}>${buttonLabel}</button>
+        <button class="button small ghost" type="button" onclick="hideDiscoveryJob(${index})">Ignore</button>
+        ${job.url ? `<a class="button small ghost" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open job</a>` : ""}
+        ${applicationUrl ? `<a class="button small ghost" href="${escapeAttribute(applicationUrl)}" target="_blank" rel="noreferrer">Application</a>` : ""}
+      </div>
+    </section>
+  `;
+}
+
+function badge(label, value) {
+  const rendered = value === undefined || value === null ? "" : String(value);
+  return `<span class="badge"><strong>${escapeHtml(label)}:</strong> ${escapeHtml(rendered)}</span>`;
+}
+
+function distanceBadge(job) {
+  if (job.distance_label === "remote") return "Remote";
+  if (job.distance_km === undefined || job.distance_km === null) return "Unknown";
+  if (Number(job.distance_km) >= 9999) return "Unknown";
+  return `${Number(job.distance_km)} km`;
+}
+
+function describeDiscoveryState(preferences, visibleCount, totalCount) {
+  const sort = preferences.sort || {};
+  const filters = preferences.filters || {};
+  const parts = [`Sort: ${labelDiscoveryField(sort.field || "overall_score")} ${sort.direction === "asc" ? "ascending" : "descending"}`];
+  if (sort.secondary_field) {
+    parts.push(`Then ${labelDiscoveryField(sort.secondary_field)} ${sort.secondary_direction === "desc" ? "descending" : "ascending"}`);
+  }
+  const activeFilters = [];
+  if (filters.salary_min) activeFilters.push(`salary >= ${filters.salary_min}`);
+  if (filters.max_distance) activeFilters.push(`distance <= ${filters.max_distance} km`);
+  if (filters.overall_score_min) activeFilters.push(`score >= ${filters.overall_score_min}`);
+  if (filters.posted_within) activeFilters.push(`posted within ${filters.posted_within} days`);
+  if (filters.remote_type) activeFilters.push(filters.remote_type);
+  if (filters.source) activeFilters.push(filters.source);
+  if (filters.job_field) activeFilters.push(filters.job_field);
+  if (filters.seniority) activeFilters.push(filters.seniority);
+  if (filters.company) activeFilters.push(filters.company);
+  if (filters.title_keywords) activeFilters.push(filters.title_keywords);
+  if (filters.known_salary_only) activeFilters.push("known salary only");
+  if (filters.known_location_only) activeFilters.push("known location only");
+  if (filters.exact_date_only) activeFilters.push("exact date only");
+  parts.push(activeFilters.length ? `Filters: ${activeFilters.join("; ")}` : "Filters: none");
+  parts.push(`${visibleCount}/${totalCount} visible`);
+  return parts.join(" | ");
+}
+
+function labelDiscoveryField(field) {
+  return {
+    overall_score: "Overall score",
+    salary: "Salary",
+    distance: "Distance",
+    posted_date: "Posted date",
+    company: "Company",
+    title: "Job title",
+    source: "Source",
+    work_arrangement: "Work arrangement",
+    seniority: "Experience level",
+    match_score: "Match score",
+    deadline: "Deadline",
+  }[field] || field;
+}
+
+function discoveryFieldValue(job, field, preferences) {
+  const salaryKnown = Number(job.salary_listed || 0) > 0;
+  const salaryValue = Number(job.salary_midpoint || job.salary_max || job.salary_min || 0);
+  const distanceValue = Number(job.distance_km || 9999);
+  const distanceConfidence = Number(job.distance_confidence || 0);
+  const remoteRule = preferences?.sort?.remote_rule || "remote_after_local";
+  const unknownSalaryPosition = preferences?.sort?.unknown_salary_position || "last";
+  const remoteLabel = job.work_arrangement || job.remote_type || "";
+  switch (field) {
+    case "salary":
+      return salaryKnown ? [0, salaryValue] : [unknownSalaryPosition === "first" ? -1 : 1, 0];
+    case "distance":
+      if (String(remoteLabel).toLowerCase().includes("remote")) {
+        if (remoteRule === "remote_first") return [0, -1, -distanceConfidence];
+        if (remoteRule === "remote_zero") return [0, 0, -distanceConfidence];
+        return [1, 9999, -distanceConfidence];
+      }
+      return [distanceValue >= 9999 ? 1 : 0, distanceValue, -distanceConfidence];
+    case "posted_date":
+      return [job.posted_date || "9999-12-31"];
+    case "company":
+      return [String(job.company || "").toLowerCase()];
+    case "title":
+      return [String(job.title || "").toLowerCase()];
+    case "source":
+      return [String(job.source || "").toLowerCase()];
+    case "work_arrangement":
+      return [String(job.work_arrangement || job.remote_type || "Unknown").toLowerCase()];
+    case "seniority":
+      return [String(job.seniority_level || "").toLowerCase()];
+    case "match_score":
+      return [Number(job.match_score || job.overall_score || 0)];
+    case "deadline":
+      return [job.deadline || "9999-12-31"];
+    case "overall_score":
+    default:
+      return [Number(job.overall_score || job.fit_score || 0)];
+  }
+}
+
+function compareDiscoveryValues(aValue, bValue, direction) {
+  const asc = direction !== "desc";
+  const maxLength = Math.max(aValue.length, bValue.length);
+  for (let i = 0; i < maxLength; i += 1) {
+    const a = aValue[i];
+    const b = bValue[i];
+    if (a === b) continue;
+    if (a == null) return asc ? 1 : -1;
+    if (b == null) return asc ? -1 : 1;
+    if (typeof a === "number" && typeof b === "number") return asc ? a - b : b - a;
+    const comparison = String(a).localeCompare(String(b));
+    return asc ? comparison : -comparison;
+  }
+  return 0;
+}
+
+function compareDiscoveryJobs(a, b, preferences) {
+  const sort = preferences?.sort || {};
+  const primary = sort.field || "overall_score";
+  const secondary = sort.secondary_field || "";
+  const primaryDirection = sort.direction || "desc";
+  const secondaryDirection = sort.secondary_direction || "asc";
+  const primaryDiff = compareDiscoveryValues(discoveryFieldValue(a, primary, preferences), discoveryFieldValue(b, primary, preferences), primaryDirection);
+  if (primaryDiff !== 0) return primaryDiff;
+  if (secondary) {
+    const secondaryDiff = compareDiscoveryValues(discoveryFieldValue(a, secondary, preferences), discoveryFieldValue(b, secondary, preferences), secondaryDirection);
+    if (secondaryDiff !== 0) return secondaryDiff;
+  }
+  return String(a.company || "").localeCompare(String(b.company || "")) || String(a.title || "").localeCompare(String(b.title || ""));
+}
+
+function passesDiscoveryFilters(job, filters = {}) {
+  if (filters.salary_min && Number(job.salary_max || 0) < Number(filters.salary_min)) return false;
+  if (filters.max_distance && Number(job.distance_km || 9999) > Number(filters.max_distance)) return false;
+  if (filters.overall_score_min && Number(job.overall_score || 0) < Number(filters.overall_score_min)) return false;
+  if (filters.posted_within) {
+    const posted = job.posted_date ? new Date(job.posted_date) : null;
+    if (!posted || Number.isNaN(posted.getTime())) return false;
+    const days = Math.floor((Date.now() - posted.getTime()) / 86400000);
+    if (days > Number(filters.posted_within)) return false;
+  }
+  const remoteFilter = String(filters.remote_type || "").toLowerCase();
+  if (remoteFilter && remoteFilter !== "any") {
+    const arrangement = String(job.work_arrangement || job.remote_type || "").toLowerCase();
+    if (!arrangement.includes(remoteFilter.toLowerCase())) return false;
+  }
+  const source = String(filters.source || "").toLowerCase();
+  if (source && source !== "any" && !String(job.source || "").toLowerCase().includes(source)) return false;
+  const jobField = String(filters.job_field || "").toLowerCase();
+  if (jobField && !`${job.title || ""} ${job.job_description || ""} ${job.required_skills || ""} ${job.preferred_skills || ""}`.toLowerCase().includes(jobField)) return false;
+  const seniority = String(filters.seniority || "").toLowerCase();
+  if (seniority && seniority !== "any" && !String(job.seniority_level || "").toLowerCase().includes(seniority)) return false;
+  if (filters.known_salary_only && !Number(job.salary_listed || 0)) return false;
+  if (filters.known_location_only && !String(job.location || "").trim()) return false;
+  if (filters.exact_date_only && !String(job.posted_date || "").trim()) return false;
+  const company = String(filters.company || "").toLowerCase();
+  if (company && !String(job.company || "").toLowerCase().includes(company)) return false;
+  const titleKeywords = String(filters.title_keywords || "").toLowerCase();
+  if (titleKeywords && !String(job.title || "").toLowerCase().includes(titleKeywords)) return false;
+  return true;
+}
+
+function applyDiscoveryClientFiltersAndSort(jobs, preferences = {}) {
+  const filtered = (jobs || []).filter((job) => !job.hidden && passesDiscoveryFilters(job, preferences.filters || {}));
+  return filtered.sort((a, b) => compareDiscoveryJobs(a, b, preferences));
+}
+
+function renderDiscoveryWhy(job) {
+  const breakdown = job.score_breakdown || {};
+  const components = Array.isArray(breakdown.components) ? breakdown.components : [];
+  const penalties = Array.isArray(breakdown.penalties) ? breakdown.penalties : [];
+  const total = Number(breakdown.overall_score || job.overall_score || 0);
+  const lines = [
+    ...components.map((item) => `<li>${escapeHtml(item.label || "Component")}: ${Number(item.score || 0)}/${Number(item.max || 0)}</li>`),
+    ...penalties.map((item) => `<li class="risk medium">${escapeHtml(item.label || "Penalty")}: -${Number(item.points || 0)} (${escapeHtml((item.items || []).join(", ") || "")})</li>`),
+    `<li><strong>Total: ${total}/100</strong></li>`,
+  ];
+  return `
+    <details class="score-details">
+      <summary>Why this score?</summary>
+      <ul class="score-breakdown-list">${lines.join("")}</ul>
+    </details>
+  `;
+}
+
+function setDiscoverySort(field) {
+  const current = value("discovery-sort-field");
+  setValue("discovery-sort-field", field);
+  setValue("discovery-sort-direction", current === field ? (value("discovery-sort-direction") === "asc" ? "desc" : "asc") : discoveryFieldDefaultDirection(field));
+  handleDiscoveryControlsChanged();
 }
 
 async function saveDiscoveryJob(index) {
@@ -1168,6 +1585,17 @@ function setValue(id, nextValue) {
     return;
   }
   element.value = nextValue || "";
+}
+
+function checked(id) {
+  const element = document.getElementById(id);
+  return Boolean(element && element.checked);
+}
+
+function setChecked(id, nextValue) {
+  const element = document.getElementById(id);
+  if (!element) return;
+  element.checked = Boolean(nextValue);
 }
 
 function setText(id, nextValue) {
