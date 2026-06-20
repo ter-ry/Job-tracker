@@ -23,12 +23,13 @@
 
     <main class="layout">
       <section id="discovery" class="tab-panel active">
-        <section class="workspace narrow">
-          <form id="discovery-form" class="panel">
+        <section class="workspace discovery-layout">
+          <form id="discovery-form" class="panel discovery-search-panel">
             <div class="panel-header"><h2>Live job discovery</h2></div>
             <div class="grid two">
               <label>Keywords<input id="discovery-keywords" required placeholder="software developer"></label>
               <label>Location<input id="discovery-location" placeholder="Toronto, Ontario"></label>
+              <label>Distance<input id="discovery-distance" type="number" min="0" step="1" placeholder="50 km"></label>
               <label>Remote preference
                 <select id="discovery-remote-preference">
                   <option value="">Any</option>
@@ -37,6 +38,7 @@
                   <option value="on-site">On-site</option>
                 </select>
               </label>
+              <label>Fetch limit<input id="discovery-total-cap" type="number" min="1" step="1" value="200"></label>
             </div>
             <fieldset class="source-picker">
               <legend>Sources</legend>
@@ -45,8 +47,8 @@
               <label><input type="checkbox" name="discovery-source" value="google"> Google Jobs</label>
               <label><input type="checkbox" name="discovery-source" value="zip_recruiter"> ZipRecruiter</label>
             </fieldset>
-            <details class="settings-block" open>
-              <summary>Search jobs</summary>
+            <details class="settings-block">
+              <summary>Search options</summary>
               <div class="grid three">
                 <label>Search depth
                   <select id="discovery-search-depth">
@@ -66,11 +68,39 @@
                   </select>
                 </label>
                 <label>Per-source cap<input id="discovery-per-source-cap" type="number" min="1" step="1" value="100"></label>
-                <label>Total cap<input id="discovery-total-cap" type="number" min="1" step="1" value="200"></label>
               </div>
             </details>
-            <fieldset id="discovery-local-controls" class="settings-block" disabled>
-              <legend>Filter results</legend>
+            <div id="discovery-status" class="muted helper" aria-live="polite"></div>
+            <div class="actions">
+              <button class="button" type="submit" id="discovery-submit">Search jobs</button>
+            </div>
+          </form>
+
+          <section class="panel discovery-results-panel">
+            <div class="panel-header discovery-toolbar">
+              <div>
+                <h2>Discovery results</h2>
+                <p id="discovery-active-state" class="muted helper">Search results will appear here.</p>
+              </div>
+              <div class="actions compact discovery-toolbar-actions">
+                <label class="toolbar-select">
+                  <span>Sort</span>
+                  <select id="discovery-sort-mode">
+                    <option value="best_match" selected>Best match</option>
+                    <option value="overall_score">Overall score</option>
+                    <option value="salary_desc">Salary: high to low</option>
+                    <option value="salary_asc">Salary: low to high</option>
+                    <option value="distance">Distance: nearest first</option>
+                    <option value="posted_date">Date posted: newest first</option>
+                    <option value="company">Company: A-Z</option>
+                  </select>
+                </label>
+                <button class="button ghost small" type="button" id="discovery-filter-toggle" disabled>Filter</button>
+                <button class="button ghost small" type="button" id="discovery-view-table">Table</button>
+                <button class="button ghost small" type="button" id="discovery-view-cards">Cards</button>
+              </div>
+            </div>
+            <div id="discovery-filter-panel" class="discovery-filter-panel" hidden>
               <div class="grid three">
                 <label>Salary minimum<input id="discovery-filter-salary-min" type="number" min="0" step="1000" placeholder=""></label>
                 <label>Max distance<input id="discovery-filter-max-distance" type="number" min="0" step="1" placeholder=""></label>
@@ -104,96 +134,22 @@
                 <label class="checkline"><input id="discovery-filter-known-location" type="checkbox"> Known location only</label>
                 <label class="checkline"><input id="discovery-filter-exact-date" type="checkbox"> Exact date only</label>
               </div>
-            </fieldset>
-            <fieldset id="discovery-sort-controls" class="settings-block" disabled>
-              <legend>Sort results</legend>
-              <div class="grid three">
-                <label>Primary sort
-                  <select id="discovery-sort-field">
-                    <option value="overall_score">Overall score</option>
-                    <option value="salary">Salary</option>
-                    <option value="distance">Distance</option>
-                    <option value="posted_date">Posted date</option>
-                    <option value="company">Company</option>
-                    <option value="title">Job title</option>
-                    <option value="source">Source</option>
-                    <option value="work_arrangement">Work arrangement</option>
-                    <option value="seniority">Experience level</option>
-                    <option value="match_score">Match score</option>
-                    <option value="deadline">Deadline</option>
-                  </select>
-                </label>
-                <label>Direction
-                  <select id="discovery-sort-direction">
-                    <option value="desc">Descending</option>
-                    <option value="asc">Ascending</option>
-                  </select>
-                </label>
-                <label>Secondary sort
-                  <select id="discovery-secondary-sort-field">
-                    <option value="">None</option>
-                    <option value="overall_score">Overall score</option>
-                    <option value="salary">Salary</option>
-                    <option value="distance">Distance</option>
-                    <option value="posted_date">Posted date</option>
-                    <option value="company">Company</option>
-                    <option value="title">Job title</option>
-                    <option value="source">Source</option>
-                    <option value="work_arrangement">Work arrangement</option>
-                    <option value="seniority">Experience level</option>
-                    <option value="match_score">Match score</option>
-                    <option value="deadline">Deadline</option>
-                  </select>
-                </label>
-                <label>Secondary direction
-                  <select id="discovery-secondary-sort-direction">
-                    <option value="asc">Ascending</option>
-                    <option value="desc">Descending</option>
-                  </select>
-                </label>
-                <label>Unknown salary
-                  <select id="discovery-unknown-salary-position">
-                    <option value="last">After known salaries</option>
-                    <option value="first">Before known salaries</option>
-                  </select>
-                </label>
-                <label>Remote distance rule
-                  <select id="discovery-remote-rule">
-                    <option value="remote_after_local">Remote after local jobs</option>
-                    <option value="remote_first">Remote first</option>
-                    <option value="remote_zero">Remote as zero distance</option>
-                  </select>
-                </label>
+              <div class="actions">
+                <button class="button ghost small" type="button" id="discovery-clear-filters">Clear filters</button>
+                <button class="button ghost small" type="button" id="discovery-show-all">Show all fetched jobs</button>
               </div>
-            </details>
-            <div id="discovery-status" class="muted helper" aria-live="polite"></div>
-            <div class="actions">
-              <button class="button" type="submit" id="discovery-submit">Search live jobs</button>
-              <button class="button ghost" type="button" id="discovery-clear-filters">Clear result filters</button>
-              <button class="button ghost" type="button" id="discovery-reset-sorting">Reset sorting</button>
-              <button class="button ghost" type="button" id="discovery-show-all">Show all fetched jobs</button>
             </div>
-          </form>
+            <div id="discovery-results" class="generated-output empty">Search results will appear here.</div>
+          </section>
 
-          <form id="csv-import-form" class="panel">
-            <div class="panel-header"><h2>CSV import</h2></div>
+          <form id="csv-import-form" class="panel discovery-secondary-panel">
+            <div class="panel-header"><h2>Import jobs</h2></div>
             <label>Import job links from external searches<input id="csv-file" type="file" accept=".csv"></label>
             <div class="actions">
-              <button class="button" type="submit">Import CSV</button>
+              <button class="button ghost" type="submit">Import CSV</button>
             </div>
             <p class="muted helper">Accepted headers include company, title, location, url, source, salary, and description.</p>
           </form>
-        </section>
-        <section class="panel">
-          <div class="panel-header">
-            <h2>Discovery results</h2>
-            <div class="actions compact">
-              <button class="button ghost small" type="button" id="discovery-view-cards">Cards</button>
-              <button class="button ghost small" type="button" id="discovery-view-table">Table</button>
-            </div>
-          </div>
-          <p id="discovery-active-state" class="muted helper">Sort and filter state will appear here.</p>
-          <div id="discovery-results" class="generated-output empty">Search results will appear here.</div>
         </section>
       </section>
 

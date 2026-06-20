@@ -8,7 +8,7 @@ const state = {
   discoveryPreferences: {},
   discoverySearchKey: "",
   discoveryMeta: {},
-  discoveryView: "cards",
+  discoveryView: "table",
   shortlist: [],
 };
 
@@ -116,26 +116,21 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("cover-letter-template-upload").addEventListener("change", uploadCoverLetterTemplate);
   document.getElementById("discovery-view-cards").addEventListener("click", () => setDiscoveryView("cards"));
   document.getElementById("discovery-view-table").addEventListener("click", () => setDiscoveryView("table"));
+  document.getElementById("discovery-filter-toggle").addEventListener("click", toggleDiscoveryFilters);
   document.getElementById("discovery-clear-filters").addEventListener("click", clearDiscoveryFilters);
-  document.getElementById("discovery-reset-sorting").addEventListener("click", resetDiscoverySorting);
   document.getElementById("discovery-show-all").addEventListener("click", showAllFetchedDiscoveryJobs);
   ["search", "status-filter", "fit-filter", "role-filter", "remote-filter", "risk-filter", "sort-by"].forEach((id) => {
     document.getElementById(id).addEventListener("input", renderJobs);
     document.getElementById(id).addEventListener("change", renderJobs);
   });
   [
+    "discovery-sort-mode",
     "discovery-date-window",
     "discovery-per-source-cap",
     "discovery-total-cap",
     "discovery-remote-preference",
     "discovery-keywords",
     "discovery-location",
-    "discovery-sort-field",
-    "discovery-sort-direction",
-    "discovery-secondary-sort-field",
-    "discovery-secondary-sort-direction",
-    "discovery-unknown-salary-position",
-    "discovery-remote-rule",
     "discovery-filter-salary-min",
     "discovery-filter-max-distance",
     "discovery-filter-overall-score-min",
@@ -151,6 +146,7 @@ document.addEventListener("DOMContentLoaded", () => {
     "discovery-filter-title-keywords",
   ].forEach((id) => {
     const element = document.getElementById(id);
+    if (!element) return;
     element.addEventListener("input", handleDiscoveryControlsChanged);
     element.addEventListener("change", handleDiscoveryControlsChanged);
   });
@@ -835,13 +831,11 @@ async function saveEditedVersion(kind, elementId) {
   }
 }
 
-function discoveryFieldDefaultDirection(field) {
-  return ["overall_score", "salary", "distance", "posted_date", "match_score", "deadline"].includes(field) ? "desc" : "asc";
-}
-
 function applyDiscoverySearchDefaults() {
   setValue("discovery-search-depth", "standard");
   setValue("discovery-date-window", "14d");
+  setValue("discovery-sort-mode", "best_match");
+  setValue("discovery-distance", "");
   setValue("discovery-per-source-cap", 100);
   setValue("discovery-total-cap", 200);
 }
@@ -864,6 +858,7 @@ function discoverySearchCriteriaFromControls() {
     location: value("discovery-location"),
     enabled_sources: selectedDiscoverySources(),
     remote_preference: value("discovery-remote-preference"),
+    distance: value("discovery-distance"),
     search_depth: value("discovery-search-depth") || "standard",
     date_window: value("discovery-date-window") || "14d",
     per_source_cap: value("discovery-per-source-cap") || 100,
@@ -872,26 +867,52 @@ function discoverySearchCriteriaFromControls() {
 }
 
 function setDiscoveryControlsEnabled(enabled) {
-  ["discovery-local-controls", "discovery-sort-controls"].forEach((id) => {
+  ["discovery-sort-mode", "discovery-filter-toggle", "discovery-clear-filters", "discovery-show-all", "discovery-view-cards", "discovery-view-table"].forEach((id) => {
     const element = document.getElementById(id);
     if (element) element.disabled = !enabled;
   });
-  ["discovery-clear-filters", "discovery-reset-sorting", "discovery-show-all", "discovery-view-cards", "discovery-view-table"].forEach((id) => {
-    const element = document.getElementById(id);
-    if (element) element.disabled = !enabled;
-  });
+  const filterPanel = document.getElementById("discovery-filter-panel");
+  if (!enabled && filterPanel) filterPanel.hidden = true;
+  updateDiscoveryFilterToggleLabel();
+}
+
+function discoverySortPreferencesFromMode(mode) {
+  const sortMode = mode || "best_match";
+  const sortMap = {
+    best_match: { field: "overall_score", direction: "desc" },
+    overall_score: { field: "overall_score", direction: "desc" },
+    salary_desc: { field: "salary", direction: "desc", unknown_salary_position: "last" },
+    salary_asc: { field: "salary", direction: "asc", unknown_salary_position: "last" },
+    distance: { field: "distance", direction: "asc", remote_rule: "remote_after_local" },
+    posted_date: { field: "posted_date", direction: "desc" },
+    company: { field: "company", direction: "asc" },
+  };
+  return {
+    field: "overall_score",
+    direction: "desc",
+    secondary_field: "",
+    secondary_direction: "asc",
+    unknown_salary_position: "last",
+    remote_rule: "remote_after_local",
+    ...(sortMap[sortMode] || sortMap.best_match),
+  };
+}
+
+function discoverySortModeFromPreferences(sort = {}) {
+  const field = sort.field || "overall_score";
+  const direction = sort.direction || "desc";
+  if (field === "salary" && direction === "asc") return "salary_asc";
+  if (field === "salary" && direction === "desc") return "salary_desc";
+  if (field === "distance" && direction === "asc") return "distance";
+  if (field === "posted_date" && direction === "desc") return "posted_date";
+  if (field === "company" && direction === "asc") return "company";
+  if (field === "overall_score" && direction === "desc") return "overall_score";
+  return "best_match";
 }
 
 function discoveryPreferencesFromControls() {
   return {
-    sort: {
-      field: value("discovery-sort-field") || "overall_score",
-      direction: value("discovery-sort-direction") || "desc",
-      secondary_field: value("discovery-secondary-sort-field") || "",
-      secondary_direction: value("discovery-secondary-sort-direction") || "asc",
-      unknown_salary_position: value("discovery-unknown-salary-position") || "last",
-      remote_rule: value("discovery-remote-rule") || "remote_after_local",
-    },
+    sort: discoverySortPreferencesFromMode(value("discovery-sort-mode")),
     filters: {
       salary_min: value("discovery-filter-salary-min"),
       max_distance: value("discovery-filter-max-distance"),
@@ -913,12 +934,7 @@ function discoveryPreferencesFromControls() {
 function applyDiscoveryPreferencesToControls(preferences = {}) {
   const sort = preferences.sort || {};
   const filters = preferences.filters || {};
-  setValue("discovery-sort-field", sort.field || "overall_score");
-  setValue("discovery-sort-direction", sort.direction || discoveryFieldDefaultDirection(sort.field || "overall_score"));
-  setValue("discovery-secondary-sort-field", sort.secondary_field || "");
-  setValue("discovery-secondary-sort-direction", sort.secondary_direction || "asc");
-  setValue("discovery-unknown-salary-position", sort.unknown_salary_position || "last");
-  setValue("discovery-remote-rule", sort.remote_rule || "remote_after_local");
+  setValue("discovery-sort-mode", discoverySortModeFromPreferences(sort));
   setValue("discovery-filter-salary-min", filters.salary_min || "");
   setValue("discovery-filter-max-distance", filters.max_distance || "");
   setValue("discovery-filter-overall-score-min", filters.overall_score_min || "");
@@ -932,6 +948,36 @@ function applyDiscoveryPreferencesToControls(preferences = {}) {
   setChecked("discovery-filter-exact-date", Boolean(filters.exact_date_only));
   setValue("discovery-filter-company", filters.company || "");
   setValue("discovery-filter-title-keywords", filters.title_keywords || "");
+  updateDiscoveryFilterToggleLabel();
+}
+
+function updateDiscoveryFilterToggleLabel() {
+  const button = document.getElementById("discovery-filter-toggle");
+  if (!button) return;
+  const filters = discoveryPreferencesFromControls().filters || {};
+  const count = [
+    filters.salary_min,
+    filters.max_distance,
+    filters.overall_score_min,
+    filters.posted_within,
+    filters.remote_type,
+    filters.source,
+    filters.job_field,
+    filters.seniority,
+    filters.known_salary_only,
+    filters.known_location_only,
+    filters.exact_date_only,
+    filters.company,
+    filters.title_keywords,
+  ].filter((value) => value !== "" && value !== false && value != null).length;
+  button.textContent = count ? `Filter (${count})` : "Filter";
+}
+
+function toggleDiscoveryFilters() {
+  const panel = document.getElementById("discovery-filter-panel");
+  if (!panel) return;
+  panel.hidden = !panel.hidden;
+  updateDiscoveryFilterToggleLabel();
 }
 
 function persistDiscoveryPreferences() {
@@ -945,6 +991,7 @@ function persistDiscoveryPreferences() {
 function handleDiscoveryControlsChanged() {
   state.discoveryPreferences = discoveryPreferencesFromControls();
   if (state.discoverySearchKey) persistDiscoveryPreferences();
+  updateDiscoveryFilterToggleLabel();
   renderDiscoveryResults(state.discoveryMeta || {});
 }
 
@@ -959,7 +1006,7 @@ async function searchDiscovery(event) {
   const status = document.getElementById("discovery-status");
   const criteria = discoverySearchCriteriaFromControls();
   button.disabled = true;
-  status.textContent = `Searching ${criteria.enabled_sources.map(sourceLabel).join(", ")}...`;
+  status.textContent = `Searching jobs from ${criteria.enabled_sources.map(sourceLabel).join(", ")}...`;
   try {
     const result = await api.send("/api/discovery/jobspy", "POST", criteria);
     state.discoveryResults = result.jobs || [];
@@ -977,6 +1024,9 @@ async function searchDiscovery(event) {
       cap_reached: Boolean(result.cap_reached),
     };
     renderDiscoveryResults(state.discoveryMeta);
+    if (state.discoveryResults.length) {
+      document.getElementById("discovery-results").scrollIntoView({ behavior: "smooth", block: "start" });
+    }
     setDiscoveryControlsEnabled(Boolean(state.discoveryResults.length));
     status.textContent = result.visible_total
       ? `Fetched ${result.total || 0} jobs and showing ${result.visible_total}.`
@@ -1019,7 +1069,10 @@ function renderDiscoveryResults(result) {
   const visibleCount = jobs.length;
   const totalCount = Number(result.total || state.discoveryMeta.total || state.discoveryResults.length || 0);
   document.getElementById("discovery-active-state").textContent = describeDiscoveryState(prefs, visibleCount, totalCount);
-  const body = state.discoveryView === "table" ? renderDiscoveryTable(jobs) : renderDiscoveryCards(jobs);
+  let body = state.discoveryView === "table" ? renderDiscoveryTable(jobs) : renderDiscoveryCards(jobs);
+  if (visibleCount === 0 && totalCount > 0) {
+    body = "<p>No jobs are visible with the current filters. Clear filters to show the fetched results.</p>";
+  }
   const rawSummary = renderDiscoveryDiagnostics(diagnostics, visibleCount, totalCount);
   container.innerHTML = `
     <div class="discovery-summary">
@@ -1393,9 +1446,15 @@ function renderDiscoveryWhy(job) {
 }
 
 function setDiscoverySort(field) {
-  const current = value("discovery-sort-field");
-  setValue("discovery-sort-field", field);
-  setValue("discovery-sort-direction", current === field ? (value("discovery-sort-direction") === "asc" ? "desc" : "asc") : discoveryFieldDefaultDirection(field));
+  const current = value("discovery-sort-mode") || "best_match";
+  const next = {
+    salary: current === "salary_desc" ? "salary_asc" : "salary_desc",
+    distance: "distance",
+    posted_date: "posted_date",
+    company: "company",
+    overall_score: "overall_score",
+  }[field] || "best_match";
+  setValue("discovery-sort-mode", next);
   handleDiscoveryControlsChanged();
 }
 
@@ -1415,16 +1474,13 @@ function clearDiscoveryFilters() {
   setChecked("discovery-filter-known-salary", false);
   setChecked("discovery-filter-known-location", false);
   setChecked("discovery-filter-exact-date", false);
+  const panel = document.getElementById("discovery-filter-panel");
+  if (panel) panel.hidden = true;
   handleDiscoveryControlsChanged();
 }
 
 function resetDiscoverySorting() {
-  setValue("discovery-sort-field", "overall_score");
-  setValue("discovery-sort-direction", "desc");
-  setValue("discovery-secondary-sort-field", "");
-  setValue("discovery-secondary-sort-direction", "asc");
-  setValue("discovery-unknown-salary-position", "last");
-  setValue("discovery-remote-rule", "remote_after_local");
+  setValue("discovery-sort-mode", "best_match");
   handleDiscoveryControlsChanged();
 }
 
@@ -1432,6 +1488,8 @@ function showAllFetchedDiscoveryJobs() {
   state.discoveryResults = state.discoveryResults.map((job) => ({ ...job, hidden: false }));
   clearDiscoveryFilters();
   resetDiscoverySorting();
+  const panel = document.getElementById("discovery-filter-panel");
+  if (panel) panel.hidden = true;
   handleDiscoveryControlsChanged();
 }
 

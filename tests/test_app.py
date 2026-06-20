@@ -271,6 +271,19 @@ class JobAssistantTest(unittest.TestCase):
         jobs = self.client.get("/api/jobs").get_json()
         self.assertEqual(jobs[0]["company"], "Acme")
 
+    def test_discovery_page_uses_compact_toolbar_and_full_width_layout(self):
+        html = self.client.get("/").data.decode("utf-8")
+        self.assertIn('id="discovery-submit">Search jobs</button>', html)
+        self.assertIn('id="discovery-sort-mode"', html)
+        self.assertIn('id="discovery-filter-toggle"', html)
+        self.assertIn('id="discovery-filter-panel"', html)
+        self.assertNotIn('id="discovery-sort-controls"', html)
+        self.assertNotIn('workspace narrow', html)
+        self.assertIn('workspace discovery-layout', html)
+        self.assertLess(html.index('id="discovery-sort-mode"'), html.index('id="discovery-results"'))
+        self.assertLess(html.index('id="discovery-results"'), html.index('id="csv-import-form"'))
+        self.assertIn('id="csv-import-form"', html)
+
     def test_jobspy_discovery_requires_keywords(self):
         response = self.client.post("/api/discovery/jobspy", json={"location": "Toronto"})
         self.assertEqual(response.status_code, 400)

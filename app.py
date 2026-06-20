@@ -695,7 +695,7 @@ def create_app() -> Flask:
         fetched = fetch_jobspy_jobs(
             keywords=keywords,
             location=search["location"],
-            distance=None,
+            distance=search["distance"],
             remote_preference=search["remote_preference"],
             job_type=None,
             results_wanted=search["per_source_cap"],
@@ -3306,6 +3306,7 @@ def discovery_search_signature(payload: dict[str, Any]) -> str:
     relevant = {
         "keywords": search["keywords"],
         "location": search["location"],
+        "distance": search["distance"],
         "enabled_sources": search["enabled_sources"],
         "remote_preference": search["remote_preference"],
         "search_depth": search["search_depth"],
@@ -3347,6 +3348,7 @@ def discovery_search_defaults(depth: str = "standard") -> dict[str, Any]:
         "per_source_cap": preset["per_source_cap"],
         "total_cap": preset["total_cap"],
         "remote_preference": "",
+        "distance": 50,
     }
 
 
@@ -3356,6 +3358,7 @@ def discovery_search_config(payload: dict[str, Any]) -> dict[str, Any]:
     date_window = normalize_choice(payload.get("date_window"), set(DISCOVERY_DATE_WINDOWS)) or f"{preset['days']}d"
     per_source_cap = clamp_int_default(payload.get("per_source_cap"), preset["per_source_cap"], 1, 1000)
     total_cap = clamp_int_default(payload.get("total_cap"), preset["total_cap"], 1, 5000)
+    distance = clamp_int_default(payload.get("distance"), 50, 0, 1000)
     if total_cap < per_source_cap:
         total_cap = max(total_cap, per_source_cap)
     return {
@@ -3367,6 +3370,7 @@ def discovery_search_config(payload: dict[str, Any]) -> dict[str, Any]:
         "remote_preference": normalize_choice(payload.get("remote_preference"), {"remote", "hybrid", "on-site"}),
         "keywords": text(payload.get("keywords")),
         "location": text(payload.get("location")),
+        "distance": distance,
         "enabled_sources": normalize_discovery_sources(payload.get("enabled_sources")),
     }
 

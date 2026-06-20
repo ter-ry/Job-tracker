@@ -154,6 +154,11 @@ a {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
+.workspace.discovery-layout {
+  grid-template-columns: minmax(0, 1fr);
+  width: 100%;
+}
+
 .panel {
   padding: 18px;
 }
@@ -164,6 +169,33 @@ a {
   justify-content: space-between;
   gap: 12px;
   margin-bottom: 16px;
+}
+
+.discovery-toolbar {
+  align-items: flex-start;
+}
+
+.discovery-toolbar h2 {
+  margin-bottom: 4px;
+}
+
+.discovery-toolbar-actions {
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.toolbar-select {
+  display: grid;
+  gap: 5px;
+  min-width: 180px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.toolbar-select select {
+  min-width: 180px;
 }
 
 .grid {
@@ -229,6 +261,33 @@ legend {
 
 .source-picker input {
   width: auto;
+}
+
+.discovery-search-panel,
+.discovery-results-panel,
+.discovery-secondary-panel {
+  width: 100%;
+}
+
+.discovery-filter-panel {
+  display: grid;
+  gap: 14px;
+  margin-bottom: 16px;
+  border-top: 1px solid var(--line);
+  padding-top: 16px;
+}
+
+.discovery-filter-panel[hidden] {
+  display: none;
+}
+
+.discovery-results-panel .generated-output {
+  margin-top: 16px;
+}
+
+.discovery-secondary-panel {
+  display: grid;
+  gap: 12px;
 }
 
 input,
@@ -589,6 +648,7 @@ th {
 
   .workspace,
   .workspace.narrow,
+  .workspace.discovery-layout,
   .grid.three {
     grid-template-columns: 1fr;
   }
@@ -602,10 +662,18 @@ th {
   .topbar,
   .panel-header,
   .actions,
+  .discovery-toolbar,
+  .discovery-toolbar-actions,
   .filter-row,
   .tabs {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .toolbar-select,
+  .toolbar-select select {
+    min-width: 0;
+    width: 100%;
   }
 
   .dashboard,
