@@ -1978,12 +1978,23 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(job["resume_generation_status"], "generated")
         self.assertEqual(job["cover_letter_generation_status"], "generated")
         self.assertIn("generation_debug", job)
-        self.assertTrue(job["generation_debug"].get("generated_at"))
+        debug = job["generation_debug"]
+        self.assertTrue(debug.get("generated_at"))
+        self.assertGreater(debug.get("approved_evidence_count", 0), 0)
+        self.assertTrue(debug.get("approved_evidence_ids"))
+        self.assertTrue(debug.get("selected_approved_evidence_ids"))
+        self.assertTrue(set(debug.get("selected_approved_evidence_ids", [])).issubset(set(debug.get("approved_evidence_ids", []))))
+        self.assertTrue(debug.get("matched_evidence_ids"))
+        self.assertIn("ollama", debug)
+        self.assertIn("called", debug["ollama"])
 
         resume_path = Path(job["resume_docx_path"])
         cover_path = Path(job["cover_letter_docx_path"])
         self.assertTrue(resume_path.exists())
         self.assertTrue(cover_path.exists())
+        generation_debug_path = resume_path.parent / "generation_debug.json"
+        self.assertTrue(generation_debug_path.exists())
+        self.assertEqual(json.loads(generation_debug_path.read_text(encoding="utf-8"))["generated_at"], debug["generated_at"])
 
         resume_doc = Document(io.BytesIO(resume_path.read_bytes()))
         cover_doc = Document(io.BytesIO(cover_path.read_bytes()))

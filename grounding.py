@@ -129,8 +129,22 @@ CONTACT_PATTERNS = [
 ]
 
 
-def build_candidate_evidence(profile: dict[str, Any]) -> dict[str, Any]:
+def build_candidate_evidence(profile: dict[str, Any], extra_sections: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     sections: list[dict[str, str]] = []
+    for item in extra_sections or []:
+        text_value = normalize_space(str(item.get("text") or item.get("content") or ""))
+        if not text_value:
+            continue
+        sections.append(
+            {
+                "field": str(item.get("source_field") or item.get("field") or "approved_evidence"),
+                "label": str(item.get("source_label") or item.get("label") or "approved evidence"),
+                "text": text_value,
+                "id": item.get("id"),
+                "source_kind": str(item.get("source_kind") or "approved_evidence"),
+                "approved": True,
+            }
+        )
     for field, label in PROFILE_EVIDENCE_FIELDS:
         content = normalize_space(str(profile.get(field) or ""))
         if field == "resume_text" and content and is_corrupted_text(content):

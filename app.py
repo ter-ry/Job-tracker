@@ -18,7 +18,7 @@ from typing import Any
 from xml.etree import ElementTree
 
 from docx import Document
-from flask import Flask, Response, g, jsonify, render_template, request, send_file
+from flask import Flask, Response, g, has_app_context, jsonify, render_template, request, send_file
 
 from grounding import (
     PDF_CORRUPTION_MESSAGE,
@@ -894,7 +894,24 @@ def create_app() -> Flask:
         if row is None:
             return jsonify({"error": "No saved version found. Generate materials first."}), 404
         job_row = query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)
-        current_profile_hash = build_candidate_evidence(load_profile())["hash"]
+        current_profile = load_profile()
+        approved_records = load_approved_evidence_records(job_id)
+        selected_records = select_approved_evidence_records(job_to_dict(job_row) if job_row else {}, approved_records, limit=6)
+        current_profile_hash = build_candidate_evidence(
+            current_profile,
+            extra_sections=[
+                {
+                    "id": record.get("id"),
+                    "field": "approved_evidence",
+                    "source_kind": text(record.get("source_kind")) or "evidence_library",
+                    "source_field": text(record.get("source_field")),
+                    "text": text(record.get("content")),
+                    "approved": True,
+                }
+                for record in selected_records
+                if text(record.get("content"))
+            ],
+        )["hash"]
         current_job_hash = generation_job_hash(job_to_dict(job_row)) if job_row else ""
         if row["profile_hash"] and row["profile_hash"] != current_profile_hash:
             return jsonify({"error": "Outdated — regenerate using current profile"}), 409
@@ -1238,6 +1255,8 @@ def generate_and_store_shortlist_documents(job_id: int, kinds: set[str] | None =
             lambda: build_format_preserving_cover_letter(job, profile, output, cover_path),
         )
 
+    generation_debug = build_generation_debug_payload(job_id, job, profile, output, resume_result, cover_result, resume_path, cover_path)
+
     metadata = {
         "job_id": job_id,
         "company": job.get("company"),
@@ -1251,8 +1270,10 @@ def generate_and_store_shortlist_documents(job_id: int, kinds: set[str] | None =
         "cover_letter_template_path": profile.get("cover_letter_docx_template_path", ""),
         "job_hash": output.get("job_hash", ""),
         "candidate_evidence_hash": output.get("candidate_evidence_hash", ""),
+        "generation_debug": generation_debug,
     }
     (folder / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    (folder / "generation_debug.json").write_text(json.dumps(generation_debug, indent=2), encoding="utf-8")
     (folder / "resume.txt").write_text(output["resume_text"], encoding="utf-8")
     (folder / "cover_letter.txt").write_text(output["cover_letter"], encoding="utf-8")
     (folder / "resume_change_log.json").write_text(json.dumps(resume_result["change_log"], indent=2), encoding="utf-8")
@@ -1279,6 +1300,7 @@ def generate_and_store_shortlist_documents(job_id: int, kinds: set[str] | None =
         "resume": resume_status,
         "cover_letter": cover_status,
         "error": "; ".join(filter(None, [resume_result["error"], cover_result["error"]])),
+        "generation_debug": generation_debug,
     }
 
 
@@ -1319,6 +1341,8 @@ def build_format_preserving_resume(
     plan = build_resume_change_plan(document, job, profile, output)
     change_log = apply_resume_change_plan(document, plan)
     document.save(resume_path)
+    reopened_resume = Document(resume_path)
+    _ = "\n".join(paragraph.text for paragraph in reopened_resume.paragraphs)
     return {
         "status": "generated",
         "error": "",
@@ -1405,6 +1429,11 @@ def build_format_preserving_cover_letter(
             },
         }
     document.save(cover_path)
+    reopened_cover = Document(cover_path)
+    reopened_error = validate_cover_letter_document(reopened_cover, job, profile)
+    if reopened_error is not None or any(classify_keyword_dump_reason(normalize_space(paragraph.text)) is not None for paragraph in reopened_cover.paragraphs):
+        write_cover_letter_docx(cover_path, output["cover_letter"])
+        reopened_cover = Document(cover_path)
     return {
         "status": "generated",
         "error": "",
@@ -1413,6 +1442,61 @@ def build_format_preserving_cover_letter(
             "output_path": str(cover_path),
             **change_log,
         },
+    }
+
+
+def build_generation_debug_payload(
+    job_id: int,
+    job: dict[str, Any],
+    profile: dict[str, str],
+    output: dict[str, Any],
+    resume_result: dict[str, Any],
+    cover_result: dict[str, Any],
+    resume_path: Path,
+    cover_path: Path,
+) -> dict[str, Any]:
+    tailoring_plan = output.get("tailoring_plan") or {}
+    approved_records = output.get("approved_evidence_records") or []
+    ranked_records = output.get("ranked_approved_evidence_records") or []
+    selected_records = output.get("selected_approved_evidence_records") or []
+    return {
+        "job_id": job_id,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "job_hash": output.get("job_hash", ""),
+        "candidate_evidence_hash": output.get("candidate_evidence_hash", ""),
+        "approved_evidence_count": len(approved_records),
+        "approved_evidence_ids": [clamp_int(item.get("id"), 0, 10**9) for item in approved_records if item.get("id") is not None],
+        "ranked_approved_evidence_ids": [clamp_int(item.get("id"), 0, 10**9) for item in ranked_records if item.get("id") is not None],
+        "selected_approved_evidence_ids": [clamp_int(item.get("id"), 0, 10**9) for item in selected_records if item.get("id") is not None],
+        "matched_evidence_ids": [clamp_int(item.get("evidence_id"), 0, 10**9) for item in tailoring_plan.get("phrase_to_evidence_matches", []) if item.get("evidence_id")],
+        "cover_letter_paragraphs": tailoring_plan.get("cover_letter_paragraphs", []),
+        "final_cover_letter_text": output.get("cover_letter", ""),
+        "resume_bullets": output.get("resume_bullets", []),
+        "resume_variants": tailoring_plan.get("resume_change_blocks", [])[:8],
+        "approved_evidence_preview": [
+            {
+                "id": clamp_int(item.get("id"), 0, 10**9),
+                "source_field": text(item.get("source_field")),
+                "source_kind": text(item.get("source_kind")),
+                "content": text(item.get("content")),
+                "score": clamp_int(item.get("score"), -1000, 1000),
+            }
+            for item in selected_records
+        ],
+        "ollama": output.get("ollama_debug", {}),
+        "resume_result": {
+            "status": text(resume_result.get("status")),
+            "error": text(resume_result.get("error")),
+            "output_path": str(resume_path),
+        },
+        "cover_result": {
+            "status": text(cover_result.get("status")),
+            "error": text(cover_result.get("error")),
+            "output_path": str(cover_path),
+        },
+        "profile_hash": build_candidate_evidence(profile)["hash"],
+        "job_company": text(job.get("company")),
+        "job_title": text(job.get("title")),
     }
 
 
@@ -1582,33 +1666,19 @@ def build_cover_letter_section_map(
     location = text(job.get("location")) or ""
     title = text(job.get("title")) or "the role"
     role = first_supported_role(profile, candidate_evidence) or "candidate"
-    fallback_skills = short_join((candidate_evidence.get("skills") or [])[:2])
-    skill_phrase = short_join(focus[:2]) if focus else (fallback_skills or "the core responsibilities of the role")
-    evidence_text = build_cover_letter_evidence_paragraph(candidate_evidence)
-    if not evidence_text:
-        evidence_text = "I have supported reliable delivery through practical software work and careful follow-through."
+    evidence_paragraphs = build_cover_letter_evidence_paragraphs(candidate_evidence)
+    if not evidence_paragraphs:
+        evidence_paragraphs = [select_concrete_evidence_sentence(candidate_evidence) or "I have practical experience I can discuss directly."]
     return {
         "date": format_cover_letter_date(date.today()),
         "company": company,
         "location": location,
         "subject": f"Re: Application for {title}",
         "greeting": f"Dear {company} Hiring Team,",
-        "opening": (
-            f"I'm excited to apply for the {title} role at {company}. My background as a {role} aligns with {skill_phrase}, "
-            f"and I am drawn to roles where reliability, documentation, and cross-functional collaboration matter as much as technical breadth."
-        ),
-        "experience": (
-            f"{evidence_text} This kind of work has helped me build careful habits around validation, logging, documentation, "
-            f"and clear communication with business users and teammates."
-        ),
-        "fit": (
-            f"I would bring that same focus to {company}, especially where the role values {skill_phrase}, clear communication, "
-            f"and steady attention to documented results."
-        ),
-        "closing": (
-            f"Thank you for your time and consideration. I would welcome the chance to discuss how my background can support {company} "
-            f"in the {title} role."
-        ),
+        "opening": f"I'm excited to apply for the {title} role at {company}.",
+        "experience": evidence_paragraphs[0],
+        "fit": evidence_paragraphs[1] if len(evidence_paragraphs) > 1 else "",
+        "closing": "Thank you for your time and consideration.",
         "signoff": "Sincerely,",
         "signature": text(profile.get("name") or ""),
     }
@@ -1676,7 +1746,7 @@ def select_concrete_evidence_sentence(candidate_evidence: dict[str, Any]) -> str
     return fallback
 
 
-def build_cover_letter_evidence_paragraph(candidate_evidence: dict[str, Any]) -> str:
+def build_cover_letter_evidence_paragraphs(candidate_evidence: dict[str, Any]) -> list[str]:
     sentences: list[str] = []
     for section in candidate_evidence.get("sections", []):
         if section.get("field") == "resume_text":
@@ -1698,16 +1768,18 @@ def build_cover_letter_evidence_paragraph(candidate_evidence: dict[str, Any]) ->
                 sentences.append(
                     "I built Python and Flask tools backed by PostgreSQL, including an automated monitoring system that stored more than 300,000 records."
                 )
-            elif "developer intern" in lower and "northstar" in lower:
+            elif "harmony 88" in lower or "northstar" in lower:
                 sentences.append(clean if clean.endswith(".") else f"{clean}.")
         if len(sentences) >= 2:
             break
     if not sentences:
         fallback = select_concrete_evidence_sentence(candidate_evidence)
-        return fallback
+        return [fallback] if fallback else []
     if len(sentences) == 1:
-        sentences.append(select_concrete_evidence_sentence(candidate_evidence))
-    return " ".join(dict.fromkeys([sentence for sentence in sentences if sentence]))
+        followup = select_concrete_evidence_sentence(candidate_evidence)
+        if followup and followup != sentences[0]:
+            sentences.append(followup)
+    return [sentence for sentence in dict.fromkeys(sentences) if sentence]
 
 
 def format_cover_letter_date(value: date) -> str:
@@ -1780,7 +1852,18 @@ def apply_cover_letter_template(
     output: dict[str, Any],
 ) -> dict[str, list[dict[str, Any]]]:
     tailoring_plan = output.get("tailoring_plan") or build_tailoring_plan(job, profile, output.get("semantic_match", {}))
-    section_map = build_cover_letter_section_map(profile, job, list(output.get("supported_keywords", [])[:4]), build_candidate_evidence(profile))
+    generated_sections = tailoring_plan.get("cover_letter_paragraphs") or []
+    candidate_evidence = output.get("candidate_evidence") or build_candidate_evidence(profile)
+    section_map = build_cover_letter_section_map(profile, job, list(output.get("supported_keywords", [])[:4]), candidate_evidence)
+    if generated_sections:
+        if len(generated_sections) > 4:
+            section_map["opening"] = generated_sections[4]
+        if len(generated_sections) > 5:
+            section_map["experience"] = generated_sections[5]
+        if len(generated_sections) > 6:
+            section_map["fit"] = generated_sections[6]
+        if len(generated_sections) > 7:
+            section_map["closing"] = generated_sections[7]
     replacements = {
         "{{DATE}}": section_map["date"],
         "{{COMPANY}}": section_map["company"],
@@ -3268,6 +3351,21 @@ def list_evidence_library() -> list[dict[str, Any]]:
     return [evidence_row_to_dict(row) for row in rows]
 
 
+def load_approved_evidence_records(job_id: int | None = None) -> list[dict[str, Any]]:
+    if job_id is None:
+        rows = query_db("SELECT * FROM evidence_library WHERE approved = 1 ORDER BY updated_at DESC, id DESC")
+    else:
+        rows = query_db(
+            """
+            SELECT * FROM evidence_library
+            WHERE approved = 1 AND (job_id = 0 OR job_id = ? OR job_id IS NULL)
+            ORDER BY updated_at DESC, id DESC
+            """,
+            [job_id],
+        )
+    return [evidence_row_to_dict(row) for row in rows]
+
+
 def evidence_row_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:
     if row is None:
         return {}
@@ -3290,6 +3388,95 @@ def update_evidence_review(evidence_id: int, approved: Any = None, review_notes:
     )
     get_db().commit()
     return evidence_row_to_dict(query_db("SELECT * FROM evidence_library WHERE id = ?", [evidence_id], one=True))
+
+
+def rank_approved_evidence_records(job: dict[str, Any], records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    job_terms = job_keywords(job)
+    keywords = {
+        "python",
+        "flask",
+        "postgresql",
+        "postgres",
+        "sql",
+        "validation",
+        "logging",
+        "data cleaning",
+        "data-cleaning",
+        "backend",
+        "integrations",
+        "documentation",
+        "monitoring",
+        "automation",
+        "api",
+        "apis",
+        "dashboard",
+        "dashboards",
+        "reliability",
+        "records",
+        "90%",
+        "300,000",
+    }
+    ranked: list[dict[str, Any]] = []
+    for record in records:
+        content = text(record.get("content"))
+        lowered = content.lower()
+        tokens = set(re.findall(r"[a-z0-9+#.-]+", lowered))
+        overlap = [term for term in job_terms if term.lower() in lowered]
+        score = 0
+        source_field = text(record.get("source_field"))
+        source_kind = text(record.get("source_kind"))
+        if source_field == "work_experience":
+            score += 45
+        elif source_field == "resume_text":
+            score += 28
+        elif source_field == "projects":
+            score += 12
+        elif source_field == "key_skills":
+            score += 8
+        elif source_field == "education":
+            score += 4
+        if source_kind == "profile":
+            score += 5
+        if len(overlap) >= 2:
+            score += 10
+        score += min(30, len(overlap) * 4)
+        if any(term in lowered for term in ["python", "flask", "postgresql", "postgres", "sql", "backend", "validation", "logging", "documentation", "automation", "monitoring"]):
+            score += 8
+        if any(term in lowered for term in ["reliability", "data cleaning", "data-cleaning", "data entry", "error", "errors"]):
+            score += 8
+        if any(term in lowered for term in ["retail", "customer service", "sales associate", "cashier", "support"]):
+            score -= 12
+        if any(re.search(pattern, lowered) for pattern in [r"\b\d{1,3}(?:,\d{3})+\b", r"\b\d{2,3}%\b", r"\b\d+\+\s*(?:records|skus|users|items|events)\b"]):
+            score += 18
+        if any(term in lowered for term in ["at ", "co.", "inc.", "ltd.", "labs", "company"]):
+            score += 8
+        if any(term in lowered for term in ["collaboration", "delivery", "alignment", "fit", "quality"]) and not any(term in lowered for term in ["python", "flask", "postgresql", "records", "validation", "logging"]):
+            score -= 8
+        if any(keyword in lowered for keyword in keywords):
+            score += 6
+        ranked.append(
+            {
+                **record,
+                "score": score,
+                "matched_terms": overlap,
+                "token_count": len(tokens),
+            }
+        )
+    ranked.sort(
+        key=lambda item: (
+            int(item.get("score", 0)),
+            len(text(item.get("content"))),
+            -clamp_int(item.get("id"), 0, 10**9),
+        ),
+        reverse=True,
+    )
+    return ranked
+
+
+def select_approved_evidence_records(job: dict[str, Any], records: list[dict[str, Any]], limit: int = 6) -> list[dict[str, Any]]:
+    ranked = rank_approved_evidence_records(job, records)
+    selected = ranked[:limit]
+    return selected
 
 
 def build_job_evidence_analysis(job: dict[str, Any], profile: dict[str, str]) -> dict[str, Any]:
@@ -3456,18 +3643,25 @@ def load_tailoring_change_log(path: Path) -> dict[str, Any]:
 
 
 def load_generation_debug(job_id: int) -> dict[str, Any]:
-    metadata_path = generated_applications_dir() / str(job_id) / "metadata.json"
-    if not metadata_path.exists():
+    folder = generated_applications_dir() / str(job_id)
+    debug_path = folder / "generation_debug.json"
+    metadata_path = folder / "metadata.json"
+    raw: dict[str, Any] = {}
+    for path in [debug_path, metadata_path]:
+        if not path.exists():
+            continue
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            break
+        except (OSError, json.JSONDecodeError):
+            continue
+    if not raw:
         return {}
-    try:
-        raw = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return {
-        "generated_at": text(raw.get("generated_at")),
-        "generation_token": text(raw.get("generation_token")),
-        "job_hash": text(raw.get("job_hash")),
-    }
+    raw["generated_at"] = text(raw.get("generated_at"))
+    raw["generation_token"] = text(raw.get("generation_token"))
+    raw["job_hash"] = text(raw.get("job_hash"))
+    raw["candidate_evidence_hash"] = text(raw.get("candidate_evidence_hash"))
+    return raw
 
 
 def summarize_tailoring_change(item: dict[str, Any]) -> dict[str, Any]:
@@ -3894,11 +4088,30 @@ def generate_application_materials(
     profile: dict[str, str],
     raise_on_validation: bool = True,
 ) -> dict[str, Any]:
-    candidate_evidence = build_candidate_evidence(profile)
+    job_id = clamp_int(job.get("id"), 0, 10**9) or None
+    approved_evidence_records = load_approved_evidence_records(job_id) if has_app_context() else []
+    ranked_approved_evidence = rank_approved_evidence_records(job, approved_evidence_records)
+    selected_approved_evidence = select_approved_evidence_records(job, approved_evidence_records, limit=6)
+    approved_sections = [
+        {
+            "id": record.get("id"),
+            "field": "approved_evidence",
+            "source_kind": text(record.get("source_kind")) or "evidence_library",
+            "source_field": text(record.get("source_field")),
+            "text": text(record.get("content")),
+            "approved": True,
+        }
+        for record in selected_approved_evidence
+        if text(record.get("content"))
+    ]
+    candidate_evidence = build_candidate_evidence(profile, extra_sections=approved_sections)
     if not evidence_has_generation_source(candidate_evidence):
         raise ValueError("Complete the Profile page with resume, project, or work-experience details before generating documents.")
     job_text = " ".join([text(job.get("title")), text(job.get("job_description")), text(job.get("required_skills"))])
     semantic = analyze_resume_match(job, profile, cache_dir=semantic_cache_dir(), use_semantic=False)
+    semantic["candidate_evidence"] = candidate_evidence
+    semantic["approved_evidence_records"] = approved_evidence_records
+    semantic["selected_approved_evidence"] = selected_approved_evidence
     seniority_analysis = analyze_job_seniority(job)
     seniority_fit = score_seniority_fit(profile, seniority_analysis)
     scoring = score_job(job, profile, semantic)
@@ -3916,6 +4129,42 @@ def generate_application_materials(
     skills_section = format_skills_guidance(skill_groups)
     cover_letter = tailoring_plan.get("cover_letter_text") or build_cover_letter(profile, job, focus, candidate_evidence)
     cover_validation = validate_cover_letter_output(cover_letter, candidate_evidence, job)
+    ollama_config = OllamaConfig.from_mapping(profile)
+    ollama_debug: dict[str, Any] = {
+        "enabled": ollama_config.enabled,
+        "called": False,
+        "model": ollama_config.model,
+        "used_fallback": True,
+        "status": "disabled" if not ollama_config.enabled else "not_called",
+        "error": "",
+        "suggestion_ok": False,
+        "validation_error": "",
+        "raw_length": 0,
+    }
+    if ollama_config.enabled:
+        ollama_debug["called"] = True
+        prompt_payload = {
+            "max_output_tokens": ollama_config.max_output_tokens,
+            "selected_evidence_ids": [text(item.get("id")) for item in selected_approved_evidence if item.get("id") is not None],
+        }
+        ollama_response = request_json_completion(
+            ollama_config,
+            build_ollama_prompt("cover_letter", job, candidate_evidence, prompt_payload),
+            system="Return strict JSON only.",
+        )
+        ollama_debug["status"] = "ok" if ollama_response.get("ok") else "error"
+        ollama_debug["error"] = text(ollama_response.get("error"))
+        ollama_debug["raw_length"] = len(text(ollama_response.get("raw")))
+        if ollama_response.get("ok"):
+            ollama_validation = validate_ollama_suggestion("cover_letter", ollama_response.get("data", {}), job, candidate_evidence)
+            ollama_debug["suggestion_ok"] = bool(ollama_validation.get("ok"))
+            ollama_debug["validation_error"] = text(ollama_validation.get("error"))
+            ollama_debug["used_fallback"] = not bool(ollama_validation.get("ok"))
+            if ollama_validation.get("ok"):
+                suggestion = text(ollama_validation.get("suggestion"))
+                if suggestion:
+                    cover_letter = suggestion
+                    cover_validation = validate_cover_letter_output(cover_letter, candidate_evidence, job)
     answers = build_answers(profile, job, focus, candidate_evidence)
     resume_text = (
         f"Suggested summary\n{summary}\n\n"
@@ -3945,6 +4194,10 @@ def generate_application_materials(
         "unsupported_keywords": unsupported,
         "skill_guidance": skill_groups,
         "candidate_evidence_hash": candidate_evidence["hash"],
+        "candidate_evidence": candidate_evidence,
+        "approved_evidence_records": approved_evidence_records,
+        "selected_approved_evidence_records": selected_approved_evidence,
+        "ranked_approved_evidence_records": ranked_approved_evidence,
         "job_hash": generation_job_hash(job),
         "validation": validation,
         "summary": summary,
@@ -3959,6 +4212,7 @@ def generate_application_materials(
         "cover_letter": cover_letter,
         "cover_validation": cover_validation,
         "resume_validation": resume_validation,
+        "ollama_debug": ollama_debug,
         "short_answers": answers,
         "tailoring_plan": tailoring_plan,
         "tailoring_review": {
