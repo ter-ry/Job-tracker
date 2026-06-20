@@ -15,6 +15,7 @@ import semantic_matching
 import seniority
 import tailoring_pipeline
 import tailoring
+import sources.jobspy_source as jobspy_source
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
@@ -307,6 +308,50 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("Keywords are required", response.get_json()["error"])
 
+    def test_discovery_location_resolution_normalizes_city_and_postal_inputs(self):
+        provider = FakeGeocodingProvider(
+            {
+                "Toronto, Ontario, Canada": {
+                    "latitude": 43.6532,
+                    "longitude": -79.3832,
+                    "display_name": "Toronto, Ontario, Canada",
+                    "ok": True,
+                    "status": "saved",
+                    "provider": "fake",
+                    "confidence": 80,
+                    "precision": "city",
+                    "geocoded_at": "2026-06-20T10:00:00",
+                    "normalized_query": "Toronto, Ontario, Canada",
+                    "error": "",
+                },
+                "M2J 0B6, Canada": {
+                    "latitude": 43.787,
+                    "longitude": -79.353,
+                    "display_name": "Toronto, Ontario, Canada",
+                    "ok": True,
+                    "status": "saved",
+                    "provider": "fake",
+                    "confidence": 95,
+                    "precision": "postal code",
+                    "geocoded_at": "2026-06-20T10:00:00",
+                    "normalized_query": "M2J 0B6, Canada",
+                    "error": "",
+                },
+            }
+        )
+        city = app_module.resolve_discovery_location_context("Toronto", {}, provider)
+        toronto_on = app_module.resolve_discovery_location_context("Toronto, ON", {}, provider)
+        postal = app_module.resolve_discovery_location_context("m2j0b6", {}, provider)
+        self.assertEqual(city["normalized_input"], "Toronto")
+        self.assertEqual(city["distance_origin"], "Toronto")
+        self.assertEqual(city["discovery_location"], "Toronto, ON")
+        self.assertEqual(toronto_on["normalized_input"], "Toronto, ON")
+        self.assertEqual(toronto_on["discovery_location"], "Toronto, ON")
+        self.assertEqual(postal["normalized_input"], "M2J 0B6")
+        self.assertEqual(postal["distance_origin"], "M2J 0B6")
+        self.assertEqual(postal["discovery_location"], "Toronto, ON")
+        self.assertEqual(postal["resolution_method"], "postal_code_to_city_region")
+
     def test_canadian_postal_code_normalization_and_cached_profile_geocoding(self):
         self.assertEqual(app_module.normalize_canadian_postal_code("m5v2t6"), "M5V 2T6")
         self.assertEqual(app_module.extract_canadian_postal_code("Suite 400, M5V 2T6"), "M5V 2T6")
@@ -379,7 +424,7 @@ class JobAssistantTest(unittest.TestCase):
             profile_response = self.client.post("/api/profile", json={"location": "Toronto"})
         self.assertEqual(profile_response.status_code, 200)
         profile = profile_response.get_json()
-        self.assertEqual(profile["home_location_normalized"], "Toronto, Ontario, Canada")
+        self.assertEqual(profile["home_location_normalized"], "Toronto, ON")
         self.assertEqual(profile["home_location_precision"], "city")
         self.assertEqual(profile["location_result"]["status"], "saved")
 
@@ -411,7 +456,7 @@ class JobAssistantTest(unittest.TestCase):
         job = body["jobs"][0]
         self.assertEqual(job["normalized_location"], "M5V 2T6, Canada")
         self.assertEqual(job["distance_label"], "approximate")
-        self.assertTrue(job["distance_note"].startswith("Approx. distance from Toronto, Ontario, Canada"))
+        self.assertTrue(job["distance_note"].startswith("Approx. distance from Toronto, ON"))
         self.assertGreaterEqual(job["distance_km"], 0)
 
     def test_discovery_jobspy_accepts_date_objects_in_raw_payloads(self):
@@ -458,6 +503,131 @@ class JobAssistantTest(unittest.TestCase):
         body = response.get_json()
         self.assertEqual(body["jobs"][0]["posted_date"], "2026-06-19")
         self.assertEqual(body["visible_total"], 1)
+
+    def test_discovery_jobspy_uses_resolved_search_location_and_reports_source_diagnostics(self):
+        provider = FakeGeocodingProvider(
+            {
+                "Toronto, Ontario, Canada": {
+                    "latitude": 43.6532,
+                    "longitude": -79.3832,
+                    "display_name": "Toronto, Ontario, Canada",
+                    "ok": True,
+                    "status": "saved",
+                    "provider": "fake",
+                    "confidence": 80,
+                    "precision": "city",
+                    "geocoded_at": "2026-06-20T10:00:00",
+                    "normalized_query": "Toronto, Ontario, Canada",
+                    "error": "",
+                },
+                "M2J 0B6, Canada": {
+                    "latitude": 43.787,
+                    "longitude": -79.353,
+                    "display_name": "Toronto, Ontario, Canada",
+                    "ok": True,
+                    "status": "saved",
+                    "provider": "fake",
+                    "confidence": 95,
+                    "precision": "postal code",
+                    "geocoded_at": "2026-06-20T10:00:00",
+                    "normalized_query": "M2J 0B6, Canada",
+                    "error": "",
+                },
+            }
+        )
+        calls: list[dict[str, object]] = []
+
+        def fake_fetch_jobspy_jobs(**kwargs):
+            calls.append(kwargs)
+            return {
+                "jobs": [],
+                "errors": {},
+                "source_counts": {"linkedin": 0, "indeed": 0},
+                "source_diagnostics": {
+                    "linkedin": {"source": "linkedin", "attempted": True, "success": True, "result_count": 0, "error": "", "skipped_reason": "", "duration_ms": 5, "effective_country_indeed": "Canada"},
+                    "indeed": {"source": "indeed", "attempted": True, "success": True, "result_count": 0, "error": "", "skipped_reason": "", "duration_ms": 7, "effective_country_indeed": "Canada"},
+                    "google": {"source": "google", "attempted": False, "success": False, "result_count": 0, "error": "", "skipped_reason": "disabled", "duration_ms": 0},
+                    "zip_recruiter": {"source": "zip_recruiter", "attempted": False, "success": False, "result_count": 0, "error": "", "skipped_reason": "disabled", "duration_ms": 0},
+                },
+            }
+
+        with patch.object(app_module, "get_geocoding_provider", return_value=provider), patch.object(app_module, "fetch_jobspy_jobs", side_effect=fake_fetch_jobspy_jobs):
+            response = self.client.post(
+                "/api/discovery/jobspy",
+                json={"keywords": "Registered Early Childhood Educator", "location": "M2J0B6", "distance": 25, "enabled_sources": ["linkedin", "indeed"], "date_window": "30d"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(calls)
+        self.assertEqual(calls[0]["location"], "Toronto, ON")
+        self.assertEqual(calls[0]["country_indeed"], "Canada")
+        body = response.get_json()
+        self.assertEqual(body["search"]["original_location"], "M2J0B6")
+        self.assertEqual(body["search"]["normalized_location"], "M2J 0B6")
+        self.assertEqual(body["search"]["distance_origin"], "M2J 0B6")
+        self.assertEqual(body["search"]["discovery_location"], "Toronto, ON")
+        self.assertIn("source_diagnostics", body["diagnostics"])
+        self.assertIn("indeed", body["diagnostics"]["source_diagnostics"])
+        self.assertTrue(body["diagnostics"]["source_diagnostics"]["indeed"]["attempted"])
+
+    def test_jobspy_source_diagnostics_capture_success_failure_and_disabled_sources(self):
+        def fake_scrape_jobs(**kwargs):
+            if kwargs["site_name"] == "linkedin":
+                return [
+                    {"title": "Role", "company": "A", "location": "Toronto, ON", "date_posted": "2026-06-19"}
+                ]
+            raise RuntimeError("parser error")
+
+        linkedin_only = jobspy_source.fetch_jobspy_jobs(
+            keywords="developer",
+            location="Toronto, ON",
+            distance=10,
+            results_wanted=5,
+            hours_old=72,
+            enabled_sources=["linkedin"],
+            country_indeed="Canada",
+            scrape_jobs_func=fake_scrape_jobs,
+        )
+        self.assertEqual(linkedin_only["source_counts"]["linkedin"], 1)
+        self.assertTrue(linkedin_only["source_diagnostics"]["linkedin"]["attempted"])
+        self.assertFalse(linkedin_only["source_diagnostics"]["indeed"]["attempted"])
+        self.assertEqual(linkedin_only["source_diagnostics"]["indeed"]["skipped_reason"], "disabled")
+
+        indeed_only = jobspy_source.fetch_jobspy_jobs(
+            keywords="developer",
+            location="Toronto, ON",
+            distance=10,
+            results_wanted=5,
+            hours_old=72,
+            enabled_sources=["indeed"],
+            country_indeed="Canada",
+            scrape_jobs_func=fake_scrape_jobs,
+        )
+        self.assertTrue(indeed_only["source_diagnostics"]["linkedin"]["skipped_reason"])
+        self.assertTrue(indeed_only["source_diagnostics"]["indeed"]["attempted"])
+        self.assertFalse(indeed_only["source_diagnostics"]["indeed"]["success"])
+        self.assertIn("parser error", indeed_only["source_diagnostics"]["indeed"]["error"])
+
+        result = jobspy_source.fetch_jobspy_jobs(
+            keywords="developer",
+            location="Toronto, ON",
+            distance=10,
+            results_wanted=5,
+            hours_old=72,
+            enabled_sources=["linkedin", "indeed"],
+            country_indeed="Canada",
+            scrape_jobs_func=fake_scrape_jobs,
+        )
+        self.assertEqual(result["source_counts"]["linkedin"], 1)
+        self.assertIn("indeed", result["errors"])
+        self.assertTrue(result["source_diagnostics"]["linkedin"]["attempted"])
+        self.assertTrue(result["source_diagnostics"]["linkedin"]["success"])
+        self.assertEqual(result["source_diagnostics"]["linkedin"]["result_count"], 1)
+        self.assertTrue(result["source_diagnostics"]["indeed"]["attempted"])
+        self.assertFalse(result["source_diagnostics"]["indeed"]["success"])
+        self.assertIn("parser error", result["source_diagnostics"]["indeed"]["error"])
+        self.assertFalse(result["source_diagnostics"]["google"]["attempted"])
+        self.assertEqual(result["source_diagnostics"]["google"]["skipped_reason"], "disabled")
 
     def test_jobspy_discovery_scores_saved_profile_and_handles_missing_fields(self):
         self.client.post(

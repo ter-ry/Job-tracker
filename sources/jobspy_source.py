@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -30,8 +31,35 @@ def fetch_jobspy_jobs(
     results: list[dict[str, Any]] = []
     errors: dict[str, str] = {}
     source_counts = {source: 0 for source in sources}
+    source_diagnostics: dict[str, dict[str, Any]] = {
+        source: {
+            "source": source,
+            "attempted": False,
+            "success": False,
+            "result_count": 0,
+            "error": "",
+            "skipped_reason": "disabled",
+            "duration_ms": 0,
+        }
+        for source in JOBSPY_SOURCE_NAMES
+    }
 
     for source in sources:
+        started = time.perf_counter()
+        source_diagnostics[source] = {
+            "source": source,
+            "attempted": True,
+            "success": False,
+            "result_count": 0,
+            "error": "",
+            "skipped_reason": "",
+            "duration_ms": 0,
+            "effective_country_indeed": country_indeed,
+            "location": location,
+            "distance": distance,
+            "hours_old": hours_old,
+            "results_wanted": results_wanted,
+        }
         try:
             frame = scrape_jobs(
                 site_name=JOBSPY_SOURCE_NAMES[source],
@@ -47,15 +75,32 @@ def fetch_jobspy_jobs(
                 linkedin_fetch_description=False,
                 verbose=0,
             )
+            matched = 0
             for row in _iter_rows(frame):
                 normalized = normalize_jobspy_row(row, fallback_source=source)
                 if normalized["title"]:
                     results.append(normalized)
                     source_counts[source] = source_counts.get(source, 0) + 1
+                    matched += 1
+            source_diagnostics[source].update(
+                {
+                    "success": True,
+                    "result_count": matched,
+                    "duration_ms": int(round((time.perf_counter() - started) * 1000)),
+                }
+            )
         except Exception as exc:
-            errors[source] = f"{type(exc).__name__}: {exc}"
+            error_message = f"{type(exc).__name__}: {exc}"
+            errors[source] = error_message
+            source_diagnostics[source].update(
+                {
+                    "success": False,
+                    "error": error_message,
+                    "duration_ms": int(round((time.perf_counter() - started) * 1000)),
+                }
+            )
 
-    return {"jobs": results, "errors": errors, "source_counts": source_counts}
+    return {"jobs": results, "errors": errors, "source_counts": source_counts, "source_diagnostics": source_diagnostics}
 
 
 def normalize_jobspy_row(row: dict[str, Any], fallback_source: str = "") -> dict[str, Any]:

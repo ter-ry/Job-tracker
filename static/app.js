@@ -1101,6 +1101,7 @@ function renderDiscoveryResults(result) {
   const counts = result.source_counts || state.discoveryMeta.source_counts || {};
   const errors = result.errors || state.discoveryMeta.errors || {};
   const diagnostics = result.diagnostics || state.discoveryMeta.diagnostics || {};
+  const sourceDiagnostics = diagnostics.source_diagnostics || {};
   const countText = Object.keys(counts).map((source) => `${sourceLabel(source)}: ${counts[source]}`).join(" | ");
   const errorText = Object.keys(errors).length
     ? `<div class="discovery-errors">${Object.entries(errors).map(([source, message]) => `<p><strong>${escapeHtml(sourceLabel(source))}:</strong> ${escapeHtml(message)}</p>`).join("")}</div>`
@@ -1113,7 +1114,16 @@ function renderDiscoveryResults(result) {
   renderDiscoveryOriginSummary();
   let body = state.discoveryView === "table" ? renderDiscoveryTable(jobs) : renderDiscoveryCards(jobs);
   if (visibleCount === 0 && totalCount > 0) {
-    body = "<p>No jobs are visible with the current filters. Clear filters to show the fetched results.</p>";
+    body = `<div class="empty-state">
+      <p>No jobs are visible with the current filters.</p>
+      <p class="muted">Raw fetches were completed, but local filters may be hiding results.</p>
+      <ul class="score-breakdown-list">
+        <li>Try a broader title keyword.</li>
+        <li>Increase the date range.</li>
+        <li>Increase the distance limit.</li>
+        <li>Use a city or region instead of a postal code.</li>
+      </ul>
+    </div>${renderSourceDiagnostics(sourceDiagnostics)}`;
   }
   if (!hasDiscoveryOrigin() && Number(prefs.filters?.max_distance || 0) > 0) {
     body = "<p>Distance filter unavailable - save a postal code or location in Profile.</p>" + body;
@@ -1149,6 +1159,7 @@ function renderDiscoveryDiagnostics(diagnostics, visibleCount, totalCount) {
   const searchCriteria = diagnostics.search_criteria || state.discoverySearchCriteria || {};
   const sourceCounts = diagnostics.source_counts || {};
   const sourceErrors = diagnostics.source_errors || {};
+  const sourceDiagnostics = diagnostics.source_diagnostics || {};
   const origin = diagnostics.saved_origin || {};
   const fetched = Number(diagnostics.raw_jobs_returned || totalCount || 0);
   const hiddenByLocalFilters = Math.max(0, Number(totalCount || 0) - Number(visibleCount || 0));
@@ -1163,6 +1174,13 @@ function renderDiscoveryDiagnostics(diagnostics, visibleCount, totalCount) {
     searchCriteria.remote_preference ? `remote=${searchCriteria.remote_preference}` : "",
     searchCriteria.distance ? `radius=${searchCriteria.distance}` : "",
   ].filter(Boolean).join("; "))}</li>`);
+  details.push(`<li><strong>Discovery location:</strong> ${escapeHtml([
+    diagnostics.original_location ? `input=${diagnostics.original_location}` : "",
+    diagnostics.normalized_location ? `normalized=${diagnostics.normalized_location}` : "",
+    diagnostics.discovery_location ? `search=${diagnostics.discovery_location}` : "",
+    diagnostics.distance_origin ? `origin=${diagnostics.distance_origin}` : "",
+    diagnostics.location_resolution_method ? `method=${diagnostics.location_resolution_method}` : "",
+  ].filter(Boolean).join("; ") || "not configured")}</li>`);
   details.push(`<li><strong>Origin:</strong> ${escapeHtml([
     origin.original_input ? `input=${origin.original_input}` : "",
     origin.normalized ? `normalized=${origin.normalized}` : "",
@@ -1181,6 +1199,9 @@ function renderDiscoveryDiagnostics(diagnostics, visibleCount, totalCount) {
   if (Object.keys(sourceErrors).length) {
     details.push(`<li><strong>Source errors:</strong> ${escapeHtml(Object.entries(sourceErrors).map(([source, message]) => `${sourceLabel(source)}=${message}`).join(" | "))}</li>`);
   }
+  if (Object.keys(sourceDiagnostics).length) {
+    details.push(`<li>${renderSourceDiagnostics(sourceDiagnostics)}</li>`);
+  }
   if (Array.isArray(diagnostics.geocoding_errors) && diagnostics.geocoding_errors.length) {
     details.push(`<li><strong>Geocoding errors:</strong> ${escapeHtml(diagnostics.geocoding_errors.join(" | "))}</li>`);
   }
@@ -1191,6 +1212,32 @@ function renderDiscoveryDiagnostics(diagnostics, visibleCount, totalCount) {
     <details class="score-details" open>
       <summary>Discovery diagnostics</summary>
       <ul class="score-breakdown-list">${details.join("")}</ul>
+    </details>
+  `;
+}
+
+function renderSourceDiagnostics(sourceDiagnostics) {
+  const entries = Object.entries(sourceDiagnostics || {});
+  if (!entries.length) return "";
+  return `
+    <details class="score-details">
+      <summary>Source diagnostics</summary>
+      <ul class="score-breakdown-list">
+        ${entries
+          .map(([source, info]) => {
+            const status = info?.attempted ? (info.success ? "success" : "failed") : `skipped${info?.skipped_reason ? ` (${info.skipped_reason})` : ""}`;
+            const pieces = [
+              `attempted=${info?.attempted ? "yes" : "no"}`,
+              `result_count=${Number(info?.result_count || 0)}`,
+              `status=${status}`,
+            ];
+            if (info?.error) pieces.push(`error=${info.error}`);
+            if (info?.duration_ms !== undefined) pieces.push(`duration=${Number(info.duration_ms)}ms`);
+            if (info?.effective_country_indeed) pieces.push(`Indeed country=${info.effective_country_indeed}`);
+            return `<li><strong>${escapeHtml(sourceLabel(source))}:</strong> ${escapeHtml(pieces.join("; "))}</li>`;
+          })
+          .join("")}
+      </ul>
     </details>
   `;
 }

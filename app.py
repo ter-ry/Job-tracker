@@ -106,6 +106,11 @@ PROVINCE_LOOKUP = {
     "nunavut": "Nunavut",
     "nu": "Nunavut",
 }
+PROVINCE_CODE_BY_NAME = {
+    province.lower(): code.upper()
+    for code, province in PROVINCE_LOOKUP.items()
+    if len(code) <= 3
+}
 
 DISCOVERY_SEARCH_DEPTHS = {
     "quick": {"per_source_cap": 25, "total_cap": 50, "days": 3},
@@ -744,10 +749,20 @@ def create_app() -> Flask:
         profile = load_profile()
         provider = get_geocoding_provider()
         origin = profile_home_location(profile)
+        try:
+            location_context = resolve_discovery_location_context(search["location"], profile, provider)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        search["original_location"] = location_context["original_input"]
+        search["normalized_location"] = location_context["normalized_input"]
+        search["distance_origin"] = location_context["distance_origin"]
+        search["discovery_location"] = location_context["discovery_location"]
+        search["location_resolution_method"] = location_context["resolution_method"]
+        search["location_geocode"] = location_context["lookup"]
 
         fetched = fetch_jobspy_jobs(
             keywords=keywords,
-            location=search["location"],
+            location=search["discovery_location"],
             distance=search["distance"],
             remote_preference=search["remote_preference"],
             job_type=None,
@@ -815,6 +830,11 @@ def create_app() -> Flask:
         diagnostics = {
             "search_criteria": search,
             "saved_origin": origin,
+            "original_location": search.get("original_location"),
+            "normalized_location": search.get("normalized_location"),
+            "distance_origin": search.get("distance_origin"),
+            "discovery_location": search.get("discovery_location"),
+            "location_resolution_method": search.get("location_resolution_method"),
             "origin_geocode_status": origin.get("status"),
             "origin_precision": origin.get("precision"),
             "origin_available": discovery_origin_available(profile),
@@ -824,11 +844,15 @@ def create_app() -> Flask:
             "jobs_excluded_by_radius": 0,
             "source_counts": source_counts,
             "source_errors": fetched.get("errors", {}),
+            "source_diagnostics": fetched.get("source_diagnostics", {}),
             "duplicates_removed": duplicates,
             "raw_jobs_returned": len(raw_jobs),
             "displayed_jobs": min(len(jobs), search["total_cap"]),
             "cap_reached": len(jobs) > search["total_cap"],
             "geocoding_errors": geocoding_errors,
+            "discovery_location": search["discovery_location"],
+            "distance_origin": search["distance_origin"],
+            "location_resolution_method": search["location_resolution_method"],
         }
         save_discovery_search_run(search_key, search, diagnostics, raw_jobs)
         if jobs:
@@ -3506,6 +3530,7 @@ def classify_location_input(value: str) -> str:
     raw = normalize_space(value)
     if not raw:
         return "empty"
+    parts = [part.strip() for part in raw.split(",") if part.strip()]
     postal = extract_canadian_postal_code(raw)
     if postal:
         compact = re.sub(r"[^A-Za-z0-9]", "", raw).upper()
@@ -3513,7 +3538,9 @@ def classify_location_input(value: str) -> str:
             return "postal_code"
         return "street_address"
     lowered = raw.lower()
-    if infer_province_from_text(raw):
+    if len(parts) >= 2 and province_code_from_text(parts[-1]):
+        return "city_region"
+    if infer_province_from_text(raw) and len(parts) == 1:
         return "province"
     if "," in raw or " " in raw:
         if any(token in lowered for token in ["st ", "street", "ave", "avenue", "rd ", "road", "blvd", "drive", "dr ", "suite", "unit"]):
@@ -3526,6 +3553,9 @@ def build_location_lookup_candidates(raw_value: str, profile: dict[str, str] | N
     if not raw:
         return []
     province = infer_province_from_text(raw) or infer_province_from_text(text((profile or {}).get("preferred_locations"))) or "Ontario"
+    province_code = province_code_from_text(raw) or province_code_from_text(text((profile or {}).get("preferred_locations")))
+    if not province_code:
+        province_code = PROVINCE_CODE_BY_NAME.get(province.lower(), "ON")
     postal = extract_canadian_postal_code(raw)
     kind = classify_location_input(raw)
     candidates: list[dict[str, Any]] = []
@@ -3560,6 +3590,18 @@ def build_location_lookup_candidates(raw_value: str, profile: dict[str, str] | N
                     "used_postal_fallback": False,
                 }
             )
+    elif kind == "city_region":
+        city = normalize_space(raw.split(",")[0].strip())
+        province_name = province
+        candidates.append(
+            {
+                "query": f"{city}, {province_name}, Canada",
+                "normalized_query": f"{city}, {province_code}",
+                "precision": "city",
+                "confidence": 82,
+                "used_postal_fallback": False,
+            }
+        )
     elif kind == "province":
         candidates.append(
             {
@@ -3574,7 +3616,7 @@ def build_location_lookup_candidates(raw_value: str, profile: dict[str, str] | N
         candidates.append(
             {
                 "query": "Toronto, Ontario, Canada",
-                "normalized_query": "Toronto, Ontario, Canada",
+                "normalized_query": "Toronto, ON",
                 "precision": "city",
                 "confidence": 75,
                 "used_postal_fallback": False,
@@ -3584,12 +3626,12 @@ def build_location_lookup_candidates(raw_value: str, profile: dict[str, str] | N
         city = raw.split(",")[0].strip()
         if city and city.lower() == "toronto":
             city = "Toronto"
-        normalized_query = f"{raw}, Canada" if "," not in raw else f"{raw}"
+        normalized_query = f"{city}, {province_code}" if city and province_code and "," in raw else f"{raw}, Canada" if "," not in raw else f"{raw}"
         if city and city.lower() == "toronto" and "ontario" not in raw.lower():
-            normalized_query = "Toronto, Ontario, Canada"
+            normalized_query = "Toronto, ON"
             candidates.append(
                 {
-                    "query": normalized_query,
+                    "query": "Toronto, Ontario, Canada",
                     "normalized_query": normalized_query,
                     "precision": "city",
                     "confidence": 75,
@@ -3599,7 +3641,7 @@ def build_location_lookup_candidates(raw_value: str, profile: dict[str, str] | N
         else:
             candidates.append(
                 {
-                    "query": normalized_query,
+                    "query": f"{raw}, Canada" if "," not in raw else f"{raw}",
                     "normalized_query": normalized_query,
                     "precision": "approximate",
                     "confidence": 60,
@@ -3627,6 +3669,8 @@ def geocoding_cache_key(lookup_type: str, query_text: str, normalized_query: str
 def load_geocoding_cache(cache_key: str) -> dict[str, Any] | None:
     if not cache_key:
         return None
+    if not has_app_context():
+        return None
     row = query_db("SELECT * FROM geocoding_cache WHERE cache_key = ?", [cache_key], one=True)
     if row is None:
         return None
@@ -3643,6 +3687,8 @@ def load_geocoding_cache(cache_key: str) -> dict[str, Any] | None:
 
 def save_geocoding_cache(cache_key: str, lookup_type: str, query_text: str, normalized_query: str, provider: str, result: dict[str, Any], success: bool) -> None:
     if not cache_key:
+        return
+    if not has_app_context():
         return
     get_db().execute(
         """
@@ -3923,6 +3969,101 @@ def geocode_profile_home_location(profile: dict[str, str], provider: GeocodingPr
         + (f", {text(result.get('status'))}." if text(result.get("status")) else ".")
     )
     return profile, {"ok": bool(result.get("ok")), "status": text(result.get("status")), "message": message, "display": display, "precision": text(result.get("precision")), "result": result}
+
+
+def province_code_from_text(value: str) -> str:
+    lowered = normalize_space(value).lower()
+    if not lowered:
+        return ""
+    for key, province in sorted(PROVINCE_LOOKUP.items(), key=lambda item: len(item[0]), reverse=True):
+        if re.search(rf"\b{re.escape(key)}\b", lowered):
+            return PROVINCE_CODE_BY_NAME.get(province.lower(), key.upper())
+    return ""
+
+
+def normalize_discovery_city_region(display_name: str, fallback: str = "") -> str:
+    raw = normalize_space(display_name) or normalize_space(fallback)
+    if not raw:
+        return ""
+    parts = [part.strip() for part in raw.split(",") if part.strip()]
+    province_code = ""
+    for part in reversed(parts):
+        code = province_code_from_text(part)
+        if code:
+            province_code = code
+            break
+    city = ""
+    if province_code:
+        for part in parts:
+            if province_code_from_text(part):
+                break
+            if part.lower() == "canada" or extract_canadian_postal_code(part):
+                continue
+            city = part
+        city = normalize_space(city or fallback)
+    else:
+        city = normalize_space(parts[0] if parts else fallback)
+    if city and province_code:
+        return f"{city}, {province_code}"
+    return city or raw
+
+
+def resolve_discovery_location_context(raw_location: str, profile: dict[str, str] | None = None, provider: GeocodingProvider | None = None) -> dict[str, Any]:
+    profile = profile or {}
+    provider = provider or get_geocoding_provider()
+    original_input = text(raw_location)
+    normalized_input = normalize_space(original_input)
+    postal = extract_canadian_postal_code(original_input)
+    normalized_postal = normalize_canadian_postal_code(postal) if postal else ""
+    distance_origin = normalized_postal or normalized_input
+    lookup_input = normalized_postal or normalized_input
+    lookup_result: dict[str, Any]
+    if lookup_input:
+        lookup_result = geocode_location_value(lookup_input, lookup_type="search", profile=profile, provider=provider)
+    else:
+        lookup_result = {
+            "ok": False,
+            "status": "missing",
+            "normalized_query": "",
+            "latitude": "",
+            "longitude": "",
+            "provider": provider.name,
+            "confidence": 0,
+            "precision": "",
+            "geocoded_at": "",
+            "error": "",
+            "cached": False,
+        }
+    discovery_location = ""
+    resolution_method = "raw"
+    if lookup_result.get("ok"):
+        discovery_location = normalize_discovery_city_region(
+            text(lookup_result.get("display_name")) or text(lookup_result.get("normalized_query")),
+            fallback=normalized_input,
+        )
+        if postal:
+            resolution_method = "postal_code_to_city_region"
+        elif discovery_location != normalized_input:
+            resolution_method = "geocoded_city_region"
+        else:
+            resolution_method = "normalized_city_region"
+    elif postal:
+        profile_location = text(profile.get("home_location_normalized"))
+        if profile_location:
+            discovery_location = profile_location
+            resolution_method = "profile_city_fallback"
+        else:
+            raise ValueError("Could not resolve the postal code to a discovery city or region.")
+    else:
+        discovery_location = normalized_input
+    return {
+        "original_input": original_input,
+        "normalized_input": normalized_postal or normalized_input,
+        "distance_origin": distance_origin,
+        "discovery_location": discovery_location,
+        "resolution_method": resolution_method,
+        "lookup": lookup_result,
+    }
 
 
 def discovery_city_coordinates(location: str) -> tuple[float, float] | None:
