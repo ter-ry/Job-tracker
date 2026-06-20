@@ -65,6 +65,21 @@ DISCOVERY_SCORE_WEIGHTS = {
 
 DISCOVERY_REMOTE_DISTANCE_RULES = {"remote_first", "remote_after_local", "remote_zero"}
 
+DISCOVERY_DATE_WINDOWS = {
+    "24h": 1,
+    "3d": 3,
+    "7d": 7,
+    "14d": 14,
+    "30d": 30,
+    "any": 0,
+}
+
+DISCOVERY_SEARCH_DEPTHS = {
+    "quick": {"per_source_cap": 25, "total_cap": 50, "days": 3},
+    "standard": {"per_source_cap": 100, "total_cap": 200, "days": 14},
+    "thorough": {"per_source_cap": 250, "total_cap": 500, "days": 30},
+}
+
 STATUSES = ["Saved", "shortlisted", "Drafting", "Applied", "Interview", "Offer", "Rejected", "Archived"]
 
 ROLE_TYPES = [
@@ -657,6 +672,14 @@ def create_app() -> Flask:
         save_discovery_preferences(search_key, preferences)
         return jsonify({"search_key": search_key, "preferences": preferences})
 
+    @app.get("/api/discovery/results")
+    def discovery_results_get() -> Response:
+        search_key = text(request.args.get("search_key"))
+        run = load_discovery_search_run(search_key)
+        if not run:
+            return jsonify({"error": "Discovery search not found"}), 404
+        return jsonify(run)
+
     @app.post("/api/discovery/jobspy")
     def discovery_jobspy() -> Response:
         payload = request.get_json(force=True)
@@ -664,79 +687,38 @@ def create_app() -> Flask:
         if not keywords:
             return jsonify({"error": "Keywords are required"}), 400
 
+        search = discovery_search_config(payload)
         search_key = discovery_search_signature(payload)
         stored_preferences = load_discovery_preferences(search_key)
-        request_preferences = discovery_preferences_payload(payload)
-        preference_override_keys = {
-            "sort",
-            "filters",
-            "sort_field",
-            "sort_direction",
-            "secondary_sort",
-            "secondary_sort_field",
-            "secondary_sort_direction",
-            "unknown_salary_position",
-            "remote_rule",
-            "remote_distance_rule",
-            "salary_min",
-            "max_distance",
-            "overall_score_min",
-            "posted_within",
-            "remote_type",
-            "source",
-            "job_field",
-            "seniority",
-            "known_salary_only",
-            "known_location_only",
-            "exact_date_only",
-            "company",
-            "title_keywords",
-            "weights",
-        }
-        has_explicit_preferences = any(key in payload for key in preference_override_keys)
-        if has_explicit_preferences:
-            preferences = {
-                "sort": {**stored_preferences.get("sort", {}), **request_preferences.get("sort", {})},
-                "filters": {**stored_preferences.get("filters", {}), **request_preferences.get("filters", {})},
-                "weights": {**stored_preferences.get("weights", {}), **request_preferences.get("weights", {})},
-            }
-        else:
-            preferences = stored_preferences or request_preferences
-        location = text(payload.get("location"))
-        enabled_sources = normalize_discovery_sources(payload.get("enabled_sources"))
-        results_wanted = clamp_int_default(payload.get("results_wanted"), 10, 1, 25)
-        hours_old = clamp_int_default(payload.get("hours_old"), 168, 1, 24 * 30)
-        distance = clamp_int_default(payload.get("distance"), 50, 0, 500)
-        remote_preference = normalize_choice(payload.get("remote_preference"), {"remote", "hybrid", "on-site"})
-        job_type = normalize_choice(payload.get("job_type"), {"fulltime", "parttime", "contract", "internship"})
-        country_indeed = text(payload.get("country_indeed")) or "Canada"
+        preferences = stored_preferences or discovery_preferences_payload({})
 
         fetched = fetch_jobspy_jobs(
             keywords=keywords,
-            location=location,
-            distance=distance,
-            remote_preference=remote_preference,
-            job_type=job_type,
-            results_wanted=results_wanted,
-            hours_old=hours_old,
-            enabled_sources=enabled_sources,
-            country_indeed=country_indeed,
+            location=search["location"],
+            distance=None,
+            remote_preference=search["remote_preference"],
+            job_type=None,
+            results_wanted=search["per_source_cap"],
+            hours_old=search["hours_old"],
+            enabled_sources=search["enabled_sources"],
+            country_indeed=text(payload.get("country_indeed")) or "Canada",
         )
 
+        raw_jobs = fetched.get("jobs", [])
         existing_keys = existing_job_dedupe_keys()
         seen_keys: set[str] = set()
         jobs: list[dict[str, Any]] = []
         duplicates = 0
         profile = load_profile()
-        for raw_job in fetched.get("jobs", []):
+        for raw_job in raw_jobs:
             payload_job = jobspy_result_to_job_payload(raw_job)
             clean = normalize_job_payload(payload_job)
-            clean = enrich_discovery_job(clean, profile, {"weights": preferences["weights"], "remote_rule": preferences["sort"].get("remote_rule")})
+            clean = enrich_discovery_job(clean, profile, {"weights": preferences.get("weights", {}), "remote_rule": preferences.get("sort", {}).get("remote_rule")})
             clean["source_job_id"] = text(raw_job.get("source_job_id"))
             clean["posted_date"] = text(raw_job.get("posted_date"))
             clean["description_available"] = bool(clean.get("job_description"))
             clean["score_breakdown"] = parse_json_object(clean.get("score_breakdown"))
-            clean["warnings"] = discovery_warning_reasons(clean, keywords, location)
+            clean["warnings"] = discovery_warning_reasons(clean, keywords, search["location"])
             clean["already_saved"] = False
             clean["duplicate_in_search"] = False
             keys = dedupe_keys(clean, clean.get("source_job_id"))
@@ -765,25 +747,41 @@ def create_app() -> Flask:
                 if source in source_counts:
                     source_counts[source] += 1
 
-        jobs = sort_discovery_jobs(
-            jobs,
-            preferences["sort"].get("field") or "overall_score",
-            preferences["sort"].get("direction") or "desc",
-            preferences["sort"].get("secondary_field") or "",
-            preferences["sort"].get("secondary_direction") or "asc",
-            preferences["sort"].get("remote_rule") or "remote_after_local",
-            preferences["sort"].get("unknown_salary_position") or "last",
-        )
-        save_discovery_preferences(search_key, preferences)
+        diagnostics = {
+            "search_criteria": search,
+            "source_counts": source_counts,
+            "source_errors": fetched.get("errors", {}),
+            "duplicates_removed": duplicates,
+            "raw_jobs_returned": len(raw_jobs),
+            "displayed_jobs": min(len(jobs), search["total_cap"]),
+            "cap_reached": len(jobs) > search["total_cap"],
+        }
+        save_discovery_search_run(search_key, search, diagnostics, raw_jobs)
+        if jobs:
+            jobs = sort_discovery_jobs(
+                jobs,
+                preferences.get("sort", {}).get("field") or "overall_score",
+                preferences.get("sort", {}).get("direction") or "desc",
+                preferences.get("sort", {}).get("secondary_field") or "",
+                preferences.get("sort", {}).get("secondary_direction") or "asc",
+                preferences.get("sort", {}).get("remote_rule") or "remote_after_local",
+                preferences.get("sort", {}).get("unknown_salary_position") or "last",
+            )
+        jobs = jobs[: search["total_cap"]]
         return jsonify(
             {
                 "jobs": jobs,
                 "errors": fetched.get("errors", {}),
                 "source_counts": source_counts,
-                "total": len(jobs),
+                "total": len(raw_jobs),
+                "visible_total": len(jobs),
                 "duplicates": duplicates,
                 "search_key": search_key,
+                "search": search,
+                "raw_jobs_returned": len(raw_jobs),
+                "cap_reached": len(raw_jobs) > search["total_cap"],
                 "preferences": preferences,
+                "diagnostics": diagnostics,
             }
         )
 
@@ -3304,16 +3302,16 @@ DISCOVERY_CITY_COORDS = {
 
 
 def discovery_search_signature(payload: dict[str, Any]) -> str:
+    search = discovery_search_config(payload)
     relevant = {
-        "keywords": text(payload.get("keywords")),
-        "location": text(payload.get("location")),
-        "distance": clamp_int_default(payload.get("distance"), 50, 0, 500),
-        "remote_preference": normalize_choice(payload.get("remote_preference"), DISCOVERY_REMOTE_DISTANCE_RULES | {"remote", "hybrid", "on-site"}),
-        "job_type": normalize_choice(payload.get("job_type"), {"fulltime", "parttime", "contract", "internship"}),
-        "results_wanted": clamp_int_default(payload.get("results_wanted"), 10, 1, 25),
-        "hours_old": clamp_int_default(payload.get("hours_old"), 168, 1, 24 * 30),
-        "enabled_sources": normalize_discovery_sources(payload.get("enabled_sources")),
-        "country_indeed": text(payload.get("country_indeed")),
+        "keywords": search["keywords"],
+        "location": search["location"],
+        "enabled_sources": search["enabled_sources"],
+        "remote_preference": search["remote_preference"],
+        "search_depth": search["search_depth"],
+        "date_window": search["date_window"],
+        "per_source_cap": search["per_source_cap"],
+        "total_cap": search["total_cap"],
     }
     return grounding_hash(json.dumps(relevant, sort_keys=True))
 
@@ -3339,6 +3337,70 @@ def save_discovery_preferences(search_key: str, preferences: dict[str, Any]) -> 
         [search_key, json.dumps(preferences, sort_keys=True)],
     )
     get_db().commit()
+
+
+def discovery_search_defaults(depth: str = "standard") -> dict[str, Any]:
+    preset = DISCOVERY_SEARCH_DEPTHS.get(depth, DISCOVERY_SEARCH_DEPTHS["standard"])
+    return {
+        "search_depth": depth if depth in DISCOVERY_SEARCH_DEPTHS else "standard",
+        "date_window": f"{preset['days']}d" if preset["days"] else "any",
+        "per_source_cap": preset["per_source_cap"],
+        "total_cap": preset["total_cap"],
+        "remote_preference": "",
+    }
+
+
+def discovery_search_config(payload: dict[str, Any]) -> dict[str, Any]:
+    depth = normalize_choice(payload.get("search_depth"), set(DISCOVERY_SEARCH_DEPTHS)) or "standard"
+    preset = DISCOVERY_SEARCH_DEPTHS[depth]
+    date_window = normalize_choice(payload.get("date_window"), set(DISCOVERY_DATE_WINDOWS)) or f"{preset['days']}d"
+    per_source_cap = clamp_int_default(payload.get("per_source_cap"), preset["per_source_cap"], 1, 1000)
+    total_cap = clamp_int_default(payload.get("total_cap"), preset["total_cap"], 1, 5000)
+    if total_cap < per_source_cap:
+        total_cap = max(total_cap, per_source_cap)
+    return {
+        "search_depth": depth,
+        "date_window": date_window,
+        "hours_old": None if date_window == "any" else DISCOVERY_DATE_WINDOWS.get(date_window, preset["days"]) * 24,
+        "per_source_cap": per_source_cap,
+        "total_cap": total_cap,
+        "remote_preference": normalize_choice(payload.get("remote_preference"), {"remote", "hybrid", "on-site"}),
+        "keywords": text(payload.get("keywords")),
+        "location": text(payload.get("location")),
+        "enabled_sources": normalize_discovery_sources(payload.get("enabled_sources")),
+    }
+
+
+def save_discovery_search_run(search_key: str, search_json: dict[str, Any], metadata_json: dict[str, Any], raw_jobs: list[dict[str, Any]]) -> None:
+    if not search_key:
+        return
+    get_db().execute(
+        """
+        INSERT INTO discovery_search_runs (search_key, search_json, metadata_json, raw_jobs_json, updated_at)
+        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(search_key) DO UPDATE SET
+            search_json = excluded.search_json,
+            metadata_json = excluded.metadata_json,
+            raw_jobs_json = excluded.raw_jobs_json,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        [search_key, json.dumps(search_json, sort_keys=True), json.dumps(metadata_json, sort_keys=True), json.dumps(raw_jobs)],
+    )
+    get_db().commit()
+
+
+def load_discovery_search_run(search_key: str) -> dict[str, Any]:
+    if not search_key:
+        return {}
+    row = query_db("SELECT * FROM discovery_search_runs WHERE search_key = ?", [search_key], one=True)
+    if row is None:
+        return {}
+    return {
+        "search_key": search_key,
+        "search": parse_json_object(row["search_json"]),
+        "metadata": parse_json_object(row["metadata_json"]),
+        "jobs": parse_json_array(row["raw_jobs_json"]),
+    }
 
 
 def discovery_city_coordinates(location: str) -> tuple[float, float] | None:
@@ -3898,6 +3960,26 @@ def init_db() -> None:
             "preferences_json": "TEXT NOT NULL DEFAULT '{}'",
         },
     )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS discovery_search_runs (
+            search_key TEXT PRIMARY KEY,
+            search_json TEXT NOT NULL DEFAULT '{}',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            raw_jobs_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    ensure_columns(
+        "discovery_search_runs",
+        {
+            "search_json": "TEXT NOT NULL DEFAULT '{}'",
+            "metadata_json": "TEXT NOT NULL DEFAULT '{}'",
+            "raw_jobs_json": "TEXT NOT NULL DEFAULT '[]'",
+        },
+    )
     db.commit()
 
 
@@ -4388,6 +4470,16 @@ def parse_json_object(value: Any) -> dict[str, Any]:
         return parsed if isinstance(parsed, dict) else {}
     except json.JSONDecodeError:
         return {}
+
+
+def parse_json_array(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    try:
+        parsed = json.loads(value or "[]")
+        return [item for item in parsed if isinstance(item, dict)] if isinstance(parsed, list) else []
+    except json.JSONDecodeError:
+        return []
 
 
 def tokenize(content: str) -> set[str]:

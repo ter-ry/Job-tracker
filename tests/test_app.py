@@ -314,6 +314,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         body = response.get_json()
         self.assertEqual(body["total"], 1)
+        self.assertEqual(body["visible_total"], 1)
         job = body["jobs"][0]
         self.assertEqual(job["company"], "Unknown company")
         self.assertGreaterEqual(job["fit_score"], 70)
@@ -349,6 +350,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(body["source_counts"]["linkedin"], 0)
         self.assertIn("linkedin", body["errors"])
         self.assertEqual(body["total"], 1)
+        self.assertEqual(body["visible_total"], 1)
 
     def test_jobspy_discovery_deduplicates_existing_jobs(self):
         self.client.post(
@@ -389,7 +391,8 @@ class JobAssistantTest(unittest.TestCase):
             response = self.client.post("/api/discovery/jobspy", json={"keywords": "software developer"})
 
         body = response.get_json()
-        self.assertEqual(body["total"], 1)
+        self.assertEqual(body["total"], 2)
+        self.assertEqual(body["visible_total"], 1)
         self.assertEqual(body["duplicates"], 2)
         self.assertTrue(body["jobs"][0]["already_saved"])
 
@@ -558,10 +561,11 @@ class JobAssistantTest(unittest.TestCase):
         search = {
             "keywords": "software developer",
             "location": "Toronto",
-            "distance": 50,
-            "results_wanted": 10,
-            "hours_old": 168,
             "enabled_sources": ["linkedin"],
+            "search_depth": "standard",
+            "date_window": "14d",
+            "per_source_cap": 100,
+            "total_cap": 200,
             "sort": {"field": "salary", "direction": "asc", "secondary_field": "posted_date", "secondary_direction": "desc", "unknown_salary_position": "last", "remote_rule": "remote_after_local"},
             "filters": {"salary_min": 0, "max_distance": 0, "overall_score_min": 0, "posted_within": 0},
         }
@@ -615,6 +619,66 @@ class JobAssistantTest(unittest.TestCase):
             ).get_json()
         self.assertEqual(result["preferences"]["sort"]["field"], "salary")
         self.assertEqual(result["jobs"][0]["company"], "B")
+
+    def test_discovery_search_results_are_stored_and_filtering_is_local(self):
+        fake = {
+            "jobs": [
+                {
+                    "source_job_id": "1",
+                    "title": "Software Developer",
+                    "company": "Scotiabank",
+                    "location": "Toronto",
+                    "source": "linkedin",
+                    "job_url": "https://example.com/1",
+                    "salary_text": "$90,000",
+                    "salary_min": 90000,
+                    "salary_max": 90000,
+                    "salary_interval": "yearly",
+                    "salary_currency": "CAD",
+                    "posted_date": "2026-06-19",
+                },
+                {
+                    "source_job_id": "2",
+                    "title": "Support Analyst",
+                    "company": "Scotiabank",
+                    "location": "Toronto",
+                    "source": "linkedin",
+                    "job_url": "https://example.com/2",
+                    "salary_text": "$80,000",
+                    "salary_min": 80000,
+                    "salary_max": 80000,
+                    "salary_interval": "yearly",
+                    "salary_currency": "CAD",
+                    "posted_date": "2026-06-18",
+                },
+            ],
+            "errors": {},
+            "source_counts": {"linkedin": 2},
+        }
+        with patch.object(app_module, "fetch_jobspy_jobs", return_value=fake):
+            result = self.client.post(
+                "/api/discovery/jobspy",
+                json={
+                    "keywords": "software developer",
+                    "location": "Toronto, Ontario",
+                    "enabled_sources": ["linkedin"],
+                    "search_depth": "thorough",
+                    "date_window": "30d",
+                    "per_source_cap": 250,
+                    "total_cap": 500,
+                    "salary_min": 70000,
+                    "overall_score_min": 70,
+                    "company": "Scotiabank",
+                },
+            ).get_json()
+
+        self.assertEqual(result["total"], 2)
+        self.assertEqual(result["visible_total"], 2)
+        self.assertIn("search", result)
+        stored = self.client.get(f"/api/discovery/results?search_key={result['search_key']}").get_json()
+        self.assertEqual(len(stored["jobs"]), 2)
+        self.assertEqual(stored["search"]["search_depth"], "thorough")
+        self.assertEqual(stored["metadata"]["raw_jobs_returned"], 2)
 
     def test_salary_extraction_from_structured_fields(self):
         salary = app_module.determine_salary(

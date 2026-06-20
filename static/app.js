@@ -116,11 +116,20 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("cover-letter-template-upload").addEventListener("change", uploadCoverLetterTemplate);
   document.getElementById("discovery-view-cards").addEventListener("click", () => setDiscoveryView("cards"));
   document.getElementById("discovery-view-table").addEventListener("click", () => setDiscoveryView("table"));
+  document.getElementById("discovery-clear-filters").addEventListener("click", clearDiscoveryFilters);
+  document.getElementById("discovery-reset-sorting").addEventListener("click", resetDiscoverySorting);
+  document.getElementById("discovery-show-all").addEventListener("click", showAllFetchedDiscoveryJobs);
   ["search", "status-filter", "fit-filter", "role-filter", "remote-filter", "risk-filter", "sort-by"].forEach((id) => {
     document.getElementById(id).addEventListener("input", renderJobs);
     document.getElementById(id).addEventListener("change", renderJobs);
   });
   [
+    "discovery-date-window",
+    "discovery-per-source-cap",
+    "discovery-total-cap",
+    "discovery-remote-preference",
+    "discovery-keywords",
+    "discovery-location",
     "discovery-sort-field",
     "discovery-sort-direction",
     "discovery-secondary-sort-field",
@@ -145,6 +154,12 @@ document.addEventListener("DOMContentLoaded", () => {
     element.addEventListener("input", handleDiscoveryControlsChanged);
     element.addEventListener("change", handleDiscoveryControlsChanged);
   });
+  document.getElementById("discovery-search-depth").addEventListener("change", () => {
+    syncDiscoveryDepthDefaults();
+    handleDiscoveryControlsChanged();
+  });
+  applyDiscoverySearchDefaults();
+  setDiscoveryControlsEnabled(false);
   loadAll();
 });
 
@@ -824,6 +839,49 @@ function discoveryFieldDefaultDirection(field) {
   return ["overall_score", "salary", "distance", "posted_date", "match_score", "deadline"].includes(field) ? "desc" : "asc";
 }
 
+function applyDiscoverySearchDefaults() {
+  setValue("discovery-search-depth", "standard");
+  setValue("discovery-date-window", "14d");
+  setValue("discovery-per-source-cap", 100);
+  setValue("discovery-total-cap", 200);
+}
+
+function syncDiscoveryDepthDefaults() {
+  const depth = value("discovery-search-depth") || "standard";
+  const preset = {
+    quick: { date_window: "3d", per_source_cap: 25, total_cap: 50 },
+    standard: { date_window: "14d", per_source_cap: 100, total_cap: 200 },
+    thorough: { date_window: "30d", per_source_cap: 250, total_cap: 500 },
+  }[depth] || { date_window: "14d", per_source_cap: 100, total_cap: 200 };
+  setValue("discovery-date-window", preset.date_window);
+  setValue("discovery-per-source-cap", preset.per_source_cap);
+  setValue("discovery-total-cap", preset.total_cap);
+}
+
+function discoverySearchCriteriaFromControls() {
+  return {
+    keywords: value("discovery-keywords"),
+    location: value("discovery-location"),
+    enabled_sources: selectedDiscoverySources(),
+    remote_preference: value("discovery-remote-preference"),
+    search_depth: value("discovery-search-depth") || "standard",
+    date_window: value("discovery-date-window") || "14d",
+    per_source_cap: value("discovery-per-source-cap") || 100,
+    total_cap: value("discovery-total-cap") || 200,
+  };
+}
+
+function setDiscoveryControlsEnabled(enabled) {
+  ["discovery-local-controls", "discovery-sort-controls"].forEach((id) => {
+    const element = document.getElementById(id);
+    if (element) element.disabled = !enabled;
+  });
+  ["discovery-clear-filters", "discovery-reset-sorting", "discovery-show-all", "discovery-view-cards", "discovery-view-table"].forEach((id) => {
+    const element = document.getElementById(id);
+    if (element) element.disabled = !enabled;
+  });
+}
+
 function discoveryPreferencesFromControls() {
   return {
     sort: {
@@ -899,36 +957,32 @@ async function searchDiscovery(event) {
   event.preventDefault();
   const button = document.getElementById("discovery-submit");
   const status = document.getElementById("discovery-status");
-  const sources = selectedDiscoverySources();
+  const criteria = discoverySearchCriteriaFromControls();
   button.disabled = true;
-  status.textContent = `Searching ${sources.map(sourceLabel).join(", ")}...`;
+  status.textContent = `Searching ${criteria.enabled_sources.map(sourceLabel).join(", ")}...`;
   try {
-    state.discoveryPreferences = discoveryPreferencesFromControls();
-    const result = await api.send("/api/discovery/jobspy", "POST", {
-      keywords: value("discovery-keywords"),
-      location: value("discovery-location"),
-      distance: value("discovery-distance"),
-      remote_preference: value("discovery-remote-preference"),
-      job_type: value("discovery-job-type"),
-      results_wanted: value("discovery-results-wanted"),
-      hours_old: value("discovery-hours-old"),
-      country_indeed: value("discovery-country-indeed"),
-      enabled_sources: sources,
-      sort: state.discoveryPreferences.sort,
-      filters: state.discoveryPreferences.filters,
-    });
+    const result = await api.send("/api/discovery/jobspy", "POST", criteria);
     state.discoveryResults = result.jobs || [];
     state.discoverySearchKey = result.search_key || "";
-    state.discoveryPreferences = result.preferences || state.discoveryPreferences;
+    state.discoveryPreferences = result.preferences || discoveryPreferencesFromControls();
+    state.discoverySearchCriteria = result.search || criteria;
     applyDiscoveryPreferencesToControls(state.discoveryPreferences);
     state.discoveryMeta = {
       total: result.total || 0,
+      visible_total: result.visible_total || (result.jobs || []).length,
       duplicates: result.duplicates || 0,
       source_counts: result.source_counts || {},
       errors: result.errors || {},
+      diagnostics: result.diagnostics || {},
+      cap_reached: Boolean(result.cap_reached),
     };
     renderDiscoveryResults(state.discoveryMeta);
-    status.textContent = result.total ? `Found ${result.total} live jobs.` : "No selected source returned jobs.";
+    setDiscoveryControlsEnabled(Boolean(state.discoveryResults.length));
+    status.textContent = result.visible_total
+      ? `Fetched ${result.total || 0} jobs and showing ${result.visible_total}.`
+      : result.total
+        ? `Fetched ${result.total} jobs; local filters are hiding all of them.`
+        : "No jobs were fetched from the selected sources.";
   } catch (error) {
     toast(error.message);
     status.textContent = error.message;
@@ -955,6 +1009,7 @@ function renderDiscoveryResults(result) {
   container.classList.remove("empty");
   const counts = result.source_counts || state.discoveryMeta.source_counts || {};
   const errors = result.errors || state.discoveryMeta.errors || {};
+  const diagnostics = result.diagnostics || state.discoveryMeta.diagnostics || {};
   const countText = Object.keys(counts).map((source) => `${sourceLabel(source)}: ${counts[source]}`).join(" | ");
   const errorText = Object.keys(errors).length
     ? `<div class="discovery-errors">${Object.entries(errors).map(([source, message]) => `<p><strong>${escapeHtml(sourceLabel(source))}:</strong> ${escapeHtml(message)}</p>`).join("")}</div>`
@@ -962,16 +1017,58 @@ function renderDiscoveryResults(result) {
   const prefs = state.discoveryPreferences || discoveryPreferencesFromControls();
   const jobs = applyDiscoveryClientFiltersAndSort(state.discoveryResults || [], prefs);
   const visibleCount = jobs.length;
-  const totalCount = Number(result.total || state.discoveryResults.length || 0);
+  const totalCount = Number(result.total || state.discoveryMeta.total || state.discoveryResults.length || 0);
   document.getElementById("discovery-active-state").textContent = describeDiscoveryState(prefs, visibleCount, totalCount);
   const body = state.discoveryView === "table" ? renderDiscoveryTable(jobs) : renderDiscoveryCards(jobs);
+  const rawSummary = renderDiscoveryDiagnostics(diagnostics, visibleCount, totalCount);
   container.innerHTML = `
     <div class="discovery-summary">
-      <p><strong>${totalCount}</strong> results | <strong>${Number(result.duplicates || state.discoveryMeta.duplicates || 0)}</strong> duplicates | <strong>${visibleCount}</strong> visible</p>
+      <p><strong>${totalCount}</strong> raw jobs | <strong>${Number(result.duplicates || state.discoveryMeta.duplicates || 0)}</strong> duplicates | <strong>${visibleCount}</strong> visible</p>
       <p class="muted">${escapeHtml(countText || "No source counts returned")}</p>
       ${errorText}
     </div>
+    ${rawSummary}
     ${body}
+  `;
+}
+
+function renderDiscoveryDiagnostics(diagnostics, visibleCount, totalCount) {
+  if (!diagnostics || !Object.keys(diagnostics).length) return "";
+  const details = [];
+  const searchCriteria = diagnostics.search_criteria || state.discoverySearchCriteria || {};
+  const sourceCounts = diagnostics.source_counts || {};
+  const sourceErrors = diagnostics.source_errors || {};
+  const fetched = Number(diagnostics.raw_jobs_returned || totalCount || 0);
+  const hiddenByLocalFilters = Math.max(0, Number(totalCount || 0) - Number(visibleCount || 0));
+  const capReached = diagnostics.cap_reached ? "Yes" : "No";
+  details.push(`<li><strong>Search:</strong> ${escapeHtml([
+    searchCriteria.keywords ? `keywords=${searchCriteria.keywords}` : "",
+    searchCriteria.location ? `location=${searchCriteria.location}` : "",
+    searchCriteria.search_depth ? `depth=${searchCriteria.search_depth}` : "",
+    searchCriteria.date_window ? `date=${searchCriteria.date_window}` : "",
+    searchCriteria.per_source_cap ? `per-source cap=${searchCriteria.per_source_cap}` : "",
+    searchCriteria.total_cap ? `total cap=${searchCriteria.total_cap}` : "",
+    searchCriteria.remote_preference ? `remote=${searchCriteria.remote_preference}` : "",
+  ].filter(Boolean).join("; "))}</li>`);
+  details.push(`<li><strong>Raw fetched:</strong> ${fetched}</li>`);
+  details.push(`<li><strong>Visible after local filters:</strong> ${Number(visibleCount || 0)}</li>`);
+  details.push(`<li><strong>Hidden by local filters:</strong> ${hiddenByLocalFilters}</li>`);
+  details.push(`<li><strong>Duplicates removed:</strong> ${Number(diagnostics.duplicates_removed || 0)}</li>`);
+  details.push(`<li><strong>Cap reached:</strong> ${capReached}</li>`);
+  if (Object.keys(sourceCounts).length) {
+    details.push(`<li><strong>By source:</strong> ${escapeHtml(Object.entries(sourceCounts).map(([source, count]) => `${sourceLabel(source)}=${count}`).join(" | "))}</li>`);
+  }
+  if (Object.keys(sourceErrors).length) {
+    details.push(`<li><strong>Source errors:</strong> ${escapeHtml(Object.entries(sourceErrors).map(([source, message]) => `${sourceLabel(source)}=${message}`).join(" | "))}</li>`);
+  }
+  if (totalCount > 0 && visibleCount === 0) {
+    details.push("<li><strong>Local filters:</strong> Jobs were fetched, but the current local filters hide all visible results.</li>");
+  }
+  return `
+    <details class="score-details" open>
+      <summary>Discovery diagnostics</summary>
+      <ul class="score-breakdown-list">${details.join("")}</ul>
+    </details>
   `;
 }
 
@@ -1299,6 +1396,42 @@ function setDiscoverySort(field) {
   const current = value("discovery-sort-field");
   setValue("discovery-sort-field", field);
   setValue("discovery-sort-direction", current === field ? (value("discovery-sort-direction") === "asc" ? "desc" : "asc") : discoveryFieldDefaultDirection(field));
+  handleDiscoveryControlsChanged();
+}
+
+function clearDiscoveryFilters() {
+  [
+    "discovery-filter-salary-min",
+    "discovery-filter-max-distance",
+    "discovery-filter-overall-score-min",
+    "discovery-filter-posted-within",
+    "discovery-filter-remote",
+    "discovery-filter-source",
+    "discovery-filter-job-field",
+    "discovery-filter-seniority",
+    "discovery-filter-company",
+    "discovery-filter-title-keywords",
+  ].forEach((id) => setValue(id, ""));
+  setChecked("discovery-filter-known-salary", false);
+  setChecked("discovery-filter-known-location", false);
+  setChecked("discovery-filter-exact-date", false);
+  handleDiscoveryControlsChanged();
+}
+
+function resetDiscoverySorting() {
+  setValue("discovery-sort-field", "overall_score");
+  setValue("discovery-sort-direction", "desc");
+  setValue("discovery-secondary-sort-field", "");
+  setValue("discovery-secondary-sort-direction", "asc");
+  setValue("discovery-unknown-salary-position", "last");
+  setValue("discovery-remote-rule", "remote_after_local");
+  handleDiscoveryControlsChanged();
+}
+
+function showAllFetchedDiscoveryJobs() {
+  state.discoveryResults = state.discoveryResults.map((job) => ({ ...job, hidden: false }));
+  clearDiscoveryFilters();
+  resetDiscoverySorting();
   handleDiscoveryControlsChanged();
 }
 
