@@ -102,6 +102,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("profile-form").addEventListener("submit", saveProfile);
   document.getElementById("discovery-form").addEventListener("submit", searchDiscovery);
   document.getElementById("csv-import-form").addEventListener("submit", importCsv);
+  document.getElementById("discovery-test-sources").addEventListener("click", testJobSources);
   document.getElementById("refresh-shortlist").addEventListener("click", loadAll);
   document.getElementById("generate").addEventListener("click", generateMaterials);
   document.getElementById("analyse-resume-match").addEventListener("click", analyseResumeMatch);
@@ -130,6 +131,7 @@ document.addEventListener("DOMContentLoaded", () => {
     "discovery-per-source-cap",
     "discovery-total-cap",
     "discovery-remote-preference",
+    "discovery-bypass-cache",
     "discovery-keywords",
     "discovery-location",
     "discovery-filter-salary-min",
@@ -162,11 +164,12 @@ document.addEventListener("DOMContentLoaded", () => {
 
 async function loadAll() {
   try {
-    const [jobs, dashboard, profile, ollamaHealth, evidence] = await Promise.all([
+    const [jobs, dashboard, profile, ollamaHealth, evidence, systemHealth] = await Promise.all([
       api.get("/api/jobs"),
       api.get("/api/dashboard"),
       api.get("/api/profile"),
       api.get("/api/ollama/health").catch((error) => ({ status: "error", summary: error.message })),
+      api.get("/api/health").catch((error) => ({ status: "error", summary: error.message })),
       api.get("/api/evidence").catch(() => []),
     ]);
     const shortlist = await api.get("/api/shortlist");
@@ -174,6 +177,7 @@ async function loadAll() {
     state.profile = profile;
     state.evidence = evidence;
     state.shortlist = shortlist;
+    state.systemHealth = systemHealth;
     renderDashboard(dashboard);
     renderProfile(profile);
     renderTemplateStatus(profile);
@@ -879,6 +883,7 @@ function applyDiscoverySearchDefaults() {
   setValue("discovery-distance", "");
   setValue("discovery-per-source-cap", 100);
   setValue("discovery-total-cap", 200);
+  setChecked("discovery-bypass-cache", false);
 }
 
 function syncDiscoveryDepthDefaults() {
@@ -904,6 +909,7 @@ function discoverySearchCriteriaFromControls() {
     date_window: value("discovery-date-window") || "14d",
     per_source_cap: value("discovery-per-source-cap") || 100,
     total_cap: value("discovery-total-cap") || 200,
+    bypass_cache: checked("discovery-bypass-cache"),
   };
 }
 
@@ -1082,6 +1088,33 @@ async function searchDiscovery(event) {
   }
 }
 
+async function testJobSources(event) {
+  event.preventDefault();
+  const button = document.getElementById("discovery-test-sources");
+  const status = document.getElementById("discovery-status");
+  const output = document.getElementById("discovery-source-test-output");
+  const criteria = {
+    keywords: "software developer",
+    location: "Toronto, ON",
+    enabled_sources: selectedDiscoverySources(),
+    bypass_cache: checked("discovery-bypass-cache"),
+  };
+  button.disabled = true;
+  status.textContent = `Testing sources: ${criteria.enabled_sources.map(sourceLabel).join(", ")}...`;
+  output.textContent = "";
+  try {
+    const result = await api.send("/api/discovery/jobspy/test-sources", "POST", criteria);
+    output.innerHTML = renderSourceTestResult(result);
+    status.textContent = "Source smoke test completed.";
+  } catch (error) {
+    output.textContent = "";
+    status.textContent = error.message;
+    toast(error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function selectedDiscoverySources() {
   return [...document.querySelectorAll('input[name="discovery-source"]:checked')].map((input) => input.value);
 }
@@ -1093,6 +1126,29 @@ function sourceLabel(source) {
     google: "Google Jobs",
     zip_recruiter: "ZipRecruiter",
   }[source] || source;
+}
+
+function renderSourceTestResult(result) {
+  const diagnostics = result.source_diagnostics || {};
+  const snapshots = result.source_snapshots || {};
+  const rows = Object.entries(diagnostics).map(([source, info]) => {
+    const count = Number(info?.raw_records_row_count || 0);
+    const title = snapshots[source]?.[0]?.title || "No title";
+    const company = snapshots[source]?.[0]?.company || "Unknown company";
+    const location = snapshots[source]?.[0]?.location || "Unknown location";
+    const error = info?.error ? ` — ${escapeHtml(info.error)}` : "";
+    return `<li><strong>${escapeHtml(sourceLabel(source))}:</strong> ${count} raw rows; ${escapeHtml(title)} / ${escapeHtml(company)} / ${escapeHtml(location)}${error}</li>`;
+  });
+  return `
+    <details class="score-details" open>
+      <summary>Source smoke test</summary>
+      <ul class="score-breakdown-list">
+        <li><strong>Query:</strong> ${escapeHtml(result.keywords || "")} @ ${escapeHtml(result.location_context?.discovery_location || result.input_location || "")}</li>
+        <li><strong>Raw results:</strong> ${Number(result.total || 0)}</li>
+        ${rows.join("")}
+      </ul>
+    </details>
+  `;
 }
 
 function renderDiscoveryResults(result) {
@@ -1174,6 +1230,12 @@ function renderDiscoveryDiagnostics(diagnostics, visibleCount, totalCount) {
     searchCriteria.remote_preference ? `remote=${searchCriteria.remote_preference}` : "",
     searchCriteria.distance ? `radius=${searchCriteria.distance}` : "",
   ].filter(Boolean).join("; "))}</li>`);
+  details.push(`<li><strong>Cache:</strong> ${escapeHtml([
+    diagnostics.cache_hit === true ? "hit" : diagnostics.cache_hit === false ? "miss" : "unknown",
+    diagnostics.cache_created_at ? `created=${diagnostics.cache_created_at}` : "",
+    diagnostics.cached_raw_result_count !== undefined ? `cached raw=${diagnostics.cached_raw_result_count}` : "",
+    diagnostics.bypass_cache ? "bypassed" : "",
+  ].filter(Boolean).join("; ") || "not available")}</li>`);
   details.push(`<li><strong>Discovery location:</strong> ${escapeHtml([
     diagnostics.original_location ? `input=${diagnostics.original_location}` : "",
     diagnostics.normalized_location ? `normalized=${diagnostics.normalized_location}` : "",

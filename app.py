@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import csv
 import html
+import importlib.metadata
 import io
 import json
 import os
 import re
 import shutil
 import sqlite3
+import subprocess
+import sys
 import urllib.error
 import urllib.request
 from urllib.parse import urlencode
@@ -17,6 +20,8 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
+import platform
+import warnings
 
 from docx import Document
 from flask import Flask, Response, g, has_app_context, jsonify, render_template, request, send_file
@@ -75,6 +80,14 @@ DISCOVERY_DATE_WINDOWS = {
     "any": 0,
 }
 
+APP_SCHEMA_VERSION = 1
+DISCOVERY_DEBUG_SNAPSHOT_LIMIT = 25
+TESTED_DEPENDENCY_VERSIONS = {
+    "python-jobspy": "1.1.82",
+    "pandas": "2.3.3",
+    "numpy": "1.26.3",
+}
+
 CANADIAN_POSTAL_CODE_RE = re.compile(r"^[ABCEGHJ-NPRSTV-Z]\d[ABCEGHJ-NPRSTV-Z][ ]?\d[ABCEGHJ-NPRSTV-Z]\d$", re.I)
 CANADIAN_POSTAL_CODE_EXTRACT_RE = re.compile(r"\b([ABCEGHJ-NPRSTV-Z]\d[ABCEGHJ-NPRSTV-Z][ ]?\d[ABCEGHJ-NPRSTV-Z]\d)\b", re.I)
 PROVINCE_LOOKUP = {
@@ -131,6 +144,62 @@ ROLE_TYPES = [
     "new grad",
     "other",
 ]
+
+
+def get_package_version(package_name: str) -> str:
+    try:
+        return importlib.metadata.version(package_name)
+    except Exception:
+        return ""
+
+
+def get_git_commit() -> str:
+    git_exe = shutil.which("git") or shutil.which("git.exe")
+    if not git_exe:
+        return ""
+    try:
+        completed = subprocess.run([git_exe, "-C", str(BASE_DIR), "rev-parse", "HEAD"], capture_output=True, text=True, check=False)
+    except Exception:
+        return ""
+    return completed.stdout.strip() if completed.returncode == 0 else ""
+
+
+def collect_environment_diagnostics() -> dict[str, Any]:
+    git_commit = get_git_commit()
+    cwd = os.getcwd()
+    return {
+        "git_commit": git_commit,
+        "active_git_commit": git_commit,
+        "python_executable": sys.executable,
+        "python_version": sys.version.split()[0],
+        "os": platform.platform(),
+        "jobspy_version": get_package_version("python-jobspy"),
+        "pandas_version": get_package_version("pandas"),
+        "numpy_version": get_package_version("numpy"),
+        "sqlite_db_path": str(DB_PATH),
+        "schema_version": APP_SCHEMA_VERSION,
+        "active_database_schema_version": APP_SCHEMA_VERSION,
+        "cwd": cwd,
+        "working_directory": cwd,
+        "discovery_cache_path": str(DB_PATH),
+        "discovery_debug_path": str(DATA_DIR / "discovery_debug"),
+    }
+
+
+def warn_on_dependency_mismatch() -> None:
+    current = collect_environment_diagnostics()
+    mismatches = []
+    current_key_map = {
+        "python-jobspy": "jobspy_version",
+        "pandas": "pandas_version",
+        "numpy": "numpy_version",
+    }
+    for package, tested in TESTED_DEPENDENCY_VERSIONS.items():
+        installed = current.get(current_key_map.get(package, f"{package.replace('-', '_')}_version"), "")
+        if installed and installed != tested:
+            mismatches.append(f"{package}={installed} (tested {tested})")
+    if mismatches:
+        warnings.warn("Dependency version mismatch: " + ", ".join(mismatches), RuntimeWarning, stacklevel=2)
 
 SCORING_WEIGHTS = {
     "skills": 30,
@@ -344,6 +413,7 @@ RESUME_VARIANT_COLUMNS = {
 
 def create_app() -> Flask:
     app = Flask(__name__)
+    warn_on_dependency_mismatch()
 
     @app.before_request
     def ensure_database() -> None:
@@ -368,6 +438,15 @@ def create_app() -> Flask:
         profile = load_profile()
         config = OllamaConfig.from_mapping(profile)
         return jsonify(build_ollama_health_report(config))
+
+    @app.get("/api/health")
+    def health() -> Response:
+        diagnostics = collect_environment_diagnostics()
+        diagnostics["database_path"] = str(DB_PATH)
+        diagnostics["discovery_cache_path"] = str(DB_PATH)
+        diagnostics["discovery_debug_path"] = str(DATA_DIR / "discovery_debug")
+        diagnostics["profile_loaded"] = bool(load_profile())
+        return jsonify(diagnostics)
 
     @app.post("/api/ollama/suggest")
     def ollama_suggest() -> Response:
@@ -735,12 +814,20 @@ def create_app() -> Flask:
             return jsonify({"error": "Discovery search not found"}), 404
         return jsonify(run)
 
+    @app.get("/api/discovery/debug/latest")
+    def discovery_debug_latest() -> Response:
+        latest = load_latest_discovery_debug_run()
+        if not latest:
+            return jsonify({"error": "No discovery debug runs found"}), 404
+        return jsonify(latest)
+
     @app.post("/api/discovery/jobspy")
     def discovery_jobspy() -> Response:
         payload = request.get_json(force=True)
         keywords = text(payload.get("keywords"))
         if not keywords:
             return jsonify({"error": "Keywords are required"}), 400
+        bypass_cache = as_bool(payload.get("bypass_cache"))
 
         search = discovery_search_config(payload)
         search_key = discovery_search_signature(payload)
@@ -750,7 +837,7 @@ def create_app() -> Flask:
         provider = get_geocoding_provider()
         origin = profile_home_location(profile)
         try:
-            location_context = resolve_discovery_location_context(search["location"], profile, provider)
+            location_context = resolve_discovery_location_context(search["location"], profile, provider, use_cache=not bypass_cache)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         search["original_location"] = location_context["original_input"]
@@ -784,7 +871,7 @@ def create_app() -> Flask:
         for raw_job in raw_jobs:
             payload_job = jobspy_result_to_job_payload(raw_job)
             clean = normalize_job_payload(payload_job)
-            clean, geocode_result = geocode_discovery_job(clean, profile, origin, provider)
+            clean, geocode_result = geocode_discovery_job(clean, profile, origin, provider, use_cache=not bypass_cache)
             if geocode_result.get("ok"):
                 geocoding_success += 1
             if geocode_result.get("cached"):
@@ -828,6 +915,10 @@ def create_app() -> Flask:
                     source_counts[source] += 1
 
         diagnostics = {
+            "bypass_cache": bypass_cache,
+            "cache_hit": False,
+            "cache_created_at": "",
+            "cached_raw_result_count": 0,
             "search_criteria": search,
             "saved_origin": origin,
             "original_location": search.get("original_location"),
@@ -854,7 +945,6 @@ def create_app() -> Flask:
             "distance_origin": search["distance_origin"],
             "location_resolution_method": search["location_resolution_method"],
         }
-        save_discovery_search_run(search_key, search, diagnostics, raw_jobs)
         if jobs:
             jobs = sort_discovery_jobs(
                 jobs,
@@ -866,6 +956,15 @@ def create_app() -> Flask:
                 preferences.get("sort", {}).get("unknown_salary_position") or "last",
             )
         jobs = jobs[: search["total_cap"]]
+        diagnostics["jobs_returned_to_frontend"] = len(jobs)
+        diagnostics["post_processing_row_count"] = len(jobs)
+        save_discovery_search_run(search_key, search, diagnostics, raw_jobs)
+        save_discovery_debug_run(
+            search_key,
+            {"keywords": keywords, **search, "bypass_cache": bypass_cache},
+            diagnostics,
+            fetched.get("source_snapshots", {}),
+        )
         return jsonify(
             {
                 "jobs": jobs,
@@ -879,7 +978,51 @@ def create_app() -> Flask:
                 "raw_jobs_returned": len(raw_jobs),
                 "cap_reached": len(raw_jobs) > search["total_cap"],
                 "preferences": preferences,
+                "bypass_cache": bypass_cache,
                 "diagnostics": diagnostics,
+            }
+        )
+
+    @app.post("/api/discovery/jobspy/test-sources")
+    def discovery_jobspy_test_sources() -> Response:
+        payload = request.get_json(force=True)
+        enabled_sources = normalize_discovery_sources(payload.get("enabled_sources"))
+        keywords = text(payload.get("keywords")) or "software developer"
+        location_input = text(payload.get("location")) or "Toronto, ON"
+        provider = get_geocoding_provider()
+        profile = load_profile()
+        bypass_value = payload.get("bypass_cache")
+        bypass_cache = True if bypass_value in (None, "") else as_bool(bypass_value)
+        try:
+            location_context = resolve_discovery_location_context(location_input, profile, provider, use_cache=not bypass_cache)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        started = datetime.now().isoformat()
+        fetched = fetch_jobspy_jobs(
+            keywords=keywords,
+            location=location_context["discovery_location"],
+            distance=5,
+            remote_preference="",
+            job_type=None,
+            results_wanted=5,
+            hours_old=168,
+            enabled_sources=enabled_sources,
+            country_indeed="Canada",
+        )
+        return jsonify(
+            {
+                "ok": True,
+                "started_at": started,
+                "ended_at": datetime.now().isoformat(),
+                "keywords": keywords,
+                "input_location": location_input,
+                "location_context": location_context,
+                "enabled_sources": enabled_sources,
+                "source_counts": fetched.get("source_counts", {}),
+                "source_diagnostics": fetched.get("source_diagnostics", {}),
+                "source_snapshots": fetched.get("source_snapshots", {}),
+                "errors": fetched.get("errors", {}),
+                "total": len(fetched.get("jobs", [])),
             }
         )
 
@@ -3497,11 +3640,47 @@ def load_discovery_search_run(search_key: str) -> dict[str, Any]:
     row = query_db("SELECT * FROM discovery_search_runs WHERE search_key = ?", [search_key], one=True)
     if row is None:
         return {}
+    raw_jobs = parse_json_array(row["raw_jobs_json"])
     return {
         "search_key": search_key,
         "search": parse_json_object(row["search_json"]),
         "metadata": parse_json_object(row["metadata_json"]),
-        "jobs": parse_json_array(row["raw_jobs_json"]),
+        "jobs": raw_jobs,
+        "cache_hit": True,
+        "cache_created_at": text(row["created_at"]),
+        "cache_updated_at": text(row["updated_at"]),
+        "cached_raw_result_count": len(raw_jobs),
+    }
+
+
+def save_discovery_debug_run(search_key: str, request_json: dict[str, Any], metadata_json: dict[str, Any], source_snapshot_json: dict[str, Any]) -> None:
+    if not search_key:
+        return
+    get_db().execute(
+        """
+        INSERT INTO discovery_debug_runs (search_key, request_json, metadata_json, source_snapshot_json, updated_at)
+        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(search_key) DO UPDATE SET
+            request_json = excluded.request_json,
+            metadata_json = excluded.metadata_json,
+            source_snapshot_json = excluded.source_snapshot_json,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        [search_key, dumps_json(request_json, sort_keys=True), dumps_json(metadata_json, sort_keys=True), dumps_json(source_snapshot_json, sort_keys=True)],
+    )
+    get_db().commit()
+
+
+def load_latest_discovery_debug_run() -> dict[str, Any]:
+    row = query_db("SELECT * FROM discovery_debug_runs ORDER BY updated_at DESC, id DESC LIMIT 1", one=True)
+    if row is None:
+        return {}
+    return {
+        "search_key": text(row["search_key"]),
+        "request": parse_json_object(row["request_json"]),
+        "metadata": parse_json_object(row["metadata_json"]),
+        "source_snapshots": parse_json_object(row["source_snapshot_json"]),
+        "created_at": text(row["updated_at"]),
     }
 
 
@@ -3741,7 +3920,14 @@ def get_geocoding_provider() -> GeocodingProvider:
     return NominatimGeocodingProvider()
 
 
-def geocode_location_value(raw_value: str, *, lookup_type: str, profile: dict[str, str] | None = None, provider: GeocodingProvider | None = None) -> dict[str, Any]:
+def geocode_location_value(
+    raw_value: str,
+    *,
+    lookup_type: str,
+    profile: dict[str, str] | None = None,
+    provider: GeocodingProvider | None = None,
+    use_cache: bool = True,
+) -> dict[str, Any]:
     profile = profile or {}
     provider = provider or get_geocoding_provider()
     raw = normalize_space(raw_value)
@@ -3783,7 +3969,7 @@ def geocode_location_value(raw_value: str, *, lookup_type: str, profile: dict[st
     errors: list[str] = []
     for candidate in candidates:
         cache_key = geocoding_cache_key(lookup_type, candidate["query"], candidate["normalized_query"])
-        cached = load_geocoding_cache(cache_key)
+        cached = load_geocoding_cache(cache_key) if use_cache else None
         if cached is not None:
             cached_result = dict(cached["result"])
             cached_result.update(
@@ -3822,7 +4008,8 @@ def geocode_location_value(raw_value: str, *, lookup_type: str, profile: dict[st
                 "display_name": text(lookup.get("display_name")),
                 "cached": False,
             }
-            save_geocoding_cache(cache_key, lookup_type, candidate["query"], candidate["normalized_query"], provider.name, result, True)
+            if use_cache:
+                save_geocoding_cache(cache_key, lookup_type, candidate["query"], candidate["normalized_query"], provider.name, result, True)
             return result
         except Exception as exc:
             error_message = f"{type(exc).__name__}: {exc}"
@@ -3841,7 +4028,8 @@ def geocode_location_value(raw_value: str, *, lookup_type: str, profile: dict[st
                 "used_fallback": bool(candidate["used_postal_fallback"]),
                 "cached": False,
             }
-            save_geocoding_cache(cache_key, lookup_type, candidate["query"], candidate["normalized_query"], provider.name, failure, False)
+            if use_cache:
+                save_geocoding_cache(cache_key, lookup_type, candidate["query"], candidate["normalized_query"], provider.name, failure, False)
             errors.append(error_message)
     return {
         "ok": False,
@@ -3860,10 +4048,16 @@ def geocode_location_value(raw_value: str, *, lookup_type: str, profile: dict[st
     }
 
 
-def geocode_discovery_job(job: dict[str, Any], profile: dict[str, str], origin: dict[str, Any], provider: GeocodingProvider | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+def geocode_discovery_job(
+    job: dict[str, Any],
+    profile: dict[str, str],
+    origin: dict[str, Any],
+    provider: GeocodingProvider | None = None,
+    use_cache: bool = True,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     provider = provider or get_geocoding_provider()
     raw_location = text(job.get("location"))
-    geocode = geocode_location_value(raw_location, lookup_type="job", profile=profile, provider=provider)
+    geocode = geocode_location_value(raw_location, lookup_type="job", profile=profile, provider=provider, use_cache=use_cache)
     job["location_original"] = raw_location
     job["normalized_location"] = text(geocode.get("normalized_query")) or raw_location
     job["location_provider"] = text(geocode.get("provider"))
@@ -4008,7 +4202,12 @@ def normalize_discovery_city_region(display_name: str, fallback: str = "") -> st
     return city or raw
 
 
-def resolve_discovery_location_context(raw_location: str, profile: dict[str, str] | None = None, provider: GeocodingProvider | None = None) -> dict[str, Any]:
+def resolve_discovery_location_context(
+    raw_location: str,
+    profile: dict[str, str] | None = None,
+    provider: GeocodingProvider | None = None,
+    use_cache: bool = True,
+) -> dict[str, Any]:
     profile = profile or {}
     provider = provider or get_geocoding_provider()
     original_input = text(raw_location)
@@ -4018,8 +4217,15 @@ def resolve_discovery_location_context(raw_location: str, profile: dict[str, str
     distance_origin = normalized_postal or normalized_input
     lookup_input = normalized_postal or normalized_input
     lookup_result: dict[str, Any]
+    postal_fallback_location = ""
+    if postal:
+        profile_location = text(profile.get("home_location_normalized"))
+        if profile_location:
+            postal_fallback_location = normalize_discovery_city_region(profile_location, fallback=profile_location)
+        elif normalized_postal.startswith("M"):
+            postal_fallback_location = "Toronto, ON"
     if lookup_input:
-        lookup_result = geocode_location_value(lookup_input, lookup_type="search", profile=profile, provider=provider)
+        lookup_result = geocode_location_value(lookup_input, lookup_type="search", profile=profile, provider=provider, use_cache=use_cache)
     else:
         lookup_result = {
             "ok": False,
@@ -4037,25 +4243,34 @@ def resolve_discovery_location_context(raw_location: str, profile: dict[str, str
     discovery_location = ""
     resolution_method = "raw"
     if lookup_result.get("ok"):
-        discovery_location = normalize_discovery_city_region(
-            text(lookup_result.get("display_name")) or text(lookup_result.get("normalized_query")),
-            fallback=normalized_input,
-        )
         if postal:
-            resolution_method = "postal_code_to_city_region"
-        elif discovery_location != normalized_input:
-            resolution_method = "geocoded_city_region"
-        else:
+            if postal_fallback_location:
+                discovery_location = postal_fallback_location
+                resolution_method = "profile_city_fallback" if text(profile.get("home_location_normalized")) else "postal_code_prefix_fallback"
+            else:
+                discovery_location = normalize_discovery_city_region(
+                    text(lookup_result.get("display_name")) or text(lookup_result.get("normalized_query")),
+                    fallback=normalized_input,
+                )
+                resolution_method = "postal_code_to_city_region"
+        elif province_code_from_text(normalized_input.split(",")[-1] if normalized_input else ""):
+            discovery_location = normalize_discovery_city_region(normalized_input, fallback=normalized_input)
             resolution_method = "normalized_city_region"
+        else:
+            discovery_location = normalize_discovery_city_region(
+                text(lookup_result.get("display_name")) or text(lookup_result.get("normalized_query")),
+                fallback=normalized_input,
+            )
+            resolution_method = "geocoded_city_region" if discovery_location != normalized_input else "normalized_city_region"
     elif postal:
-        profile_location = text(profile.get("home_location_normalized"))
-        if profile_location:
-            discovery_location = profile_location
-            resolution_method = "profile_city_fallback"
+        if postal_fallback_location:
+            discovery_location = postal_fallback_location
+            resolution_method = "profile_city_fallback" if text(profile.get("home_location_normalized")) else "postal_code_prefix_fallback"
         else:
             raise ValueError("Could not resolve the postal code to a discovery city or region.")
     else:
         discovery_location = normalized_input
+        resolution_method = "normalized_city_region" if normalized_input else "raw"
     return {
         "original_input": original_input,
         "normalized_input": normalized_postal or normalized_input,
@@ -4701,6 +4916,33 @@ def init_db() -> None:
     )
     db.execute(
         """
+        CREATE TABLE IF NOT EXISTS discovery_debug_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            search_key TEXT NOT NULL DEFAULT '',
+            request_json TEXT NOT NULL DEFAULT '{}',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            source_snapshot_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    ensure_columns(
+        "discovery_debug_runs",
+        {
+            "request_json": "TEXT NOT NULL DEFAULT '{}'",
+            "metadata_json": "TEXT NOT NULL DEFAULT '{}'",
+            "source_snapshot_json": "TEXT NOT NULL DEFAULT '{}'",
+        },
+    )
+    db.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS discovery_debug_runs_search_key_idx
+        ON discovery_debug_runs(search_key)
+        """
+    )
+    db.execute(
+        """
         CREATE TABLE IF NOT EXISTS geocoding_cache (
             cache_key TEXT PRIMARY KEY,
             lookup_type TEXT NOT NULL DEFAULT '',
@@ -4724,6 +4966,7 @@ def init_db() -> None:
             "success": "INTEGER NOT NULL DEFAULT 0",
         },
     )
+    db.execute(f"PRAGMA user_version = {APP_SCHEMA_VERSION}")
     db.commit()
 
 
@@ -5288,6 +5531,10 @@ def extract_job_details(content: str, source: str = "", existing: dict[str, Any]
 
 def normalize_space(value: str) -> str:
     return re.sub(r"\s+", " ", value or "").strip()
+
+
+def as_bool(value: Any) -> bool:
+    return text(value).lower() in {"1", "true", "yes", "on", "allowed"}
 
 
 def guess_title(lines: list[str]) -> str:

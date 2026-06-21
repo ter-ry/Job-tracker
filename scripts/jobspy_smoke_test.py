@@ -11,12 +11,12 @@ def run_source(source: str) -> None:
     try:
         jobs = scrape_jobs(
             site_name=source,
-            search_term="junior software developer",
-            google_search_term="junior software developer jobs near Toronto Ontario",
+            search_term="early childhood educator",
+            google_search_term="early childhood educator jobs near Toronto Ontario",
             location="Toronto, Ontario",
             country_indeed="Canada",
-            results_wanted=10,
-            hours_old=168,
+            results_wanted=30,
+            hours_old=336,
             linkedin_fetch_description=False,
             verbose=0,
         )

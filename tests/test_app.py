@@ -350,7 +350,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(postal["normalized_input"], "M2J 0B6")
         self.assertEqual(postal["distance_origin"], "M2J 0B6")
         self.assertEqual(postal["discovery_location"], "Toronto, ON")
-        self.assertEqual(postal["resolution_method"], "postal_code_to_city_region")
+        self.assertEqual(postal["resolution_method"], "postal_code_prefix_fallback")
 
     def test_canadian_postal_code_normalization_and_cached_profile_geocoding(self):
         self.assertEqual(app_module.normalize_canadian_postal_code("m5v2t6"), "M5V 2T6")
@@ -388,6 +388,160 @@ class JobAssistantTest(unittest.TestCase):
         response = self.client.post("/api/profile", json={"location": "M5V2T"})
         self.assertEqual(response.status_code, 400)
         self.assertIn("Invalid Canadian postal code", response.get_json()["error"])
+
+    def test_api_health_reports_environment_diagnostics(self):
+        health = self.client.get("/api/health")
+        self.assertEqual(health.status_code, 200)
+        body = health.get_json()
+        self.assertEqual(body["sqlite_db_path"], str(app_module.DB_PATH))
+        self.assertEqual(body["discovery_cache_path"], str(app_module.DB_PATH))
+        self.assertEqual(body["schema_version"], 1)
+        self.assertIn("python_executable", body)
+        self.assertIn("python_version", body)
+        self.assertIn("os", body)
+        self.assertIn("jobspy_version", body)
+        self.assertIn("pandas_version", body)
+        self.assertIn("numpy_version", body)
+        self.assertIn("cwd", body)
+
+    def test_discovery_returns_jobs_without_profile_origin(self):
+        provider = FakeGeocodingProvider(
+            {
+                "Toronto, Ontario, Canada": {
+                    "latitude": 43.6532,
+                    "longitude": -79.3832,
+                    "display_name": "Toronto, Ontario, Canada",
+                    "ok": True,
+                    "status": "saved",
+                    "provider": "fake",
+                    "confidence": 80,
+                    "precision": "city",
+                    "geocoded_at": "2026-06-20T10:00:00",
+                    "normalized_query": "Toronto, ON",
+                    "error": "",
+                },
+            }
+        )
+        fake = {
+            "jobs": [
+                {
+                    "source_job_id": "1",
+                    "title": "Software Developer",
+                    "company": "Northstar",
+                    "location": "Toronto, ON",
+                    "source": "linkedin",
+                    "job_url": "https://example.com/1",
+                    "description": "Python SQL APIs",
+                    "posted_date": "2026-06-19",
+                }
+            ],
+            "errors": {},
+            "source_counts": {"linkedin": 1},
+            "source_diagnostics": {
+                "linkedin": {"source": "linkedin", "attempted": True, "success": True, "result_count": 1, "error": "", "skipped_reason": "", "duration_ms": 5, "raw_records_row_count": 1, "normalized_row_count": 1},
+                "indeed": {"source": "indeed", "attempted": False, "success": False, "result_count": 0, "error": "", "skipped_reason": "disabled", "duration_ms": 0},
+                "google": {"source": "google", "attempted": False, "success": False, "result_count": 0, "error": "", "skipped_reason": "disabled", "duration_ms": 0},
+                "zip_recruiter": {"source": "zip_recruiter", "attempted": False, "success": False, "result_count": 0, "error": "", "skipped_reason": "disabled", "duration_ms": 0},
+            },
+            "source_snapshots": {"linkedin": [{"source": "linkedin", "title": "Software Developer", "company": "Northstar", "location": "Toronto, ON", "date_posted": "2026-06-19", "url": "https://example.com/1", "raw_field_types": {"title": "str"}}]},
+        }
+        with patch.object(app_module, "get_geocoding_provider", return_value=provider), patch.object(app_module, "fetch_jobspy_jobs", return_value=fake):
+            response = self.client.post(
+                "/api/discovery/jobspy",
+                json={"keywords": "software developer", "location": "Toronto, ON", "enabled_sources": ["linkedin"], "bypass_cache": True},
+            )
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertEqual(body["total"], 1)
+        self.assertEqual(body["visible_total"], 1)
+        self.assertFalse(body["diagnostics"]["origin_available"])
+        self.assertEqual(body["bypass_cache"], True)
+
+    def test_discovery_source_smoke_test_reports_each_enabled_source(self):
+        provider = FakeGeocodingProvider(
+            {
+                "Toronto, Ontario, Canada": {
+                    "latitude": 43.6532,
+                    "longitude": -79.3832,
+                    "display_name": "Toronto, Ontario, Canada",
+                    "ok": True,
+                    "status": "saved",
+                    "provider": "fake",
+                    "confidence": 80,
+                    "precision": "city",
+                    "geocoded_at": "2026-06-20T10:00:00",
+                    "normalized_query": "Toronto, ON",
+                    "error": "",
+                }
+            }
+        )
+        fake = {
+            "jobs": [],
+            "errors": {"indeed": "RuntimeError: parser error"},
+            "source_counts": {"linkedin": 0, "indeed": 0},
+            "source_diagnostics": {
+                "linkedin": {"source": "linkedin", "attempted": True, "success": True, "result_count": 0, "error": "", "skipped_reason": "", "duration_ms": 5, "raw_records_row_count": 0, "normalized_row_count": 0},
+                "indeed": {"source": "indeed", "attempted": True, "success": False, "result_count": 0, "error": "RuntimeError: parser error", "skipped_reason": "", "duration_ms": 7, "raw_records_row_count": 0, "normalized_row_count": 0},
+                "google": {"source": "google", "attempted": False, "success": False, "result_count": 0, "error": "", "skipped_reason": "disabled", "duration_ms": 0},
+                "zip_recruiter": {"source": "zip_recruiter", "attempted": False, "success": False, "result_count": 0, "error": "", "skipped_reason": "disabled", "duration_ms": 0},
+            },
+            "source_snapshots": {},
+        }
+        with patch.object(app_module, "get_geocoding_provider", return_value=provider), patch.object(app_module, "fetch_jobspy_jobs", return_value=fake) as mocked_fetch:
+            response = self.client.post(
+                "/api/discovery/jobspy/test-sources",
+                json={"enabled_sources": ["linkedin", "indeed"], "bypass_cache": True},
+            )
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertEqual(body["location_context"]["discovery_location"], "Toronto, ON")
+        self.assertEqual(body["source_diagnostics"]["linkedin"]["attempted"], True)
+        self.assertEqual(body["source_diagnostics"]["indeed"]["attempted"], True)
+        self.assertEqual(body["source_diagnostics"]["indeed"]["error"], "RuntimeError: parser error")
+        self.assertEqual(mocked_fetch.call_args.kwargs["location"], "Toronto, ON")
+        self.assertEqual(body["source_counts"]["linkedin"], 0)
+
+    def test_discovery_debug_latest_endpoint_returns_latest_run(self):
+        provider = FakeGeocodingProvider(
+            {
+                "Toronto, Ontario, Canada": {
+                    "latitude": 43.6532,
+                    "longitude": -79.3832,
+                    "display_name": "Toronto, Ontario, Canada",
+                    "ok": True,
+                    "status": "saved",
+                    "provider": "fake",
+                    "confidence": 80,
+                    "precision": "city",
+                    "geocoded_at": "2026-06-20T10:00:00",
+                    "normalized_query": "Toronto, ON",
+                    "error": "",
+                },
+            }
+        )
+        fake = {
+            "jobs": [],
+            "errors": {},
+            "source_counts": {"linkedin": 0},
+            "source_diagnostics": {
+                "linkedin": {"source": "linkedin", "attempted": True, "success": True, "result_count": 0, "error": "", "skipped_reason": "", "duration_ms": 4, "raw_records_row_count": 0, "normalized_row_count": 0},
+                "indeed": {"source": "indeed", "attempted": False, "success": False, "result_count": 0, "error": "", "skipped_reason": "disabled", "duration_ms": 0},
+                "google": {"source": "google", "attempted": False, "success": False, "result_count": 0, "error": "", "skipped_reason": "disabled", "duration_ms": 0},
+                "zip_recruiter": {"source": "zip_recruiter", "attempted": False, "success": False, "result_count": 0, "error": "", "skipped_reason": "disabled", "duration_ms": 0},
+            },
+            "source_snapshots": {},
+        }
+        with patch.object(app_module, "get_geocoding_provider", return_value=provider), patch.object(app_module, "fetch_jobspy_jobs", return_value=fake):
+            self.client.post(
+                "/api/discovery/jobspy",
+                json={"keywords": "software developer", "location": "Toronto, ON", "enabled_sources": ["linkedin"], "bypass_cache": True},
+            )
+        latest = self.client.get("/api/discovery/debug/latest")
+        self.assertEqual(latest.status_code, 200)
+        body = latest.get_json()
+        self.assertIn("source_snapshots", body)
+        self.assertIn("metadata", body)
+        self.assertEqual(body["metadata"]["jobs_returned_to_frontend"], 0)
 
     def test_toronto_city_and_job_distance_metadata_are_geocoded(self):
         provider = FakeGeocodingProvider(
@@ -1032,6 +1186,8 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(len(stored["jobs"]), 2)
         self.assertEqual(stored["search"]["search_depth"], "thorough")
         self.assertEqual(stored["metadata"]["raw_jobs_returned"], 2)
+        self.assertTrue(stored["cache_hit"])
+        self.assertEqual(stored["cached_raw_result_count"], 2)
 
     def test_salary_extraction_from_structured_fields(self):
         salary = app_module.determine_salary(
