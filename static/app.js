@@ -179,6 +179,7 @@ async function loadAll() {
     state.shortlist = shortlist;
     state.systemHealth = systemHealth;
     renderDashboard(dashboard);
+    renderPipelineDashboard(jobs);
     renderProfile(profile);
     renderTemplateStatus(profile);
     renderOllamaHealth(ollamaHealth);
@@ -205,6 +206,39 @@ function renderDashboard(dashboard) {
   setText("interview-rate", `${dashboard.interview_rate}%`);
   setText("missing-salary", dashboard.missing_salary);
   setText("high-coding-risk", dashboard.high_coding_risk);
+}
+
+let pipelineCategory = "All";
+
+function renderPipelineDashboard(jobs) {
+  const items = Array.isArray(jobs) ? jobs : [];
+  const categories = ["All", ...new Set(items.map((job) => String(job.role_type || "").trim()).filter(Boolean))];
+  const filters = document.getElementById("pipeline-filters");
+  if (!filters) return;
+  if (!categories.includes(pipelineCategory)) pipelineCategory = "All";
+  filters.innerHTML = categories.map((category) => `<button class="pipeline-filter ${category === pipelineCategory ? "active" : ""}" role="tab" aria-selected="${category === pipelineCategory}" data-category="${escapeHtml(category)}">${escapeHtml(category)}</button>`).join("");
+  filters.querySelectorAll("button").forEach((button) => button.addEventListener("click", () => {
+    pipelineCategory = button.dataset.category || "All";
+    renderPipelineDashboard(items);
+  }));
+  const filtered = pipelineCategory === "All" ? items : items.filter((job) => String(job.role_type || "") === pipelineCategory);
+  setText("pipeline-discovered", items.length);
+  setText("pipeline-matches", items.filter((job) => Number(job.fit_score || 0) >= 75).length);
+  setText("pipeline-ready", items.filter((job) => ["Saved", "shortlisted", "Drafting"].includes(job.status)).length);
+  const cards = document.getElementById("pipeline-cards");
+  if (!filtered.length) {
+    cards.innerHTML = `<p class="pipeline-empty">No saved jobs match this category.</p>`;
+    return;
+  }
+  cards.innerHTML = filtered.slice().sort((a, b) => Number(b.fit_score || 0) - Number(a.fit_score || 0)).map((job) => {
+    const score = Number(job.fit_score || 0);
+    const action = ["Applied", "Interview", "Offer"].includes(job.status) ? "Track" : score >= 75 ? "Ready" : "Review";
+    return `<article class="pipeline-card"><div><h3>${escapeHtml(job.title || "Untitled role")}</h3><p>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location not listed")}</p><p class="pipeline-subline">Suggested résumé: ${escapeHtml(job.role_type || "General")}</p></div><div class="pipeline-score"><strong>${score}%</strong><span>Fit score</span><button type="button" data-job-id="${job.id}" class="pipeline-action">${action}</button></div></article>`;
+  }).join("");
+  cards.querySelectorAll(".pipeline-action").forEach((button) => button.addEventListener("click", () => {
+    const job = state.jobs.find((item) => String(item.id) === String(button.dataset.jobId));
+    if (job) { switchTab({ currentTarget: { dataset: { tab: "tracker" } } }); loadJob(job); }
+  }));
 }
 
 function renderProfile(profile) {

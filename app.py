@@ -48,6 +48,9 @@ from sources.jobspy_source import fetch_jobspy_jobs
 from tailoring import controlled_rewrite, generate_tailored_resume_draft
 from tailoring_pipeline import build_cover_letter_paragraphs, build_tailoring_plan, short_join
 from werkzeug.utils import secure_filename
+from db.migrations import run_migrations
+from profile_store import CandidateProfileStore
+from services.document_generation import DocumentGenerationService
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -80,7 +83,10 @@ DISCOVERY_DATE_WINDOWS = {
     "any": 0,
 }
 
+# Keep the public diagnostics field stable for existing API clients.  The
+# database itself is now tracked independently by the migration runner.
 APP_SCHEMA_VERSION = 1
+CURRENT_DB_SCHEMA_VERSION = 2
 DISCOVERY_DEBUG_SNAPSHOT_LIMIT = 25
 TESTED_DEPENDENCY_VERSIONS = {
     "python-jobspy": "1.1.82",
@@ -178,7 +184,7 @@ def collect_environment_diagnostics() -> dict[str, Any]:
         "numpy_version": get_package_version("numpy"),
         "sqlite_db_path": str(DB_PATH),
         "schema_version": APP_SCHEMA_VERSION,
-        "active_database_schema_version": APP_SCHEMA_VERSION,
+        "active_database_schema_version": CURRENT_DB_SCHEMA_VERSION,
         "cwd": cwd,
         "working_directory": cwd,
         "discovery_cache_path": str(DB_PATH),
@@ -432,6 +438,43 @@ def create_app() -> Flask:
     @app.get("/api/profile")
     def get_profile() -> Response:
         return jsonify(load_profile())
+
+    @app.get("/api/candidate-profiles")
+    def candidate_profiles() -> Response:
+        return jsonify(CandidateProfileStore(get_db()).list_profiles())
+
+    @app.post("/api/candidate-profiles")
+    def create_candidate_profile() -> Response:
+        payload = request.get_json(force=True) or {}
+        name = text(payload.get("name"))
+        if not name:
+            return jsonify({"error": "Profile name is required"}), 400
+        profile_id = CandidateProfileStore(get_db()).create_profile(name, text(payload.get("description")))
+        return jsonify({"id": profile_id}), 201
+
+    @app.get("/api/candidate-profiles/<int:profile_id>/documents")
+    def candidate_profile_documents(profile_id: int) -> Response:
+        return jsonify(CandidateProfileStore(get_db()).documents_for(profile_id))
+
+    @app.post("/api/candidate-profiles/<int:profile_id>/resumes")
+    def create_base_resume(profile_id: int) -> Response:
+        payload = request.get_json(force=True) or {}
+        if not text(payload.get("name")):
+            return jsonify({"error": "Resume name is required"}), 400
+        resume_id = CandidateProfileStore(get_db()).add_resume(
+            profile_id, text(payload.get("name")), text(payload.get("content")), text(payload.get("docx_path")), bool(payload.get("is_default"))
+        )
+        return jsonify({"id": resume_id}), 201
+
+    @app.post("/api/candidate-profiles/<int:profile_id>/cover-letter-templates")
+    def create_cover_letter_template(profile_id: int) -> Response:
+        payload = request.get_json(force=True) or {}
+        if not text(payload.get("name")):
+            return jsonify({"error": "Template name is required"}), 400
+        template_id = CandidateProfileStore(get_db()).add_cover_letter_template(
+            profile_id, text(payload.get("name")), text(payload.get("content")), text(payload.get("docx_path")), bool(payload.get("is_default"))
+        )
+        return jsonify({"id": template_id}), 201
 
     @app.get("/api/ollama/health")
     def ollama_health() -> Response:
@@ -1463,7 +1506,9 @@ def generated_applications_dir() -> Path:
 
 def run_document_generation(kind: str, builder: Any) -> dict[str, Any]:
     try:
-        result = builder()
+        result = DocumentGenerationService().generate(kind, builder)
+        if result.get("status") == "failed" and result.get("error"):
+            raise RuntimeError(result["error"])
         if not isinstance(result, dict):
             raise TypeError(f"{kind} builder returned an invalid result")
         return result
@@ -4966,7 +5011,8 @@ def init_db() -> None:
             "success": "INTEGER NOT NULL DEFAULT 0",
         },
     )
-    db.execute(f"PRAGMA user_version = {APP_SCHEMA_VERSION}")
+    run_migrations(db)
+    db.execute(f"PRAGMA user_version = {CURRENT_DB_SCHEMA_VERSION}")
     db.commit()
 
 
