@@ -18,6 +18,7 @@
 ## Synchronization and safety
 
 - A GitHub connector commit does not advance the local Windows Git `HEAD`. Verify local and remote synchronization before starting subsequent work; never assume it.
-- Do not overwrite unrelated local changes, force-push, rewrite history, commit credentials or secrets, alter production data, modify Flowtally, begin Milestone 2, or bypass the sandbox.
+- Do not overwrite unrelated local changes, force-push, rewrite history, commit credentials or secrets, alter production data, modify Flowtally, or bypass the sandbox.
+- Do not begin a new milestone without explicit user approval in the current conversation.
 - Codex Desktop managed worktrees may provide isolated Git-backed checkouts, but no supported operation has been demonstrated that reconciles this existing Windows checkout's local `HEAD` with connector-created remote commits under restricted workspace-write. Do not claim full end-to-end automation until that reconciliation is demonstrated.
 - If local reconciliation remains unavailable, continue with local validation plus connector publication and clearly report the remaining synchronization action or limitation. Do not invent a custom synchronization script.
