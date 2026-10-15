@@ -28,13 +28,15 @@ keeping the existing Flask routes and generation algorithms compatible.
   category filter showed only the AI role. Profile data survived save,
   navigation, and reload. A separate empty database showed zero statistics
   and the intended empty-state message.
-- Responsive contract: the rendered dashboard uses the documented compact
-  dark shell and responsive CSS breakpoints at 640px, 760px, and 1180px.
-- Screenshot capture: the browser-rendered dashboard was inspected during QA;
-  no persistent screenshot artifact was added to the repository.
-- No confirmed Milestone 1 application regression was found. Full visual
-  comparison at additional viewport sizes remains a reviewer follow-up because
-  the connected browser does not expose a viewport override in this session.
+- Desktop QA: the approved desktop layout was reviewed and accepted against
+  the reference image. The rendered dashboard uses the documented compact dark
+  shell, readable metrics, category filters, full-width job cards, and existing
+  navigation.
+- Mobile and tablet optimization are explicitly deferred because Career
+  Pipeline is currently intended for desktop use only.
+- Screenshot capture: the browser-rendered desktop dashboard was inspected
+  during QA; no persistent screenshot artifact was added to the repository.
+- No confirmed Milestone 1 application regression was found.
 
 ## Recommended next milestone
 
