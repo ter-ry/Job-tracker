@@ -695,3 +695,59 @@ th {
     grid-template-columns: 1fr;
   }
 }
+
+/* Career Pipeline dashboard contract: docs/design/career-pipeline-reference.png */
+.pipeline-dashboard {
+  border: 1px solid #242424;
+  border-radius: 18px;
+  background: #050505;
+  color: #f1f1f1;
+  padding: clamp(20px, 3vw, 34px);
+}
+
+.pipeline-heading,
+.pipeline-stats,
+.pipeline-card {
+  display: flex;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.pipeline-heading h2 { font-size: clamp(1.35rem, 2.2vw, 1.75rem); }
+.pipeline-heading p,
+.pipeline-stats span,
+.pipeline-card p { color: #9d9d9d; }
+.pipeline-heading p { margin-top: 4px; }
+.pipeline-settings { color: #bdbdbd; font-size: 1.5rem; }
+.pipeline-stats { margin: 38px 18px 30px; justify-content: flex-start; gap: clamp(70px, 20vw, 230px); }
+.pipeline-stats div { display: grid; gap: 2px; }
+.pipeline-stats strong { font-size: clamp(1.8rem, 3vw, 2.35rem); }
+.pipeline-stats span { font-size: .9rem; }
+.pipeline-filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 12px; margin-bottom: 20px; }
+.pipeline-filter { border: 0; border-radius: 28px; background: transparent; color: #bcbcbc; cursor: pointer; font: inherit; font-weight: 700; padding: 10px 16px; }
+.pipeline-filter.active { background: #252525; color: #f4f4f4; }
+.pipeline-cards { display: grid; gap: 12px; }
+.pipeline-card { align-items: center; border: 1px solid #242424; border-radius: 14px; padding: 22px 18px; }
+.pipeline-card h3 { color: #f2f2f2; font-size: 1.2rem; margin-bottom: 3px; }
+.pipeline-subline { margin-top: 20px; }
+.pipeline-score { display: grid; justify-items: end; min-width: 90px; }
+.pipeline-score strong { color: #f2f2f2; font-size: 1.45rem; }
+.pipeline-card:first-child .pipeline-score strong { color: #25c976; }
+.pipeline-score span { color: #9d9d9d; font-size: .75rem; }
+.pipeline-action { border: 0; border-radius: 20px; background: #252525; color: #e5e5e5; cursor: pointer; font: inherit; font-weight: 700; margin-top: 8px; padding: 6px 13px; }
+.pipeline-empty { color: #9d9d9d; padding: 18px 0 4px; }
+
+body { background: #050505; color: #ededed; }
+.topbar, .panel, .dashboard article { background: #0b0b0b; border-color: #242424; color: #ededed; }
+.topbar { border-bottom-color: #242424; }
+.tab { background: #151515; border-color: #292929; color: #bdbdbd; }
+.tab.active { background: #252525; border-color: #404040; color: #fff; }
+.eyebrow, a { color: #d4d4d4; }
+input, select, textarea { background: #111; border-color: #303030; color: #eee; }
+.muted, label, .dashboard p { color: #9d9d9d; }
+
+@media (max-width: 640px) {
+  .pipeline-stats { gap: 24px; margin-left: 0; margin-right: 0; }
+  .pipeline-card { align-items: flex-start; }
+  .pipeline-score { min-width: 72px; }
+}

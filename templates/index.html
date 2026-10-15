@@ -23,6 +23,24 @@
 
     <main class="layout">
       <section id="discovery" class="tab-panel active">
+        <section class="pipeline-dashboard" aria-labelledby="pipeline-title">
+          <div class="pipeline-heading">
+            <div>
+              <h2 id="pipeline-title">Career Pipeline</h2>
+              <p>Live view of saved jobs and application readiness</p>
+            </div>
+            <span class="pipeline-settings" aria-hidden="true">☷</span>
+          </div>
+          <div class="pipeline-stats">
+            <div><strong id="pipeline-discovered">0</strong><span>Discovered</span></div>
+            <div><strong id="pipeline-matches">0</strong><span>Strong matches</span></div>
+            <div><strong id="pipeline-ready">0</strong><span>Ready to review</span></div>
+          </div>
+          <div id="pipeline-filters" class="pipeline-filters" role="tablist" aria-label="Pipeline categories"></div>
+          <div id="pipeline-cards" class="pipeline-cards" aria-live="polite">
+            <p class="pipeline-empty">No saved jobs yet. Use Discovery to add jobs to the pipeline.</p>
+          </div>
+        </section>
         <section class="workspace discovery-layout">
           <form id="discovery-form" class="panel discovery-search-panel">
             <div class="panel-header"><h2>Live job discovery</h2></div>
@@ -68,11 +86,14 @@
                   </select>
                 </label>
                 <label>Per-source cap<input id="discovery-per-source-cap" type="number" min="1" step="1" value="100"></label>
+                <label class="checkline"><input id="discovery-bypass-cache" type="checkbox"> Bypass cache</label>
               </div>
             </details>
             <div id="discovery-status" class="muted helper" aria-live="polite"></div>
+            <div id="discovery-source-test-output" class="muted helper" aria-live="polite"></div>
             <div class="actions">
               <button class="button" type="submit" id="discovery-submit">Search jobs</button>
+              <button class="button ghost" type="button" id="discovery-test-sources">Test job sources</button>
             </div>
           </form>
 
