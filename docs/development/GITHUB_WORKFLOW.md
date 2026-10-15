@@ -24,9 +24,20 @@ This verifies that Flowtally handled multi-commit PR revisions and complete remo
 
 The GitHub evidence does not reveal how local Windows edits were transferred into those commits, how local `HEAD` was reconciled afterward, or how already-committed local changes were marked as processed. No local Flowtally checkout or synchronization log was available in the connected evidence. Those points remain unverified rather than inferred.
 
+## Permanent local Git workflow
+
+1. Remain in workspace-write for normal development and inspect the local branch, remote state, working-tree changes, and divergence before editing.
+2. Edit and validate source files locally.
+3. After an approved task passes its relevant tests, stage only the intended files, inspect the staged diff, run `git diff --cached --check`, commit locally, and push the corresponding feature branch.
+4. Request `sandbox_permissions: require_escalated` only on individual Git commands that need protected `.git` metadata access. Do not switch the whole session to danger-full-access or create broad reusable approval rules without explicit permission.
+5. Verify local `HEAD` and the remote feature-branch `HEAD` match after pushing.
+6. Create or update a draft PR targeting `master` when appropriate. Never merge or deploy without explicit authorization.
+
+The validated commands are `git add`, `git commit`, `git push`, `git fetch`, and `git pull --ff-only`. The GitHub connector remains the fallback for remote Git operations and is the preferred tool for PR creation, PR updates, reviews, and verification.
+
 ## What is verified
 
-The GitHub connector can perform this remote-only sequence without local Git metadata writes:
+The GitHub connector can perform this remote sequence, and the local Git workflow above can perform the complete validated sequence without session-wide Full Access:
 
 1. Create a branch from a remote branch or commit.
 2. Create UTF-8 text files and commit them on that branch.
@@ -45,7 +56,7 @@ The controlled test used branch `codex/job-tracker-integration-test`, commit `25
 5. Verify the remote branch head and compare it with its target branch before opening or updating a PR.
 6. Create or update the PR and verify its changed-file list.
 
-Do not describe a remote connector commit as proof that the local checkout has been synchronized. After a remote-only commit, the local checkout is known to be stale until a supported reconciliation operation is demonstrated.
+After any push, verify local and remote HEADs explicitly; never assume synchronization.
 
 ## Unsupported or not demonstrated
 
@@ -53,9 +64,7 @@ Do not describe a remote connector commit as proof that the local checkout has b
 - Binary-asset transfer, deleted-file handling, and multi-commit replay were not demonstrated in this session.
 - Flowtally's remote PR mechanics are verified above, but its local-to-remote transfer and local-HEAD reconciliation mechanics remain unverified.
 - The connector does not expose a branch-delete operation. The temporary test PR is closed, but the temporary branch remains until it is deleted manually on GitHub.
-- Native Windows restricted workspace-write prevents routine local Git metadata updates in this checkout. Therefore local edits, local tests, remote connector commits, and PR creation are individually supported, but a complete automatic local-edit-to-local-HEAD-to-remote reconciliation loop is not verified.
-
-Codex Desktop's managed-worktree capability is a supported way to create or attach an isolated Git worktree, but it is not a demonstrated reconciliation mechanism for this existing Windows checkout. It should not be treated as proof that connector-created commits advance this checkout's local `HEAD`.
+- Individual Git commands that write protected `.git` metadata may require an approval dialog. Keep those approvals command-scoped and do not create a broad reusable rule without explicit permission.
 
 ## Temporary test cleanup
 
