@@ -10,6 +10,8 @@ const state = {
   discoveryMeta: {},
   discoveryView: "table",
   shortlist: [],
+  candidateProfiles: [],
+  generationSelections: {},
 };
 
 const jobFields = [
@@ -56,6 +58,7 @@ const profileFields = [
   "work-experience",
   "resume-text",
   "cover-letter-template",
+  "cover-letter-no-dashes",
   "ollama-enabled",
   "ollama-base-url",
   "ollama-model",
@@ -164,19 +167,22 @@ document.addEventListener("DOMContentLoaded", () => {
 
 async function loadAll() {
   try {
-    const [jobs, dashboard, profile, ollamaHealth, evidence, systemHealth] = await Promise.all([
+    const [jobs, dashboard, profile, ollamaHealth, evidence, systemHealth, candidateProfiles] = await Promise.all([
       api.get("/api/jobs"),
       api.get("/api/dashboard"),
       api.get("/api/profile"),
       api.get("/api/ollama/health").catch((error) => ({ status: "error", summary: error.message })),
       api.get("/api/health").catch((error) => ({ status: "error", summary: error.message })),
       api.get("/api/evidence").catch(() => []),
+      api.get("/api/candidate-profiles").catch(() => []),
     ]);
     const shortlist = await api.get("/api/shortlist");
     state.jobs = jobs;
     state.profile = profile;
     state.evidence = evidence;
     state.shortlist = shortlist;
+    state.candidateProfiles = Array.isArray(candidateProfiles) ? candidateProfiles : [];
+    await hydrateGenerationSelections();
     state.systemHealth = systemHealth;
     renderDashboard(dashboard);
     renderPipelineDashboard(jobs);
@@ -1709,6 +1715,20 @@ function renderShortlist() {
   container.innerHTML = state.shortlist.map(renderShortlistCard).join("");
 }
 
+async function hydrateGenerationSelections() {
+  await Promise.all(state.shortlist.map(async (job) => {
+    const selection = generationSelection(job.id);
+    if (!selection.profileId || selection.documents.resumes?.length || selection.documents.cover_letter_templates?.length) return;
+    try {
+      selection.documents = await api.get(`/api/candidate-profiles/${selection.profileId}/documents`);
+      selection.resumeId = String(selection.documents.resumes?.find((item) => item.is_default)?.id || selection.documents.resumes?.[0]?.id || "");
+      selection.coverLetterTemplateId = String(selection.documents.cover_letter_templates?.find((item) => item.is_default)?.id || selection.documents.cover_letter_templates?.[0]?.id || "");
+    } catch (error) {
+      // The shortlist remains usable if a candidate profile was removed while it was open.
+    }
+  }));
+}
+
 function renderTailoringChanges(job) {
   const changes = job.tailoring_changes || {};
   const resume = changes.resume || {};
@@ -1751,46 +1771,6 @@ function renderTailoringChanges(job) {
   `;
 }
 
-function renderShortlistCard(job) {
-  const resumeReady = job.resume_generation_status === "generated";
-  const coverReady = job.cover_letter_generation_status === "generated";
-  const salaryLabel = job.salary_source === "estimated" ? `${job.salary} (estimated)` : job.salary || "Salary unavailable";
-  const error = job.generation_error ? `<p class="risk high">${escapeHtml(job.generation_error)}</p>` : "";
-  return `
-    <section class="discovery-card">
-      <div class="discovery-card-main">
-        <div>
-          <h3>${escapeHtml(job.title || "Untitled role")}</h3>
-          <p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(job.location || "Location unavailable")}</p>
-          <p class="muted">${escapeHtml(job.source || "")} · ${escapeHtml(salaryLabel)} · Shortlisted ${escapeHtml(job.date_shortlisted || job.date_added || "")}</p>
-          <p>${scorePill(job.fit_score)} <span class="muted">${miniBreakdown(job)}</span></p>
-          <p class="muted">Resume: ${escapeHtml(job.resume_generation_status || "pending")} · Cover letter: ${escapeHtml(job.cover_letter_generation_status || "pending")}</p>
-          ${error}
-          ${renderTailoringChanges(job)}
-        </div>
-      </div>
-      <div class="row-actions">
-        ${job.url ? `<a class="button small ghost" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open job</a>` : ""}
-        <a class="button small ghost ${resumeReady ? "" : "disabled-link"}" href="/api/shortlist/${job.id}/resume">Download resume</a>
-        <a class="button small ghost ${coverReady ? "" : "disabled-link"}" href="/api/shortlist/${job.id}/cover-letter">Download cover letter</a>
-        <button class="button small ghost" type="button" onclick="regenerateShortlist(${job.id})">Regenerate documents</button>
-        <button class="button small ghost" type="button" onclick="markShortlistApplied(${job.id})">Mark applied</button>
-        <button class="button small ghost danger" type="button" onclick="removeShortlist(${job.id})">Remove</button>
-      </div>
-    </section>
-  `;
-}
-
-async function regenerateShortlist(id) {
-  try {
-    await api.send(`/api/shortlist/${id}/regenerate`, "POST", {});
-    toast("Documents regenerated");
-    await loadAll();
-  } catch (error) {
-    toast(error.message);
-  }
-}
-
 async function markShortlistApplied(id) {
   try {
     await api.send(`/api/shortlist/${id}/applied`, "POST", {});
@@ -1811,35 +1791,103 @@ async function removeShortlist(id) {
   }
 }
 
+function generationSelection(jobId) {
+  if (!state.generationSelections[jobId]) {
+    const first = state.candidateProfiles[0];
+    state.generationSelections[jobId] = { profileId: first ? String(first.id) : "", resumeId: "", coverLetterTemplateId: "", documents: { resumes: [], cover_letter_templates: [] } };
+  }
+  return state.generationSelections[jobId];
+}
+
+function generationPayload(jobId) {
+  const selection = generationSelection(jobId);
+  if (!selection.profileId) return {};
+  return {
+    candidate_profile_id: Number(selection.profileId),
+    ...(selection.resumeId ? { resume_id: Number(selection.resumeId) } : {}),
+    ...(selection.coverLetterTemplateId ? { cover_letter_template_id: Number(selection.coverLetterTemplateId) } : {}),
+  };
+}
+
+async function selectGenerationProfile(jobId, profileId) {
+  const selection = generationSelection(jobId);
+  selection.profileId = String(profileId || "");
+  selection.resumeId = "";
+  selection.coverLetterTemplateId = "";
+  selection.documents = { resumes: [], cover_letter_templates: [] };
+  if (selection.profileId) {
+    try {
+      selection.documents = await api.get(`/api/candidate-profiles/${selection.profileId}/documents`);
+      selection.resumeId = String(selection.documents.resumes?.find((item) => item.is_default)?.id || selection.documents.resumes?.[0]?.id || "");
+      selection.coverLetterTemplateId = String(selection.documents.cover_letter_templates?.find((item) => item.is_default)?.id || selection.documents.cover_letter_templates?.[0]?.id || "");
+    } catch (error) {
+      toast(error.message);
+    }
+  }
+  renderShortlist();
+}
+
+function selectGenerationDocument(jobId, kind, value) {
+  const selection = generationSelection(jobId);
+  if (kind === "resume") selection.resumeId = String(value || "");
+  if (kind === "cover") selection.coverLetterTemplateId = String(value || "");
+}
+
+async function previewShortlist(id) {
+  const target = document.getElementById(`document-preview-${id}`);
+  if (!target) return;
+  try {
+    const preview = await api.get(`/api/shortlist/${id}/preview`);
+    target.classList.remove("empty");
+    target.innerHTML = `<h4>Generated preview</h4><h5>Résumé</h5><pre>${escapeHtml(preview.resume || "No résumé preview is available.")}</pre><h5>Cover letter</h5><pre>${escapeHtml(preview.cover_letter || "No cover letter preview is available.")}</pre>`;
+  } catch (error) {
+    target.textContent = error.message;
+  }
+}
+
+function documentSelectorOptions(items, selectedId, emptyLabel) {
+  if (!items.length) return `<option value="">${emptyLabel}</option>`;
+  return items.map((item) => `<option value="${escapeAttribute(item.id)}" ${String(item.id) === String(selectedId) ? "selected" : ""}>${escapeHtml(item.name || "Unnamed document")}</option>`).join("");
+}
+
 function renderShortlistCard(job) {
-  const resumeReady = job.resume_generation_status === "generated";
-  const coverReady = job.cover_letter_generation_status === "generated";
-  const salaryLabel = job.salary_source === "estimated" ? `${job.salary} (estimated)` : job.salary || "Salary unavailable";
+  const selection = generationSelection(job.id);
+  const profileOptions = [`<option value="" ${selection.profileId ? "" : "selected"}>Use active profile</option>`, ...state.candidateProfiles.map((profile) => `<option value="${escapeAttribute(profile.id)}" ${String(profile.id) === String(selection.profileId) ? "selected" : ""}>${escapeHtml(profile.name)}</option>`)].join("");
+  const resumeAvailable = Boolean(job.resume_docx_path);
+  const coverAvailable = Boolean(job.cover_letter_docx_path);
   const resumeStatus = job.resume_generation_status || "pending";
   const coverStatus = job.cover_letter_generation_status || "pending";
   const resumeError = job.resume_generation_error ? `<p class="risk high">Resume error: ${escapeHtml(job.resume_generation_error)}</p>` : "";
   const coverError = job.cover_letter_generation_error ? `<p class="risk high">Cover letter error: ${escapeHtml(job.cover_letter_generation_error)}</p>` : "";
   const coverWarning = job.cover_letter_generation_warning ? `<p class="warning">Cover letter warning: ${escapeHtml(job.cover_letter_generation_warning)}</p>` : "";
+  const salaryLabel = job.salary_source === "estimated" ? `${job.salary} (estimated)` : job.salary || "Salary unavailable";
   return `
     <section class="discovery-card">
       <div class="discovery-card-main">
         <div>
           <h3>${escapeHtml(job.title || "Untitled role")}</h3>
-          <p><strong>${escapeHtml(job.company || "Unknown company")}</strong> Â· ${escapeHtml(job.location || "Location unavailable")}</p>
-          <p class="muted">${escapeHtml(job.source || "")} Â· ${escapeHtml(salaryLabel)} Â· Shortlisted ${escapeHtml(job.date_shortlisted || job.date_added || "")}</p>
+          <p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(job.location || "Location unavailable")}</p>
+          <p class="muted">${escapeHtml(job.source || "")} · ${escapeHtml(salaryLabel)} · Shortlisted ${escapeHtml(job.date_shortlisted || job.date_added || "")}</p>
           <p>${scorePill(job.fit_score)} <span class="muted">${miniBreakdown(job)}</span></p>
-          <p class="muted">Resume: ${escapeHtml(resumeStatus)}${resumeReady ? " (ready)" : ""}</p>
+          <p class="muted">Résumé: ${escapeHtml(resumeStatus)}${resumeAvailable ? " · previous file available" : ""}</p>
           ${resumeError}
-          <p class="muted">Cover letter: ${escapeHtml(coverStatus)}${coverReady ? " (ready)" : ""}</p>
-          ${coverError}
-          ${coverWarning}
+          <p class="muted">Cover letter: ${escapeHtml(coverStatus)}${coverAvailable ? " · previous file available" : ""}</p>
+          ${coverError}${coverWarning}
+          <div class="document-selection panel nested-panel">
+            <h4>Document selection</h4>
+            <label>Candidate profile<select onchange="selectGenerationProfile(${job.id}, this.value)">${profileOptions}</select></label>
+            <label>Base résumé<select onchange="selectGenerationDocument(${job.id}, 'resume', this.value)">${documentSelectorOptions(selection.documents.resumes || [], selection.resumeId, "Select a profile first")}</select></label>
+            <label>Cover letter template<select onchange="selectGenerationDocument(${job.id}, 'cover', this.value)">${documentSelectorOptions(selection.documents.cover_letter_templates || [], selection.coverLetterTemplateId, "Select a profile first")}</select></label>
+          </div>
+          <div id="document-preview-${job.id}" class="generated-output empty">Preview is available after generation.</div>
         </div>
       </div>
       <div class="row-actions">
         ${job.url ? `<a class="button small ghost" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open job</a>` : ""}
-        <a class="button small ghost ${resumeReady ? "" : "disabled-link"}" href="/api/shortlist/${job.id}/resume">Download resume</a>
-        <a class="button small ghost ${coverReady ? "" : "disabled-link"}" href="/api/shortlist/${job.id}/cover-letter">Download cover letter</a>
-        <button class="button small ghost" type="button" onclick="regenerateShortlistResume(${job.id})">Regenerate resume</button>
+        <a class="button small ghost ${resumeAvailable ? "" : "disabled-link"}" href="/api/shortlist/${job.id}/resume">Download résumé</a>
+        <a class="button small ghost ${coverAvailable ? "" : "disabled-link"}" href="/api/shortlist/${job.id}/cover-letter">Download cover letter</a>
+        <button class="button small ghost" type="button" onclick="previewShortlist(${job.id})">Preview documents</button>
+        <button class="button small ghost" type="button" onclick="regenerateShortlistResume(${job.id})">Regenerate résumé</button>
         <button class="button small ghost" type="button" onclick="regenerateShortlistCoverLetter(${job.id})">Regenerate cover letter</button>
         <button class="button small ghost" type="button" onclick="regenerateShortlist(${job.id})">Regenerate both</button>
         <button class="button small ghost" type="button" onclick="markShortlistApplied(${job.id})">Mark applied</button>
@@ -1850,33 +1898,18 @@ function renderShortlistCard(job) {
 }
 
 async function regenerateShortlist(id) {
-  try {
-    await api.send(`/api/shortlist/${id}/regenerate`, "POST", {});
-    toast("Documents regenerated");
-    await loadAll();
-  } catch (error) {
-    toast(error.message);
-  }
+  try { await api.send(`/api/shortlist/${id}/regenerate`, "POST", generationPayload(id)); toast("Documents regenerated"); await loadAll(); }
+  catch (error) { toast(error.message); await loadAll(); }
 }
 
 async function regenerateShortlistResume(id) {
-  try {
-    await api.send(`/api/shortlist/${id}/regenerate-resume`, "POST", {});
-    toast("Resume regenerated");
-    await loadAll();
-  } catch (error) {
-    toast(error.message);
-  }
+  try { await api.send(`/api/shortlist/${id}/regenerate-resume`, "POST", generationPayload(id)); toast("Résumé regenerated"); await loadAll(); }
+  catch (error) { toast(error.message); await loadAll(); }
 }
 
 async function regenerateShortlistCoverLetter(id) {
-  try {
-    await api.send(`/api/shortlist/${id}/regenerate-cover-letter`, "POST", {});
-    toast("Cover letter regenerated");
-    await loadAll();
-  } catch (error) {
-    toast(error.message);
-  }
+  try { await api.send(`/api/shortlist/${id}/regenerate-cover-letter`, "POST", generationPayload(id)); toast("Cover letter regenerated"); await loadAll(); }
+  catch (error) { toast(error.message); await loadAll(); }
 }
 
 function hideDiscoveryJob(index) {

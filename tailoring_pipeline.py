@@ -148,6 +148,11 @@ ACTION_VERBS = {
 }
 
 
+def remove_cover_letter_dashes(value: str) -> str:
+    """Apply the optional personal-letter punctuation preference."""
+    return re.sub(r"\s+", " ", re.sub(r"[-–—]", " ", value)).strip()
+
+
 def build_tailoring_plan(job: dict[str, Any], profile: dict[str, Any], semantic_result: dict[str, Any]) -> dict[str, Any]:
     candidate_evidence = semantic_result.get("candidate_evidence") or build_candidate_evidence(profile)
     resume_evidence = semantic_result.get("evidence") or extract_resume_evidence(profile)
@@ -882,12 +887,12 @@ def build_cover_letter_paragraphs(
     )
     fit_paragraph = (
         f"{concrete_example} "
-        f"{supporting_example if supporting_example else ('That kind of work taught me how to keep software dependable when teams need clear data, predictable behavior, and straightforward handoffs.' if software_focused else 'That kind of work taught me how to support people, communicate clearly, and keep details organized.')} "
-        f"I would bring that same care to the work at {company}. That matters in real work, day to day."
+        f"{' '.join(evidence_sentences[1:3]) if len(evidence_sentences) > 1 else ('That kind of work taught me how to keep software dependable when teams need clear data, predictable behavior, and straightforward handoffs.' if software_focused else 'That kind of work taught me how to support people, communicate clearly, and keep details organized.')} "
+        f"I would bring that same care to the work at {company}. I communicate clearly and keep commitments visible to the team. That matters in real work, day to day."
     )
     employer_line = company if not location else f"{company}, {location}"
     subject = f"Re: Application for {title}"
-    return [
+    paragraphs = [
         date.today().strftime("%B %d, %Y").replace(" 0", " "),
         employer_line,
         f"Dear {company} Hiring Team,",
@@ -899,6 +904,8 @@ def build_cover_letter_paragraphs(
         "Sincerely,",
         name,
     ]
+    no_dashes = str(profile.get("cover_letter_no_dashes", "true")).strip().lower() not in {"0", "false", "no", "off"}
+    return [remove_cover_letter_dashes(paragraph) for paragraph in paragraphs] if no_dashes else paragraphs
 
 
 def build_opening_fit_sentence(selected_blocks: list[dict[str, Any]], candidate_evidence: dict[str, Any]) -> str:

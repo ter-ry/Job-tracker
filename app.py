@@ -382,6 +382,7 @@ PROFILE_COLUMNS = {
     "cover_letter_template": "TEXT NOT NULL DEFAULT ''",
     "cover_letter_docx_template_path": "TEXT NOT NULL DEFAULT ''",
     "cover_letter_template_status": "TEXT NOT NULL DEFAULT ''",
+    "cover_letter_no_dashes": "TEXT NOT NULL DEFAULT 'true'",
     "ollama_enabled": "TEXT NOT NULL DEFAULT 'false'",
     "ollama_base_url": "TEXT NOT NULL DEFAULT 'http://127.0.0.1:11434'",
     "ollama_model": "TEXT NOT NULL DEFAULT 'qwen3:4b'",
@@ -800,6 +801,30 @@ def create_app() -> Flask:
     @app.get("/api/shortlist/<int:job_id>/cover-letter")
     def download_shortlist_cover_letter(job_id: int) -> Response:
         return download_shortlist_document(job_id, "cover_letter")
+
+    @app.get("/api/shortlist/<int:job_id>/preview")
+    def preview_shortlist_documents(job_id: int) -> Response:
+        row = query_db("SELECT * FROM jobs WHERE id = ? AND status = 'shortlisted'", [job_id], one=True)
+        if row is None:
+            return jsonify({"error": "Shortlisted job not found"}), 404
+        folder = generated_applications_dir() / str(job_id)
+
+        def read_preview(name: str) -> str:
+            path = folder / name
+            if not path.is_file():
+                return ""
+            try:
+                return path.read_text(encoding="utf-8")
+            except OSError:
+                return ""
+
+        return jsonify({
+            "resume": read_preview("resume.txt"),
+            "cover_letter": read_preview("cover_letter.txt"),
+            "resume_status": text(row["resume_generation_status"]),
+            "cover_letter_status": text(row["cover_letter_generation_status"]),
+            "generation_debug": load_generation_debug(job_id),
+        })
 
     @app.post("/api/jobs/from-description")
     def job_from_description() -> Response:
@@ -1742,14 +1767,20 @@ def resolve_generation_profile(payload: dict[str, Any] | None) -> dict[str, Any]
 
     resume = select_document(documents["resumes"], "resume_id")
     cover = select_document(documents["cover_letter_templates"], "cover_letter_template_id")
-    profile = load_profile()
+    if resume is None:
+        raise ValueError("Selected candidate profile has no base résumé. Add a résumé before generating documents")
+    if not text(resume.get("docx_path")):
+        raise ValueError("Selected base résumé has no usable DOCX template path. Upload a DOCX résumé for this profile")
+    profile = {field: "" for field in PROFILE_COLUMNS}
     profile.update({
-        "name": text(profile_row.get("name")) or profile.get("name", ""),
-        "resume_text": text((resume or {}).get("content")) or text(profile_row.get("description")) or profile.get("resume_text", ""),
+        "name": text(profile_row.get("name")),
+        "resume_text": text((resume or {}).get("content")) or text(profile_row.get("description")),
+        "work_experience": text((resume or {}).get("content")) or text(profile_row.get("description")),
         "resume_docx_template_path": text((resume or {}).get("docx_path")),
-        "cover_letter_template": text((cover or {}).get("content")) or profile.get("cover_letter_template", ""),
+        "cover_letter_template": text((cover or {}).get("content")),
         "cover_letter_docx_template_path": text((cover or {}).get("docx_path")),
     })
+    profile["_candidate_profile_id"] = str(profile_id)
     return profile
 
 
@@ -5980,7 +6011,9 @@ def generate_application_materials(
     raise_on_validation: bool = True,
 ) -> dict[str, Any]:
     job_id = clamp_int(job.get("id"), 0, 10**9) or None
-    approved_evidence_records = load_approved_evidence_records(job_id) if has_app_context() else []
+    approved_evidence_records = (
+        [] if profile.get("_candidate_profile_id") else load_approved_evidence_records(job_id) if has_app_context() else []
+    )
     ranked_approved_evidence = rank_approved_evidence_records(job, approved_evidence_records)
     selected_approved_evidence = select_approved_evidence_records(job, approved_evidence_records, limit=6)
     approved_sections = [
@@ -6028,7 +6061,7 @@ def generate_application_materials(
     if refreshed_cover_letter_paragraphs:
         tailoring_plan["cover_letter_paragraphs"] = refreshed_cover_letter_paragraphs
         tailoring_plan["cover_letter_text"] = "\n\n".join(refreshed_cover_letter_paragraphs)
-    cover_letter = build_cover_letter(profile, job, focus, candidate_evidence)
+    cover_letter = tailoring_plan.get("cover_letter_text") or build_cover_letter(profile, job, focus, candidate_evidence)
     tailoring_plan["cover_letter_text"] = cover_letter
     tailoring_plan["cover_letter_paragraphs"] = [paragraph for paragraph in cover_letter.split("\n\n") if paragraph]
     cover_validation = validate_cover_letter_output(cover_letter, candidate_evidence, job)
@@ -6068,6 +6101,12 @@ def generate_application_materials(
                 if suggestion:
                     cover_letter = suggestion
                     cover_validation = validate_cover_letter_output(cover_letter, candidate_evidence, job)
+    if str(profile.get("cover_letter_no_dashes", "true")).strip().lower() not in {"0", "false", "no", "off"}:
+        cover_letter = re.sub(r"[-–—]", " ", cover_letter)
+        cover_letter = re.sub(r"[ \t]+", " ", cover_letter)
+        cover_letter = re.sub(r" +\n", "\n", cover_letter)
+        tailoring_plan["cover_letter_text"] = cover_letter
+        tailoring_plan["cover_letter_paragraphs"] = [paragraph for paragraph in cover_letter.split("\n\n") if paragraph]
     answers = build_answers(profile, job, focus, candidate_evidence)
     resume_text = (
         f"Suggested summary\n{summary}\n\n"

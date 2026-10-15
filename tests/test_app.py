@@ -1877,19 +1877,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(len(body_paragraphs), 3)
         self.assertGreaterEqual(len(body_text.split()), 180)
         self.assertLessEqual(len(body_text.split()), 260)
-        self.assertTrue(
-            sum(
-                1
-                for phrase in [
-                    "validation, logging, and data-cleaning",
-                    "database structures and data models",
-                    "backend integrations and data workflows",
-                    "technical documentation",
-                ]
-                if phrase in joined.lower()
-            )
-            >= 2
-        )
+        self.assertIn("Developer Intern at Northstar", joined)
         self.assertEqual(sum(1 for text in paragraphs if re.search(r"\b[A-Z][a-z]+ \d{1,2}, \d{4}\b", text)), 1)
         self.assertEqual(sum(1 for text in paragraphs if text == "Sincerely,"), 1)
         self.assertEqual(paragraphs[-2], "Sincerely,")
@@ -1919,8 +1907,8 @@ class JobAssistantTest(unittest.TestCase):
         self.assertNotIn("hochitterry.mak@georgebrown.ca", visible_text)
         self.assertIn("Scotiabank Hiring Team", visible_text)
         self.assertIn("I'm excited to apply for the Software Developer role at Scotiabank", visible_text)
-        self.assertIn("backend integrations and data workflows", visible_text)
-        self.assertIn("Retool and Google Docs", visible_text)
+        self.assertIn("Developer Intern at Northstar", visible_text)
+        self.assertNotIn("Retool and Google Docs", visible_text)
         self.assertIsNone(app_module.validate_cover_letter_document(cover_doc, self.scotiabank_job(), {"name": "Terry Mak"}))
 
         downloaded = self.client.get(f"/api/shortlist/{created['id']}/cover-letter")
@@ -2218,6 +2206,110 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(job["resume_generation_status"], "generated")
         self.assertEqual(job["cover_letter_generation_status"], "generated")
         self.assertIn("Alternate_profile", Path(job["resume_docx_path"]).name)
+
+    def test_selected_candidate_profile_isolated_from_legacy_and_other_profiles(self):
+        self.seed_profile_for_documents(with_template=True)
+        legacy = self.client.post(
+            "/api/profile",
+            json={
+                "name": "Legacy Candidate",
+                "work_experience": "LegacyCorp maintained legacy systems and legacy customer workflows.",
+                "resume_text": "LegacyCorp maintained legacy systems and legacy customer workflows.",
+            },
+        )
+        self.assertEqual(legacy.status_code, 200)
+        profiles = []
+        for name, evidence in [
+            ("Profile Alpha", "Alpha Systems built Python APIs and automated reporting for finance teams with careful validation."),
+            ("Profile Beta", "Beta Labs managed unrelated Java services and mobile release operations."),
+        ]:
+            created_profile = self.client.post("/api/candidate-profiles", json={"name": name, "description": evidence})
+            self.assertEqual(created_profile.status_code, 201)
+            profile_id = created_profile.get_json()["id"]
+            resume_response = self.client.post(
+                f"/api/candidate-profiles/{profile_id}/resumes",
+                json={
+                    "name": f"{name} resume",
+                    "content": evidence + " This work included documented tests and reliable handoffs for maintainers.",
+                    "docx_path": str(self.build_formatted_resume_fixture()),
+                    "is_default": True,
+                },
+            )
+            self.assertEqual(resume_response.status_code, 201)
+            profiles.append(profile_id)
+
+        created = self.client.post(
+            "/api/shortlist",
+            json={
+                "company": "Alpha Hiring",
+                "title": "Python Developer",
+                "location": "Toronto",
+                "url": "https://example.com/job/profile-isolation",
+                "job_description": "Python APIs validation reporting testing",
+                "candidate_profile_id": profiles[0],
+            },
+        )
+        self.assertEqual(created.status_code, 201)
+        job = created.get_json()
+        resume_text = "\n".join(paragraph.text for paragraph in Document(io.BytesIO(Path(job["resume_docx_path"]).read_bytes())).paragraphs)
+        cover_text = "\n".join(paragraph.text for paragraph in Document(io.BytesIO(Path(job["cover_letter_docx_path"]).read_bytes())).paragraphs)
+        self.assertIn("Alpha Systems", resume_text + cover_text)
+        self.assertNotIn("LegacyCorp", resume_text + cover_text)
+        self.assertNotIn("Beta Labs", resume_text + cover_text)
+
+    def test_selected_document_validation_and_preview_are_actionable(self):
+        self.seed_profile_for_documents(with_template=True)
+        created_profile = self.client.post(
+            "/api/candidate-profiles",
+            json={"name": "Incomplete profile", "description": "A profile with enough documented evidence for a useful generation error."},
+        )
+        profile_id = created_profile.get_json()["id"]
+        invalid = self.client.post(
+            "/api/shortlist",
+            json={
+                "company": "Invalid Selection Co",
+                "title": "Developer",
+                "location": "Toronto",
+                "job_description": "Python testing",
+                "candidate_profile_id": profile_id,
+                "resume_id": 999999,
+            },
+        )
+        self.assertEqual(invalid.status_code, 400)
+        self.assertIn("resume_id", invalid.get_json()["error"])
+
+        valid = self.client.post(
+            "/api/shortlist",
+            json={
+                "company": "Preview Co",
+                "title": "Python Developer",
+                "location": "Toronto",
+                "job_description": "Python Flask SQL testing",
+            },
+        )
+        self.assertEqual(valid.status_code, 201)
+        job = valid.get_json()
+        preview = self.client.get(f"/api/shortlist/{job['id']}/preview")
+        self.assertEqual(preview.status_code, 200)
+        self.assertTrue(preview.get_json()["resume"])
+        self.assertTrue(preview.get_json()["cover_letter"])
+
+    def test_generated_cover_letter_uses_current_date_and_default_no_dash_preference(self):
+        self.seed_profile_for_documents(with_template=True)
+        created = self.client.post(
+            "/api/shortlist",
+            json={
+                "company": "Current Date Co",
+                "title": "Python Developer",
+                "location": "Toronto",
+                "job_description": "Python Flask SQL testing",
+            },
+        )
+        self.assertEqual(created.status_code, 201)
+        cover_doc = Document(io.BytesIO(Path(created.get_json()["cover_letter_docx_path"]).read_bytes()))
+        cover_text = "\n".join(paragraph.text for paragraph in app_module.iter_document_paragraphs(cover_doc))
+        self.assertRegex(cover_text, rf"{date.today().strftime('%B')}\s+0?{date.today().day},\s+{date.today().year}")
+        self.assertNotRegex(cover_text, r"[-–—]")
 
     def test_empty_projects_or_education_do_not_fabricate(self):
         profile = self.rece_profile()
