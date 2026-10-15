@@ -885,7 +885,7 @@ def build_cover_letter_paragraphs(
         f"{supporting_example if supporting_example else ('That kind of work taught me how to keep software dependable when teams need clear data, predictable behavior, and straightforward handoffs.' if software_focused else 'That kind of work taught me how to support people, communicate clearly, and keep details organized.')} "
         f"I would bring that same care to the work at {company}. That matters in real work, day to day."
     )
-    employer_line = company if not location else f"{company} - {location}"
+    employer_line = company if not location else f"{company}, {location}"
     subject = f"Re: Application for {title}"
     return [
         date.today().strftime("%B %d, %Y").replace(" 0", " "),

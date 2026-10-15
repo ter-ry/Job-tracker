@@ -2114,6 +2114,34 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(self.client.get(f"/api/shortlist/{created['id']}/resume").status_code, 404)
         self.assertEqual(self.client.get(f"/api/shortlist/{created['id']}/cover-letter").status_code, 200)
 
+    def test_failed_regeneration_preserves_previous_successful_documents(self):
+        self.seed_profile_for_documents(with_template=True)
+        created = self.client.post(
+            "/api/shortlist",
+            json={
+                "company": "RecoveryCo",
+                "title": "Software Developer",
+                "location": "Toronto",
+                "url": "https://example.com/job/recovery",
+                "job_description": "Python Flask SQL React dashboards cloud automation",
+            },
+        ).get_json()
+        previous_resume = Path(created["resume_docx_path"])
+        previous_cover = Path(created["cover_letter_docx_path"])
+        with patch.object(app_module, "build_format_preserving_resume", side_effect=RuntimeError("resume retry failed")), patch.object(
+            app_module, "build_format_preserving_cover_letter", side_effect=RuntimeError("cover retry failed")
+        ):
+            regenerated = self.client.post(f"/api/shortlist/{created['id']}/regenerate", json={}).get_json()
+
+        self.assertEqual(regenerated["resume_generation_status"], "failed")
+        self.assertEqual(regenerated["cover_letter_generation_status"], "failed")
+        self.assertEqual(Path(regenerated["resume_docx_path"]), previous_resume)
+        self.assertEqual(Path(regenerated["cover_letter_docx_path"]), previous_cover)
+        self.assertTrue(previous_resume.is_file())
+        self.assertTrue(previous_cover.is_file())
+        self.assertEqual(self.client.get(f"/api/shortlist/{created['id']}/resume").status_code, 200)
+        self.assertEqual(self.client.get(f"/api/shortlist/{created['id']}/cover-letter").status_code, 200)
+
     def test_pdf_only_profile_cannot_request_format_preserving_export(self):
         self.client.post(
             "/api/profile",
@@ -2154,6 +2182,42 @@ class JobAssistantTest(unittest.TestCase):
         opened = Document(io.BytesIO(resume_path.read_bytes()))
         self.assertGreater(len(opened.paragraphs), 0)
         self.assertIn("Terry Mak", opened.paragraphs[0].text)
+
+    def test_shortlist_can_generate_from_selected_candidate_profile_documents(self):
+        self.seed_profile_for_documents(with_template=True)
+        current_profile = self.client.get("/api/profile").get_json()
+        created_profile = self.client.post(
+            "/api/candidate-profiles",
+            json={"name": "Alternate profile", "description": "Python developer with documented API and SQL project experience."},
+        )
+        self.assertEqual(created_profile.status_code, 201)
+        profile_id = created_profile.get_json()["id"]
+        resume_response = self.client.post(
+            f"/api/candidate-profiles/{profile_id}/resumes",
+            json={
+                "name": "Alternate base resume",
+                "content": "Python developer with documented API and SQL project experience and reliable testing practices.",
+                "docx_path": current_profile["resume_docx_template_path"],
+                "is_default": True,
+            },
+        )
+        self.assertEqual(resume_response.status_code, 201)
+        created = self.client.post(
+            "/api/shortlist",
+            json={
+                "company": "ProfileCo",
+                "title": "Python Developer",
+                "location": "Toronto",
+                "url": "https://example.com/job/profile-selection",
+                "job_description": "Python SQL API testing",
+                "candidate_profile_id": profile_id,
+            },
+        )
+        self.assertEqual(created.status_code, 201)
+        job = created.get_json()
+        self.assertEqual(job["resume_generation_status"], "generated")
+        self.assertEqual(job["cover_letter_generation_status"], "generated")
+        self.assertIn("Alternate_profile", Path(job["resume_docx_path"]).name)
 
     def test_empty_projects_or_education_do_not_fabricate(self):
         profile = self.rece_profile()

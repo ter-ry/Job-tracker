@@ -674,6 +674,10 @@ def create_app() -> Flask:
     @app.post("/api/shortlist")
     def create_shortlist_item() -> Response:
         payload = request.get_json(force=True)
+        try:
+            generation_profile = resolve_generation_profile(payload)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         clean = normalize_job_payload({**payload, "status": "shortlisted"})
         existing = find_existing_shortlist_match(clean)
         if existing is not None:
@@ -681,7 +685,7 @@ def create_app() -> Flask:
             if text(existing_dict.get("status")) == "shortlisted":
                 return jsonify({**existing_dict, "duplicate": True, "restored": False})
             restore_shortlist_item(existing_dict["id"])
-            generation = generate_and_store_shortlist_documents(existing_dict["id"])
+            generation = generate_and_store_shortlist_documents(existing_dict["id"], profile_override=generation_profile)
             job = query_db("SELECT * FROM jobs WHERE id = ?", [existing_dict["id"]], one=True)
             return jsonify({**job_to_dict(job), "generation": generation, "duplicate": False, "restored": True}), 200
 
@@ -705,7 +709,7 @@ def create_app() -> Flask:
         )
         db.commit()
         job_id = int(cursor.lastrowid)
-        generation = generate_and_store_shortlist_documents(job_id)
+        generation = generate_and_store_shortlist_documents(job_id, profile_override=generation_profile)
         job = query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)
         return jsonify({**job_to_dict(job), "generation": generation, "duplicate": False, "restored": False}), 201
 
@@ -714,7 +718,12 @@ def create_app() -> Flask:
         job = query_db("SELECT * FROM jobs WHERE id = ? AND status = 'shortlisted'", [job_id], one=True)
         if job is None:
             return jsonify({"error": "Shortlisted job not found"}), 404
-        generation = generate_and_store_shortlist_documents(job_id)
+        payload = request.get_json(silent=True) or {}
+        try:
+            generation_profile = resolve_generation_profile(payload)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        generation = generate_and_store_shortlist_documents(job_id, profile_override=generation_profile)
         refreshed = query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)
         return jsonify({**job_to_dict(refreshed), "generation": generation})
 
@@ -723,7 +732,12 @@ def create_app() -> Flask:
         job = query_db("SELECT * FROM jobs WHERE id = ? AND status = 'shortlisted'", [job_id], one=True)
         if job is None:
             return jsonify({"error": "Shortlisted job not found"}), 404
-        generation = generate_and_store_shortlist_documents(job_id, {"resume"})
+        payload = request.get_json(silent=True) or {}
+        try:
+            generation_profile = resolve_generation_profile(payload)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        generation = generate_and_store_shortlist_documents(job_id, {"resume"}, generation_profile)
         refreshed = query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)
         return jsonify({**job_to_dict(refreshed), "generation": generation})
 
@@ -732,7 +746,12 @@ def create_app() -> Flask:
         job = query_db("SELECT * FROM jobs WHERE id = ? AND status = 'shortlisted'", [job_id], one=True)
         if job is None:
             return jsonify({"error": "Shortlisted job not found"}), 404
-        generation = generate_and_store_shortlist_documents(job_id, {"cover_letter"})
+        payload = request.get_json(silent=True) or {}
+        try:
+            generation_profile = resolve_generation_profile(payload)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        generation = generate_and_store_shortlist_documents(job_id, {"cover_letter"}, generation_profile)
         refreshed = query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)
         return jsonify({**job_to_dict(refreshed), "generation": generation})
 
@@ -1511,6 +1530,10 @@ def run_document_generation(kind: str, builder: Any) -> dict[str, Any]:
             raise RuntimeError(result["error"])
         if not isinstance(result, dict):
             raise TypeError(f"{kind} builder returned an invalid result")
+        if result.get("status") == "generated":
+            output_path = text((result.get("change_log") or {}).get("output_path"))
+            if not output_path or not Path(output_path).is_file():
+                raise RuntimeError(f"{kind} builder reported success without a readable output file")
         return result
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
@@ -1534,13 +1557,13 @@ def run_document_generation(kind: str, builder: Any) -> dict[str, Any]:
         }
 
 
-def generate_and_store_shortlist_documents(job_id: int, kinds: set[str] | None = None) -> dict[str, Any]:
+def generate_and_store_shortlist_documents(job_id: int, kinds: set[str] | None = None, profile_override: dict[str, Any] | None = None) -> dict[str, Any]:
     job_row = query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)
     if job_row is None:
         return {"resume": "failed", "cover_letter": "failed", "error": "Job not found"}
     job = job_to_dict(job_row)
     requested_kinds = set(kinds or {"resume", "cover_letter"})
-    profile = load_profile()
+    profile = profile_override or load_profile()
     if not profile_has_generation_source(profile):
         error = "Complete the Profile page with resume, project, or work-experience details before generating documents."
         current_resume_status = text(job.get("resume_generation_status")) or "pending"
@@ -1600,6 +1623,8 @@ def generate_and_store_shortlist_documents(job_id: int, kinds: set[str] | None =
                 "resume",
                 lambda: build_format_preserving_resume(job, profile, output, resume_path),
             )
+            if resume_result.get("status") == "failed" and resume_path.exists():
+                resume_path.unlink()
         else:
             resume_result = {
                 "status": "failed",
@@ -1625,6 +1650,8 @@ def generate_and_store_shortlist_documents(job_id: int, kinds: set[str] | None =
             "cover_letter",
             lambda: build_format_preserving_cover_letter(job, profile, output, cover_path),
         )
+        if cover_result.get("status") == "failed" and cover_path.exists():
+            cover_path.unlink()
 
     generation_debug = build_generation_debug_payload(job_id, job, profile, output, resume_result, cover_result, resume_path, cover_path)
 
@@ -1659,8 +1686,8 @@ def generate_and_store_shortlist_documents(job_id: int, kinds: set[str] | None =
         job_id,
         resume_status,
         cover_status,
-        str(resume_path) if "resume" in requested_kinds and resume_result["status"] == "generated" else ("" if "resume" in requested_kinds else current_resume_path),
-        str(cover_path) if "cover_letter" in requested_kinds and cover_result["status"] == "generated" else ("" if "cover_letter" in requested_kinds else current_cover_path),
+        str(resume_path) if "resume" in requested_kinds and resume_result["status"] == "generated" else (current_resume_path if "resume" in requested_kinds else current_resume_path),
+        str(cover_path) if "cover_letter" in requested_kinds and cover_result["status"] == "generated" else (current_cover_path if "cover_letter" in requested_kinds else current_cover_path),
         "; ".join(filter(None, [resume_error, cover_error])),
         resume_error,
         cover_error,
@@ -1677,6 +1704,53 @@ def generate_and_store_shortlist_documents(job_id: int, kinds: set[str] | None =
 
 def profile_has_generation_source(profile: dict[str, str]) -> bool:
     return evidence_has_generation_source(build_candidate_evidence(profile))
+
+
+def resolve_generation_profile(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Resolve an optional reusable candidate profile and document selections.
+
+    The legacy profile remains the default. A selected candidate profile supplies
+    its chosen base resume and cover-letter template without mutating the user's
+    saved profile or the original template files.
+    """
+    payload = payload or {}
+    raw_profile_id = payload.get("candidate_profile_id", payload.get("profile_id"))
+    if raw_profile_id in (None, "", 0):
+        return None
+    try:
+        profile_id = int(raw_profile_id)
+    except (TypeError, ValueError):
+        raise ValueError("candidate_profile_id must be an integer")
+    store = CandidateProfileStore(get_db())
+    profile_row = next((item for item in store.list_profiles() if int(item["id"]) == profile_id), None)
+    if profile_row is None:
+        raise ValueError("Selected candidate profile was not found")
+    documents = store.documents_for(profile_id)
+
+    def select_document(items: list[dict[str, Any]], key: str) -> dict[str, Any] | None:
+        raw_id = payload.get(key)
+        if raw_id not in (None, "", 0):
+            try:
+                selected_id = int(raw_id)
+            except (TypeError, ValueError):
+                raise ValueError(f"{key} must be an integer")
+            selected = next((item for item in items if int(item["id"]) == selected_id), None)
+            if selected is None:
+                raise ValueError(f"Selected {key} was not found for this candidate profile")
+            return selected
+        return next((item for item in items if item.get("is_default")), None) or (items[0] if items else None)
+
+    resume = select_document(documents["resumes"], "resume_id")
+    cover = select_document(documents["cover_letter_templates"], "cover_letter_template_id")
+    profile = load_profile()
+    profile.update({
+        "name": text(profile_row.get("name")) or profile.get("name", ""),
+        "resume_text": text((resume or {}).get("content")) or text(profile_row.get("description")) or profile.get("resume_text", ""),
+        "resume_docx_template_path": text((resume or {}).get("docx_path")),
+        "cover_letter_template": text((cover or {}).get("content")) or profile.get("cover_letter_template", ""),
+        "cover_letter_docx_template_path": text((cover or {}).get("docx_path")),
+    })
+    return profile
 
 
 def build_format_preserving_resume(
