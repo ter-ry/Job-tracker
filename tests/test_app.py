@@ -16,6 +16,7 @@ import semantic_matching
 import seniority
 import tailoring_pipeline
 import tailoring
+import resume_layout
 import sources.jobspy_source as jobspy_source
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -1585,14 +1586,13 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(master_doc.paragraphs[0].style.name, tailored_doc.paragraphs[0].style.name)
         self.assertEqual(master_doc.paragraphs[0].text, tailored_doc.paragraphs[0].text)
 
-        self.assertNotEqual(master_doc.paragraphs[2].text, tailored_doc.paragraphs[2].text)
+        self.assertEqual(master_doc.paragraphs[2].text, tailored_doc.paragraphs[2].text)
         self.assertEqual(master_doc.paragraphs[2].runs[0].font.name, tailored_doc.paragraphs[2].runs[0].font.name)
         self.assertEqual(master_doc.paragraphs[2].runs[0].font.size.pt, tailored_doc.paragraphs[2].runs[0].font.size.pt)
 
         self.assertEqual(master_doc.paragraphs[5].style.name, "List Bullet")
         self.assertEqual(tailored_doc.paragraphs[5].style.name, "List Bullet")
-        self.assertNotEqual(master_doc.paragraphs[5].text, tailored_doc.paragraphs[5].text)
-        self.assertIn("Built Python automation", tailored_doc.paragraphs[5].text)
+        self.assertEqual(master_doc.paragraphs[5].text, tailored_doc.paragraphs[5].text)
         self.assertEqual(master_doc.paragraphs[6].text, tailored_doc.paragraphs[6].text)
         self.assertEqual(master_doc.paragraphs[8].style.name, tailored_doc.paragraphs[8].style.name)
         self.assertNotEqual(master_doc.paragraphs[8].text, tailored_doc.paragraphs[8].text)
@@ -1649,10 +1649,9 @@ class JobAssistantTest(unittest.TestCase):
             self.assertIn(text_value, [paragraph.text for paragraph in tailored_doc.paragraphs])
 
         master_bullet = next(paragraph for paragraph in master_doc.paragraphs if paragraph.text.startswith("made Python automation"))
-        tailored_bullet = next(paragraph for paragraph in tailored_doc.paragraphs if "Built Python automation" in paragraph.text)
+        tailored_bullet = next(paragraph for paragraph in tailored_doc.paragraphs if paragraph.text.startswith("made Python automation"))
         self.assertEqual(master_bullet.style.name, tailored_bullet.style.name)
-        self.assertNotEqual(master_bullet.text, tailored_bullet.text)
-        self.assertIn("Built Python automation", tailored_bullet.text)
+        self.assertEqual(master_bullet.text, tailored_bullet.text)
 
         xml = zipfile.ZipFile(resume_path).read("word/document.xml").decode("utf-8", errors="ignore")
         self.assertNotIn("Suggested summary", xml)
@@ -1682,11 +1681,10 @@ class JobAssistantTest(unittest.TestCase):
 
         change_log = json.loads((resume_path.parent / "resume_change_log.json").read_text(encoding="utf-8"))
         self.assertGreaterEqual(change_log["summary"]["total_editable_paragraphs"], 6)
-        self.assertGreaterEqual(change_log["summary"]["total_proposed_changes"], 4)
-        self.assertGreaterEqual(change_log["summary"]["total_applied_changes"], 4)
-        self.assertLessEqual(change_log["summary"]["total_applied_changes"], 6)
+        self.assertGreaterEqual(change_log["summary"]["total_proposed_changes"], 1)
+        self.assertLessEqual(change_log["summary"]["total_applied_changes"], 1)
         self.assertGreaterEqual(change_log["summary"]["total_skipped_changes"], 1)
-        self.assertTrue(any(item.get("applied") for item in change_log["applied"]))
+        self.assertLessEqual(len(change_log["applied"]), 1)
         self.assertTrue(any(item.get("skip_reason") for item in change_log["skipped"]))
 
         tailored_doc = Document(io.BytesIO(resume_path.read_bytes()))
@@ -1695,9 +1693,9 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("Software Developer | Northstar Labs | 2021-2025", tailored_text)
         self.assertIn("Computer programming diploma | 2023", tailored_text)
         self.assertIn("validation, logging", tailored_text.lower())
-        self.assertIn("Strengthened software reliability by implementing validation, logging, and data-cleaning logic that detected malformed inputs and reduced manual data-entry errors by 90%.", tailored_text)
-        self.assertIn("database structures and data models", tailored_text)
-        self.assertIn("cross-functional data workflows using Retool and Google Docs", tailored_text)
+        self.assertIn("reduce manual data entry errors by 90%", tailored_text)
+        self.assertNotIn("database structures and data models", tailored_text)
+        self.assertNotIn("cross-functional data workflows using Retool and Google Docs", tailored_text)
 
         skills_line = next(paragraph.text for paragraph in tailored_doc.paragraphs if paragraph.text.startswith("Skills:"))
         self.assertTrue(skills_line.startswith("Skills: Python, SQL, AWS, Linux"))
@@ -1705,9 +1703,9 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("collaboration", skills_line.lower())
 
         bullet_texts = [paragraph.text for paragraph in tailored_doc.paragraphs if getattr(getattr(paragraph, "style", None), "name", "").startswith("List")]
-        self.assertTrue(any("Strengthened software reliability by implementing validation, logging, and data-cleaning logic that detected malformed inputs and reduced manual data-entry errors by 90%." in text for text in bullet_texts))
-        self.assertTrue(any("database structures and data models" in text for text in bullet_texts))
-        self.assertTrue(any("cross-functional data workflows using Retool and Google Docs" in text for text in bullet_texts))
+        self.assertTrue(any("reduce manual data entry errors by 90%" in text for text in bullet_texts))
+        self.assertFalse(any("database structures and data models" in text for text in bullet_texts))
+        self.assertFalse(any("cross-functional data workflows using Retool and Google Docs" in text for text in bullet_texts))
 
         opened = Document(io.BytesIO(resume_path.read_bytes()))
         self.assertGreater(len(opened.paragraphs), 0)
@@ -1729,7 +1727,7 @@ class JobAssistantTest(unittest.TestCase):
         resume_path = Path(created["resume_docx_path"])
         self.assertEqual(master_before, master_path.read_bytes())
         change_log = json.loads((resume_path.parent / "resume_change_log.json").read_text(encoding="utf-8"))
-        self.assertGreaterEqual(change_log["summary"]["total_applied_changes"], 3)
+        self.assertLessEqual(change_log["summary"]["total_applied_changes"], 3)
         self.assertLessEqual(change_log["summary"]["total_applied_changes"], 6)
         self.assertGreaterEqual(change_log["summary"]["total_skipped_changes"], 1)
         self.assertTrue(
@@ -1739,21 +1737,7 @@ class JobAssistantTest(unittest.TestCase):
                 for item in change_log["applied"]
             )
         )
-        meaningful_applied = [
-            item
-            for item in change_log["applied"]
-            if any(
-                phrase in item["replacement"].lower()
-                for phrase in [
-                    "strengthened software reliability by implementing validation, logging, and data-cleaning logic",
-                    "database structures and data models",
-                    "backend integrations and data workflows",
-                    "collaborated with cross-functional",
-                    "technical documentation",
-                ]
-            )
-        ]
-        self.assertGreaterEqual(len(meaningful_applied), 2)
+        self.assertTrue(all(len(item["replacement"]) <= len(item["original"]) for item in change_log["applied"]))
 
         tailored_doc = Document(io.BytesIO(resume_path.read_bytes()))
         changed_paragraphs = [
@@ -1769,12 +1753,11 @@ class JobAssistantTest(unittest.TestCase):
         substantive_bullet_changes = [
             item for item in changed_paragraphs if item["style"].startswith("List") and not tailoring.is_cosmetic_only_change(item["base"], item["tailored"])
         ]
-        self.assertGreaterEqual(len(substantive_bullet_changes), 2)
+        self.assertLessEqual(len(substantive_bullet_changes), 3)
         tailored_text = "\n".join(paragraph.text for paragraph in tailored_doc.paragraphs)
-        self.assertIn("database structures and data models", tailored_text)
-        self.assertIn("Strengthened software reliability by implementing validation, logging, and data-cleaning logic that detected malformed inputs and reduced manual data-entry errors by 90%.", tailored_text)
-        self.assertIn("collaborated with cross-functional teammates", tailored_text.lower())
-        self.assertIn("cross-functional data workflows", tailored_text.lower())
+        self.assertNotIn("Strengthened software reliability", tailored_text)
+        self.assertNotIn("collaborated with cross-functional teammates", tailored_text.lower())
+        self.assertNotIn("cross-functional data workflows", tailored_text.lower())
         self.assertNotIn("saved profile", tailored_text.lower())
 
     def test_scotiabank_requirements_rank_and_map_to_grounded_evidence(self):
@@ -1800,7 +1783,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("supported_technologies", top_match)
         self.assertIn("supported_outcome", top_match)
         self.assertGreaterEqual(top_match["confidence"], 40)
-        self.assertTrue(any("database structures" in item["matched_source_bullet"].lower() or "validation" in item["matched_source_bullet"].lower() for item in inventory))
+        self.assertFalse(any("database structures" in item["matched_source_bullet"].lower() for item in inventory))
 
     def test_controlled_rewrite_rejects_cosmetic_only_changes(self):
         original = "Built supplier specific items and data entry workflows for operations."
@@ -1811,6 +1794,55 @@ class JobAssistantTest(unittest.TestCase):
             section="projects",
         )
         self.assertEqual(rewritten, original)
+
+    def test_minimal_resume_substitution_is_noop_or_explicit_alias_only(self):
+        original = "Built NodeJS services for reporting and reduced errors by 90%."
+        evidence = {"full_text": original}
+        alias_match = {"job_phrase": "Node.js services", "evidence_text": original}
+        proposed, reason = tailoring_pipeline.minimal_resume_substitution(original, alias_match)
+        validation = tailoring_pipeline.validate_minimal_substitution(original, proposed, alias_match, evidence)
+        self.assertEqual(proposed, "Built Node.js services for reporting and reduced errors by 90%.")
+        self.assertTrue(validation["grounded"])
+        self.assertIn("NodeJS", original)
+        self.assertIn("90%", proposed)
+
+        noop, _ = tailoring_pipeline.minimal_resume_substitution(original, {"job_phrase": "Python services"})
+        self.assertEqual(noop, original)
+        unsupported, _ = tailoring_pipeline.minimal_resume_substitution(original, {"job_phrase": "Kubernetes services"})
+        self.assertEqual(unsupported, original)
+
+    def test_layout_validation_rejects_line_or_page_changes(self):
+        with patch(
+            "resume_layout.measure_docx_layout",
+            side_effect=[
+                {"available": True, "pages": 1, "paragraphs": [{"index": 0, "lines": 2}]},
+                {"available": True, "pages": 2, "paragraphs": [{"index": 0, "lines": 3}]},
+            ],
+        ):
+            result = resume_layout.compare_docx_layout("original.docx", "candidate.docx")
+        self.assertFalse(result["verified"])
+        self.assertTrue(result["page_mismatch"])
+        self.assertTrue(result["line_mismatches"])
+
+    def test_keyword_coverage_deduplicates_aliases_and_warns_on_unsupported_groups(self):
+        job = {"title": "Software Engineer", "required_skills": "NodeJS, Node.js, Kubernetes, database design", "preferred_skills": "Postgres, PostgreSQL"}
+        profile = {"work_experience": "Built NodeJS services with SQL reporting.", "key_skills": "NodeJS, SQL"}
+        semantic = {
+            "matches": [
+                {"job_requirement": "NodeJS", "category": "required_skill", "matched_resume_evidence": "Built NodeJS services.", "confidence": 80, "match_type": "direct"},
+                {"job_requirement": "Node.js", "category": "required_skill", "matched_resume_evidence": "Built NodeJS services.", "confidence": 80, "match_type": "direct"},
+                {"job_requirement": "Kubernetes", "category": "required_skill", "matched_resume_evidence": "", "confidence": 0, "match_type": "missing"},
+                {"job_requirement": "database design", "category": "required_skill", "matched_resume_evidence": "", "confidence": 0, "match_type": "missing"},
+                {"job_requirement": "Postgres", "category": "preferred_skill", "matched_resume_evidence": "SQL reporting", "confidence": 60, "match_type": "transferable"},
+                {"job_requirement": "PostgreSQL", "category": "preferred_skill", "matched_resume_evidence": "SQL reporting", "confidence": 60, "match_type": "transferable"},
+            ]
+        }
+        report = app_module.build_keyword_coverage_report(job, profile, semantic)
+        self.assertEqual(report["required"]["total"], 4)
+        self.assertEqual(report["preferred"]["total"], 1)
+        self.assertTrue(report["review_job_fit"])
+        self.assertTrue(any("below 60%" in warning for warning in report["warnings"]))
+        self.assertTrue(any(item["requirement"] == "Kubernetes" for item in report["required"]["unsupported"]))
 
     def test_cover_letter_template_upload_and_placeholder_replacement(self):
         self.seed_profile_for_documents(with_template=True)
@@ -3192,10 +3224,10 @@ class JobAssistantTest(unittest.TestCase):
         rewritten_resume_2 = "Strengthened software reliability by implementing validation, logging, and data-cleaning logic that detected malformed inputs and reduced manual data-entry errors by 90%."
         bad_cover_paragraph = "Python, JavaScript, Flask, React, SQL, cloud, AWS, Azure, dashboards, automation, APIs, reporting. This is the kind of work I would bring to Scotiabank."
 
-        self.assertNotIn(original_resume_1, resume_text)
-        self.assertNotIn(original_resume_2, resume_text)
-        self.assertIn(rewritten_resume_1, resume_text)
-        self.assertIn(rewritten_resume_2, resume_text)
+        self.assertIn(original_resume_1, resume_text)
+        self.assertIn(original_resume_2, resume_text)
+        self.assertNotIn(rewritten_resume_1, resume_text)
+        self.assertNotIn(rewritten_resume_2, resume_text)
         self.assertNotIn("testing", resume_text.lower())
         self.assertNotIn(bad_cover_paragraph, cover_text)
         self.assertEqual(len(cover_body), 3)

@@ -28,6 +28,7 @@ from flask import Flask, Response, g, has_app_context, jsonify, render_template,
 
 from grounding import (
     PDF_CORRUPTION_MESSAGE,
+    TECHNICAL_TERMS,
     build_candidate_evidence,
     classify_supported_skills,
     classify_keyword_dump_reason,
@@ -45,12 +46,21 @@ from semantic_matching import MODEL_DOWNLOAD_SIZE, MODEL_NAME, analyze_resume_ma
 from seniority import DETECTED_LEVELS, SENIORITY_LEVELS, analyze_job_seniority, score_seniority_fit
 from ollama_client import OllamaConfig, build_ollama_health_report, ollama_profile_defaults, request_json_completion
 from sources.jobspy_source import fetch_jobspy_jobs
-from tailoring import controlled_rewrite, generate_tailored_resume_draft
-from tailoring_pipeline import build_cover_letter_paragraphs, build_tailoring_plan, short_join
+from tailoring import generate_tailored_resume_draft
+from tailoring_pipeline import (
+    build_cover_letter_paragraphs,
+    build_tailoring_plan,
+    classify_phrase,
+    minimal_resume_substitution,
+    rank_job_requirements,
+    short_join,
+    validate_minimal_substitution,
+)
 from werkzeug.utils import secure_filename
 from db.migrations import run_migrations
 from profile_store import CandidateProfileStore
 from services.document_generation import DocumentGenerationService
+from resume_layout import compare_docx_layout
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -1936,12 +1946,36 @@ def build_format_preserving_resume(
             },
         }
 
-    shutil.copyfile(template_path, resume_path)
-    document = Document(resume_path)
+    candidate_path = resume_path.with_name(f"{resume_path.stem}.layout-check.docx")
+    shutil.copyfile(template_path, candidate_path)
+    document = Document(candidate_path)
     replace_resume_identity(document, text(profile.get("name")))
     plan = build_resume_change_plan(document, job, profile, output)
     change_log = apply_resume_change_plan(document, plan)
-    document.save(resume_path)
+    document.save(candidate_path)
+    layout_validation = compare_docx_layout(template_path, candidate_path)
+    change_log["layout_validation"] = layout_validation
+    if layout_validation.get("available") and layout_validation.get("verified"):
+        shutil.copyfile(candidate_path, resume_path)
+    else:
+        # Never silently accept edits whose rendered layout cannot be verified.
+        shutil.copyfile(template_path, resume_path)
+        identity_candidate = resume_path.with_name(f"{resume_path.stem}.identity-check.docx")
+        shutil.copyfile(template_path, identity_candidate)
+        identity_document = Document(identity_candidate)
+        replace_resume_identity(identity_document, text(profile.get("name")))
+        identity_document.save(identity_candidate)
+        identity_validation = compare_docx_layout(template_path, identity_candidate)
+        if identity_validation.get("available") and identity_validation.get("verified"):
+            shutil.copyfile(identity_candidate, resume_path)
+        identity_candidate.unlink(missing_ok=True)
+        for item in change_log.get("applied", []):
+            item["applied"] = False
+            item["skip_reason"] = layout_validation.get("reason") or "Rendered layout changed."
+            change_log.setdefault("skipped", []).append(item)
+        change_log["applied"] = []
+        change_log["layout_warning"] = layout_validation.get("reason") or "Rendered layout could not be verified. Original résumé preserved."
+    candidate_path.unlink(missing_ok=True)
     reopened_resume = Document(resume_path)
     _ = "\n".join(paragraph.text for paragraph in reopened_resume.paragraphs)
     return {
@@ -2634,18 +2668,42 @@ def build_resume_change_plan(
 
     summary_context = next((ctx for ctx in contexts if ctx["section"] == "summary" and ctx["editable"]), None)
     if summary_context is not None:
-        candidate_map["summary"] = {
-            "kind": "summary",
-            "paragraph_type": "summary_paragraph",
-            "section": "summary",
-            "original": summary_context["text"],
-            "replacement": output.get("summary", ""),
-            "supporting_evidence": supporting_snippet_for_plan(candidate_evidence, output, job),
-            "matched_job_requirement": text(job.get("title")),
-            "confidence": 90,
-            "validation_status": "pending",
-            "priority": 2,
+        summary_original = summary_context["text"]
+        summary_replacement = summary_original
+        summary_match = {
+            "job_phrase": text(job.get("title")),
+            "evidence_text": summary_original,
         }
+        summary_replacement, summary_change = minimal_resume_substitution(summary_original, summary_match)
+        summary_validation = validate_minimal_substitution(summary_original, summary_replacement, summary_match, candidate_evidence)
+        if summary_validation.get("grounded"):
+            candidate_map["summary"] = {
+                "kind": "summary",
+                "paragraph_type": "summary_paragraph",
+                "section": "summary",
+                "original": summary_original,
+                "replacement": summary_replacement,
+                "supporting_evidence": summary_original,
+                "matched_job_requirement": text(job.get("title")),
+                "confidence": 90,
+                "validation_status": "pending",
+                "priority": 2,
+            }
+        else:
+            plan.append(
+                {
+                    "kind": "summary",
+                    "paragraph_type": "summary_paragraph",
+                    "section": "summary",
+                    "original": summary_original,
+                    "replacement": summary_original,
+                    "supporting_evidence": summary_original,
+                    "matched_job_requirement": text(job.get("title")),
+                    "confidence": 0,
+                    "validation_status": "skipped",
+                    "reason": summary_validation.get("reason", "No safe minimal summary substitution."),
+                }
+            )
     else:
         plan.append(
             {
@@ -2659,6 +2717,7 @@ def build_resume_change_plan(
                 "confidence": 0,
                 "validation_status": "skipped",
                 "reason": "Skipped summary tailoring: no existing summary section",
+                "priority": 2,
             }
         )
 
@@ -2855,50 +2914,6 @@ def build_resume_change_plan(
             "priority": 0 if context["section"] == "experience" else 1,
             "source": "shared-plan",
         }
-
-    for context in contexts:
-        if context["section"] not in {"experience", "projects"} or not context["editable"] or not context["is_bullet"]:
-            continue
-        original = context["text"]
-        key = normalize_space(original)
-        if not key or key in candidate_map:
-            continue
-        replacement = controlled_rewrite(original, job_requirement, evidence_text=candidate_evidence["full_text"], section=context["section"])
-        if normalize_space(replacement) == key:
-            plan.append(
-                {
-                    "kind": "bullet",
-                    "paragraph_type": "bullet_paragraph",
-                    "section": context["section"],
-                    "original": original,
-                    "replacement": replacement,
-                    "supporting_evidence": original,
-                    "matched_job_requirement": job_requirement,
-                    "confidence": 45,
-                    "validation_status": "skipped",
-                    "reason": "No ATS benefit: wording already reads well for the current job.",
-                    "priority": 0 if context["section"] == "experience" else 1,
-                    "source": "generic",
-                }
-            )
-            continue
-        confidence = resume_change_confidence(original, replacement, job_requirement, candidate_evidence["full_text"])
-        candidate = {
-            "kind": "bullet",
-            "paragraph_type": "bullet_paragraph",
-            "section": context["section"],
-            "original": original,
-            "replacement": replacement,
-            "supporting_evidence": original,
-            "matched_job_requirement": job_requirement,
-            "confidence": confidence,
-            "validation_status": "pending",
-            "priority": 0 if context["section"] == "experience" else 1,
-            "source": "generic",
-        }
-        existing = candidate_map.get(key)
-        if existing is None or int(candidate["confidence"]) > int(existing.get("confidence", 0)):
-            candidate_map[key] = candidate
 
     pending_candidates = sorted(
         candidate_map.values(),
@@ -6192,7 +6207,13 @@ def generate_application_materials(
     unsupported = skill_groups["unsupported_job_keywords"]
     transferable = skill_groups["transferable_supported"]
     focus = supported[:4]
-    resume_lines = [item["proposed_bullet"] for item in tailored["rewrite_suggestions"]] or source_backed_bullets(profile, focus)
+    resume_lines = [item["proposed_bullet"] for item in tailored["rewrite_suggestions"]]
+    if not resume_lines:
+        resume_lines = [
+            item["text"]
+            for item in semantic.get("evidence", [])
+            if item.get("evidence_type") in {"professional experience", "project"}
+        ]
     grounded_resume_lines = [block["proposed_text"] for block in tailoring_plan.get("resume_change_blocks", []) if block.get("grounded")]
     summary = build_summary(profile, job, focus, candidate_evidence)
     skills_section = format_skills_guidance(skill_groups)
@@ -6267,6 +6288,7 @@ def generate_application_materials(
         "resume_ok": resume_validation["ok"],
         "cover_letter_ok": cover_validation["ok"],
     }
+    keyword_coverage = build_keyword_coverage_report(job, profile, semantic, tailoring_plan)
     if raise_on_validation:
         if not resume_validation["ok"]:
             conflicts = ", ".join(resume_validation["conflicting_phrases"]) or "empty or corrupted candidate evidence"
@@ -6286,6 +6308,7 @@ def generate_application_materials(
         "ranked_approved_evidence_records": ranked_approved_evidence,
         "job_hash": generation_job_hash(job),
         "validation": validation,
+        "keyword_coverage": keyword_coverage,
         "summary": summary,
         "skills_section": skills_section,
         "resume_bullets": grounded_resume_lines or resume_lines,
@@ -6313,6 +6336,181 @@ def generate_application_materials(
     }
 
 
+def build_keyword_coverage_report(
+    job: dict[str, Any],
+    profile: dict[str, Any],
+    semantic_result: dict[str, Any],
+    tailoring_plan: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return a transparent, heuristic requirement coverage report."""
+    matches = semantic_result.get("matches", []) or []
+    required_categories = {"required_skill", "responsibility", "role_title"}
+    preferred_categories = {"preferred_skill"}
+    aliases = {
+        "nodejs": "node.js",
+        "java script": "javascript",
+        "postgres": "postgresql",
+        "restful apis": "rest apis",
+    }
+
+    def normalize_requirement(value: Any) -> str:
+        result = normalize_space(str(value or "")).lower()
+        for source, target in aliases.items():
+            result = re.sub(rf"\b{re.escape(source)}\b", target, result)
+        return result
+
+    def dedupe(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        seen: set[str] = set()
+        output: list[dict[str, Any]] = []
+        for item in items:
+            key = normalize_requirement(item.get("job_requirement"))
+            if not key or key in seen:
+                continue
+            if any(key in existing or existing in key for existing in seen):
+                continue
+            seen.add(key)
+            output.append(item)
+        return output
+
+    title = normalize_requirement(job.get("title"))
+    company = normalize_requirement(job.get("company"))
+    location = normalize_requirement(job.get("location"))
+
+    def meaningful_requirement(item: dict[str, Any]) -> bool:
+        requirement = normalize_requirement(item.get("job_requirement"))
+        if not requirement or len(requirement) > 80:
+            return False
+        if requirement in {company, location, "full-time", "apply now", "job details"}:
+            return False
+        if any(term in requirement for term in [
+            "paid time off", "vision care", "dental care", "life insurance",
+            "employee assistance", "disability insurance", "$",
+        ]):
+            return False
+        if re.search(r"\b\d{3,}\b", requirement) and not re.search(r"\b(?:api|sql|python|java|c\+\+|years?)\b", requirement):
+            return False
+        important_technical_terms = {
+            *(term.lower() for term in TECHNICAL_TERMS),
+            "kubernetes", "jira", "rmq", "gps", "figma", "windows", "linux",
+            "java", "c++", "c#", ".net", "video analytics", "thermal cameras",
+        }
+        known_technical = any(term in requirement for term in important_technical_terms)
+        if item.get("category") == "required_skill" and classify_phrase(requirement) == "domain terminology" and requirement != title and not known_technical:
+            return False
+        return True
+
+    ranked = (tailoring_plan or {}).get("ranked_requirements") or rank_job_requirements(job)
+    requirement_items: list[dict[str, Any]] = []
+    for item in ranked:
+        source_field = item.get("source_field")
+        category = "preferred_skill" if source_field == "preferred_skills" else "required_skill"
+        requirement_items.append({
+            "job_requirement": item.get("phrase", ""),
+            "category": category,
+            "source_field": source_field,
+        })
+    known_requirements = {normalize_requirement(item.get("job_requirement")) for item in requirement_items}
+    requirement_items.extend(
+        item for item in matches
+        if normalize_requirement(item.get("job_requirement")) not in known_requirements
+    )
+
+    required = dedupe([item for item in requirement_items if item.get("category") in required_categories and meaningful_requirement(item)])
+    preferred = dedupe([item for item in requirement_items if item.get("category") in preferred_categories and meaningful_requirement(item)])
+
+    profile_text = normalize_requirement(" ".join(text(profile.get(field)) for field in ["work_experience", "key_skills", "education", "projects", "resume_text"]))
+    evidence_lines = []
+    for field in ["work_experience", "key_skills", "education", "projects", "resume_text"]:
+        value = text(profile.get(field))
+        evidence_lines.extend(split_sentences(value) or [normalize_space(value)] if value else [])
+    match_by_requirement = {normalize_requirement(item.get("job_requirement")): item for item in matches}
+
+    def enrich(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        enriched: list[dict[str, Any]] = []
+        for item in items:
+            requirement = item.get("job_requirement", "")
+            normalized = normalize_requirement(requirement)
+            source_match = match_by_requirement.get(normalized, {})
+            evidence = ""
+            if normalized and normalized in profile_text:
+                evidence = next((line for line in evidence_lines if normalized in normalize_requirement(line)), "")
+            if not evidence:
+                evidence = normalize_space(source_match.get("matched_resume_evidence"))
+            enriched.append({**item, "matched_resume_evidence": evidence, "confidence": source_match.get("confidence", 100 if evidence and normalized in profile_text else 0), "match_type": source_match.get("match_type", "direct" if evidence and normalized in profile_text else "missing")})
+        return enriched
+
+    required = enrich(required)
+    preferred = enrich(preferred)
+
+    def classify(items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        covered: list[dict[str, Any]] = []
+        potential: list[dict[str, Any]] = []
+        unsupported: list[dict[str, Any]] = []
+        for item in items:
+            evidence = normalize_space(item.get("matched_resume_evidence"))
+            confidence = int(item.get("confidence") or 0)
+            record = {
+                "requirement": item.get("job_requirement", ""),
+                "evidence": evidence,
+                "confidence": confidence,
+                "match_type": item.get("match_type", "missing"),
+                "category": item.get("category", ""),
+                "group": classify_phrase(str(item.get("job_requirement") or "")),
+            }
+            if evidence and item.get("match_type") == "direct" and confidence >= 40:
+                covered.append(record)
+            elif evidence and confidence >= 40:
+                potential.append(record)
+            else:
+                unsupported.append(record)
+        return covered, potential, unsupported
+
+    required_covered, required_potential, required_unsupported = classify(required)
+    preferred_covered, preferred_potential, preferred_unsupported = classify(preferred)
+    required_total = len(required)
+    required_coverage = round((len(required_covered) / required_total) * 100) if required_total else 100
+    critical_groups = {item["group"] for item in required_unsupported if item.get("group")}
+    warnings: list[str] = []
+    if required_total and required_coverage < 60:
+        warnings.append("Review job fit: required-skill coverage is below 60%.")
+    if len(critical_groups) >= 3:
+        warnings.append("Review job fit: at least 3 critical required-skill groups are unsupported.")
+
+    job_text = normalize_requirement(" ".join(text(job.get(field)) for field in ["title", "required_skills", "preferred_skills", "responsibilities", "job_description"]))
+    profile_text = normalize_requirement(" ".join(text(profile.get(field)) for field in ["work_experience", "key_skills", "education", "projects", "resume_text"]))
+    eligibility: list[dict[str, str]] = []
+    if any(term in job_text for term in ["in person", "commute", "relocate", "on-site", "onsite"]):
+        if not any(term in profile_text for term in ["toronto", "abbotsford", "relocate", "commute"]):
+            eligibility.append({"type": "location", "message": "Confirm commute, relocation, or in-person availability."})
+    if any(term in job_text for term in ["authorized to work", "work authorization", "legally authorized"]):
+        if not any(term in profile_text for term in ["authorized", "authorization"]):
+            eligibility.append({"type": "authorization", "message": "Work authorization is not established in the résumé."})
+    if re.search(r"\b(?:3|4|5|7|10)\+?\s+years?", job_text) and not re.search(r"\b(?:3|4|5|7|10)\+?\s+years?", profile_text):
+        eligibility.append({"type": "experience", "message": "Required years of experience are not explicitly established in the résumé."})
+
+    return {
+        "required": {
+            "covered": required_covered,
+            "potential_safe_substitutions": required_potential,
+            "unsupported": required_unsupported,
+            "coverage_percent": required_coverage,
+            "total": required_total,
+        },
+        "preferred": {
+            "covered": preferred_covered,
+            "potential_safe_substitutions": preferred_potential,
+            "unsupported": preferred_unsupported,
+            "coverage_percent": round((len(preferred_covered) / len(preferred)) * 100) if preferred else 100,
+            "total": len(preferred),
+        },
+        "warnings": warnings,
+        "review_job_fit": bool(warnings),
+        "critical_unsupported_groups": sorted(critical_groups),
+        "eligibility_concerns": eligibility,
+        "heuristic_note": "Coverage is a review heuristic, not an ATS score or hiring decision.",
+    }
+
+
 def source_backed_bullets(profile: dict[str, str], focus: list[str]) -> list[str]:
     source = normalize_space(" ".join([profile.get("projects", ""), profile.get("work_experience", ""), profile.get("resume_text", "")]))
     snippets = split_sentences(source)
@@ -6336,21 +6534,7 @@ def split_sentences(value: str) -> list[str]:
 def build_summary(profile: dict[str, str], job: dict[str, Any], focus: list[str], candidate_evidence: dict[str, Any]) -> str:
     source_summary = normalize_space(text(profile.get("_source_summary")))
     if source_summary:
-        source_summary = re.sub(r"\bdocumented\s+", "", source_summary, flags=re.I)
-        source_summary = re.sub(r"\bsupported\s+experience\b", "experience", source_summary, flags=re.I)
         return source_summary
-    role = first_supported_role(profile, candidate_evidence) or infer_documented_role(candidate_evidence)
-    evidence_sentence = first_narrative_evidence_sentence(candidate_evidence)
-    relevant_terms = [term for term in focus[:4] if term]
-    if not relevant_terms:
-        relevant_terms = matching_evidence_terms(job, candidate_evidence, limit=3)
-    skill_phrase = ", ".join(relevant_terms)
-    if role and skill_phrase and evidence_sentence:
-        return f"{role} with experience in {skill_phrase}. {evidence_sentence}"
-    if role and evidence_sentence:
-        return f"{role} with hands-on experience. {evidence_sentence}"
-    if evidence_sentence:
-        return evidence_sentence
     return source_backed_summary_fallback(profile)
 
 

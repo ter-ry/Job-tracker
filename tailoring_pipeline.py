@@ -362,40 +362,15 @@ def build_resume_change_blocks(
     candidate_evidence: dict[str, Any],
     evidence_index: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    """Build only minimal, source-local résumé substitutions.
+
+    Résumé tailoring must not synthesize or rewrite whole bullets.  Every
+    accepted change is a short equivalent-term replacement inside the matched
+    source paragraph; unsupported or layout-expanding edits are left pending.
+    """
     blocks: list[dict[str, Any]] = []
     seen_originals: set[str] = set()
     relevant_sections = {"professional experience", "project", "skill", "uploaded resume text"}
-    direct_candidates = build_direct_resume_rewrite_candidates(candidate_evidence, phrase_matches)
-    for candidate in direct_candidates:
-        original = normalize_space(candidate["original_text"])
-        if not original or original in seen_originals:
-            continue
-        proposed = rewrite_from_requirement_evidence(original, candidate["match"], candidate_evidence)
-        if proposed is None or proposed == original:
-            continue
-        validation = validate_rewrite(original, proposed, candidate["match"]["job_phrase"], candidate_evidence)
-        if not validation["grounded"]:
-            continue
-        blocks.append(
-            {
-                "change_id": _stable_id(f"{original}|{candidate['match']['job_phrase']}"),
-                "section": _section_for_evidence(candidate["match"].get("evidence_section", "experience")),
-                "original_text": original,
-                "proposed_text": proposed,
-                "matched_job_phrase": candidate["match"]["job_phrase"],
-                "supporting_evidence": candidate["match"].get("evidence_text", original),
-                "changed_wording": "Grounded rewrite emphasizing the highest-priority requirement.",
-                "confidence": int(candidate["match"].get("confidence", 0)),
-                "grounded": True,
-                "validation_result": validation,
-                "skip_reason": "",
-                "evidence_id": candidate["match"].get("evidence_id", _stable_id(original)),
-                "evidence_section": candidate["match"].get("evidence_section", "experience"),
-                "match_type": candidate["match"].get("match_type", "direct"),
-                "unsupported_terms": candidate["match"].get("unsupported_terms", []),
-            }
-        )
-        seen_originals.add(original)
     for match in sorted(
         phrase_matches,
         key=lambda item: (int(item.get("job_requirement_importance", 0)), item["confidence"], item["exact_keyword_overlap"]),
@@ -404,13 +379,9 @@ def build_resume_change_blocks(
         original = normalize_space(match["exact_original_resume_paragraph"])
         if not original or original in seen_originals or match["evidence_section"] not in relevant_sections:
             continue
-        proposed = rewrite_from_requirement_evidence(original, match, candidate_evidence)
-        if proposed is None:
-            proposed, changed, validation, skip_reason = rewrite_paragraph(original, match["job_phrase"], match, job, candidate_evidence)
-        else:
-            changed = "Grounded rewrite emphasizing the highest-priority requirement."
-            validation = validate_rewrite(original, proposed, match["job_phrase"], candidate_evidence)
-            skip_reason = "" if validation["grounded"] else validation.get("reason", "rewrite was not sufficiently grounded")
+        proposed, changed = minimal_resume_substitution(original, match)
+        validation = validate_minimal_substitution(original, proposed, match, candidate_evidence)
+        skip_reason = "" if validation["grounded"] else validation.get("reason", "no safe minimal substitution")
         block = {
             "change_id": _stable_id(f"{original}|{match['job_phrase']}"),
             "section": _section_for_evidence(match["evidence_section"]),
@@ -431,7 +402,73 @@ def build_resume_change_blocks(
         if validation["grounded"] and proposed.strip() and proposed != original:
             blocks.append(block)
             seen_originals.add(original)
-    return blocks[:5]
+    return blocks[:3]
+
+
+# These are deliberately conservative aliases.  They only fire when the
+# source paragraph already contains the left-hand wording and the job uses the
+# right-hand wording.  No technology, metric, employer, or responsibility is
+# introduced by this table.
+MINIMAL_TERM_ALIASES = (
+    ("nodejs", "node.js"),
+    ("java script", "javascript"),
+    ("restful apis", "rest apis"),
+    ("web based", "web-based"),
+)
+
+
+def minimal_resume_substitution(original: str, match: dict[str, Any]) -> tuple[str, str]:
+    """Return one source-local terminology substitution, or the original."""
+    job_phrase = normalize_space(str(match.get("job_phrase") or "")).lower()
+    proposed = original
+    changed = "No safe minimal substitution identified."
+    for source_term, target_term in MINIMAL_TERM_ALIASES:
+        if source_term in original.lower() and target_term in job_phrase and source_term != target_term:
+            def replace_term(match: re.Match[str]) -> str:
+                replacement = target_term
+                if match.group(0)[:1].isupper():
+                    replacement = replacement[:1].upper() + replacement[1:]
+                return replacement
+
+            proposed = re.sub(re.escape(source_term), replace_term, original, count=1, flags=re.I)
+            changed = f"Replaced equivalent terminology: {source_term} -> {target_term}."
+            break
+    return proposed, changed
+
+
+def validate_minimal_substitution(
+    original: str,
+    proposed: str,
+    match: dict[str, Any],
+    candidate_evidence: dict[str, Any],
+) -> dict[str, Any]:
+    """Reject semantic rewrites, new terms, metric changes, and expansion."""
+    alias_target_present = any(
+        source in original.lower()
+        and target in proposed.lower()
+        and target in str(match.get("job_phrase") or "").lower()
+        for source, target in MINIMAL_TERM_ALIASES
+    )
+    if proposed == original or (is_cosmetic_only_change(original, proposed) and not alias_target_present):
+        return {"grounded": False, "ok": False, "reason": "no meaningful substitution"}
+    original_numbers = re.findall(r"\d+(?:\.\d+)?%?", original)
+    proposed_numbers = re.findall(r"\d+(?:\.\d+)?%?", proposed)
+    if original_numbers != proposed_numbers:
+        return {"grounded": False, "ok": False, "reason": "quantified achievement changed"}
+    original_sentences = len(split_sentences(original))
+    proposed_sentences = len(split_sentences(proposed))
+    if original_sentences != proposed_sentences:
+        return {"grounded": False, "ok": False, "reason": "sentence structure changed"}
+    original_terms = useful_tokens(original)
+    proposed_terms = useful_tokens(proposed)
+    removed = original_terms - proposed_terms
+    added = proposed_terms - original_terms
+    unsupported_added = set() if alias_target_present else added
+    if removed and unsupported_added and not all(term in candidate_evidence.get("full_text", "").lower() for term in unsupported_added):
+        return {"grounded": False, "ok": False, "reason": "substitution introduced unsupported terms"}
+    if not added or not any(term in str(match.get("job_phrase") or "").lower() for term in added):
+        return {"grounded": False, "ok": False, "reason": "substitution does not improve job terminology"}
+    return {"grounded": True, "ok": True, "reason": ""}
 
 
 def build_direct_resume_rewrite_candidates(
@@ -485,18 +522,16 @@ def build_requirement_evidence_inventory(
         evidence_text = normalize_space(str(match.get("evidence_text") or match.get("exact_original_resume_paragraph") or ""))
         if not evidence_text:
             continue
-        rewritten_bullet = rewrite_from_requirement_evidence(evidence_text, match, candidate_evidence) or evidence_text
-        technologies = [
-            term
-            for term in TECHNICAL_TERMS
-            if contains_phrase(rewritten_bullet, term) or contains_phrase(evidence_text, term)
-        ]
-        outcome = _extract_outcome_phrase(rewritten_bullet) or _extract_outcome_phrase(evidence_text)
+        # Keep the inventory traceable to the uploaded résumé.  Generated
+        # rewrites must not appear as if they were source evidence.
+        source_bullet = evidence_text
+        technologies = [term for term in TECHNICAL_TERMS if contains_phrase(source_bullet, term)]
+        outcome = _extract_outcome_phrase(source_bullet)
         inventory.append(
             {
                 "requirement": match.get("job_phrase", ""),
                 "importance": int(match.get("job_requirement_importance", 0)),
-                "matched_source_bullet": rewritten_bullet,
+                "matched_source_bullet": source_bullet,
                 "match_reason": match_reason(match),
                 "supported_technologies": technologies[:6],
                 "supported_outcome": outcome,
