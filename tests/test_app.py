@@ -2210,6 +2210,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(job["cover_letter_generation_status"], "generated")
         self.assertIn("Alex_Rivera", Path(job["resume_docx_path"]).name)
         cover_text = "\n".join(paragraph.text for paragraph in Document(io.BytesIO(Path(job["cover_letter_docx_path"]).read_bytes())).paragraphs)
+        self.assertIn("Alex Rivera", cover_text)
         self.assertNotIn("SWE Resume", cover_text)
 
     def test_selected_candidate_profile_isolated_from_legacy_and_other_profiles(self):
