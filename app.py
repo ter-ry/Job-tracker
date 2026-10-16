@@ -86,7 +86,7 @@ DISCOVERY_DATE_WINDOWS = {
 # Keep the public diagnostics field stable for existing API clients.  The
 # database itself is now tracked independently by the migration runner.
 APP_SCHEMA_VERSION = 1
-CURRENT_DB_SCHEMA_VERSION = 2
+CURRENT_DB_SCHEMA_VERSION = 3
 DISCOVERY_DEBUG_SNAPSHOT_LIMIT = 25
 TESTED_DEPENDENCY_VERSIONS = {
     "python-jobspy": "1.1.82",
@@ -450,8 +450,32 @@ def create_app() -> Flask:
         name = text(payload.get("name"))
         if not name:
             return jsonify({"error": "Profile name is required"}), 400
-        profile_id = CandidateProfileStore(get_db()).create_profile(name, text(payload.get("description")))
+        profile_id = CandidateProfileStore(get_db()).create_profile(
+            name,
+            text(payload.get("description")),
+            identity_mode=text(payload.get("identity_mode")) or ("distinct" if text(payload.get("applicant_name")) else "shared"),
+            applicant_name=text(payload.get("applicant_name")),
+            applicant_email=text(payload.get("applicant_email")),
+            applicant_phone=text(payload.get("applicant_phone")),
+            applicant_location=text(payload.get("applicant_location")),
+        )
         return jsonify({"id": profile_id}), 201
+
+    @app.patch("/api/candidate-profiles/<int:profile_id>")
+    def update_candidate_profile(profile_id: int) -> Response:
+        payload = request.get_json(force=True) or {}
+        try:
+            profile = CandidateProfileStore(get_db()).update_profile(
+                profile_id,
+                identity_mode=text(payload.get("identity_mode")) or None,
+                applicant_name=text(payload.get("applicant_name")) if "applicant_name" in payload else None,
+                applicant_email=text(payload.get("applicant_email")) if "applicant_email" in payload else None,
+                applicant_phone=text(payload.get("applicant_phone")) if "applicant_phone" in payload else None,
+                applicant_location=text(payload.get("applicant_location")) if "applicant_location" in payload else None,
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify(profile)
 
     @app.get("/api/candidate-profiles/<int:profile_id>/documents")
     def candidate_profile_documents(profile_id: int) -> Response:
@@ -809,7 +833,7 @@ def create_app() -> Flask:
             return jsonify({"error": "Shortlisted job not found"}), 404
         folder = generated_applications_dir() / str(job_id)
 
-        def read_preview(name: str) -> str:
+        def read_draft(name: str) -> str:
             path = folder / name
             if not path.is_file():
                 return ""
@@ -818,9 +842,27 @@ def create_app() -> Flask:
             except OSError:
                 return ""
 
+        def read_docx(field: str) -> tuple[str, bool]:
+            path = safe_generated_path(row[field])
+            if path is None or not path.is_file():
+                return "", False
+            try:
+                document = Document(io.BytesIO(path.read_bytes()))
+                value = "\n".join(paragraph.text for paragraph in iter_document_paragraphs(document) if paragraph.text.strip())
+                return value, True
+            except (OSError, ValueError, zipfile.BadZipFile):
+                return "", False
+
+        resume_preview, resume_available = read_docx("resume_docx_path")
+        cover_preview, cover_available = read_docx("cover_letter_docx_path")
+
         return jsonify({
-            "resume": read_preview("resume.txt"),
-            "cover_letter": read_preview("cover_letter.txt"),
+            "resume": resume_preview,
+            "cover_letter": cover_preview,
+            "resume_draft": read_draft("resume.txt"),
+            "cover_letter_draft": read_draft("cover_letter.txt"),
+            "resume_source": "successful_docx" if resume_available else "unavailable",
+            "cover_letter_source": "successful_docx" if cover_available else "unavailable",
             "resume_status": text(row["resume_generation_status"]),
             "cover_letter_status": text(row["cover_letter_generation_status"]),
             "generation_debug": load_generation_debug(job_id),
@@ -1771,9 +1813,23 @@ def resolve_generation_profile(payload: dict[str, Any] | None) -> dict[str, Any]
         raise ValueError("Selected candidate profile has no base résumé. Add a résumé before generating documents")
     if not text(resume.get("docx_path")):
         raise ValueError("Selected base résumé has no usable DOCX template path. Upload a DOCX résumé for this profile")
+    if text(profile_row.get("identity_mode")) == "distinct":
+        identity = {
+            "name": text(profile_row.get("applicant_name")),
+            "email": text(profile_row.get("applicant_email")),
+            "phone": text(profile_row.get("applicant_phone")),
+            "location": text(profile_row.get("applicant_location")),
+        }
+        if not identity["name"]:
+            raise ValueError("Selected candidate profile uses distinct identity but has no applicant name")
+    else:
+        shared = load_profile()
+        identity = {field: text(shared.get(field)) for field in ["name", "email", "phone", "location"]}
+        if not identity["name"]:
+            raise ValueError("Selected candidate profile uses shared identity but the active profile has no applicant name")
     profile = {field: "" for field in PROFILE_COLUMNS}
     profile.update({
-        "name": text(profile_row.get("name")),
+        **identity,
         "resume_text": text((resume or {}).get("content")) or text(profile_row.get("description")),
         "work_experience": text((resume or {}).get("content")) or text(profile_row.get("description")),
         "resume_docx_template_path": text((resume or {}).get("docx_path")),
@@ -1814,6 +1870,7 @@ def build_format_preserving_resume(
 
     shutil.copyfile(template_path, resume_path)
     document = Document(resume_path)
+    replace_resume_identity(document, text(profile.get("name")))
     plan = build_resume_change_plan(document, job, profile, output)
     change_log = apply_resume_change_plan(document, plan)
     document.save(resume_path)
@@ -1828,6 +1885,34 @@ def build_format_preserving_resume(
             **change_log,
         },
     }
+
+
+def replace_resume_identity(document: Document, applicant_name: str) -> bool:
+    """Replace only the leading name line, never unrelated résumé evidence."""
+    applicant_name = normalize_space(applicant_name)
+    if not applicant_name:
+        return False
+    for paragraph in document.paragraphs:
+        current = normalize_space(paragraph.text)
+        if not current:
+            continue
+        if len(current.split()) <= 6 and not any(char in current for char in "@|:;•"):
+            if current != applicant_name:
+                return replace_paragraph_text(paragraph, paragraph.text, applicant_name)
+            return False
+        break
+    return False
+
+
+def remove_dashes_from_document(document: Document) -> bool:
+    changed = False
+    for paragraph in iter_document_paragraphs(document):
+        for run in paragraph.runs:
+            updated = re.sub(r"[-–—]", " ", run.text)
+            if updated != run.text:
+                run.text = re.sub(r"[ \t]+", " ", updated)
+                changed = True
+    return changed
 
 
 def build_format_preserving_cover_letter(
@@ -1904,6 +1989,8 @@ def build_format_preserving_cover_letter(
                 "template_mode": "plain_fallback",
             },
         }
+    if str(profile.get("cover_letter_no_dashes", "true")).strip().lower() not in {"0", "false", "no", "off"}:
+        remove_dashes_from_document(document)
     document.save(cover_path)
     reopened_cover = Document(cover_path)
     if any(classify_keyword_dump_reason(normalize_space(paragraph.text)) is not None for paragraph in reopened_cover.paragraphs):
@@ -2264,25 +2351,22 @@ def select_concrete_evidence_sentence(candidate_evidence: dict[str, Any]) -> str
 def build_cover_letter_evidence_paragraphs(candidate_evidence: dict[str, Any]) -> list[str]:
     sentences: list[str] = []
     full_text = text(candidate_evidence.get("full_text"))
-    lowered = full_text.lower()
-    if "postgresql" in lowered and ("records" in lowered or "monitoring" in lowered):
-        sentences.append(
-            "At Harmony 88 Co., I built Python and Flask tools backed by PostgreSQL, including an automated monitoring system that stored more than 300,000 records."
-        )
-    if "backend integrations" in lowered and ("retool" in lowered or "google docs" in lowered):
-        sentences.append(
-            "I built backend integrations and data workflows with real-time data from Retool and Google Docs for operations reporting and handoffs."
-        )
-    if "validation" in lowered and ("logging" in lowered or "data cleaning" in lowered or "data-cleaning" in lowered):
-        sentences.append(
-            "I strengthened software reliability by implementing validation, logging, and data-cleaning logic that detected malformed inputs and reduced manual data-entry errors by 90%."
-        )
-    if "harmony 88" in lowered or "northstar" in lowered:
-        for sentence in split_sentences(full_text):
+    for section in candidate_evidence.get("sections", []):
+        if section.get("field") == "resume_text":
+            continue
+        for sentence in split_sentences(section.get("text", "")):
             clean = normalize_space(sentence)
-            if "harmony 88" in clean.lower() or "northstar" in clean.lower():
-                sentences.append(clean if clean.endswith(".") else f"{clean}.")
+            if not clean or len(clean.split()) < 8:
+                continue
+            if contains_contact_details(clean) or contains_resume_section_heading(clean):
+                continue
+            if classify_keyword_dump_reason(clean) is not None:
+                continue
+            sentences.append(clean if clean.endswith((".", "!", "?")) else f"{clean}.")
+            if len(sentences) >= 3:
                 break
+        if len(sentences) >= 3:
+            break
     if not sentences:
         fallback = select_concrete_evidence_sentence(candidate_evidence)
         return [fallback] if fallback else []
@@ -6243,7 +6327,7 @@ def build_cover_letter_sections(
     candidate_evidence: dict[str, Any],
 ) -> list[str]:
     section_map = build_cover_letter_section_map(profile, job, focus, candidate_evidence)
-    employer_line = section_map["company"] if not section_map["location"] else f"{section_map['company']} - {section_map['location']}"
+    employer_line = section_map["company"] if not section_map["location"] else f"{section_map['company']}, {section_map['location']}"
     sections = [
         section_map["date"],
         employer_line,

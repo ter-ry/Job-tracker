@@ -815,36 +815,20 @@ def build_cover_letter_paragraphs(
             seen_sentences.add(clean)
             evidence_sentences.append(clean)
 
-    full_evidence_text = " ".join(
-        normalize_space(section.get("text", ""))
-        for section in candidate_evidence.get("sections", [])
-        if section.get("field") != "resume_text"
-    ).lower()
-    if "postgresql" in full_evidence_text and ("records" in full_evidence_text or "monitoring" in full_evidence_text):
-        add_sentence(
-            "At Harmony 88 Co., I built Python and Flask tools backed by PostgreSQL, including an automated monitoring system that stored more than 300,000 records."
-        )
-    if "validation" in full_evidence_text and ("logging" in full_evidence_text or "data cleaning" in full_evidence_text or "data-cleaning" in full_evidence_text):
-        add_sentence(
-            "I strengthened software reliability by implementing validation, logging, and data-cleaning logic that detected malformed inputs and reduced manual data-entry errors by 90%."
-        )
-    if "backend integrations" in full_evidence_text and ("retool" in full_evidence_text or "google docs" in full_evidence_text):
-        add_sentence(
-            "I built backend integrations and data workflows with real-time data from Retool and Google Docs for operations reporting and handoffs."
-        )
-    if "harmony 88" in full_evidence_text or "northstar" in full_evidence_text:
-        harmony_sentence = next(
-            (
-                normalize_space(sentence)
-                for section in candidate_evidence.get("sections", [])
-                if section.get("field") != "resume_text"
-                for sentence in split_sentences(section.get("text", ""))
-                if "harmony 88" in sentence.lower() or "northstar" in sentence.lower()
-            ),
-            "",
-        )
-        if harmony_sentence:
-            add_sentence(harmony_sentence if harmony_sentence.endswith(".") else f"{harmony_sentence}.")
+    for section in candidate_evidence.get("sections", []):
+        if section.get("field") == "resume_text":
+            continue
+        for sentence in split_sentences(section.get("text", "")):
+            clean = normalize_space(sentence)
+            if not clean or contains_contact_details(clean) or contains_resume_section_heading(clean):
+                continue
+            if classify_keyword_dump_reason(clean) is not None or len(clean.split()) < 8:
+                continue
+            add_sentence(clean if clean.endswith((".", "!", "?")) else f"{clean}.")
+            if len(evidence_sentences) >= 3:
+                break
+        if len(evidence_sentences) >= 3:
+            break
     if len(evidence_sentences) < 2:
         for sentence in cover_letter_supporting_snippets((concepts or skill_focus)[:4], candidate_evidence, limit=3):
             clean = normalize_space(sentence)

@@ -8,6 +8,12 @@ templates. Generation accepts an optional reusable candidate profile selection
 the profile contains more than one document. Without a selection, the legacy
 active profile remains the default.
 
+Candidate profile labels are presentation metadata, not applicant identity.
+Profiles may explicitly use the shared active-profile identity or define a
+distinct applicant name and contact details. Only those approved identity
+fields are copied; employment history, projects, skills, and qualifications
+remain profile-local.
+
 The Shortlist screen now exposes the complete desktop workflow: select a
 candidate profile, choose its base résumé and cover-letter template, generate
 or regenerate either document, inspect a text preview, review status/errors and
@@ -28,6 +34,9 @@ successful document.
   approved-evidence records. A selected profile must provide a usable DOCX
   résumé template; missing evidence or invalid document IDs return an
   actionable error.
+- Preview reads the latest successful downloadable DOCX files in memory and
+  labels draft text separately. Failed retries therefore keep preview and
+  download aligned with the previous successful versions.
 - Cover letters use the actual generation date and remove hyphens, en dashes,
   and em dashes by default. The preference is configurable on the Profile
   screen.
@@ -36,9 +45,10 @@ successful document.
 
 The milestone test suite covers readable DOCX output, structured templates,
 multi-run paragraphs, bullets, tables, evidence validation, selected candidate
-profile isolation, document-selection validation, preview responses, current
-date and dash preferences, and failed-generation recovery. The complete suite
-currently passes 90 tests. Python compilation and JavaScript syntax validation
+profile isolation, shared and distinct applicant identities,
+document-selection validation, preview responses, current date and dash
+preferences, and failed-generation recovery. The complete suite currently
+passes 94 tests. Python compilation and JavaScript syntax validation
 pass. Playwright and a Node browser runner are not installed in this workspace;
 the in-app browser also cannot reach the local Flask server, so a rendered
 desktop E2E pass remains a local follow-up rather than a claimed automated

@@ -16,13 +16,49 @@ class CandidateProfileStore:
         rows = self.db.execute("SELECT * FROM candidate_profiles ORDER BY is_active DESC, name").fetchall()
         return [dict(row) for row in rows]
 
-    def create_profile(self, name: str, description: str = "") -> int:
+    def create_profile(
+        self,
+        name: str,
+        description: str = "",
+        identity_mode: str = "shared",
+        applicant_name: str = "",
+        applicant_email: str = "",
+        applicant_phone: str = "",
+        applicant_location: str = "",
+    ) -> int:
         cursor = self.db.execute(
-            "INSERT INTO candidate_profiles(name, description, is_active) VALUES (?, ?, ?)",
-            (name.strip(), description.strip(), 1 if not self.list_profiles() else 0),
+            """INSERT INTO candidate_profiles(
+                name, description, is_active, identity_mode, applicant_name,
+                applicant_email, applicant_phone, applicant_location
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                name.strip(), description.strip(), 1 if not self.list_profiles() else 0,
+                identity_mode if identity_mode in {"shared", "distinct"} else "shared",
+                applicant_name.strip(), applicant_email.strip(), applicant_phone.strip(), applicant_location.strip(),
+            ),
         )
         self.db.commit()
         return int(cursor.lastrowid)
+
+    def update_profile(self, profile_id: int, **fields: str | None) -> dict[str, Any]:
+        existing = self.db.execute("SELECT * FROM candidate_profiles WHERE id = ?", (profile_id,)).fetchone()
+        if existing is None:
+            raise ValueError("Candidate profile was not found")
+        allowed = {"identity_mode", "applicant_name", "applicant_email", "applicant_phone", "applicant_location"}
+        updates = {key: value for key, value in fields.items() if key in allowed and value is not None}
+        if "identity_mode" in updates and updates["identity_mode"] not in {"shared", "distinct"}:
+            raise ValueError("identity_mode must be shared or distinct")
+        if updates.get("identity_mode") == "distinct" and not updates.get("applicant_name", existing["applicant_name"]):
+            raise ValueError("Distinct identity requires applicant_name")
+        if updates:
+            assignments = ", ".join(f"{key} = ?" for key in updates)
+            self.db.execute(
+                f"UPDATE candidate_profiles SET {assignments}, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (*updates.values(), profile_id),
+            )
+            self.db.commit()
+        row = self.db.execute("SELECT * FROM candidate_profiles WHERE id = ?", (profile_id,)).fetchone()
+        return dict(row)
 
     def add_resume(self, profile_id: int, name: str, content: str = "", docx_path: str = "", is_default: bool = False) -> int:
         cursor = self.db.execute(

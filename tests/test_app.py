@@ -1,4 +1,5 @@
 import json
+import gc
 import io
 import re
 import tempfile
@@ -2176,7 +2177,7 @@ class JobAssistantTest(unittest.TestCase):
         current_profile = self.client.get("/api/profile").get_json()
         created_profile = self.client.post(
             "/api/candidate-profiles",
-            json={"name": "Alternate profile", "description": "Python developer with documented API and SQL project experience."},
+            json={"name": "SWE Resume", "description": "Python developer with documented API and SQL project experience.", "identity_mode": "distinct", "applicant_name": "Alex Rivera"},
         )
         self.assertEqual(created_profile.status_code, 201)
         profile_id = created_profile.get_json()["id"]
@@ -2205,7 +2206,10 @@ class JobAssistantTest(unittest.TestCase):
         job = created.get_json()
         self.assertEqual(job["resume_generation_status"], "generated")
         self.assertEqual(job["cover_letter_generation_status"], "generated")
-        self.assertIn("Alternate_profile", Path(job["resume_docx_path"]).name)
+        self.assertIn("Alex_Rivera", Path(job["resume_docx_path"]).name)
+        cover_text = "\n".join(paragraph.text for paragraph in Document(io.BytesIO(Path(job["cover_letter_docx_path"]).read_bytes())).paragraphs)
+        self.assertIn("Alex Rivera", cover_text)
+        self.assertNotIn("SWE Resume", cover_text)
 
     def test_selected_candidate_profile_isolated_from_legacy_and_other_profiles(self):
         self.seed_profile_for_documents(with_template=True)
@@ -2310,6 +2314,89 @@ class JobAssistantTest(unittest.TestCase):
         cover_text = "\n".join(paragraph.text for paragraph in app_module.iter_document_paragraphs(cover_doc))
         self.assertRegex(cover_text, rf"{date.today().strftime('%B')}\s+0?{date.today().day},\s+{date.today().year}")
         self.assertNotRegex(cover_text, r"[-–—]")
+
+    def test_profile_label_does_not_replace_shared_or_distinct_applicant_identity(self):
+        self.seed_profile_for_documents(with_template=True)
+        shared_profile = self.client.post(
+            "/api/candidate-profiles",
+            json={"name": "Business Applications", "description": "Python application delivery and testing.", "identity_mode": "shared"},
+        ).get_json()
+        shared_resume = self.client.post(
+            f"/api/candidate-profiles/{shared_profile['id']}/resumes",
+            json={"name": "Shared resume", "content": "Python application delivery and testing with documented handoffs.", "docx_path": self.client.get("/api/profile").get_json()["resume_docx_template_path"], "is_default": True},
+        )
+        self.assertEqual(shared_resume.status_code, 201)
+        shared_job = self.client.post(
+            "/api/shortlist",
+            json={"company": "Shared Co", "title": "Developer", "job_description": "Python testing", "candidate_profile_id": shared_profile["id"]},
+        ).get_json()
+        shared_cover = "\n".join(paragraph.text for paragraph in Document(io.BytesIO(Path(shared_job["cover_letter_docx_path"]).read_bytes())).paragraphs)
+        self.assertIn("Terry Mak", shared_cover)
+        self.assertNotIn("Business Applications", shared_cover)
+
+        distinct = self.client.post(
+            "/api/candidate-profiles",
+            json={"name": "SWE Resume", "description": "Python application delivery and testing.", "identity_mode": "distinct", "applicant_name": "Jordan Lee", "applicant_email": "jordan@example.com"},
+        ).get_json()
+        distinct_resume = self.client.post(
+            f"/api/candidate-profiles/{distinct['id']}/resumes",
+            json={"name": "Jordan resume", "content": "Python application delivery and testing with documented handoffs.", "docx_path": self.client.get("/api/profile").get_json()["resume_docx_template_path"], "is_default": True},
+        )
+        self.assertEqual(distinct_resume.status_code, 201)
+        distinct_job = self.client.post(
+            "/api/shortlist",
+            json={"company": "Distinct Co", "title": "Developer", "job_description": "Python testing", "candidate_profile_id": distinct["id"]},
+        ).get_json()
+        distinct_cover = "\n".join(paragraph.text for paragraph in Document(io.BytesIO(Path(distinct_job["cover_letter_docx_path"]).read_bytes())).paragraphs)
+        distinct_resume_text = "\n".join(paragraph.text for paragraph in Document(io.BytesIO(Path(distinct_job["resume_docx_path"]).read_bytes())).paragraphs)
+        self.assertIn("Jordan Lee", distinct_cover + distinct_resume_text)
+        self.assertNotIn("SWE Resume", distinct_cover + distinct_resume_text)
+
+    def test_keyword_only_evidence_does_not_create_fabricated_achievements(self):
+        self.client.post(
+            "/api/profile",
+            json={"name": "Evidence Candidate", "resume_text": "Monitoring validation with PostgreSQL and routine reporting.", "work_experience": "Monitoring validation with PostgreSQL and routine reporting."},
+        )
+        self.upload_master_resume_template()
+        created = self.client.post(
+            "/api/shortlist",
+            json={"company": "Evidence Co", "title": "Developer", "job_description": "monitoring validation PostgreSQL"},
+        ).get_json()
+        cover = "\n".join(paragraph.text for paragraph in Document(io.BytesIO(Path(created["cover_letter_docx_path"]).read_bytes())).paragraphs)
+        self.assertNotIn("300,000", cover)
+        self.assertNotIn("90%", cover)
+        self.assertNotIn("Harmony 88", cover)
+        self.assertIn("Monitoring validation with PostgreSQL", cover)
+
+    def test_preview_matches_successful_docx_and_survives_failed_retry(self):
+        self.seed_profile_for_documents(with_template=True)
+        created = self.client.post(
+            "/api/shortlist",
+            json={"company": "Preview Co", "title": "Developer", "location": "Toronto", "job_description": "Python testing"},
+        ).get_json()
+        preview_before = self.client.get(f"/api/shortlist/{created['id']}/preview").get_json()
+        downloaded_resume = self.client.get(f"/api/shortlist/{created['id']}/resume")
+        downloaded_cover = self.client.get(f"/api/shortlist/{created['id']}/cover-letter")
+        def docx_text(payload: bytes) -> str:
+            document = Document(io.BytesIO(payload))
+            value = "\n".join(paragraph.text for paragraph in app_module.iter_document_paragraphs(document) if paragraph.text.strip())
+            del document
+            return value
+        self.assertEqual(preview_before["resume_source"], "successful_docx")
+        self.assertEqual(preview_before["cover_letter_source"], "successful_docx")
+        self.assertEqual(preview_before["resume"], docx_text(downloaded_resume.data))
+        self.assertEqual(preview_before["cover_letter"], docx_text(downloaded_cover.data))
+        self.assertNotRegex(docx_text(downloaded_cover.data), r"[-–—]")
+        with patch.object(app_module, "build_format_preserving_resume", side_effect=RuntimeError("resume retry failed")), patch.object(app_module, "build_format_preserving_cover_letter", side_effect=RuntimeError("cover retry failed")):
+            failed = self.client.post(f"/api/shortlist/{created['id']}/regenerate", json={}).get_json()
+        self.assertEqual(failed["resume_generation_status"], "failed")
+        self.assertEqual(failed["cover_letter_generation_status"], "failed")
+        preview_after = self.client.get(f"/api/shortlist/{created['id']}/preview").get_json()
+        self.assertEqual(preview_after["resume"], preview_before["resume"])
+        self.assertEqual(preview_after["cover_letter"], preview_before["cover_letter"])
+        self.assertEqual(self.client.get(f"/api/shortlist/{created['id']}/resume").status_code, 200)
+        self.assertEqual(self.client.get(f"/api/shortlist/{created['id']}/cover-letter").status_code, 200)
+        gc.collect()
 
     def test_empty_projects_or_education_do_not_fabricate(self):
         profile = self.rece_profile()
@@ -2951,11 +3038,10 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(len(cover_body), 3)
         self.assertGreaterEqual(len(" ".join(cover_body).split()), 180)
         self.assertLessEqual(len(" ".join(cover_body).split()), 260)
-        self.assertIn("Python and Flask tools backed by PostgreSQL", cover_text)
-        self.assertIn("At Harmony 88 Co.", cover_text)
+        self.assertIn("automated ASIN monitoring system", cover_text)
         self.assertIn("PostgreSQL", cover_text)
-        self.assertTrue("300,000+ records" in cover_text or "more than 300,000 records" in cover_text)
-        self.assertIn("backend integrations and data workflows", cover_text)
+        self.assertIn("300,000+ records", cover_text)
+        self.assertIn("validation, logging, and data cleaning", cover_text)
         self.assertIsNone(app_module.validate_cover_letter_document(cover_doc, self.scotiabank_job(), {"name": "Terry Mak"}))
 
         download_resume = self.client.get(f"/api/shortlist/{job_id}/resume")
