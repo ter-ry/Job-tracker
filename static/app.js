@@ -1966,21 +1966,23 @@ function renderShortlistCard(job) {
   const coverAvailable = Boolean(job.cover_letter_docx_path);
   const resumeStatus = job.resume_generation_status || "pending";
   const coverStatus = job.cover_letter_generation_status || "pending";
+  const resumePrevious = resumeStatus !== "generated" && resumeAvailable ? " · previous résumé available" : "";
+  const coverPrevious = coverStatus !== "generated" && coverAvailable ? " · previous cover letter available" : "";
   const resumeError = job.resume_generation_error ? `<p class="risk high">Resume error: ${escapeHtml(job.resume_generation_error)}</p>` : "";
   const coverError = job.cover_letter_generation_error ? `<p class="risk high">Cover letter error: ${escapeHtml(job.cover_letter_generation_error)}</p>` : "";
   const coverWarning = job.cover_letter_generation_warning ? `<p class="warning">Cover letter warning: ${escapeHtml(job.cover_letter_generation_warning)}</p>` : "";
   const salaryLabel = job.salary_source === "estimated" ? `${job.salary} (estimated)` : job.salary || "Salary unavailable";
   return `
-    <section class="discovery-card">
+    <section class="discovery-card shortlist-card">
       <div class="discovery-card-main">
         <div>
           <h3>${escapeHtml(job.title || "Untitled role")}</h3>
           <p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(job.location || "Location unavailable")}</p>
           <p class="muted">${escapeHtml(job.source || "")} · ${escapeHtml(salaryLabel)} · Shortlisted ${escapeHtml(job.date_shortlisted || job.date_added || "")}</p>
           <p>${scorePill(job.fit_score)} <span class="muted">${miniBreakdown(job)}</span></p>
-          <p class="muted">Résumé: ${escapeHtml(resumeStatus)}${resumeAvailable ? " · previous file available" : ""}</p>
+          <p class="muted">Résumé: ${escapeHtml(resumeStatus)}${resumePrevious}</p>
           ${resumeError}
-          <p class="muted">Cover letter: ${escapeHtml(coverStatus)}${coverAvailable ? " · previous file available" : ""}</p>
+          <p class="muted">Cover letter: ${escapeHtml(coverStatus)}${coverPrevious}</p>
           ${coverError}${coverWarning}
           <div class="document-selection panel nested-panel">
             <h4>Document selection</h4>
