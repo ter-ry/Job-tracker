@@ -2438,6 +2438,57 @@ class JobAssistantTest(unittest.TestCase):
         self.assertNotIn("Harmony 88", cover)
         self.assertIn("monitor validation with postgresql", cover.lower())
 
+    def test_cover_letter_does_not_attribute_prior_work_to_hiring_company(self):
+        profile = {
+            "name": "Alex Rivera",
+            "email": "alex.rivera@example.test",
+            "location": "Toronto, ON",
+            "work_experience": "Northstar Labs — Business Analyst. Led requirements workshops and translated stakeholder needs into SQL reporting workflows.",
+            "resume_text": "Alex Rivera\nNorthstar Labs — Business Analyst\nLed requirements workshops and translated stakeholder needs into SQL reporting workflows.",
+            "key_skills": "SQL, requirements workshops, documentation",
+            "cover_letter_no_dashes": "true",
+        }
+        job = {
+            "company": "Cedar Bridge Consulting",
+            "title": "Business Analyst",
+            "location": "Toronto, ON",
+            "job_description": "Lead requirements workshops, create SQL reports, document processes, and coordinate validation.",
+            "required_skills": "SQL, requirements workshops",
+        }
+        output = app_module.generate_application_materials(job, profile)
+        letter = output["cover_letter"]
+        self.assertIn("Cedar Bridge Consulting", letter)
+        self.assertIn("At Northstar Labs", letter)
+        self.assertNotIn("At Cedar Bridge Consulting,", letter)
+        self.assertEqual(letter.lower().count("role's focus on"), 1)
+        self.assertNotRegex(letter, r"[-–—]")
+
+    def test_cedar_bridge_docx_preview_and_metadata_keep_prior_employer(self):
+        self.seed_profile_for_documents(with_template=True)
+        self.upload_cover_letter_template(self.build_cover_letter_template_fixture())
+        created = self.client.post(
+            "/api/shortlist",
+            json={
+                "company": "Cedar Bridge Consulting",
+                "title": "Business Analyst",
+                "location": "Toronto, ON",
+                "url": "https://example.com/job/cedar-bridge-employer-check",
+                "job_description": "Lead requirements workshops, create SQL reports, document processes, and coordinate validation.",
+            },
+        ).get_json()
+        preview = self.client.get(f"/api/shortlist/{created['id']}/preview").get_json()
+        downloaded = self.client.get(f"/api/shortlist/{created['id']}/cover-letter")
+        document = Document(io.BytesIO(downloaded.data))
+        docx_text = "\n".join(paragraph.text for paragraph in app_module.iter_document_paragraphs(document) if paragraph.text.strip())
+        del document
+        self.assertEqual(preview["cover_letter_source"], "successful_docx")
+        self.assertEqual(preview["cover_letter"], docx_text)
+        self.assertIn("At Northstar", docx_text)
+        self.assertNotIn("At Cedar Bridge Consulting,", docx_text)
+        self.assertEqual(created["generation_debug"]["final_cover_letter_text"], preview["cover_letter"])
+        self.assertNotRegex(docx_text, r"[-–—]")
+        gc.collect()
+
     def test_preview_matches_successful_docx_and_survives_failed_retry(self):
         self.seed_profile_for_documents(with_template=True)
         created = self.client.post(

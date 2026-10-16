@@ -2089,6 +2089,18 @@ def build_generation_debug_payload(
     approved_records = output.get("approved_evidence_records") or []
     ranked_records = output.get("ranked_approved_evidence_records") or []
     selected_records = output.get("selected_approved_evidence_records") or []
+    final_cover_letter_text = text(output.get("cover_letter", ""))
+    if cover_path.is_file():
+        try:
+            rendered_cover = Document(cover_path)
+            final_cover_letter_text = "\n".join(
+                paragraph.text.strip()
+                for paragraph in iter_document_paragraphs(rendered_cover)
+                if paragraph.text.strip()
+            )
+            del rendered_cover
+        except (OSError, ValueError, zipfile.BadZipFile):
+            pass
     return {
         "job_id": job_id,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -2099,8 +2111,8 @@ def build_generation_debug_payload(
         "ranked_approved_evidence_ids": [clamp_int(item.get("id"), 0, 10**9) for item in ranked_records if item.get("id") is not None],
         "selected_approved_evidence_ids": [clamp_int(item.get("id"), 0, 10**9) for item in selected_records if item.get("id") is not None],
         "matched_evidence_ids": [clamp_int(item.get("evidence_id"), 0, 10**9) for item in tailoring_plan.get("phrase_to_evidence_matches", []) if item.get("evidence_id")],
-        "cover_letter_paragraphs": tailoring_plan.get("cover_letter_paragraphs", []),
-        "final_cover_letter_text": output.get("cover_letter", ""),
+        "cover_letter_paragraphs": [paragraph for paragraph in final_cover_letter_text.split("\n\n") if paragraph],
+        "final_cover_letter_text": final_cover_letter_text,
         "resume_bullets": output.get("resume_bullets", []),
         "resume_variants": tailoring_plan.get("resume_change_blocks", [])[:8],
         "approved_evidence_preview": [
@@ -2319,9 +2331,7 @@ def build_cover_letter_section_map(
         "greeting": f"Dear {company} Hiring Team,",
         "opening": f"I am pleased to apply for the {title} role at {company}. {alignment}",
         "experience": " ".join(as_first_person(item) for item in dict.fromkeys([concrete_example, supporting_example]) if item).strip(),
-        "fit": (
-            f"{alignment} I would bring the same care to the work at {company}."
-        ),
+        "fit": f"I would bring the same care to the work at {company}.",
         "closing": "Thank you for your time and consideration.",
         "signoff": "Sincerely,",
         "signature": text(profile.get("name") or ""),

@@ -842,6 +842,7 @@ def build_cover_letter_paragraphs(
                 evidence_sentences.append(clean)
     concrete_example = evidence_sentences[0] if evidence_sentences else ""
     supporting_example = evidence_sentences[1] if len(evidence_sentences) > 1 else ""
+    previous_employer = infer_candidate_employer(candidate_evidence)
     supported_focus = [
         concept for concept in concepts
         if concept.lower() in evidence_text and concept.lower() in job_text
@@ -854,11 +855,11 @@ def build_cover_letter_paragraphs(
     alignment = f"The role's focus on {short_join(supported_focus)} aligns with that experience." if supported_focus else "The role's responsibilities align with the practical experience described in my résumé."
     opening_paragraph = f"I am pleased to apply for the {title} role at {company}. {alignment}"
     experience_paragraph = " ".join(evidence_as_first_person(item) for item in [concrete_example, supporting_example] if item)
-    if experience_paragraph and company:
-        experience_paragraph = f"At {company}, {experience_paragraph[0].upper() + experience_paragraph[1:]}"
+    if experience_paragraph and previous_employer:
+        experience_paragraph = f"At {previous_employer}, {experience_paragraph[0].upper() + experience_paragraph[1:]}"
     if not experience_paragraph:
         experience_paragraph = "My background includes practical work that I would welcome the opportunity to discuss with your team."
-    fit_paragraph = f"{alignment} I would bring that same care to the work at {company}."
+    fit_paragraph = f"I would bring that same care to the work at {company}."
     employer_line = company if not location else f"{company}, {location}"
     subject = f"Re: Application for {title}"
     paragraphs = [
@@ -908,6 +909,26 @@ def looks_like_role_heading(value: str) -> bool:
         clean,
         re.I,
     ))
+
+
+def infer_candidate_employer(candidate_evidence: dict[str, Any]) -> str:
+    """Return an employer only when a résumé role heading states it explicitly."""
+    role_words = r"developer|engineer|analyst|manager|designer|intern|administrator|specialist"
+    for section in candidate_evidence.get("sections", []):
+        if section.get("field") != "work_experience":
+            continue
+        for line in str(section.get("text") or "").splitlines():
+            clean = normalize_space(line).rstrip(".")
+            if not clean:
+                continue
+            if "—" in clean or "|" in clean:
+                parts = [normalize_space(part) for part in re.split(r"—|\|", clean) if normalize_space(part)]
+                if len(parts) >= 2 and re.search(rf"\b(?:{role_words})\b", parts[-1], re.I):
+                    return parts[0]
+            match = re.search(rf"\b(?:{role_words})\b\s+(?:at|with)\s+(.+?)(?:\s+from\b|\s+\d{{4}}\b|[.,]|$)", clean, re.I)
+            if match:
+                return normalize_space(match.group(1))
+    return ""
 
 
 def build_opening_fit_sentence(selected_blocks: list[dict[str, Any]], candidate_evidence: dict[str, Any]) -> str:
