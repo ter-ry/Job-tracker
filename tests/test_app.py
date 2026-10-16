@@ -3081,6 +3081,50 @@ class JobAssistantTest(unittest.TestCase):
         self.assertTrue(duplicate.get_json()["duplicate"])
         self.assertEqual(len(self.client.get("/api/shortlist").get_json()), 1)
 
+    def test_candidate_profile_uploads_are_safe_and_defaults_are_selectable(self):
+        created = self.client.post(
+            "/api/candidate-profiles",
+            json={"name": "Managed Profile", "identity_mode": "distinct", "applicant_name": "QA Applicant"},
+        )
+        self.assertEqual(created.status_code, 201)
+        profile_id = created.get_json()["id"]
+        document = Document()
+        document.add_paragraph("QA Applicant")
+        document.add_paragraph("Documented Python and SQL experience.")
+        buffer = io.BytesIO()
+        document.save(buffer)
+        first = self.client.post(
+            f"/api/candidate-profiles/{profile_id}/resumes/upload",
+            data={"file": (io.BytesIO(buffer.getvalue()), "first resume.docx"), "is_default": "true"},
+            content_type="multipart/form-data",
+        )
+        second = self.client.post(
+            f"/api/candidate-profiles/{profile_id}/resumes/upload",
+            data={"file": (io.BytesIO(buffer.getvalue()), "second resume.docx"), "is_default": "true"},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 201)
+        documents = self.client.get(f"/api/candidate-profiles/{profile_id}/documents").get_json()
+        self.assertEqual(sum(item["is_default"] for item in documents["resumes"]), 1)
+        self.assertTrue(Path(first.get_json()["path"]).exists())
+        self.assertTrue(Path(second.get_json()["path"]).exists())
+        selected = next(item for item in documents["resumes"] if item["is_default"])
+        self.assertEqual(selected["id"], second.get_json()["id"])
+        response = self.client.post(f"/api/candidate-profiles/{profile_id}/resumes/{first.get_json()['id']}/default")
+        self.assertEqual(response.status_code, 200)
+        documents = self.client.get(f"/api/candidate-profiles/{profile_id}/documents").get_json()
+        self.assertEqual([item["id"] for item in documents["resumes"] if item["is_default"]], [first.get_json()["id"]])
+
+    def test_generation_response_exposes_actual_status_for_frontend_feedback(self):
+        self.seed_profile_for_documents(with_template=True)
+        created = self.client.post("/api/shortlist", json={"company": "Feedback Co", "title": "Developer", "job_description": "Python SQL"}).get_json()
+        self.assertEqual(created["generation"]["resume"], "generated")
+        self.assertEqual(created["generation"]["cover_letter"], "generated")
+        frontend = Path(app_module.BASE_DIR, "static", "app.js").read_text(encoding="utf-8")
+        self.assertIn("function showGenerationOutcome", frontend)
+        self.assertIn("previous successful document remains available", frontend)
+
     def test_regeneration_after_profile_update(self):
         created = self.client.post(
             "/api/shortlist",

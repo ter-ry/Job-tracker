@@ -163,6 +163,58 @@ a {
   padding: 18px;
 }
 
+.candidate-profile-manager {
+  display: grid;
+  gap: 14px;
+}
+
+.candidate-profile-list {
+  display: grid;
+  gap: 10px;
+}
+
+.candidate-profile-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.candidate-profile-card.selected {
+  border-color: var(--accent);
+  background: var(--soft);
+}
+
+.profile-manager-form,
+.candidate-profile-documents {
+  display: grid;
+  gap: 12px;
+}
+
+.document-columns {
+  align-items: start;
+}
+
+.document-list {
+  display: grid;
+  gap: 8px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.document-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border-bottom: 1px solid var(--line);
+  padding: 7px 0;
+}
+
 .panel-header {
   display: flex;
   align-items: center;

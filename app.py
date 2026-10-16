@@ -501,6 +501,68 @@ def create_app() -> Flask:
         )
         return jsonify({"id": template_id}), 201
 
+    @app.post("/api/candidate-profiles/<int:profile_id>/resumes/upload")
+    def upload_candidate_resume(profile_id: int) -> Response:
+        uploaded = request.files.get("file")
+        if uploaded is None or not uploaded.filename:
+            return jsonify({"error": "Choose a DOCX résumé first"}), 400
+        if Path(uploaded.filename).suffix.lower() != ".docx":
+            return jsonify({"error": "Candidate résumés must be DOCX files"}), 400
+        content = uploaded.read()
+        if not content:
+            return jsonify({"error": "The résumé file is empty"}), 400
+        try:
+            Document(io.BytesIO(content))
+        except (ValueError, zipfile.BadZipFile, KeyError):
+            return jsonify({"error": "The résumé is not a readable DOCX file"}), 400
+        extracted = extract_uploaded_text(uploaded.filename, content)
+        folder = DATA_DIR / "candidate_profiles" / str(profile_id) / "resumes"
+        folder.mkdir(parents=True, exist_ok=True)
+        filename = f"{safe_filename(Path(uploaded.filename).stem) or 'resume'}_{uuid.uuid4().hex[:10]}.docx"
+        path = folder / filename
+        path.write_bytes(content)
+        name = text(request.form.get("name")) or Path(uploaded.filename).stem
+        document_id = CandidateProfileStore(get_db()).add_resume(profile_id, name, extracted, str(path), request.form.get("is_default") == "true")
+        return jsonify({"id": document_id, "name": name, "path": str(path)}), 201
+
+    @app.post("/api/candidate-profiles/<int:profile_id>/cover-letter-templates/upload")
+    def upload_candidate_cover_letter_template(profile_id: int) -> Response:
+        uploaded = request.files.get("file")
+        if uploaded is None or not uploaded.filename:
+            return jsonify({"error": "Choose a DOCX cover letter template first"}), 400
+        if Path(uploaded.filename).suffix.lower() != ".docx":
+            return jsonify({"error": "Cover letter templates must be DOCX files"}), 400
+        content = uploaded.read()
+        if not content:
+            return jsonify({"error": "The cover letter file is empty"}), 400
+        try:
+            Document(io.BytesIO(content))
+        except (ValueError, zipfile.BadZipFile, KeyError):
+            return jsonify({"error": "The cover letter is not a readable DOCX file"}), 400
+        extracted = extract_uploaded_text(uploaded.filename, content)
+        folder = DATA_DIR / "candidate_profiles" / str(profile_id) / "cover-letter-templates"
+        folder.mkdir(parents=True, exist_ok=True)
+        filename = f"{safe_filename(Path(uploaded.filename).stem) or 'cover_letter'}_{uuid.uuid4().hex[:10]}.docx"
+        path = folder / filename
+        path.write_bytes(content)
+        name = text(request.form.get("name")) or Path(uploaded.filename).stem
+        document_id = CandidateProfileStore(get_db()).add_cover_letter_template(profile_id, name, extracted, str(path), request.form.get("is_default") == "true")
+        return jsonify({"id": document_id, "name": name, "path": str(path)}), 201
+
+    @app.post("/api/candidate-profiles/<int:profile_id>/resumes/<int:document_id>/default")
+    def set_candidate_resume_default(profile_id: int, document_id: int) -> Response:
+        try:
+            return jsonify(CandidateProfileStore(get_db()).set_default(profile_id, "resume", document_id))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+    @app.post("/api/candidate-profiles/<int:profile_id>/cover-letter-templates/<int:document_id>/default")
+    def set_candidate_cover_default(profile_id: int, document_id: int) -> Response:
+        try:
+            return jsonify(CandidateProfileStore(get_db()).set_default(profile_id, "cover_letter_template", document_id))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
     @app.get("/api/ollama/health")
     def ollama_health() -> Response:
         profile = load_profile()

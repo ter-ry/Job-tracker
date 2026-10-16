@@ -61,6 +61,8 @@ class CandidateProfileStore:
         return dict(row)
 
     def add_resume(self, profile_id: int, name: str, content: str = "", docx_path: str = "", is_default: bool = False) -> int:
+        if is_default:
+            self.db.execute("UPDATE base_resumes SET is_default = 0, updated_at = CURRENT_TIMESTAMP WHERE profile_id = ?", (profile_id,))
         cursor = self.db.execute(
             "INSERT INTO base_resumes(profile_id, name, content, docx_path, is_default) VALUES (?, ?, ?, ?, ?)",
             (profile_id, name.strip(), content, docx_path, int(is_default)),
@@ -69,12 +71,26 @@ class CandidateProfileStore:
         return int(cursor.lastrowid)
 
     def add_cover_letter_template(self, profile_id: int, name: str, content: str = "", docx_path: str = "", is_default: bool = False) -> int:
+        if is_default:
+            self.db.execute("UPDATE cover_letter_templates SET is_default = 0, updated_at = CURRENT_TIMESTAMP WHERE profile_id = ?", (profile_id,))
         cursor = self.db.execute(
             "INSERT INTO cover_letter_templates(profile_id, name, content, docx_path, is_default) VALUES (?, ?, ?, ?, ?)",
             (profile_id, name.strip(), content, docx_path, int(is_default)),
         )
         self.db.commit()
         return int(cursor.lastrowid)
+
+    def set_default(self, profile_id: int, kind: str, document_id: int) -> dict[str, Any]:
+        table = {"resume": "base_resumes", "cover_letter_template": "cover_letter_templates"}.get(kind)
+        if not table:
+            raise ValueError("Unsupported document type")
+        row = self.db.execute(f"SELECT * FROM {table} WHERE id = ? AND profile_id = ?", (document_id, profile_id)).fetchone()
+        if row is None:
+            raise ValueError("Document was not found for this candidate profile")
+        self.db.execute(f"UPDATE {table} SET is_default = 0, updated_at = CURRENT_TIMESTAMP WHERE profile_id = ?", (profile_id,))
+        self.db.execute(f"UPDATE {table} SET is_default = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (document_id,))
+        self.db.commit()
+        return dict(self.db.execute(f"SELECT * FROM {table} WHERE id = ?", (document_id,)).fetchone())
 
     def documents_for(self, profile_id: int) -> dict[str, list[dict[str, Any]]]:
         resumes = self.db.execute("SELECT * FROM base_resumes WHERE profile_id = ? ORDER BY is_default DESC, name", (profile_id,)).fetchall()

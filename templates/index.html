@@ -339,6 +339,26 @@
       </section>
 
       <section id="profile" class="tab-panel">
+        <section class="panel candidate-profile-manager">
+          <div class="panel-header">
+            <div><h2>Candidate profiles</h2><p class="muted helper">Keep role-specific documents and applicant identity separate from the active matching profile.</p></div>
+            <button class="button" type="button" id="new-candidate-profile">Create profile</button>
+          </div>
+          <div id="candidate-profile-list" class="candidate-profile-list"></div>
+          <form id="candidate-profile-form" class="nested-panel profile-manager-form" hidden>
+            <h3 id="candidate-profile-form-title">Create candidate profile</h3>
+            <div class="grid three">
+              <label>Profile label<input id="candidate-profile-name" required placeholder="Software Engineering"></label>
+              <label>Identity mode<select id="candidate-profile-identity-mode"><option value="shared">Use active profile identity</option><option value="distinct">Use a distinct applicant identity</option></select></label>
+              <label>Applicant name<input id="candidate-profile-applicant-name" placeholder="Required for distinct identity"></label>
+              <label>Email<input id="candidate-profile-applicant-email" type="email"></label>
+              <label>Phone<input id="candidate-profile-applicant-phone"></label>
+              <label>Location<input id="candidate-profile-applicant-location"></label>
+            </div>
+            <div class="actions compact"><button class="button" type="submit">Save profile</button><button class="button ghost" type="button" id="cancel-candidate-profile">Cancel</button></div>
+          </form>
+          <div id="candidate-profile-documents" class="candidate-profile-documents empty">Select a candidate profile to manage its documents.</div>
+        </section>
         <form id="profile-form" class="panel">
           <div class="panel-header">
             <h2>Profile and base documents</h2>

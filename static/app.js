@@ -12,6 +12,7 @@ const state = {
   shortlist: [],
   candidateProfiles: [],
   generationSelections: {},
+  selectedCandidateProfileId: "",
 };
 
 const jobFields = [
@@ -119,6 +120,9 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("profile-test-location").addEventListener("click", testAndSaveLocation);
   document.getElementById("resume-upload").addEventListener("change", uploadResume);
   document.getElementById("cover-letter-template-upload").addEventListener("change", uploadCoverLetterTemplate);
+  document.getElementById("new-candidate-profile").addEventListener("click", () => showCandidateProfileForm());
+  document.getElementById("cancel-candidate-profile").addEventListener("click", hideCandidateProfileForm);
+  document.getElementById("candidate-profile-form").addEventListener("submit", saveCandidateProfile);
   document.getElementById("discovery-view-cards").addEventListener("click", () => setDiscoveryView("cards"));
   document.getElementById("discovery-view-table").addEventListener("click", () => setDiscoveryView("table"));
   document.getElementById("discovery-filter-toggle").addEventListener("click", toggleDiscoveryFilters);
@@ -187,6 +191,7 @@ async function loadAll() {
     renderDashboard(dashboard);
     renderPipelineDashboard(jobs);
     renderProfile(profile);
+    renderCandidateProfiles();
     renderTemplateStatus(profile);
     renderOllamaHealth(ollamaHealth);
     renderEvidenceLibrary(evidence);
@@ -195,6 +200,110 @@ async function loadAll() {
   } catch (error) {
     toast(error.message);
   }
+}
+
+function showCandidateProfileForm(profile = null) {
+  const form = document.getElementById("candidate-profile-form");
+  form.hidden = false;
+  form.dataset.profileId = profile?.id || "";
+  setText("candidate-profile-form-title", profile ? `Edit ${profile.name}` : "Create candidate profile");
+  document.getElementById("candidate-profile-name").value = profile?.name || "";
+  document.getElementById("candidate-profile-name").disabled = Boolean(profile);
+  document.getElementById("candidate-profile-identity-mode").value = profile?.identity_mode || "shared";
+  document.getElementById("candidate-profile-applicant-name").value = profile?.applicant_name || "";
+  document.getElementById("candidate-profile-applicant-email").value = profile?.applicant_email || "";
+  document.getElementById("candidate-profile-applicant-phone").value = profile?.applicant_phone || "";
+  document.getElementById("candidate-profile-applicant-location").value = profile?.applicant_location || "";
+}
+
+function hideCandidateProfileForm() {
+  const form = document.getElementById("candidate-profile-form");
+  form.hidden = true;
+  form.reset();
+  form.dataset.profileId = "";
+  document.getElementById("candidate-profile-name").disabled = false;
+}
+
+async function saveCandidateProfile(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const payload = {
+    name: value("candidate-profile-name"),
+    identity_mode: value("candidate-profile-identity-mode"),
+    applicant_name: value("candidate-profile-applicant-name"),
+    applicant_email: value("candidate-profile-applicant-email"),
+    applicant_phone: value("candidate-profile-applicant-phone"),
+    applicant_location: value("candidate-profile-applicant-location"),
+  };
+  try {
+    if (form.dataset.profileId) await api.send(`/api/candidate-profiles/${form.dataset.profileId}`, "PATCH", payload);
+    else await api.send("/api/candidate-profiles", "POST", payload);
+    hideCandidateProfileForm();
+    toast("Candidate profile saved");
+    await loadAll();
+  } catch (error) { toast(error.message); }
+}
+
+function renderCandidateProfiles() {
+  const list = document.getElementById("candidate-profile-list");
+  if (!list) return;
+  if (!state.candidateProfiles.length) {
+    list.innerHTML = '<p class="muted">No reusable candidate profiles yet.</p>';
+    document.getElementById("candidate-profile-documents").classList.add("empty");
+    document.getElementById("candidate-profile-documents").textContent = "Create a profile to add role-specific documents.";
+    return;
+  }
+  if (!state.selectedCandidateProfileId) state.selectedCandidateProfileId = String(state.candidateProfiles[0].id);
+  list.innerHTML = state.candidateProfiles.map((profile) => `
+    <article class="candidate-profile-card ${String(profile.id) === state.selectedCandidateProfileId ? "selected" : ""}">
+      <div><h3>${escapeHtml(profile.name)}</h3><p class="muted">${profile.identity_mode === "distinct" ? escapeHtml(profile.applicant_name || "Distinct identity not set") : "Uses active profile identity"}</p></div>
+      <div class="actions compact"><button class="button small ghost" type="button" onclick="selectCandidateProfile(${profile.id})">Manage documents</button><button class="button small ghost" type="button" onclick='showCandidateProfileForm(${JSON.stringify(profile).replaceAll("'", "&#39;")})'>Edit identity</button></div>
+    </article>`).join("");
+  renderCandidateProfileDocuments();
+}
+
+async function selectCandidateProfile(profileId) {
+  state.selectedCandidateProfileId = String(profileId);
+  renderCandidateProfiles();
+  await renderCandidateProfileDocuments();
+}
+
+async function renderCandidateProfileDocuments() {
+  const target = document.getElementById("candidate-profile-documents");
+  if (!target || !state.selectedCandidateProfileId) return;
+  const profile = state.candidateProfiles.find((item) => String(item.id) === state.selectedCandidateProfileId);
+  if (!profile) return;
+  try {
+    const documents = await api.get(`/api/candidate-profiles/${profile.id}/documents`);
+    const documentRows = (items, kind, label) => items.length ? items.map((item) => `<li><span>${escapeHtml(item.name)}${item.is_default ? " <strong>(default)</strong>" : ""}</span>${item.is_default ? "" : `<button class="button small ghost" type="button" onclick="setCandidateDefault(${profile.id}, '${kind}', ${item.id})">Set default</button>`}</li>`).join("") : `<li class="muted">No ${label} uploaded yet.</li>`;
+    target.classList.remove("empty");
+    target.innerHTML = `<div class="panel-header"><h3>${escapeHtml(profile.name)} documents</h3><span class="muted">Original DOCX files are kept in the application data directory.</span></div>
+      <div class="grid two"><label>Upload base résumé (.docx)<input id="candidate-resume-file" type="file" accept=".docx" onchange="uploadCandidateDocument(${profile.id}, 'resume', this)"></label><label>Upload cover letter template (.docx)<input id="candidate-cover-file" type="file" accept=".docx" onchange="uploadCandidateDocument(${profile.id}, 'cover', this)"></label></div>
+      <div class="grid two document-columns"><div><h4>Base résumés</h4><ul class="document-list">${documentRows(documents.resumes || [], "resume", "résumés")}</ul></div><div><h4>Cover letter templates</h4><ul class="document-list">${documentRows(documents.cover_letter_templates || [], "cover", "templates")}</ul></div></div>`;
+  } catch (error) { target.textContent = error.message; }
+}
+
+async function uploadCandidateDocument(profileId, kind, input) {
+  const file = input.files[0];
+  if (!file) return;
+  const data = new FormData();
+  data.append("file", file);
+  data.append("is_default", "true");
+  try {
+    const route = kind === "resume" ? "resumes" : "cover-letter-templates";
+    await api.upload(`/api/candidate-profiles/${profileId}/${route}/upload`, data);
+    toast("Document uploaded and selected as default");
+    await loadAll();
+  } catch (error) { toast(error.message); }
+}
+
+async function setCandidateDefault(profileId, kind, documentId) {
+  try {
+    const route = kind === "resume" ? "resumes" : "cover-letter-templates";
+    await api.send(`/api/candidate-profiles/${profileId}/${route}/${documentId}/default`, "POST", {});
+    toast("Default document updated");
+    await loadAll();
+  } catch (error) { toast(error.message); }
 }
 
 function switchTab(event) {
@@ -1898,18 +2007,32 @@ function renderShortlistCard(job) {
 }
 
 async function regenerateShortlist(id) {
-  try { await api.send(`/api/shortlist/${id}/regenerate`, "POST", generationPayload(id)); toast("Documents regenerated"); await loadAll(); }
+  try { showGenerationOutcome(await api.send(`/api/shortlist/${id}/regenerate`, "POST", generationPayload(id)), ["resume", "cover_letter"]); await loadAll(); }
   catch (error) { toast(error.message); await loadAll(); }
 }
 
 async function regenerateShortlistResume(id) {
-  try { await api.send(`/api/shortlist/${id}/regenerate-resume`, "POST", generationPayload(id)); toast("Résumé regenerated"); await loadAll(); }
+  try { showGenerationOutcome(await api.send(`/api/shortlist/${id}/regenerate-resume`, "POST", generationPayload(id)), ["resume"]); await loadAll(); }
   catch (error) { toast(error.message); await loadAll(); }
 }
 
 async function regenerateShortlistCoverLetter(id) {
-  try { await api.send(`/api/shortlist/${id}/regenerate-cover-letter`, "POST", generationPayload(id)); toast("Cover letter regenerated"); await loadAll(); }
+  try { showGenerationOutcome(await api.send(`/api/shortlist/${id}/regenerate-cover-letter`, "POST", generationPayload(id)), ["cover_letter"]); await loadAll(); }
   catch (error) { toast(error.message); await loadAll(); }
+}
+
+function showGenerationOutcome(result, requestedKinds) {
+  const payload = result?.generation || result || {};
+  const statuses = requestedKinds.map((kind) => payload[kind] || payload[`${kind}_generation_status`] || "failed");
+  const generated = statuses.filter((status) => status === "generated").length;
+  const previous = requestedKinds.some((kind) => Boolean(payload[`${kind === "resume" ? "resume" : "cover_letter"}_docx_path`]));
+  if (generated === requestedKinds.length) {
+    toast(requestedKinds.length > 1 ? "Résumé and cover letter generated" : `${requestedKinds[0] === "resume" ? "Résumé" : "Cover letter"} generated`);
+  } else if (generated > 0) {
+    toast(`Partial generation: ${generated}/${requestedKinds.length} document generated${previous ? "; previous successful document remains available" : ""}`);
+  } else {
+    toast(`Generation failed${previous ? "; previous successful document remains available" : ""}`);
+  }
 }
 
 function hideDiscoveryJob(index) {
