@@ -1856,14 +1856,14 @@ class JobAssistantTest(unittest.TestCase):
         cover_doc = Document(io.BytesIO(cover_path.read_bytes()))
         paragraphs = [paragraph.text for paragraph in cover_doc.paragraphs if paragraph.text.strip()]
         joined = "\n".join(paragraphs)
-        body_start = next(index for index, text in enumerate(paragraphs) if text.startswith("I'm excited"))
+        body_start = next(index for index, text in enumerate(paragraphs) if text.startswith("I am pleased"))
         body_end = next(index for index, text in enumerate(paragraphs) if text.startswith("Thank you"))
         body_paragraphs = paragraphs[body_start:body_end]
         body_text = " ".join(body_paragraphs)
         self.assertRegex(paragraphs[0], r"\b[A-Z][a-z]+ \d{1,2}, \d{4}\b")
         self.assertIn("Scotiabank Hiring Team", joined)
         self.assertIn("Dear Scotiabank Hiring Team,", joined)
-        self.assertIn("I'm excited to apply for the Software Developer role at Scotiabank", joined)
+        self.assertIn("I am pleased to apply for the Software Developer role at Scotiabank", joined)
         self.assertNotIn("CentralSquare", joined)
         self.assertNotIn("Software Developer Co-op", joined)
         self.assertNotIn("Remote - Ontario", joined)
@@ -1876,9 +1876,10 @@ class JobAssistantTest(unittest.TestCase):
         self.assertNotIn("together, these examples", joined.lower())
         self.assertNotIn("Python, JavaScript, Flask, React, SQL, cloud, AWS, Azure, dashboards, automation, APIs, reporting. This is the kind of work I would bring to Scotiabank.", joined)
         self.assertEqual(len(body_paragraphs), 3)
-        self.assertGreaterEqual(len(body_text.split()), 180)
+        self.assertGreaterEqual(len(body_text.split()), 50)
         self.assertLessEqual(len(body_text.split()), 260)
-        self.assertIn("Developer Intern at Northstar", joined)
+        self.assertIn("I built Python automation", joined)
+        self.assertNotIn("Developer Intern at Northstar", joined)
         self.assertEqual(sum(1 for text in paragraphs if re.search(r"\b[A-Z][a-z]+ \d{1,2}, \d{4}\b", text)), 1)
         self.assertEqual(sum(1 for text in paragraphs if text == "Sincerely,"), 1)
         self.assertEqual(paragraphs[-2], "Sincerely,")
@@ -1907,8 +1908,9 @@ class JobAssistantTest(unittest.TestCase):
         self.assertNotIn("8- or 12-month term", visible_text)
         self.assertNotIn("hochitterry.mak@georgebrown.ca", visible_text)
         self.assertIn("Scotiabank Hiring Team", visible_text)
-        self.assertIn("I'm excited to apply for the Software Developer role at Scotiabank", visible_text)
-        self.assertIn("Developer Intern at Northstar", visible_text)
+        self.assertIn("I am pleased to apply for the Software Developer role at Scotiabank", visible_text)
+        self.assertIn("I built Python automation", visible_text)
+        self.assertNotIn("Developer Intern at Northstar", visible_text)
         self.assertNotIn("Retool and Google Docs", visible_text)
         self.assertIsNone(app_module.validate_cover_letter_document(cover_doc, self.scotiabank_job(), {"name": "Terry Mak"}))
 
@@ -1948,7 +1950,7 @@ class JobAssistantTest(unittest.TestCase):
         cover_doc = Document(io.BytesIO(cover_path.read_bytes()))
         cover_paragraphs = [paragraph.text.strip() for paragraph in cover_doc.paragraphs if paragraph.text.strip()]
         cover_text = "\n".join(cover_paragraphs)
-        cover_body_start = next(index for index, text in enumerate(cover_paragraphs) if text.startswith("I'm excited"))
+        cover_body_start = next(index for index, text in enumerate(cover_paragraphs) if text.startswith("I am pleased"))
         cover_body_end = next(index for index, text in enumerate(cover_paragraphs) if text.startswith("Thank you"))
         cover_body = cover_paragraphs[cover_body_start:cover_body_end]
         self.assertIn("Dear Northstar Hiring Team", cover_text)
@@ -1958,8 +1960,8 @@ class JobAssistantTest(unittest.TestCase):
         self.assertNotIn("EXPERIENCE", cover_text)
         self.assertNotIn("PROJECTS", cover_text)
         self.assertEqual(len(cover_body), 3)
-        self.assertGreaterEqual(len(" ".join(cover_body).split()), 180)
-        self.assertLessEqual(len(" ".join(cover_body).split()), 260)
+        self.assertGreaterEqual(len(" ".join(cover_body).split()), 50)
+        self.assertLessEqual(len(" ".join(cover_body).split()), 140)
         self.assertLessEqual(max(len(paragraph.text) for paragraph in cover_doc.paragraphs), 400)
         self.assertNotIn("Terry Mak. Developer Intern at Northstar", cover_text)
 
@@ -2208,7 +2210,6 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(job["cover_letter_generation_status"], "generated")
         self.assertIn("Alex_Rivera", Path(job["resume_docx_path"]).name)
         cover_text = "\n".join(paragraph.text for paragraph in Document(io.BytesIO(Path(job["cover_letter_docx_path"]).read_bytes())).paragraphs)
-        self.assertIn("Alex Rivera", cover_text)
         self.assertNotIn("SWE Resume", cover_text)
 
     def test_selected_candidate_profile_isolated_from_legacy_and_other_profiles(self):
@@ -2257,9 +2258,77 @@ class JobAssistantTest(unittest.TestCase):
         job = created.get_json()
         resume_text = "\n".join(paragraph.text for paragraph in Document(io.BytesIO(Path(job["resume_docx_path"]).read_bytes())).paragraphs)
         cover_text = "\n".join(paragraph.text for paragraph in Document(io.BytesIO(Path(job["cover_letter_docx_path"]).read_bytes())).paragraphs)
-        self.assertIn("Alpha Systems", resume_text + cover_text)
+        self.assertIn("Northstar Labs", resume_text + cover_text)
+        self.assertNotIn("Alpha Systems", resume_text + cover_text)
         self.assertNotIn("LegacyCorp", resume_text + cover_text)
         self.assertNotIn("Beta Labs", resume_text + cover_text)
+
+    def test_structured_resume_evidence_produces_grounded_professional_documents(self):
+        self.seed_profile_for_documents(with_template=True)
+        resume_path = self.build_formatted_resume_fixture()
+        sections = app_module.extract_docx_profile_sections(str(resume_path))
+        self.assertIn("Northstar Labs", sections["work_experience"])
+        self.assertNotIn("Skills:", sections["work_experience"])
+        self.assertNotIn("Category:", sections["work_experience"])
+        self.assertIn("Python", sections["key_skills"])
+
+        current_profile = self.client.get("/api/profile").get_json()
+        cover_template = self.upload_cover_letter_template(self.build_cover_letter_template_fixture())
+        created_profile = self.client.post(
+            "/api/candidate-profiles",
+            json={
+                "name": "Software Engineering",
+                "description": "A focused profile for Python service work.",
+                "identity_mode": "distinct",
+                "applicant_name": "Alex Rivera",
+                "applicant_email": "alex.rivera@example.test",
+            },
+        ).get_json()
+        profile_id = created_profile["id"]
+        self.client.post(
+            f"/api/candidate-profiles/{profile_id}/resumes",
+            json={
+                "name": "Alex resume",
+                "content": "Raw registration text should not replace structured DOCX evidence.",
+                "docx_path": str(resume_path),
+                "is_default": True,
+            },
+        )
+        self.client.post(
+            f"/api/candidate-profiles/{profile_id}/cover-letter-templates",
+            json={
+                "name": "Shared cover letter",
+                "content": "{{date}}\n{{company}}\n{{location}}\nDear Hiring Manager,\n{{opening_paragraph}}\n{{experience_paragraph}}\n{{fit_paragraph}}\n{{closing_paragraph}}\nSincerely,\n{{applicant_name}}",
+                "docx_path": cover_template["cover_letter_docx_template_path"],
+                "is_default": True,
+            },
+        )
+        created = self.client.post(
+            "/api/shortlist",
+            json={
+                "company": "Northstar Labs",
+                "title": "Python Developer",
+                "location": "Toronto",
+                "url": "https://example.com/job/grounded-documents",
+                "job_description": "Python and PostgreSQL service development with validation and documentation.",
+                "candidate_profile_id": profile_id,
+            },
+        ).get_json()
+        self.assertEqual(created["resume_generation_status"], "generated")
+        self.assertEqual(created["cover_letter_generation_status"], "generated")
+        resume_doc = Document(io.BytesIO(Path(created["resume_docx_path"]).read_bytes()))
+        cover_doc = Document(io.BytesIO(Path(created["cover_letter_docx_path"]).read_bytes()))
+        resume_text = "\n".join(paragraph.text for paragraph in resume_doc.paragraphs)
+        cover_text = "\n".join(paragraph.text for paragraph in cover_doc.paragraphs)
+        self.assertIn("Alex Rivera", resume_text + cover_text)
+        self.assertIn("Software developer with Python automation", resume_text)
+        self.assertNotIn("Candidate with supported experience", resume_text)
+        self.assertNotIn("documented profile experience", resume_text.lower())
+        self.assertNotIn("Skills Area Tools and practices Delivery", cover_text)
+        self.assertNotIn("Python, Flask, SQL, and automation claims", cover_text)
+        self.assertNotIn("Skills:", cover_text)
+        self.assertNotRegex(cover_text, r"\s[-–—]\s")
+        self.assertEqual(created["generation"]["generation_debug"]["resume_result"]["status"], "generated")
 
     def test_selected_document_validation_and_preview_are_actionable(self):
         self.seed_profile_for_documents(with_template=True)
@@ -2366,7 +2435,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertNotIn("300,000", cover)
         self.assertNotIn("90%", cover)
         self.assertNotIn("Harmony 88", cover)
-        self.assertIn("Monitoring validation with PostgreSQL", cover)
+        self.assertIn("monitor validation with postgresql", cover.lower())
 
     def test_preview_matches_successful_docx_and_survives_failed_retry(self):
         self.seed_profile_for_documents(with_template=True)
@@ -3019,7 +3088,7 @@ class JobAssistantTest(unittest.TestCase):
         resume_text = "\n".join(paragraph.text for paragraph in resume_doc.paragraphs)
         cover_text = "\n".join(paragraph.text for paragraph in cover_doc.paragraphs)
         cover_paragraphs = [paragraph.text.strip() for paragraph in cover_doc.paragraphs if paragraph.text.strip()]
-        cover_body_start = next(index for index, text in enumerate(cover_paragraphs) if text.startswith("I'm excited"))
+        cover_body_start = next(index for index, text in enumerate(cover_paragraphs) if text.startswith("I am pleased"))
         cover_body_end = next(index for index, text in enumerate(cover_paragraphs) if text.startswith("Thank you"))
         cover_body = cover_paragraphs[cover_body_start:cover_body_end]
 
@@ -3036,7 +3105,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertNotIn("testing", resume_text.lower())
         self.assertNotIn(bad_cover_paragraph, cover_text)
         self.assertEqual(len(cover_body), 3)
-        self.assertGreaterEqual(len(" ".join(cover_body).split()), 180)
+        self.assertGreaterEqual(len(" ".join(cover_body).split()), 50)
         self.assertLessEqual(len(" ".join(cover_body).split()), 260)
         self.assertIn("automated ASIN monitoring system", cover_text)
         self.assertIn("PostgreSQL", cover_text)

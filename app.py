@@ -1890,14 +1890,20 @@ def resolve_generation_profile(payload: dict[str, Any] | None) -> dict[str, Any]
         if not identity["name"]:
             raise ValueError("Selected candidate profile uses shared identity but the active profile has no applicant name")
     profile = {field: "" for field in PROFILE_COLUMNS}
+    structured_resume = extract_docx_profile_sections(text(resume.get("docx_path"))) if resume and text(resume.get("docx_path")) else {}
     profile.update({
         **identity,
-        "resume_text": text((resume or {}).get("content")) or text(profile_row.get("description")),
-        "work_experience": text((resume or {}).get("content")) or text(profile_row.get("description")),
+        "resume_text": text(structured_resume.get("resume_text")) or text((resume or {}).get("content")) or text(profile_row.get("description")),
+        "work_experience": text(structured_resume.get("work_experience")) or text((resume or {}).get("content")) or text(profile_row.get("description")),
+        "key_skills": text(structured_resume.get("key_skills")),
+        "projects": text(structured_resume.get("projects")),
+        "education": text(structured_resume.get("education")),
         "resume_docx_template_path": text((resume or {}).get("docx_path")),
         "cover_letter_template": text((cover or {}).get("content")),
         "cover_letter_docx_template_path": text((cover or {}).get("docx_path")),
     })
+    if structured_resume.get("summary"):
+        profile["_source_summary"] = structured_resume["summary"]
     profile["_candidate_profile_id"] = str(profile_id)
     return profile
 
@@ -2298,49 +2304,23 @@ def build_cover_letter_section_map(
             text(job.get("job_description")),
         ]
     ).lower()
-    evidence_text = text(candidate_evidence.get("full_text")).lower()
-    software_focused = any(term in job_text or term in evidence_text for term in ["python", "flask", "sql", "backend", "automation", "postgresql", "api", "software developer", "developer"])
     evidence_paragraphs = build_cover_letter_evidence_paragraphs(candidate_evidence)
+    supported_terms = matching_evidence_terms(job, candidate_evidence, limit=3)
     if not evidence_paragraphs:
-        evidence_paragraphs = [select_concrete_evidence_sentence(candidate_evidence) or "I have practical experience I can discuss directly."]
+        evidence_paragraphs = [select_concrete_evidence_sentence(candidate_evidence)] if select_concrete_evidence_sentence(candidate_evidence) else []
     concrete_example = evidence_paragraphs[0]
     supporting_example = evidence_paragraphs[1] if len(evidence_paragraphs) > 1 else ""
+    alignment = f"The role's focus on {short_join(supported_terms)} aligns with that experience." if supported_terms else "That experience would transfer well to this role."
     return {
         "date": format_cover_letter_date(date.today()),
         "company": company,
         "location": location,
         "subject": f"Re: Application for {title}",
         "greeting": f"Dear {company} Hiring Team,",
-        "opening": (
-            (
-                f"I'm excited to apply for the {title} role at {company}. "
-                f"The role feels like a strong match for the Python, Flask, SQL, and automation work I have done in production settings, especially when delivery has to stay practical, reliable, and easy for a team to support. "
-                "I am drawn to work where the code has to be useful to the people who maintain it, not just correct on paper."
-            )
-            if software_focused
-            else (
-                f"I'm excited to apply for the {title} role at {company}. "
-                "The role feels like a strong match for the experience I have built in settings where careful support, communication, and dependable follow-through matter. "
-                "I like work where the details make the day-to-day experience better for the team."
-            )
-        ),
-        "experience": (
-            (
-                "In recent work, I have focused on backend tools that move data cleanly between systems and make reporting easier to trust. "
-                "I like work that combines application logic, data quality, and documentation because those pieces matter after the first release as much as they do on day one. "
-                "It also helps keep handoffs straightforward for the next person who touches the code."
-            )
-            if software_focused
-            else (
-                "In recent work, I have focused on practical work that keeps tasks organized and makes it easier for others to rely on the result. "
-                "I like roles that combine attention to detail, documentation, and consistent communication. "
-                "It helps me stay steady and useful when priorities shift."
-            )
-        ),
+        "opening": f"I am pleased to apply for the {title} role at {company}. {alignment}",
+        "experience": " ".join(as_first_person(item) for item in dict.fromkeys([concrete_example, supporting_example]) if item).strip(),
         "fit": (
-            f"{concrete_example} "
-            f"{supporting_example if supporting_example else ('That kind of work taught me how to keep software dependable when teams need clear data, predictable behavior, and straightforward handoffs.' if software_focused else 'That kind of work taught me how to support people, communicate clearly, and keep details organized.')} "
-            f"I would bring that same care to the work at {company}. That matters in real work, day to day."
+            f"{alignment} I would bring the same care to the work at {company}."
         ),
         "closing": "Thank you for your time and consideration.",
         "signoff": "Sincerely,",
@@ -2393,13 +2373,13 @@ def select_concrete_evidence_sentence(candidate_evidence: dict[str, Any]) -> str
     sections = candidate_evidence.get("sections") or []
     fallback = ""
     for section in sections:
-        if section.get("field") == "resume_text":
+        if section.get("field") not in {"work_experience", "projects"}:
             continue
         for sentence in split_sentences(section.get("text", "")):
             clean = normalize_space(sentence)
             if not clean or len(clean.split()) < 8:
                 continue
-            if contains_contact_details(clean) or contains_resume_section_heading(clean):
+            if contains_contact_details(clean) or contains_resume_section_heading(clean) or is_resume_role_heading(clean):
                 continue
             if classify_keyword_dump_reason(clean) is not None:
                 continue
@@ -2410,17 +2390,25 @@ def select_concrete_evidence_sentence(candidate_evidence: dict[str, Any]) -> str
     return fallback
 
 
+def as_first_person(value: str) -> str:
+    clean = normalize_space(value)
+    if not clean:
+        return ""
+    if clean.lower().startswith("i "):
+        return clean
+    return f"I {clean[0].lower() + clean[1:]}"
+
+
 def build_cover_letter_evidence_paragraphs(candidate_evidence: dict[str, Any]) -> list[str]:
     sentences: list[str] = []
-    full_text = text(candidate_evidence.get("full_text"))
     for section in candidate_evidence.get("sections", []):
-        if section.get("field") == "resume_text":
+        if section.get("field") not in {"work_experience", "projects"}:
             continue
         for sentence in split_sentences(section.get("text", "")):
             clean = normalize_space(sentence)
             if not clean or len(clean.split()) < 8:
                 continue
-            if contains_contact_details(clean) or contains_resume_section_heading(clean):
+            if contains_contact_details(clean) or contains_resume_section_heading(clean) or is_resume_role_heading(clean):
                 continue
             if classify_keyword_dump_reason(clean) is not None:
                 continue
@@ -3035,7 +3023,7 @@ def paragraph_resume_section(paragraph: Any) -> str:
 def collect_resume_paragraph_contexts(document: Document) -> list[dict[str, Any]]:
     contexts: list[dict[str, Any]] = []
     current_section = ""
-    for paragraph in iter_document_paragraphs(document):
+    for paragraph in document.paragraphs:
         section = paragraph_resume_section(paragraph)
         if section:
             current_section = section
@@ -6336,14 +6324,82 @@ def split_sentences(value: str) -> list[str]:
 
 
 def build_summary(profile: dict[str, str], job: dict[str, Any], focus: list[str], candidate_evidence: dict[str, Any]) -> str:
-    target = text(job.get("title")) or "target role"
-    role = first_supported_role(profile, candidate_evidence)
-    snippets = supporting_snippets(focus, candidate_evidence, limit=2)
-    skill_phrase = ", ".join(focus[:4]) if focus else "documented profile experience"
-    base = f"{role or 'Candidate'} with supported experience in {skill_phrase} for the {target} role."
-    if snippets:
-        return f"{base} Evidence includes {snippets[0]}"
-    return f"{base} Summary kept conservative because saved evidence is limited."
+    source_summary = normalize_space(text(profile.get("_source_summary")))
+    if source_summary:
+        source_summary = re.sub(r"\bdocumented\s+", "", source_summary, flags=re.I)
+        source_summary = re.sub(r"\bsupported\s+experience\b", "experience", source_summary, flags=re.I)
+        return source_summary
+    role = first_supported_role(profile, candidate_evidence) or infer_documented_role(candidate_evidence)
+    evidence_sentence = first_narrative_evidence_sentence(candidate_evidence)
+    relevant_terms = [term for term in focus[:4] if term]
+    if not relevant_terms:
+        relevant_terms = matching_evidence_terms(job, candidate_evidence, limit=3)
+    skill_phrase = ", ".join(relevant_terms)
+    if role and skill_phrase and evidence_sentence:
+        return f"{role} with experience in {skill_phrase}. {evidence_sentence}"
+    if role and evidence_sentence:
+        return f"{role} with hands-on experience. {evidence_sentence}"
+    if evidence_sentence:
+        return evidence_sentence
+    return source_backed_summary_fallback(profile)
+
+
+def source_backed_summary_fallback(profile: dict[str, str]) -> str:
+    for field in ("work_experience", "projects", "education"):
+        sentence = first_meaningful_sentence(text(profile.get(field)))
+        if sentence:
+            return sentence
+    return ""
+
+
+def first_meaningful_sentence(value: str) -> str:
+    for sentence in split_sentences(value):
+        clean = normalize_space(sentence)
+        if clean and not is_resume_role_heading(clean) and not contains_contact_details(clean) and not contains_resume_section_heading(clean):
+            return clean if clean.endswith((".", "!", "?")) else f"{clean}."
+    return ""
+
+
+def infer_documented_role(candidate_evidence: dict[str, Any]) -> str:
+    for section in candidate_evidence.get("sections", []):
+        if section.get("field") != "work_experience":
+            continue
+        for line in str(section.get("text") or "").splitlines():
+            clean = normalize_space(line)
+            if "—" in clean or "|" in clean:
+                parts = [normalize_space(part) for part in re.split(r"—|\|", clean) if normalize_space(part)]
+                if len(parts) >= 2 and len(parts[-1].split()) <= 6:
+                    return parts[-1]
+    return ""
+
+
+def first_narrative_evidence_sentence(candidate_evidence: dict[str, Any]) -> str:
+    for field in ("work_experience", "projects"):
+        for section in candidate_evidence.get("sections", []):
+            if section.get("field") != field:
+                continue
+            for sentence in split_sentences(section.get("text", "")):
+                clean = normalize_space(sentence)
+                if clean and not is_resume_role_heading(clean) and not contains_contact_details(clean) and not contains_resume_section_heading(clean):
+                    return clean if clean.endswith((".", "!", "?")) else f"{clean}."
+    return ""
+
+
+def is_resume_role_heading(value: str) -> bool:
+    clean = normalize_space(value)
+    return len(clean.split()) <= 10 and ("—" in clean or "|" in clean) and not any(char in clean for char in "!?;")
+
+
+def matching_evidence_terms(job: dict[str, Any], candidate_evidence: dict[str, Any], limit: int = 3) -> list[str]:
+    job_lower = normalize_space(" ".join(text(job.get(field)) for field in ["title", "required_skills", "preferred_skills", "responsibilities", "job_description"])).lower()
+    evidence_lower = text(candidate_evidence.get("full_text")).lower()
+    terms: list[str] = []
+    for term in ["Python", "Flask", "PostgreSQL", "SQL", "JavaScript", "React", "API", "testing", "validation", "documentation", "reporting", "automation"]:
+        if term.lower() in job_lower and term.lower() in evidence_lower and term.lower() not in {item.lower() for item in terms}:
+            terms.append(term)
+        if len(terms) >= limit:
+            break
+    return terms
 
 
 def format_skills_guidance(skill_groups: dict[str, list[str]]) -> str:
@@ -6683,6 +6739,53 @@ def extract_docx_text(content: bytes) -> str:
         if texts:
             paragraphs.append("".join(texts))
     return "\n".join(paragraphs)
+
+
+def extract_docx_profile_sections(path_value: str) -> dict[str, str]:
+    """Extract résumé content by section without treating tables as prose."""
+    path = safe_local_path(path_value)
+    if path is None or not path.is_file():
+        return {}
+    try:
+        document = Document(path)
+    except (OSError, ValueError, zipfile.BadZipFile):
+        return {}
+    sections = {"summary": [], "work_experience": [], "key_skills": [], "projects": [], "education": []}
+    heading_map = {
+        "summary": "summary", "professional summary": "summary", "profile summary": "summary", "resume summary": "summary",
+        "experience": "work_experience", "work experience": "work_experience", "professional experience": "work_experience",
+        "skills": "key_skills", "technical skills": "key_skills", "core skills": "key_skills",
+        "projects": "projects", "selected projects": "projects", "education": "education",
+    }
+    current = ""
+    for paragraph in document.paragraphs:
+        value = normalize_space(paragraph.text)
+        if not value:
+            continue
+        heading = value.lower().rstrip(":")
+        style_name = normalize_space(getattr(getattr(paragraph, "style", None), "name", "")).lower()
+        if heading in heading_map:
+            current = heading_map[heading]
+            continue
+        if not current or contains_contact_details(value) or value == value.upper() and len(value.split()) <= 5:
+            continue
+        if current == "work_experience" and not value.endswith((".", "!", "?")) and (style_name.startswith("heading") or "—" in value or "|" in value):
+            value = f"{value}."
+        sections[current].append(value)
+    if current == "key_skills":
+        for table in document.tables:
+            for row in table.rows:
+                values = [normalize_space(cell.text) for cell in row.cells]
+                values = [value for value in values if value]
+                if not values or all(value.lower() in {"area", "tools and practices", "skill", "skills"} for value in values):
+                    continue
+                line = ": ".join(values)
+                if line not in sections["key_skills"]:
+                    sections["key_skills"].append(line)
+    cleaned = {key: "\n".join(dict.fromkeys(value for value in values if value)) for key, values in sections.items()}
+    ordered = [cleaned[key] for key in ["summary", "work_experience", "key_skills", "projects", "education"] if cleaned[key]]
+    cleaned["resume_text"] = "\n".join(ordered)
+    return cleaned
 
 
 def extract_pdf_text(content: bytes) -> str:

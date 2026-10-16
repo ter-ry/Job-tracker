@@ -796,7 +796,6 @@ def build_cover_letter_paragraphs(
         ]
     ).lower()
     evidence_text = normalize_space(str(candidate_evidence.get("full_text") or "")).lower()
-    software_focused = any(term in job_text or term in evidence_text for term in ["python", "flask", "sql", "backend", "automation", "postgresql", "api", "software developer", "developer"])
     concepts = [
         normalize_space(block.get("matched_job_phrase") or block.get("job_phrase") or "")
         for block in selected_blocks
@@ -816,11 +815,11 @@ def build_cover_letter_paragraphs(
             evidence_sentences.append(clean)
 
     for section in candidate_evidence.get("sections", []):
-        if section.get("field") == "resume_text":
+        if section.get("field") not in {"work_experience", "projects"}:
             continue
         for sentence in split_sentences(section.get("text", "")):
             clean = normalize_space(sentence)
-            if not clean or contains_contact_details(clean) or contains_resume_section_heading(clean):
+            if not clean or contains_contact_details(clean) or contains_resume_section_heading(clean) or looks_like_role_heading(clean):
                 continue
             if classify_keyword_dump_reason(clean) is not None or len(clean.split()) < 8:
                 continue
@@ -841,39 +840,25 @@ def build_cover_letter_paragraphs(
             if clean and clean not in seen_sentences:
                 seen_sentences.add(clean)
                 evidence_sentences.append(clean)
-    concrete_example = evidence_sentences[0] if evidence_sentences else "I have practical experience I can discuss directly."
+    concrete_example = evidence_sentences[0] if evidence_sentences else ""
     supporting_example = evidence_sentences[1] if len(evidence_sentences) > 1 else ""
-    opening_paragraph = (
-        (
-            f"I'm excited to apply for the {title} role at {company}. "
-            f"The position feels like a strong match for the Python, Flask, SQL, and automation work I have done in production settings, especially when delivery has to stay practical, reliable, and easy for a team to support. "
-            "I am drawn to work where the code has to be useful to the people who maintain it, not just correct on paper."
-        )
-        if software_focused
-        else (
-            f"I'm excited to apply for the {title} role at {company}. "
-            "The position feels like a strong match for the experience I have built in settings where careful support, communication, and dependable follow-through matter. "
-            "I like work where the details make the day-to-day experience better for the team."
-        )
-    )
-    experience_paragraph = (
-        (
-            "In recent work, I have focused on backend tools that move data cleanly between systems and make reporting easier to trust. "
-            "I like work that combines application logic, data quality, and documentation because those pieces matter after the first release as much as they do on day one. "
-            "It also helps keep handoffs straightforward for the next person who touches the code."
-        )
-        if software_focused
-        else (
-            "In recent work, I have focused on practical work that keeps tasks organized and makes it easier for others to rely on the result. "
-            "I like roles that combine attention to detail, documentation, and consistent communication. "
-            "It helps me stay steady and useful when priorities shift."
-        )
-    )
-    fit_paragraph = (
-        f"{concrete_example} "
-        f"{' '.join(evidence_sentences[1:3]) if len(evidence_sentences) > 1 else ('That kind of work taught me how to keep software dependable when teams need clear data, predictable behavior, and straightforward handoffs.' if software_focused else 'That kind of work taught me how to support people, communicate clearly, and keep details organized.')} "
-        f"I would bring that same care to the work at {company}. I communicate clearly and keep commitments visible to the team. That matters in real work, day to day."
-    )
+    supported_focus = [
+        concept for concept in concepts
+        if concept.lower() in evidence_text and concept.lower() in job_text
+    ][:3]
+    if not supported_focus:
+        supported_focus = [
+            term for term in ["Python", "Flask", "PostgreSQL", "SQL", "JavaScript", "React", "API", "testing", "validation", "documentation", "reporting", "automation"]
+            if term.lower() in evidence_text and term.lower() in job_text
+        ][:3]
+    alignment = f"The role's focus on {short_join(supported_focus)} aligns with that experience." if supported_focus else "The role's responsibilities align with the practical experience described in my résumé."
+    opening_paragraph = f"I am pleased to apply for the {title} role at {company}. {alignment}"
+    experience_paragraph = " ".join(evidence_as_first_person(item) for item in [concrete_example, supporting_example] if item)
+    if experience_paragraph and company:
+        experience_paragraph = f"At {company}, {experience_paragraph[0].upper() + experience_paragraph[1:]}"
+    if not experience_paragraph:
+        experience_paragraph = "My background includes practical work that I would welcome the opportunity to discuss with your team."
+    fit_paragraph = f"{alignment} I would bring that same care to the work at {company}."
     employer_line = company if not location else f"{company}, {location}"
     subject = f"Re: Application for {title}"
     paragraphs = [
@@ -884,12 +869,45 @@ def build_cover_letter_paragraphs(
         opening_paragraph,
         experience_paragraph,
         fit_paragraph,
-        f"Thank you for your consideration. I would welcome the chance to discuss how I can contribute to {company} as a {title.lower()}.",
+        f"Thank you for your consideration. I would welcome the chance to discuss how I can contribute to {company}.",
         "Sincerely,",
         name,
     ]
     no_dashes = str(profile.get("cover_letter_no_dashes", "true")).strip().lower() not in {"0", "false", "no", "off"}
     return [remove_cover_letter_dashes(paragraph) for paragraph in paragraphs] if no_dashes else paragraphs
+
+
+def evidence_as_first_person(sentence: str) -> str:
+    clean = normalize_space(sentence)
+    if not clean:
+        return ""
+    if clean.lower().startswith("i "):
+        return clean
+    gerund_replacements = {
+        "monitoring": "monitor",
+        "maintaining": "maintain",
+        "managing": "manage",
+        "supporting": "support",
+        "documenting": "document",
+        "developing": "develop",
+        "using": "use",
+        "working": "work",
+    }
+    first_word, _, remainder = clean.partition(" ")
+    replacement = gerund_replacements.get(first_word.lower())
+    if replacement:
+        return f"I {replacement}{(' ' + remainder) if remainder else ''}"
+    return f"I {clean[0].lower() + clean[1:]}"
+
+
+def looks_like_role_heading(value: str) -> bool:
+    clean = normalize_space(value)
+    return bool(re.search(
+        r"\b(?:developer|engineer|analyst|manager|designer|intern|administrator|specialist)\b"
+        r".*(?:\bat\b|\||—|\bfrom\b).*\b(?:19|20)\d{2}\b",
+        clean,
+        re.I,
+    ))
 
 
 def build_opening_fit_sentence(selected_blocks: list[dict[str, Any]], candidate_evidence: dict[str, Any]) -> str:
@@ -927,7 +945,7 @@ def fallback_concrete_evidence_sentences(candidate_evidence: dict[str, Any], lim
             continue
         for sentence in split_sentences(section.get("text", "")):
             clean = normalize_space(sentence)
-            if not clean or contains_contact_details(clean) or contains_resume_section_heading(clean):
+            if not clean or contains_contact_details(clean) or contains_resume_section_heading(clean) or looks_like_role_heading(clean):
                 continue
             if classify_keyword_dump_reason(clean) is not None:
                 continue
@@ -950,7 +968,7 @@ def cover_letter_supporting_snippets(terms: list[str], evidence: dict[str, Any],
             clean = normalize_space(sentence)
             if not clean or len(clean) > 320:
                 continue
-            if contains_contact_details(clean) or contains_resume_section_heading(clean):
+            if contains_contact_details(clean) or contains_resume_section_heading(clean) or looks_like_role_heading(clean):
                 continue
             if classify_keyword_dump_reason(clean) is not None:
                 continue

@@ -283,9 +283,9 @@ def validate_generated_content(content: str, evidence: dict[str, Any], job: dict
         if contains_phrase(lower, term) and not evidence_supports_phrase(term, evidence):
             conflicts.append(term)
     role_words = useful_tokens(str(job.get("title") or ""))
-    candidate_roles = useful_tokens(" ".join(evidence.get("preferred_roles") or []))
-    if any(term in lower for term in ["software developer", "software engineer"]) and not ({"software", "developer", "engineer"} & candidate_roles):
-        conflicts.append("generated software role wording not supported by preferred roles")
+    for role_phrase in ("software developer", "software engineer"):
+        if role_phrase in lower and not evidence_supports_phrase(role_phrase, evidence):
+            conflicts.append(f"generated {role_phrase} wording is not supported by candidate evidence")
     empty_or_corrupted = not evidence_has_generation_source(evidence) or is_corrupted_text(str(evidence.get("full_text") or ""))
     return {
         "ok": not conflicts and not empty_or_corrupted,
