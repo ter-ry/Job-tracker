@@ -153,6 +153,9 @@ def request_json_completion(config: OllamaConfig, prompt: str, system: str = "")
         "system": system,
         "stream": False,
         "format": "json",
+        # Qwen3 can spend the entire response budget in its reasoning channel
+        # unless thinking is explicitly disabled for this structured endpoint.
+        "think": False,
         "options": {
             "num_predict": config.max_output_tokens,
         },

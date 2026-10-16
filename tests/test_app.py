@@ -230,6 +230,48 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(disabled["status"], "disabled")
         self.assertFalse(disabled["reachable"])
 
+    def test_ollama_json_completion_disables_thinking_and_parses_final_response(self):
+        captured = {}
+
+        def fake_urlopen(request, timeout):
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            return FakeUrlopenResponse({"response": '{"ok": true, "message": "hello"}'})
+
+        config = ollama_client.OllamaConfig(
+            enabled=True,
+            base_url="http://127.0.0.1:11434",
+            model="qwen3:4b",
+            timeout_seconds=1,
+            max_output_tokens=120,
+            max_prompt_chars=24000,
+        )
+        with patch.object(ollama_client.urllib.request, "urlopen", side_effect=fake_urlopen):
+            result = ollama_client.request_json_completion(config, "Return a tiny JSON object.")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data"], {"ok": True, "message": "hello"})
+        self.assertIs(captured["payload"]["think"], False)
+        self.assertEqual(captured["payload"]["options"]["num_predict"], 120)
+
+    def test_ollama_json_completion_rejects_empty_final_response(self):
+        config = ollama_client.OllamaConfig(
+            enabled=True,
+            base_url="http://127.0.0.1:11434",
+            model="qwen3:4b",
+            timeout_seconds=1,
+            max_output_tokens=120,
+            max_prompt_chars=24000,
+        )
+        with patch.object(
+            ollama_client.urllib.request,
+            "urlopen",
+            return_value=FakeUrlopenResponse({"response": "", "thinking": "private reasoning"}),
+        ):
+            result = ollama_client.request_json_completion(config, "Return JSON.")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "Ollama returned an empty response.")
+
     def test_job_create_scores_and_dashboard(self):
         self.seed_profile_for_documents(with_template=True)
         response = self.client.post(
