@@ -197,6 +197,7 @@ async function loadAll() {
     renderEvidenceLibrary(evidence);
     renderJobs();
     renderShortlist();
+    await refreshShortlistKeywordScores();
   } catch (error) {
     toast(error.message);
   }
@@ -1861,6 +1862,24 @@ function renderShortlist() {
   container.innerHTML = state.shortlist.map(renderShortlistCard).join("");
 }
 
+async function refreshShortlistKeywordScores() {
+  await Promise.all(state.shortlist.map(async (job) => {
+    const selection = generationSelection(job.id);
+    selection.keywordScoreLoading = true;
+    selection.keywordScoreError = "";
+    try {
+      const result = await api.send(`/api/shortlist/${job.id}/keyword-score`, "POST", generationPayload(job.id));
+      selection.keywordScore = result.keywords_score || null;
+    } catch (error) {
+      selection.keywordScore = null;
+      selection.keywordScoreError = error.message;
+    } finally {
+      selection.keywordScoreLoading = false;
+    }
+  }));
+  renderShortlist();
+}
+
 async function hydrateGenerationSelections() {
   await Promise.all(state.shortlist.map(async (job) => {
     const selection = generationSelection(job.id);
@@ -1940,7 +1959,7 @@ async function removeShortlist(id) {
 function generationSelection(jobId) {
   if (!state.generationSelections[jobId]) {
     const first = state.candidateProfiles[0];
-    state.generationSelections[jobId] = { profileId: first ? String(first.id) : "", resumeId: "", coverLetterTemplateId: "", documents: { resumes: [], cover_letter_templates: [] } };
+    state.generationSelections[jobId] = { profileId: first ? String(first.id) : "", resumeId: "", coverLetterTemplateId: "", documents: { resumes: [], cover_letter_templates: [] }, keywordScore: null, keywordScoreError: "", keywordScoreLoading: false };
   }
   return state.generationSelections[jobId];
 }
@@ -1961,6 +1980,7 @@ async function selectGenerationProfile(jobId, profileId) {
   selection.resumeId = "";
   selection.coverLetterTemplateId = "";
   selection.documents = { resumes: [], cover_letter_templates: [] };
+  selection.keywordScore = null;
   if (selection.profileId) {
     try {
       selection.documents = await api.get(`/api/candidate-profiles/${selection.profileId}/documents`);
@@ -1971,12 +1991,17 @@ async function selectGenerationProfile(jobId, profileId) {
     }
   }
   renderShortlist();
+  await refreshShortlistKeywordScores();
 }
 
-function selectGenerationDocument(jobId, kind, value) {
+async function selectGenerationDocument(jobId, kind, value) {
   const selection = generationSelection(jobId);
   if (kind === "resume") selection.resumeId = String(value || "");
   if (kind === "cover") selection.coverLetterTemplateId = String(value || "");
+  selection.keywordScore = null;
+  selection.keywordScoreError = "";
+  renderShortlist();
+  await refreshShortlistKeywordScores();
 }
 
 async function previewShortlist(id) {
@@ -2008,6 +2033,13 @@ function renderShortlistCard(job) {
   const resumeError = job.resume_generation_error ? `<p class="risk high">Resume error: ${escapeHtml(job.resume_generation_error)}</p>` : "";
   const coverError = job.cover_letter_generation_error ? `<p class="risk high">Cover letter error: ${escapeHtml(job.cover_letter_generation_error)}</p>` : "";
   const coverWarning = job.cover_letter_generation_warning ? `<p class="warning">Cover letter warning: ${escapeHtml(job.cover_letter_generation_warning)}</p>` : "";
+  const keywordScorePanel = selection.keywordScoreLoading
+    ? `<section class="keywords-score-panel"><h3>Keywords Score</h3><p class="muted">Reviewing the selected résumé…</p></section>`
+    : selection.keywordScoreError
+      ? `<section class="keywords-score-panel"><h3>Keywords Score</h3><p class="risk medium">${escapeHtml(selection.keywordScoreError)}</p></section>`
+      : selection.keywordScore
+        ? renderKeywordCoverage({ keywords_score: selection.keywordScore, eligibility_concerns: [] })
+        : `<section class="keywords-score-panel"><h3>Keywords Score</h3><p class="muted">Select a candidate profile and base résumé to inspect keyword coverage. This does not generate documents.</p></section>`;
   const salaryLabel = job.salary_source === "estimated" ? `${job.salary} (estimated)` : job.salary || "Salary unavailable";
   return `
     <section class="discovery-card shortlist-card">
@@ -2027,6 +2059,7 @@ function renderShortlistCard(job) {
             <label>Base résumé<select onchange="selectGenerationDocument(${job.id}, 'resume', this.value)">${documentSelectorOptions(selection.documents.resumes || [], selection.resumeId, "Select a profile first")}</select></label>
             <label>Cover letter template<select onchange="selectGenerationDocument(${job.id}, 'cover', this.value)">${documentSelectorOptions(selection.documents.cover_letter_templates || [], selection.coverLetterTemplateId, "Select a profile first")}</select></label>
           </div>
+          ${keywordScorePanel}
           <div id="document-preview-${job.id}" class="generated-output empty">Preview is available after generation.</div>
         </div>
       </div>

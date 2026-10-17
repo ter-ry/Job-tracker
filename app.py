@@ -825,6 +825,34 @@ def create_app() -> Flask:
         refreshed = query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)
         return jsonify({**job_to_dict(refreshed), "generation": generation})
 
+    @app.post("/api/shortlist/<int:job_id>/keyword-score")
+    def shortlist_keyword_score(job_id: int) -> Response:
+        """Score the selected base résumé without generating or changing documents."""
+        row = query_db("SELECT * FROM jobs WHERE id = ? AND status = 'shortlisted'", [job_id], one=True)
+        if row is None:
+            return jsonify({"error": "Shortlisted job not found"}), 404
+        payload = request.get_json(silent=True) or {}
+        try:
+            selected_profile = resolve_generation_profile(payload)
+            profile = selected_profile if selected_profile is not None else load_profile()
+            if selected_profile is not None and not text(profile.get("resume_text")):
+                raise ValueError("Selected base résumé has no readable text to score")
+            if selected_profile is None and not profile_has_generation_source(profile):
+                raise ValueError("Complete the Profile page with resume, project, or work-experience details before reviewing Keywords Score")
+            job = job_to_dict(row)
+            selected_resume_text = text(profile.get("resume_text"))
+            score = build_keywords_score_report(job, profile, final_resume_text=selected_resume_text)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify(
+            {
+                "keywords_score": score,
+                "candidate_profile_id": profile.get("_candidate_profile_id", ""),
+                "resume_id": payload.get("resume_id", ""),
+                "generated": False,
+            }
+        )
+
     @app.post("/api/shortlist/<int:job_id>/regenerate-resume")
     def regenerate_shortlist_resume(job_id: int) -> Response:
         job = query_db("SELECT * FROM jobs WHERE id = ? AND status = 'shortlisted'", [job_id], one=True)
@@ -1233,7 +1261,10 @@ def create_app() -> Flask:
         payload = request.get_json(force=True)
         job = normalize_job_payload(payload)
         profile = load_profile()
-        result = generate_application_materials(job, profile)
+        try:
+            result = generate_application_materials(job, profile)
+        except ValueError as exc:
+            return jsonify({"error": str(exc), "validation_error": True}), 400
         job_id = clamp_int(payload.get("id") or payload.get("job_id"), 0, 10**9)
         if job_id:
             save_version(job_id, "resume", result["resume_text"], result["candidate_evidence_hash"], result["job_hash"])

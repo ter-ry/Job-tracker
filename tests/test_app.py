@@ -2556,6 +2556,86 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("Alex Rivera", cover_text)
         self.assertNotIn("SWE Resume", cover_text)
 
+    def test_legacy_generate_without_resume_evidence_returns_helpful_400(self):
+        response = self.client.post(
+            "/api/generate",
+            json={"company": "Validation Co", "title": "Developer", "job_description": "Python"},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertTrue(response.get_json()["validation_error"])
+        self.assertIn("Complete the Profile page", response.get_json()["error"])
+
+    def test_shortlist_keyword_score_uses_selected_resume_without_generating_documents(self):
+        self.seed_profile_for_documents()
+        profile_response = self.client.post(
+            "/api/candidate-profiles",
+            json={"name": "Selected QA Profile", "identity_mode": "distinct", "applicant_name": "Alex Rivera"},
+        )
+        self.assertEqual(profile_response.status_code, 201)
+        profile_id = profile_response.get_json()["id"]
+        resume_path = self.build_formatted_resume_fixture()
+        with resume_path.open("rb") as handle:
+            uploaded = self.client.post(
+                f"/api/candidate-profiles/{profile_id}/resumes/upload",
+                data={"file": (handle, "selected.docx"), "name": "Selected résumé", "is_default": "true"},
+                content_type="multipart/form-data",
+            )
+        self.assertEqual(uploaded.status_code, 201)
+        resume_id = uploaded.get_json()["id"]
+        job = self.client.post(
+            "/api/jobs",
+            json={"company": "Score Co", "title": "Python Developer", "status": "shortlisted", "job_description": "Python SQL APIs"},
+        ).get_json()
+
+        scored = self.client.post(
+            f"/api/shortlist/{job['id']}/keyword-score",
+            json={"candidate_profile_id": profile_id, "resume_id": resume_id},
+        )
+        self.assertEqual(scored.status_code, 200)
+        body = scored.get_json()
+        self.assertFalse(body["generated"])
+        self.assertEqual(body["candidate_profile_id"], str(profile_id))
+        self.assertGreaterEqual(body["keywords_score"]["total"], 1)
+        saved = next(item for item in self.client.get("/api/jobs").get_json() if item["id"] == job["id"])
+        self.assertFalse(saved.get("resume_docx_path"))
+        self.assertFalse(saved.get("cover_letter_docx_path"))
+
+    def test_shortlist_keyword_score_changes_when_selected_resume_changes(self):
+        self.seed_profile_for_documents()
+        profile_id = self.client.post(
+            "/api/candidate-profiles",
+            json={"name": "Resume Choice Profile", "identity_mode": "distinct", "applicant_name": "Alex Rivera"},
+        ).get_json()["id"]
+        first_path = self.build_formatted_resume_fixture()
+        second_path = Path(self.tmpdir.name) / "unrelated_resume.docx"
+        second_doc = Document()
+        second_doc.add_paragraph("Alex Rivera")
+        second_doc.add_paragraph("Customer support specialist with scheduling and communications experience.")
+        second_doc.save(second_path)
+        first = self.client.post(
+            f"/api/candidate-profiles/{profile_id}/resumes",
+            json={"name": "Technical résumé", "content": "Python SQL APIs", "docx_path": str(first_path), "is_default": True},
+        ).get_json()
+        second = self.client.post(
+            f"/api/candidate-profiles/{profile_id}/resumes",
+            json={"name": "Other résumé", "content": "Customer support", "docx_path": str(second_path), "is_default": False},
+        ).get_json()
+        job = self.client.post(
+            "/api/jobs",
+            json={"company": "Score Co", "title": "Python Developer", "status": "shortlisted", "job_description": "Python SQL APIs"},
+        ).get_json()
+        first_score = self.client.post(
+            f"/api/shortlist/{job['id']}/keyword-score",
+            json={"candidate_profile_id": profile_id, "resume_id": first["id"]},
+        ).get_json()["keywords_score"]
+        second_response = self.client.post(
+            f"/api/shortlist/{job['id']}/keyword-score",
+            json={"candidate_profile_id": profile_id, "resume_id": second["id"]},
+        )
+        self.assertEqual(second_response.status_code, 200, second_response.get_data(as_text=True))
+        second_score = second_response.get_json()["keywords_score"]
+        self.assertGreater(first_score["matched_count"], second_score["matched_count"])
+
     def test_selected_candidate_profile_isolated_from_legacy_and_other_profiles(self):
         self.seed_profile_for_documents(with_template=True)
         legacy = self.client.post(
