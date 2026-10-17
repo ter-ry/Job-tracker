@@ -12,9 +12,9 @@ class FoundationArchitectureTest(unittest.TestCase):
         db = sqlite3.connect(":memory:")
         first = run_migrations(db)
         second = run_migrations(db)
-        self.assertEqual(first, 2)
-        self.assertEqual(second, 2)
-        self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 2)
+        self.assertEqual(first, 3)
+        self.assertEqual(second, 3)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 3)
         self.assertTrue(db.execute("SELECT 1 FROM sqlite_master WHERE name = 'base_resumes'").fetchone())
 
     def test_profile_store_supports_multiple_document_variants(self):
@@ -34,11 +34,24 @@ class FoundationArchitectureTest(unittest.TestCase):
         db = sqlite3.connect(":memory:")
         db.execute("CREATE TABLE legacy_jobs (id INTEGER PRIMARY KEY, title TEXT)")
         db.execute("PRAGMA user_version = 1")
-        self.assertEqual(run_migrations(db), 2)
+        self.assertEqual(run_migrations(db), 3)
         applied = db.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
-        self.assertEqual(applied, [(1,), (2,)])
+        self.assertEqual(applied, [(1,), (2,), (3,)])
         self.assertTrue(db.execute("SELECT 1 FROM sqlite_master WHERE name = 'legacy_jobs'").fetchone())
         self.assertTrue(db.execute("SELECT 1 FROM sqlite_master WHERE name = 'candidate_profiles'").fetchone())
+
+    def test_candidate_identity_fields_persist_without_profile_label_leakage(self):
+        db = sqlite3.connect(":memory:")
+        db.row_factory = sqlite3.Row
+        run_migrations(db)
+        store = CandidateProfileStore(db)
+        profile_id = store.create_profile("SWE Resume", identity_mode="distinct", applicant_name="Alex Rivera", applicant_email="alex@example.com")
+        profile = store.list_profiles()[0]
+        self.assertEqual(profile["name"], "SWE Resume")
+        self.assertEqual(profile["applicant_name"], "Alex Rivera")
+        self.assertEqual(profile["identity_mode"], "distinct")
+        updated = store.update_profile(profile_id, applicant_phone="555-0100")
+        self.assertEqual(updated["applicant_phone"], "555-0100")
 
     def test_multiple_profiles_and_documents_persist_across_reopen(self):
         with tempfile.TemporaryDirectory() as tmpdir:

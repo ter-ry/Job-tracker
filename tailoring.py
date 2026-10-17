@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from grounding import build_candidate_evidence, classify_supported_skills, normalize_space, supporting_snippets
+from grounding import build_candidate_evidence, classify_supported_skills, normalize_space
 from tailoring_pipeline import build_tailoring_plan, rewrite_paragraph
 
 
@@ -219,16 +219,14 @@ def build_supported_summary(
     skills: list[str],
     evidence: list[dict[str, Any]],
 ) -> str:
-    role = str(job.get("title") or "target role")
-    candidate_evidence = build_candidate_evidence(profile)
-    grouped = classify_supported_skills(job, candidate_evidence)
-    supported_focus = grouped["supported_relevant"] or skills[:4]
-    education = " with relevant education" if str(profile.get("education") or "").strip() else ""
-    focus = ", ".join(supported_focus[:4]) if supported_focus else "documented profile experience"
-    snippets = supporting_snippets(supported_focus, candidate_evidence, limit=1)
-    proof = evidence[0]["text"] if evidence else (snippets[0] if snippets else "")
-    proof_clause = f" Evidence includes: {proof}" if proof else ""
-    return f"Candidate for {role}{education}, with supported experience across {focus}.{proof_clause}"
+    source_summary = normalize_space(str(profile.get("_source_summary") or ""))
+    if source_summary:
+        return source_summary
+    for item in evidence:
+        candidate = normalize_space(str(item.get("text") or ""))
+        if candidate and len(candidate.split()) >= 8:
+            return candidate
+    return ""
 
 
 def format_draft(
