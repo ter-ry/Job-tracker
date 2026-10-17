@@ -2101,7 +2101,16 @@ class JobAssistantTest(unittest.TestCase):
         ).get_json()
         self.assertEqual(created["cover_letter_generation_status"], "generated")
         self.assertIn("tailoring_changes", created)
-        self.assertGreaterEqual(len(created["tailoring_changes"]["resume"]["applied"]), 1)
+        # The approved résumé engine is substitution-only.  This fixture has
+        # no supported terminology alias to apply.  It may still reorder
+        # existing skills, but must not rewrite experience bullets or add
+        # unsupported content.
+        resume_changes = created["tailoring_changes"]["resume"]["applied"]
+        self.assertLessEqual(len(resume_changes), 1)
+        self.assertTrue(all(item["kind"] == "skills" for item in resume_changes))
+        resume_output = Document(io.BytesIO(Path(created["resume_docx_path"]).read_bytes()))
+        resume_text = "\n".join(paragraph.text for paragraph in resume_output.paragraphs)
+        self.assertIn("reduce manual data entry errors by 90%", resume_text)
         self.assertGreaterEqual(len(created["tailoring_changes"]["cover_letter"]["applied"]), 1)
         cover_path = Path(created["cover_letter_docx_path"])
         self.assertEqual(master_before, master_path.read_bytes())
