@@ -259,7 +259,7 @@ def evidence_snippet(value: str, phrase: str, minimum: int = 80, maximum: int = 
         return clean
     match = re.search(re.escape(phrase), clean, re.IGNORECASE)
     if not match:
-        return clean[:maximum].rstrip() + "…"
+        return clean[: maximum - 1].rstrip() + "…"
     start = max(0, match.start() - maximum // 3)
     end = min(len(clean), start + maximum)
     if end - start < minimum:
