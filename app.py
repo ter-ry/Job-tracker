@@ -2163,10 +2163,18 @@ def build_format_preserving_cover_letter(
         remove_dashes_from_document(document)
     document.save(cover_path)
     reopened_cover = Document(cover_path)
-    if any(classify_keyword_dump_reason(normalize_space(paragraph.text)) is not None for paragraph in reopened_cover.paragraphs):
+    if change_log.get("template_mode") != "structured_template" and any(
+        classify_keyword_dump_reason(normalize_space(paragraph.text)) is not None
+        for paragraph in reopened_cover.paragraphs
+    ):
         write_cover_letter_docx(cover_path, output["cover_letter"])
         reopened_cover = Document(cover_path)
-    residual = find_unreplaced_template_content(template_path, reopened_cover, profile)
+    residual = find_unreplaced_template_content(
+        template_path,
+        reopened_cover,
+        profile,
+        preserved_texts=change_log.get("preserved", []),
+    )
     if residual:
         write_cover_letter_docx(cover_path, output["cover_letter"])
         return {
@@ -2223,7 +2231,12 @@ def _has_cover_letter_stale_content(document: Document) -> bool:
     )
 
 
-def find_unreplaced_template_content(template_path: Path, generated: Document, profile: dict[str, str]) -> str:
+def find_unreplaced_template_content(
+    template_path: Path,
+    generated: Document,
+    profile: dict[str, str],
+    preserved_texts: list[dict[str, Any]] | None = None,
+) -> str:
     """Find exact source-template text that survived in body, headers, or footers."""
     try:
         source = Document(template_path)
@@ -2243,12 +2256,28 @@ def find_unreplaced_template_content(template_path: Path, generated: Document, p
         "kind regards,",
         "regards,",
     }
-    for paragraph in iter_document_paragraphs(source):
+    preserved = {
+        normalize_space(item.get("original", "")).lower()
+        for item in (preserved_texts or [])
+        if normalize_space(item.get("original", ""))
+    }
+    source_paragraphs = list(iter_document_paragraphs(source))
+    subject_seen = False
+    for paragraph in source_paragraphs:
         value = normalize_space(paragraph.text)
         lowered = value.lower()
         if not value or lowered in allowed or len(value) < 4:
             continue
+        if lowered.startswith(("re:", "subject:")):
+            subject_seen = True
+            continue
+        if not subject_seen:
+            # The applicant contact and recipient address are intentionally
+            # preserved source content, not stale body prose.
+            continue
         if contains_contact_details(value) or _looks_like_date_text(lowered) or "{{" in value:
+            continue
+        if lowered in preserved:
             continue
         if lowered in generated_text:
             return value[:160]
@@ -2512,6 +2541,7 @@ def build_cover_letter_section_map(
         "date": format_cover_letter_date(date.today()),
         "company": company,
         "location": location,
+        "title": title,
         "subject": f"Re: Application for {title}",
         "greeting": f"Dear {company} Hiring Team,",
         "opening": opening,
@@ -2522,6 +2552,9 @@ def build_cover_letter_section_map(
         "closing": "Thank you for your time and consideration.",
         "signoff": "Sincerely,",
         "signature": text(profile.get("name") or ""),
+        "applicant_email": text(profile.get("email") or ""),
+        "applicant_phone": text(profile.get("phone") or ""),
+        "applicant_location": text(profile.get("location") or ""),
     }
 
 
@@ -2534,15 +2567,15 @@ def build_job_motivation(job: dict[str, Any]) -> str:
         clean = normalize_space(sentence).rstrip(".")
         if company_lower not in clean.lower() or len(clean.split()) < 8:
             continue
-        detail = re.sub(
-            rf"^{re.escape(company)}(?:\s*\([^)]*\))?\s+is\s+",
-            "",
+        match = re.match(
+            rf"^{re.escape(company)}(?:\s*\([^)]*\))?\s+((?:is|provides|develops|builds|offers|delivers)\s+.+)$",
             clean,
             flags=re.I,
-        ).strip()
-        if detail != clean:
+        )
+        if match:
+            detail = normalize_space(match.group(1))
             return (
-                f"I am particularly interested in {company} because the posting describes it as {detail}. "
+                f"I am particularly interested in {company} because the posting states that it {detail}. "
                 "I would welcome the opportunity to contribute to that work in a collaborative engineering team."
             )
     return (
@@ -2592,6 +2625,62 @@ def render_cover_letter_template_without_placeholders(document: Document, sectio
     return {"applied": applied, "skipped": skipped, "template_mode": "structured_fallback"}
 
 
+def paragraph_by_index_text(document: Document, index: int) -> str:
+    paragraphs = list(document.paragraphs)
+    return paragraphs[index].text if 0 <= index < len(paragraphs) else ""
+
+
+def adapt_cover_letter_opening(original: str, section_map: dict[str, str]) -> str:
+    """Change only the prior application's role and company in its opening."""
+    target_title = section_map.get("title") or "the role"
+    target_company = section_map.get("company") or "the company"
+    pattern = re.compile(r"(apply for (?:the )?)(.+?)( position at )([^.!?]+)([.!?])", re.I)
+    adapted = pattern.sub(lambda match: f"{match.group(1)}{target_title}{match.group(3)}{target_company}{match.group(5)}", original, count=1)
+    if adapted == original:
+        return section_map.get("opening", original)
+    return adapted
+
+
+def refresh_cover_letter_identity(
+    document: Document,
+    section_map: dict[str, str],
+    applied: list[dict[str, Any]],
+) -> None:
+    """Refresh identity only when the selected profile is distinct."""
+    nonempty = [(index, paragraph) for index, paragraph in enumerate(document.paragraphs) if normalize_space(paragraph.text)]
+    if not nonempty or not section_map.get("signature"):
+        return
+    first_index, first = nonempty[0]
+    if normalize_space(first.text).lower() != normalize_space(section_map["signature"]).lower():
+        original = first.text
+        if replace_paragraph_text(first, original, section_map["signature"]):
+            applied.append({
+                "kind": "identity",
+                "original": original,
+                "replacement": section_map["signature"],
+                "changes": ["applicant name"],
+                "reason": "Refreshed the selected distinct applicant identity.",
+                "validation_status": "passed",
+            })
+    for index, paragraph in nonempty:
+        value = normalize_space(paragraph.text)
+        replacement = ""
+        change = ""
+        if "@" in value and section_map.get("applicant_email"):
+            replacement, change = section_map["applicant_email"], "applicant email"
+        elif re.search(r"\d[\d ()+.-]{6,}\d", value) and section_map.get("applicant_phone"):
+            replacement, change = section_map["applicant_phone"], "applicant phone"
+        if replacement and normalize_space(value) != normalize_space(replacement) and replace_paragraph_text(paragraph, paragraph.text, replacement):
+            applied.append({
+                "kind": "identity",
+                "original": value,
+                "replacement": replacement,
+                "changes": [change],
+                "reason": "Refreshed the selected distinct applicant identity.",
+                "validation_status": "passed",
+            })
+
+
 def render_cover_letter_template_by_structure(document: Document, section_map: dict[str, str]) -> dict[str, list[dict[str, Any]]]:
     """Refresh a plain cover-letter template while preserving its paragraph layout."""
     paragraphs = list(document.paragraphs)
@@ -2629,6 +2718,20 @@ def render_cover_letter_template_by_structure(document: Document, section_map: d
     if signoff_index is not None:
         replacements[signoff_index] = section_map["signoff"]
 
+    # Preserve the source contact block for the same applicant, but refresh
+    # identity fields when a distinct reusable candidate profile is selected.
+    first_content_index = next((index for index, _ in nonempty), None)
+    if first_content_index is not None and section_map.get("signature"):
+        source_name = normalize_space(paragraph_by_index_text(document, first_content_index))
+        if source_name and source_name.lower() != normalize_space(section_map["signature"]).lower():
+            replacements[first_content_index] = section_map["signature"]
+    for index, paragraph in nonempty:
+        value = normalize_space(paragraph.text)
+        if "@" in value and section_map.get("applicant_email"):
+            replacements[index] = section_map["applicant_email"]
+        elif re.search(r"\d[\d ()+.-]{6,}\d", value) and section_map.get("applicant_phone"):
+            replacements[index] = section_map["applicant_phone"]
+
     # The address block is the nonempty content between the date and subject.
     address_indexes = [index for index, _ in nonempty if date_index is not None and date_index < index < subject_index]
     if len(address_indexes) >= 3:
@@ -2644,15 +2747,38 @@ def render_cover_letter_template_by_structure(document: Document, section_map: d
     body_indexes = [
         index
         for index, _ in nonempty
-        if greeting_index < index and (closing_index is None or index < closing_index) and index not in replacements
+        if greeting_index < index
+        and (closing_index is None or index < closing_index)
+        and (signoff_index is None or index < signoff_index)
+        and index not in replacements
     ]
-    body_values = [
-        section_map.get("opening", ""),
-        section_map.get("experience", ""),
-        section_map.get("experience_secondary", ""),
-        section_map.get("motivation", section_map.get("fit", "")),
-    ]
-    for index, replacement in zip(body_indexes, body_values):
+    preserved_body: list[dict[str, Any]] = []
+    body_replacements: dict[int, tuple[str, str]] = {}
+    paragraph_by_index = dict(nonempty)
+    if body_indexes:
+        opening_index = body_indexes[0]
+        opening_original = paragraph_by_index_text(document, opening_index)
+        opening = adapt_cover_letter_opening(opening_original, section_map)
+        body_replacements[opening_index] = (opening, "Updated the prior application title and company while preserving the source opening.")
+    if len(body_indexes) > 1:
+        motivation_index = body_indexes[-1]
+        motivation_original = paragraph_by_index_text(document, motivation_index)
+        body_replacements[motivation_index] = (
+            section_map.get("motivation", section_map.get("fit", "")),
+            "Replaced the prior employer specific motivation with job description grounded motivation.",
+        )
+    for index in body_indexes:
+        if index not in body_replacements:
+            original = paragraph_by_index_text(document, index)
+            preserved_body.append(
+                {
+                    "original": original,
+                    "replacement": original,
+                    "changes": [],
+                    "reason": "Preserved because the paragraph contains candidate evidence that remains factually appropriate.",
+                }
+            )
+    for index, (replacement, reason) in body_replacements.items():
         if replacement:
             replacements[index] = replacement
 
@@ -2665,27 +2791,32 @@ def render_cover_letter_template_by_structure(document: Document, section_map: d
 
     applied: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
-    paragraph_by_index = dict(nonempty)
     for index, replacement in replacements.items():
         paragraph = paragraph_by_index.get(index)
         if paragraph is None or not replacement or normalize_space(paragraph.text) == normalize_space(replacement):
             continue
         original = paragraph.text
         if replace_paragraph_text(paragraph, original, replacement):
-            applied.append(
-                {
-                    "kind": "structured_paragraph",
-                    "original": original,
-                    "replacement": replacement,
-                    "matched_job_requirement": "cover letter structure",
-                    "supporting_evidence": "approved candidate profile and job details",
-                    "confidence": 90,
-                    "validation_status": "passed",
-                }
-            )
+            body_reason = dict(body_replacements).get(index, ("", ""))[1]
+            applied.append({
+                "kind": "structured_paragraph",
+                "original": original,
+                "replacement": replacement,
+                "changes": ["paragraph text"],
+                "reason": body_reason or "Updated a document field required for this application.",
+                "matched_job_requirement": "cover letter structure",
+                "supporting_evidence": "approved candidate profile and job details",
+                "confidence": 90,
+                "validation_status": "passed",
+            })
         else:
             skipped.append({"kind": "structured_paragraph", "original": original, "replacement": replacement, "reason": "Paragraph text did not match."})
-    return {"applied": applied, "skipped": skipped, "template_mode": "structured_template"}
+    return {
+        "applied": applied,
+        "skipped": skipped,
+        "preserved": preserved_body,
+        "template_mode": "structured_template",
+    }
 
 
 def select_concrete_evidence_sentence(candidate_evidence: dict[str, Any]) -> str:
@@ -2885,6 +3016,7 @@ def apply_cover_letter_template(
                 break
         if not replaced and any(marker in original for marker in replacements):
             skipped.append({"kind": "placeholder", "original": original, "replacement": replacement, "reason": "Template marker present but paragraph did not match."})
+    refresh_cover_letter_identity(document, section_map, applied)
     if not applied and not skipped and not has_placeholders:
         return render_cover_letter_template_by_structure(document, section_map)
     return {

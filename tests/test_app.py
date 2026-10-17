@@ -2130,9 +2130,73 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("Gatekeeper Systems Inc", joined)
         self.assertIn("Dear Gatekeeper Systems Inc Hiring Team,", joined)
         self.assertNotIn("Pinterest", joined)
-        self.assertNotIn("restaurant operations", joined.lower())
+        self.assertIn("restaurant operations", joined.lower())
         self.assertNotRegex(joined, r"[-–—]")
         self.assertEqual(paragraphs[-2:], ["Sincerely,", "Terry Mak"])
+
+    def test_structured_template_preserves_factual_body_paragraphs_and_logs_adaptation(self):
+        template = Path(self.tmpdir.name) / "preserving_cover_letter_fixture.docx"
+        document = Document()
+        document.add_paragraph("Terry Mak")
+        document.add_paragraph("Toronto, ON")
+        document.add_paragraph("terry@example.com")
+        document.add_paragraph("October 1, 2026")
+        document.add_paragraph("Hiring Manager")
+        document.add_paragraph("Pinterest")
+        document.add_paragraph("Toronto, ON")
+        document.add_paragraph("Re: Software Engineer II, Web")
+        document.add_paragraph("Dear Hiring Manager,")
+        opening = document.add_paragraph(
+            "I am writing to apply for the Software Engineer II, Web position at Pinterest. "
+            "With a Bachelor of Science in Computer Science, I bring relevant experience."
+        )
+        flowtally = document.add_paragraph(
+            "Most recently, I designed and built Flowtally, an operations platform. "
+            "I also built 25+ automated backend tests."
+        )
+        employers = document.add_paragraph(
+            "At Oasis Elea Inc., I built internal web tooling and helped launch a storefront with "
+            "40 products and 450+ variants. At Harmony 88 Co., I reduced data errors by 75 percent."
+        )
+        motivation = document.add_paragraph(
+            "I am particularly interested in Pinterest's focus on web platform development and testing."
+        )
+        document.add_paragraph("Sincerely,")
+        document.add_paragraph("Terry Mak")
+        document.save(template)
+        original_bytes = template.read_bytes()
+        profile = {
+            "name": "Terry Mak",
+            "work_experience": "Built internal web tools with Python and SQL.",
+            "projects": "Built Flowtally and automated backend tests.",
+            "resume_text": "Terry Mak. Built internal web tools with Python and SQL. Built Flowtally and automated backend tests.",
+            "cover_letter_docx_template_path": str(template),
+            "cover_letter_no_dashes": "true",
+        }
+        job = {
+            "company": "Gatekeeper Systems Inc",
+            "title": "Software Engineer",
+            "location": "Abbotsford, BC",
+            "job_description": "Gatekeeper Systems Inc provides intelligent video and data solutions for safer transportation.",
+        }
+        output = app_module.generate_application_materials(job, profile, raise_on_validation=False)
+        output_path = Path(self.tmpdir.name) / "preserving_cover_letter_output.docx"
+        artifact = app_module.build_format_preserving_cover_letter(job, profile, output, output_path)
+        generated = Document(output_path)
+        generated_text = "\n".join(paragraph.text for paragraph in generated.paragraphs)
+        self.assertIn("Software Engineer position at Gatekeeper Systems Inc", generated_text)
+        self.assertIn("25+ automated backend tests", generated_text)
+        self.assertIn("40 products and 450+ variants", generated_text)
+        self.assertIn("reduced data errors by 75 percent", generated_text)
+        self.assertIn("safer transportation", generated_text)
+        self.assertNotIn("Pinterest", generated_text)
+        self.assertNotRegex(generated_text, r"[-–—]")
+        self.assertEqual(original_bytes, template.read_bytes())
+
+        self.assertEqual(artifact["status"], "generated")
+        self.assertGreaterEqual(len(artifact["change_log"]["preserved"]), 2)
+        self.assertTrue(any("Flowtally" in item["original"] for item in artifact["change_log"]["preserved"]))
+        self.assertTrue(any("Pinterest" in item["original"] and "Gatekeeper" in item["replacement"] for item in artifact["change_log"]["applied"]))
 
     def test_cover_letter_motivation_and_evidence_follow_each_job(self):
         profile = {
