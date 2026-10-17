@@ -57,6 +57,16 @@ TECHNICAL_TERMS = [
     "postgres",
 ]
 
+# These are spelling variants, not transferable skills.  Normalizing them only
+# for evidence checks permits a format-preserving terminology correction while
+# keeping the original claim and its scope intact.
+EQUIVALENT_TECHNOLOGY_TERMS = {
+    "nodejs": "node.js",
+    "java script": "javascript",
+    "postgres": "postgresql",
+    "restful apis": "rest apis",
+}
+
 QUALITY_METADATA_TERMS = [
     "endobj",
     "obj",
@@ -245,9 +255,9 @@ def classify_supported_skills(job: dict[str, Any], evidence: dict[str, Any]) -> 
 
 
 def evidence_supports_phrase(phrase: str, evidence: dict[str, Any]) -> bool:
-    clean = normalize_space(phrase).lower()
-    evidence_text = str(evidence.get("full_text") or "")
-    role_text = " ".join(evidence.get("preferred_roles") or [])
+    clean = normalize_equivalent_technology_terms(normalize_space(phrase).lower())
+    evidence_text = normalize_equivalent_technology_terms(str(evidence.get("full_text") or ""))
+    role_text = normalize_equivalent_technology_terms(" ".join(evidence.get("preferred_roles") or []))
     if not clean or len(clean) < 2:
         return False
     if contains_phrase(evidence_text, clean) or contains_phrase(role_text, clean):
@@ -257,6 +267,13 @@ def evidence_supports_phrase(phrase: str, evidence: dict[str, Any]) -> bool:
         return False
     evidence_tokens = set(evidence.get("tokens") or set()) | useful_tokens(role_text)
     return bool(phrase_tokens) and len(phrase_tokens & evidence_tokens) / len(phrase_tokens) >= 0.7
+
+
+def normalize_equivalent_technology_terms(value: str) -> str:
+    normalized = value.lower()
+    for source, target in EQUIVALENT_TECHNOLOGY_TERMS.items():
+        normalized = re.sub(rf"\b{re.escape(source)}\b", target, normalized)
+    return normalized
 
 
 def supporting_snippets(terms: list[str], evidence: dict[str, Any], limit: int = 4) -> list[str]:

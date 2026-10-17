@@ -1792,6 +1792,28 @@ def generate_and_store_shortlist_documents(job_id: int, kinds: set[str] | None =
         if cover_result.get("status") == "failed" and cover_path.exists():
             cover_path.unlink()
 
+    # The initial report is deliberately based on the uploaded evidence.  Once a
+    # résumé has been rendered, refresh the after-state from the actual DOCX so a
+    # layout-rejected substitution is never reported as an applied improvement.
+    if "resume" in requested_kinds and resume_result.get("status") == "generated" and resume_path.is_file():
+        try:
+            rendered_resume = Document(resume_path)
+            final_resume_text = "\n".join(
+                paragraph.text.strip()
+                for paragraph in iter_document_paragraphs(rendered_resume)
+                if paragraph.text.strip()
+            )
+            del rendered_resume
+            output["keyword_coverage"] = build_keyword_coverage_report(
+                job,
+                profile,
+                output.get("semantic_match") or {},
+                output.get("tailoring_plan"),
+                final_resume_text=final_resume_text,
+            )
+        except (OSError, ValueError, zipfile.BadZipFile):
+            pass
+
     generation_debug = build_generation_debug_payload(job_id, job, profile, output, resume_result, cover_result, resume_path, cover_path)
 
     metadata = {
@@ -1807,6 +1829,7 @@ def generate_and_store_shortlist_documents(job_id: int, kinds: set[str] | None =
         "cover_letter_template_path": profile.get("cover_letter_docx_template_path", ""),
         "job_hash": output.get("job_hash", ""),
         "candidate_evidence_hash": output.get("candidate_evidence_hash", ""),
+        "keyword_coverage": output.get("keyword_coverage", {}),
         "generation_debug": generation_debug,
     }
     (folder / "metadata.json").write_text(dumps_json(metadata, indent=2), encoding="utf-8")
@@ -6341,8 +6364,9 @@ def build_keyword_coverage_report(
     profile: dict[str, Any],
     semantic_result: dict[str, Any],
     tailoring_plan: dict[str, Any] | None = None,
+    final_resume_text: str | None = None,
 ) -> dict[str, Any]:
-    """Return a transparent, heuristic requirement coverage report."""
+    """Return baseline and final-DOCX coverage as transparent review heuristics."""
     matches = semantic_result.get("matches", []) or []
     required_categories = {"required_skill", "responsibility", "role_title"}
     preferred_categories = {"preferred_skill"}
@@ -6399,11 +6423,43 @@ def build_keyword_coverage_report(
             return False
         return True
 
+    def raw_description_field(field: str) -> bool:
+        value = normalize_requirement(job.get(field))
+        description = normalize_requirement(job.get("job_description"))
+        return bool(value and description and value == description)
+
+    def description_classification(requirement: str) -> str:
+        """Only classify explicit JD requirements; incidental prose is not mandatory."""
+        description = text(job.get("job_description"))
+        lowered = description.lower()
+        needle = normalize_requirement(requirement)
+        index = lowered.find(needle)
+        if index < 0:
+            return "mentioned"
+        # Include the labelled phrase itself: a heading such as
+        # "Requirements: Node.js experience" begins at the same position as
+        # the extracted phrase, not before it.
+        context = lowered[max(0, index - 260):index + len(needle)]
+        if re.search(r"\b(preferred|nice to have|bonus|asset)\b", context):
+            return "preferred_skill"
+        if re.search(r"\b(required|requirements|must have|minimum qualifications|qualifications)\b", context):
+            return "required_skill"
+        return "mentioned"
+
     ranked = (tailoring_plan or {}).get("ranked_requirements") or rank_job_requirements(job)
     requirement_items: list[dict[str, Any]] = []
     for item in ranked:
         source_field = item.get("source_field")
-        category = "preferred_skill" if source_field == "preferred_skills" else "required_skill"
+        if source_field == "preferred_skills" and not raw_description_field("preferred_skills"):
+            category = "preferred_skill"
+        elif source_field in {"required_skills", "responsibilities"} and not raw_description_field(source_field):
+            category = "required_skill"
+        elif source_field == "title":
+            category = "required_skill"
+        else:
+            category = description_classification(str(item.get("phrase") or ""))
+        if category == "mentioned":
+            continue
         requirement_items.append({
             "job_requirement": item.get("phrase", ""),
             "category": category,
@@ -6418,29 +6474,74 @@ def build_keyword_coverage_report(
     required = dedupe([item for item in requirement_items if item.get("category") in required_categories and meaningful_requirement(item)])
     preferred = dedupe([item for item in requirement_items if item.get("category") in preferred_categories and meaningful_requirement(item)])
 
-    profile_text = normalize_requirement(" ".join(text(profile.get(field)) for field in ["work_experience", "key_skills", "education", "projects", "resume_text"]))
-    evidence_lines = []
-    for field in ["work_experience", "key_skills", "education", "projects", "resume_text"]:
-        value = text(profile.get(field))
-        evidence_lines.extend(split_sentences(value) or [normalize_space(value)] if value else [])
     match_by_requirement = {normalize_requirement(item.get("job_requirement")): item for item in matches}
 
-    def enrich(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def evidence_for_text(source_text: str) -> tuple[str, list[str]]:
+        normalized = normalize_requirement(source_text)
+        # Keep short skill lines such as "SQL, Node.js".  The general sentence
+        # splitter intentionally drops short prose fragments, but doing so here
+        # would under-report what is visibly present in the final DOCX.
+        paragraph_lines = [normalize_space(line) for line in source_text.splitlines() if normalize_space(line)]
+        lines = list(dict.fromkeys([*paragraph_lines, *split_sentences(source_text)])) or ([normalize_space(source_text)] if source_text else [])
+        return normalized, lines
+
+    baseline_text = " ".join(text(profile.get(field)) for field in ["work_experience", "key_skills", "education", "projects", "resume_text"])
+
+    def enrich(items: list[dict[str, Any]], source_text: str, permit_semantic_evidence: bool) -> list[dict[str, Any]]:
+        profile_text, evidence_lines = evidence_for_text(source_text)
         enriched: list[dict[str, Any]] = []
         for item in items:
             requirement = item.get("job_requirement", "")
             normalized = normalize_requirement(requirement)
             source_match = match_by_requirement.get(normalized, {})
             evidence = ""
+            direct_lexical_match = False
             if normalized and normalized in profile_text:
                 evidence = next((line for line in evidence_lines if normalized in normalize_requirement(line)), "")
+                direct_lexical_match = bool(evidence)
+            # Requirement sentences often include a generic suffix such as
+            # "experience".  Count an exact supported technical term in that
+            # sentence without requiring the entire sentence to appear in a
+            # résumé.
             if not evidence:
+                technical_terms = sorted({normalize_requirement(term) for term in TECHNICAL_TERMS} | set(aliases.values()), key=len, reverse=True)
+                direct_term = next((term for term in technical_terms if term and term in normalized and term in profile_text), "")
+                if direct_term:
+                    evidence = next((line for line in evidence_lines if direct_term in normalize_requirement(line)), "")
+                    direct_lexical_match = bool(evidence)
+            if not evidence and permit_semantic_evidence:
                 evidence = normalize_space(source_match.get("matched_resume_evidence"))
-            enriched.append({**item, "matched_resume_evidence": evidence, "confidence": source_match.get("confidence", 100 if evidence and normalized in profile_text else 0), "match_type": source_match.get("match_type", "direct" if evidence and normalized in profile_text else "missing")})
+            enriched.append({
+                **item,
+                "matched_resume_evidence": evidence,
+                "confidence": 100 if direct_lexical_match else source_match.get("confidence", 0),
+                "match_type": "direct" if direct_lexical_match else source_match.get("match_type", "missing"),
+            })
         return enriched
 
-    required = enrich(required)
-    preferred = enrich(preferred)
+    def snapshot(source_text: str, permit_semantic_evidence: bool) -> dict[str, Any]:
+        required_items = enrich(required, source_text, permit_semantic_evidence)
+        preferred_items = enrich(preferred, source_text, permit_semantic_evidence)
+        required_covered, required_potential, required_unsupported = classify(required_items)
+        preferred_covered, preferred_potential, preferred_unsupported = classify(preferred_items)
+        required_total = len(required_items)
+        required_coverage = round((len(required_covered) / required_total) * 100) if required_total else 100
+        return {
+            "required": {
+                "covered": required_covered,
+                "potential_safe_substitutions": required_potential,
+                "unsupported": required_unsupported,
+                "coverage_percent": required_coverage,
+                "total": required_total,
+            },
+            "preferred": {
+                "covered": preferred_covered,
+                "potential_safe_substitutions": preferred_potential,
+                "unsupported": preferred_unsupported,
+                "coverage_percent": round((len(preferred_covered) / len(preferred_items)) * 100) if preferred_items else 100,
+                "total": len(preferred_items),
+            },
+        }
 
     def classify(items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
         covered: list[dict[str, Any]] = []
@@ -6465,19 +6566,18 @@ def build_keyword_coverage_report(
                 unsupported.append(record)
         return covered, potential, unsupported
 
-    required_covered, required_potential, required_unsupported = classify(required)
-    preferred_covered, preferred_potential, preferred_unsupported = classify(preferred)
-    required_total = len(required)
-    required_coverage = round((len(required_covered) / required_total) * 100) if required_total else 100
+    before = snapshot(baseline_text, True)
+    after = snapshot(final_resume_text or baseline_text, not bool(final_resume_text))
+    required_unsupported = after["required"]["unsupported"]
     critical_groups = {item["group"] for item in required_unsupported if item.get("group")}
     warnings: list[str] = []
-    if required_total and required_coverage < 60:
+    if after["required"]["total"] and after["required"]["coverage_percent"] < 60:
         warnings.append("Review job fit: required-skill coverage is below 60%.")
     if len(critical_groups) >= 3:
         warnings.append("Review job fit: at least 3 critical required-skill groups are unsupported.")
 
     job_text = normalize_requirement(" ".join(text(job.get(field)) for field in ["title", "required_skills", "preferred_skills", "responsibilities", "job_description"]))
-    profile_text = normalize_requirement(" ".join(text(profile.get(field)) for field in ["work_experience", "key_skills", "education", "projects", "resume_text"]))
+    profile_text = normalize_requirement(final_resume_text or baseline_text)
     eligibility: list[dict[str, str]] = []
     if any(term in job_text for term in ["in person", "commute", "relocate", "on-site", "onsite"]):
         if not any(term in profile_text for term in ["toronto", "abbotsford", "relocate", "commute"]):
@@ -6489,20 +6589,10 @@ def build_keyword_coverage_report(
         eligibility.append({"type": "experience", "message": "Required years of experience are not explicitly established in the résumé."})
 
     return {
-        "required": {
-            "covered": required_covered,
-            "potential_safe_substitutions": required_potential,
-            "unsupported": required_unsupported,
-            "coverage_percent": required_coverage,
-            "total": required_total,
-        },
-        "preferred": {
-            "covered": preferred_covered,
-            "potential_safe_substitutions": preferred_potential,
-            "unsupported": preferred_unsupported,
-            "coverage_percent": round((len(preferred_covered) / len(preferred)) * 100) if preferred else 100,
-            "total": len(preferred),
-        },
+        # Top-level fields remain the final rendered-DOCX view for existing API clients.
+        **after,
+        "before": before,
+        "after": after,
         "warnings": warnings,
         "review_job_fit": bool(warnings),
         "critical_unsupported_groups": sorted(critical_groups),

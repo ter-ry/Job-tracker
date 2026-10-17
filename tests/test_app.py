@@ -1844,6 +1844,107 @@ class JobAssistantTest(unittest.TestCase):
         self.assertTrue(any("below 60%" in warning for warning in report["warnings"]))
         self.assertTrue(any(item["requirement"] == "Kubernetes" for item in report["required"]["unsupported"]))
 
+    def test_nodejs_alias_substitution_preserves_word_layout_and_reports_final_docx_coverage(self):
+        master = Path(self.tmpdir.name) / "nodejs_alias_master.docx"
+        document = Document()
+        section = document.sections[0]
+        section.top_margin = Inches(0.55)
+        section.bottom_margin = Inches(0.55)
+        section.left_margin = Inches(0.45)
+        section.right_margin = Inches(0.45)
+        title = document.add_paragraph()
+        title.add_run("Alex Morgan").bold = True
+        summary = document.add_paragraph("Software developer focused on reliable internal tools.")
+        document.add_paragraph("Work Experience", style="Heading 1")
+        experience = document.add_paragraph(style="List Bullet")
+        experience.add_run("Built NodeJS services and reduced review time by 35%.")
+        document.add_paragraph("Skills", style="Heading 1")
+        skills = document.add_paragraph("Skills: NodeJS, SQL")
+        for paragraph in document.paragraphs:
+            for run in paragraph.runs:
+                run.font.name = "Aptos"
+                run.font.size = Pt(10)
+        document.save(master)
+        master_before = master.read_bytes()
+
+        self.client.post(
+            "/api/profile",
+            json={
+                "name": "Alex Morgan",
+                "key_skills": "NodeJS, SQL",
+                "work_experience": "Built NodeJS services and reduced review time by 35%.",
+                "resume_text": "Built NodeJS services and reduced review time by 35%.",
+            },
+        )
+        self.upload_resume_template(master)
+        created = self.client.post(
+            "/api/shortlist",
+            json={
+                "company": "Example Systems",
+                "title": "Software Developer",
+                "job_description": "Requirements: Node.js experience. Preferred: SQL.",
+                "required_skills": "Node.js",
+                "preferred_skills": "SQL",
+            },
+        ).get_json()
+        self.assertEqual(created["resume_generation_status"], "generated", created)
+        resume_path = Path(created["resume_docx_path"])
+        self.assertEqual(master_before, master.read_bytes())
+
+        comparison = resume_layout.compare_docx_layout(master, resume_path)
+        self.assertTrue(comparison["available"], comparison.get("reason"))
+        self.assertTrue(comparison["verified"], comparison)
+        self.assertEqual(comparison["original_pages"], 1)
+        self.assertEqual(comparison["candidate_pages"], 1)
+
+        tailored = Document(resume_path)
+        tailored_text = "\n".join(paragraph.text for paragraph in tailored.paragraphs)
+        change_log = json.loads((resume_path.parent / "resume_change_log.json").read_text(encoding="utf-8"))
+        self.assertIn("Built Node.js services and reduced review time by 35%.", tailored_text, change_log)
+        self.assertNotIn("Built NodeJS services", tailored_text)
+        self.assertIn("35%", tailored_text)
+        self.assertEqual(document.paragraphs[3].style.name, tailored.paragraphs[3].style.name)
+        self.assertEqual(document.paragraphs[3].runs[0].font.size, tailored.paragraphs[3].runs[0].font.size)
+        del tailored
+
+        self.assertTrue(any(
+            "NodeJS" in item.get("original", "") and "Node.js" in item.get("replacement", "")
+            for item in change_log["applied"]
+        ))
+        preview = self.client.get(f"/api/shortlist/{created['id']}/preview").get_json()
+        downloaded = self.client.get(f"/api/shortlist/{created['id']}/resume")
+        self.assertEqual(downloaded.status_code, 200)
+        downloaded_document = Document(io.BytesIO(downloaded.data))
+        downloaded_text = "\n".join(
+            paragraph.text for paragraph in app_module.iter_document_paragraphs(downloaded_document) if paragraph.text.strip()
+        )
+        del downloaded_document
+        downloaded.close()
+        self.assertEqual(preview["resume_source"], "successful_docx")
+        self.assertEqual(preview["resume"], downloaded_text)
+        self.assertIn("Node.js", preview["resume"])
+
+        metadata = json.loads((resume_path.parent / "metadata.json").read_text(encoding="utf-8"))
+        coverage = metadata["keyword_coverage"]
+        self.assertIn("before", coverage)
+        self.assertIn("after", coverage)
+        self.assertEqual(coverage["after"]["required"]["coverage_percent"], coverage["required"]["coverage_percent"])
+        self.assertEqual(coverage["before"]["required"]["coverage_percent"], coverage["after"]["required"]["coverage_percent"])
+        self.assertTrue(any("node.js" in item["requirement"].lower() for item in coverage["after"]["required"]["covered"]))
+        self.assertTrue(any("sql" in item["requirement"].lower() for item in coverage["after"]["preferred"]["covered"]))
+        gc.collect()
+
+    def test_keyword_coverage_ignores_incidental_description_mentions_without_requirement_labels(self):
+        job = {
+            "title": "Software Developer",
+            "job_description": "Our team uses Kubernetes for one internal service. Requirements: Node.js experience. Preferred: SQL.",
+        }
+        profile = {"work_experience": "Built NodeJS services for reporting.", "key_skills": "NodeJS"}
+        report = app_module.build_keyword_coverage_report(job, profile, {"matches": []})
+        requirements = [item["requirement"] for item in report["required"]["covered"] + report["required"]["unsupported"]]
+        self.assertTrue(any("node.js" in requirement.lower() for requirement in requirements))
+        self.assertNotIn("Kubernetes", requirements)
+
     def test_cover_letter_template_upload_and_placeholder_replacement(self):
         self.seed_profile_for_documents(with_template=True)
         profile = self.client.get("/api/profile").get_json()

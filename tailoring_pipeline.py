@@ -5,7 +5,7 @@ from datetime import date
 from dataclasses import dataclass
 from typing import Any
 
-from grounding import TECHNICAL_TERMS, build_candidate_evidence, classify_keyword_dump_reason, contains_contact_details, contains_phrase, contains_resume_section_heading, normalize_space, split_sentences, useful_tokens
+from grounding import TECHNICAL_TERMS, build_candidate_evidence, classify_keyword_dump_reason, contains_contact_details, contains_phrase, contains_resume_section_heading, normalize_equivalent_technology_terms, normalize_space, split_sentences, useful_tokens
 from semantic_matching import extract_resume_evidence, keyword_overlap, lexical_similarity
 
 
@@ -267,7 +267,15 @@ def match_job_phrase(
 ) -> dict[str, Any]:
     job_phrase = phrase["phrase"]
     best_match = _best_semantic_match(job_phrase, phrase["category"], semantic_result.get("matches", []), resume_evidence, evidence_index)
-    evidence_item = evidence_index.get(normalize_space(best_match.get("matched_resume_evidence", ""))) if best_match else None
+    canonical_phrase = normalize_equivalent_technology_terms(job_phrase)
+    equivalent_evidence_item = next(
+        (
+            item for item in resume_evidence
+            if canonical_phrase and contains_phrase(normalize_equivalent_technology_terms(item.get("text", "")), canonical_phrase)
+        ),
+        None,
+    )
+    evidence_item = equivalent_evidence_item or (evidence_index.get(normalize_space(best_match.get("matched_resume_evidence", ""))) if best_match else None)
     if evidence_item is None and best_match and best_match.get("matched_resume_evidence"):
         evidence_item = {
             "text": best_match["matched_resume_evidence"],
@@ -281,6 +289,13 @@ def match_job_phrase(
     exact_overlap = round(keyword_overlap(job_phrase, evidence_item.get("text", "")), 3)
     semantic_similarity = round(float(best_match.get("semantic_similarity", 0)) if best_match else lexical_similarity(job_phrase, evidence_item.get("text", "")), 3)
     confidence = int(best_match.get("confidence", 0)) if best_match else int(round((semantic_similarity * 70) + (exact_overlap * 30)))
+    equivalent_phrase = canonical_phrase
+    equivalent_evidence = normalize_equivalent_technology_terms(evidence_item.get("text", ""))
+    equivalent_direct_match = bool(equivalent_phrase and contains_phrase(equivalent_evidence, equivalent_phrase))
+    if equivalent_direct_match:
+        exact_overlap = max(exact_overlap, 1.0)
+        semantic_similarity = max(semantic_similarity, 1.0)
+        confidence = max(confidence, 90)
     grounded = _phrase_is_supported(job_phrase, evidence_item, candidate_evidence)
     unsupported_terms = _unsupported_terms(job_phrase, candidate_evidence, evidence_item)
     return {
@@ -292,7 +307,7 @@ def match_job_phrase(
         "evidence_section": evidence_item.get("source_section") or evidence_item.get("evidence_type") or "uploaded resume text",
         "semantic_similarity": semantic_similarity,
         "exact_keyword_overlap": exact_overlap,
-        "match_type": best_match.get("match_type", "transferable") if best_match else ("direct" if exact_overlap >= 0.35 else "transferable"),
+        "match_type": "direct" if equivalent_direct_match else (best_match.get("match_type", "transferable") if best_match else ("direct" if exact_overlap >= 0.35 else "transferable")),
         "confidence": confidence,
         "unsupported_terms": unsupported_terms,
         "evidence_id": _stable_id(evidence_item.get("text", "")),
@@ -1165,8 +1180,8 @@ def _fallback_evidence(job_phrase: str, resume_evidence: list[dict[str, Any]]) -
 
 
 def _phrase_is_supported(job_phrase: str, evidence_item: dict[str, Any], candidate_evidence: dict[str, Any]) -> bool:
-    evidence_text = f"{evidence_item.get('text', '')} {candidate_evidence.get('full_text', '')}".lower()
-    tokens = useful_tokens(job_phrase)
+    evidence_text = normalize_equivalent_technology_terms(f"{evidence_item.get('text', '')} {candidate_evidence.get('full_text', '')}")
+    tokens = useful_tokens(normalize_equivalent_technology_terms(job_phrase))
     if not tokens:
         return False
     hits = sum(1 for token in tokens if token in evidence_text)
@@ -1174,8 +1189,8 @@ def _phrase_is_supported(job_phrase: str, evidence_item: dict[str, Any], candida
 
 
 def _unsupported_terms(job_phrase: str, candidate_evidence: dict[str, Any], evidence_item: dict[str, Any]) -> list[str]:
-    tokens = useful_tokens(job_phrase)
-    available = useful_tokens(candidate_evidence.get("full_text", "") + " " + evidence_item.get("text", ""))
+    tokens = useful_tokens(normalize_equivalent_technology_terms(job_phrase))
+    available = useful_tokens(normalize_equivalent_technology_terms(candidate_evidence.get("full_text", "") + " " + evidence_item.get("text", "")))
     return sorted(token for token in tokens if token not in available)
 
 
