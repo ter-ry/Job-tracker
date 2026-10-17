@@ -183,22 +183,38 @@ def build_candidate_evidence(profile: dict[str, Any], extra_sections: list[dict[
             {
                 "field": str(item.get("source_field") or item.get("field") or "approved_evidence"),
                 "label": str(item.get("source_label") or item.get("label") or "approved evidence"),
-                "text": text_value,
+                "text": preserve_evidence_boundaries(text_value),
                 "id": item.get("id"),
                 "source_kind": str(item.get("source_kind") or "approved_evidence"),
                 "approved": True,
             }
         )
-    for field, label in PROFILE_EVIDENCE_FIELDS:
-        content = normalize_space(str(profile.get(field) or ""))
-        if field == "resume_text" and content and is_corrupted_text(content):
-            continue
-        if content:
-            sections.append({"field": field, "label": label, "text": content})
+    resume_sections = profile.get("_resume_sections")
+    if isinstance(resume_sections, list) and resume_sections:
+        for item in resume_sections:
+            if not isinstance(item, dict):
+                continue
+            value = preserve_evidence_boundaries(str(item.get("text") or item.get("content") or ""))
+            if value:
+                sections.append(
+                    {
+                        "field": "selected_resume",
+                        "label": str(item.get("label") or "Résumé"),
+                        "text": value,
+                    }
+                )
+    else:
+        for field, label in PROFILE_EVIDENCE_FIELDS:
+            content = str(profile.get(field) or "")
+            if field == "resume_text" and content and is_corrupted_text(content):
+                continue
+            if content:
+                sections.append({"field": field, "label": label, "text": preserve_evidence_boundaries(content)})
     full_text = normalize_space(" ".join(section["text"] for section in sections))
     skills = split_profile_skills(str(profile.get("key_skills") or ""))
     return {
         "sections": sections,
+        "units": evidence_units(sections),
         "full_text": full_text,
         "tokens": sorted(useful_tokens(full_text)),
         "skills": skills,
@@ -217,6 +233,43 @@ def build_candidate_evidence(profile: dict[str, Any], extra_sections: list[dict[
             )
         ),
     }
+
+
+def preserve_evidence_boundaries(value: str) -> str:
+    """Normalize spacing without erasing résumé paragraph or line boundaries."""
+    return "\n".join(normalize_space(line) for line in str(value or "").splitlines() if normalize_space(line))
+
+
+def evidence_units(sections: list[dict[str, Any]]) -> list[dict[str, str]]:
+    units: list[dict[str, str]] = []
+    for section in sections:
+        for line in str(section.get("text") or "").splitlines():
+            clean_line = normalize_space(line)
+            if not clean_line:
+                continue
+            sentences = split_sentences(clean_line)
+            for sentence in sentences or [clean_line]:
+                units.append({"section": str(section.get("label") or "Résumé"), "text": sentence})
+    return units
+
+
+def evidence_snippet(value: str, phrase: str, minimum: int = 80, maximum: int = 160) -> str:
+    clean = normalize_space(value)
+    if len(clean) <= maximum:
+        return clean
+    match = re.search(re.escape(phrase), clean, re.IGNORECASE)
+    if not match:
+        return clean[:maximum].rstrip() + "…"
+    start = max(0, match.start() - maximum // 3)
+    end = min(len(clean), start + maximum)
+    if end - start < minimum:
+        start = max(0, end - minimum)
+    snippet = clean[start:end].strip()
+    if start > 0:
+        snippet = "…" + snippet
+    if end < len(clean):
+        snippet += "…"
+    return snippet if len(snippet) <= maximum else snippet[: maximum - 1].rstrip() + "…"
 
 
 def evidence_has_generation_source(evidence: dict[str, Any]) -> bool:
@@ -317,6 +370,7 @@ def extract_job_keywords(job: dict[str, Any]) -> list[dict[str, Any]]:
 def match_job_keywords_to_resume(job: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
     evidence = build_candidate_evidence(profile)
     full_text = evidence.get("full_text") or ""
+    units = evidence.get("units") or []
     records = {"matched": [], "related": [], "missing": []}
     for keyword in extract_job_keywords(job):
         normalized = keyword["normalized"]
@@ -325,16 +379,29 @@ def match_job_keywords_to_resume(job: dict[str, Any], profile: dict[str, Any]) -
             keyword_present(full_text, source) and normalize_keyword(source) == normalized
             for source in [keyword["keyword"], normalized, *KEYWORD_ALIASES.keys(), *KEYWORD_ALIASES.values()]
         )
-        evidence_text = next((section["text"] for section in evidence.get("sections", []) if keyword_present(section["text"], keyword["keyword"]) or keyword_present(section["text"], normalized)), "")
-        record = {**keyword, "match_type": "exact" if exact else "equivalent" if equivalent else "missing", "evidence": evidence_text}
+        source_phrase = keyword["keyword"]
+        if equivalent and not exact:
+            source_phrase = next(
+                (candidate for candidate in [keyword["keyword"], normalized, *KEYWORD_ALIASES.keys(), *KEYWORD_ALIASES.values()] if keyword_present(full_text, candidate) and normalize_keyword(candidate) == normalized),
+                keyword["keyword"],
+            )
+        evidence_unit = next((unit for unit in units if keyword_present(unit["text"], source_phrase) or keyword_present(unit["text"], normalized)), None)
+        record = {
+            **keyword,
+            "match_type": "exact" if exact else "equivalent" if equivalent else "missing",
+            "found_as": source_phrase if exact or equivalent else "",
+            "source_section": evidence_unit.get("section", "Résumé") if evidence_unit else "Résumé",
+            "evidence": evidence_snippet(evidence_unit["text"], source_phrase) if evidence_unit and (exact or equivalent) else "",
+        }
         if exact or equivalent:
             records["matched"].append(record)
             continue
         related_terms = RELATED_KEYWORD_EVIDENCE.get(normalized, ())
-        related_evidence = next((section["text"] for section in evidence.get("sections", []) if any(keyword_present(section["text"], term) or term in section["text"].lower() for term in related_terms)), "")
-        if related_evidence:
+        related_unit = next((unit for unit in units if any(keyword_present(unit["text"], term) or term in unit["text"].lower() for term in related_terms)), None)
+        if related_unit:
             record["match_type"] = "related_review"
-            record["evidence"] = related_evidence
+            record["source_section"] = related_unit.get("section", "Résumé")
+            record["evidence"] = evidence_snippet(related_unit["text"], next((term for term in related_terms if keyword_present(related_unit["text"], term)), related_terms[0] if related_terms else ""))
             records["related"].append(record)
         else:
             records["missing"].append(record)
@@ -345,6 +412,8 @@ def build_keywords_score_report(job: dict[str, Any], profile: dict[str, Any], fi
     """Return an explainable keyword score; related evidence is never counted."""
     selected_resume = final_resume_text if final_resume_text is not None else str(profile.get("resume_text") or "")
     selected_profile = {"resume_text": selected_resume} if selected_resume else profile
+    if profile.get("_resume_sections") and final_resume_text is None:
+        selected_profile["_resume_sections"] = profile["_resume_sections"]
     result = match_job_keywords_to_resume(job, selected_profile)
     inventory = extract_job_keywords(job)
     matched = result["matched"]

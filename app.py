@@ -840,8 +840,7 @@ def create_app() -> Flask:
             if selected_profile is None and not profile_has_generation_source(profile):
                 raise ValueError("Complete the Profile page with resume, project, or work-experience details before reviewing Keywords Score")
             job = job_to_dict(row)
-            selected_resume_text = text(profile.get("resume_text"))
-            score = build_keywords_score_report(job, profile, final_resume_text=selected_resume_text)
+            score = build_keywords_score_report(job, profile)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         return jsonify(
@@ -1971,6 +1970,17 @@ def resolve_generation_profile(payload: dict[str, Any] | None) -> dict[str, Any]
     })
     if structured_resume.get("summary"):
         profile["_source_summary"] = structured_resume["summary"]
+    profile["_resume_sections"] = [
+        {"label": label, "text": structured_resume.get(field, "")}
+        for field, label in (
+            ("summary", "Summary"),
+            ("work_experience", "Experience"),
+            ("key_skills", "Skills, Technologies"),
+            ("projects", "Projects"),
+            ("education", "Education"),
+        )
+        if text(structured_resume.get(field))
+    ]
     profile["_candidate_profile_id"] = str(profile_id)
     return profile
 
@@ -6237,7 +6247,7 @@ def score_job(job: dict[str, Any], profile: dict[str, str], semantic_result: dic
             text(job.get("job_description")),
         ]
     ).lower()
-    profile_text = " ".join(profile.values()).lower()
+    profile_text = " ".join(text(value) for key, value in profile.items() if not str(key).startswith("_")).lower()
     skill_hits = keyword_hits(content, REWARD_KEYWORDS)
     supported_hits = [hit for hit in skill_hits if contains_phrase(profile_text, hit)]
     penalties = keyword_hits(content, PENALTY_KEYWORDS)

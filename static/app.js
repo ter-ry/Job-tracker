@@ -893,14 +893,19 @@ function renderKeywordCoverage(report) {
   if (!report) return "";
   const score = report.keywords_score || {};
   const list = (items, empty) => Array.isArray(items) && items.length
-    ? `<ul class="review-list">${items.map((item) => `<li><strong>${escapeHtml(item.requirement || "Requirement")}</strong><div>${escapeHtml(item.evidence || item.message || "")}</div></li>`).join("")}</ul>`
+    ? `<div class="keyword-records">${items.map((item) => {
+      const keyword = item.keyword || item.normalized || item.requirement || "Keyword";
+      const status = item.match_type === "equivalent" ? "Equivalent" : item.match_type === "exact" ? "Exact" : item.match_type === "related_review" ? "Related" : "Missing";
+      const category = item.requirement_type || "unclassified";
+      const detail = item.evidence
+        ? `<div class="keyword-evidence"><strong>Found as:</strong> ${escapeHtml(item.found_as || keyword)}<br><strong>Source:</strong> ${escapeHtml(item.source_section || "Résumé")}<br><strong>Evidence:</strong> ${escapeHtml(item.evidence)}</div>`
+        : `<div class="keyword-evidence muted">No résumé evidence recorded.</div>`;
+      return `<details class="keyword-record"><summary><span class="keyword-chip">${escapeHtml(keyword)}</span><span class="keyword-status">${escapeHtml(status)}</span><span class="keyword-category">${escapeHtml(category)}</span></summary>${detail}</details>`;
+    }).join("")}</div>`
     : `<p class="muted">${escapeHtml(empty)}</p>`;
   const eligibility = Array.isArray(report.eligibility_concerns) && report.eligibility_concerns.length
     ? `<h4>Eligibility concerns</h4>${list(report.eligibility_concerns, "None")}`
     : `<p class="muted">No nontechnical eligibility concerns.</p>`;
-  const keywordItems = (items, empty) => Array.isArray(items) && items.length
-    ? `<ul class="review-list">${items.map((item) => `<li><strong>${escapeHtml(item.keyword || item.normalized || "Keyword")}</strong><div>${escapeHtml(item.evidence || "No résumé evidence recorded")}</div><span class="muted">${escapeHtml(item.match_type || item.requirement_type || "")}</span></li>`).join("")}</ul>`
-    : `<p class="muted">${escapeHtml(empty)}</p>`;
   const preferredScore = score.preferred && score.preferred.status === "assessed"
     ? `${Number(score.preferred.score_percent || 0)}% (${Number(score.preferred.matched || 0)}/${Number(score.preferred.total || 0)})`
     : "Not assessed";
@@ -909,11 +914,11 @@ function renderKeywordCoverage(report) {
       <h3>Keywords Score</h3>
       <p><strong>${Number(score.score_percent || 0)}%</strong> · ${Number(score.matched_count || 0)}/${Number(score.total || 0)} eligible keywords matched</p>
       <p><strong>Required (explicitly classified only):</strong> ${score.required && score.required.status === "assessed" ? `${Number(score.required.score_percent || 0)}% (${Number(score.required.matched || 0)}/${Number(score.required.total || 0)})` : "Not assessed"} · <strong>Preferred:</strong> ${preferredScore}</p>
+      <p class="muted">Keywords Score measures coverage in the selected résumé. Overall Fit is a separate job prioritization metric and may use the saved active profile.</p>
       ${score.review_before_applying ? `<p class="risk medium"><strong>Review job fit</strong><br>Coverage is below the configurable ${Number(score.review_threshold_percent || 70)}% review guideline.</p>` : `<p class="muted">No keyword coverage review warning.</p>`}
-      <h4>Matched</h4>${keywordItems(score.matched, "No exact or equivalent keyword matches.")}
-      <h4>Related evidence for review</h4>${keywordItems(score.related, "None identified.")}
-      <h4>Missing</h4>${keywordItems(score.missing, "No eligible keywords missing.")}
-      <h4>Unclassified inventory</h4>${keywordItems(score.unclassified_keywords, "No unclassified keywords.")}
+      <h4>Matched</h4>${list(score.matched, "No exact or equivalent keyword matches.")}
+      <h4>Related evidence for review</h4>${list(score.related, "None identified.")}
+      <h4>Missing</h4>${list(score.missing, "No eligible keywords missing.")}
       <p class="muted">${escapeHtml(score.heuristic_note || "Keyword coverage is a review heuristic, not a hiring decision.")}</p>
     </section>` : "";
   return `
@@ -2048,7 +2053,8 @@ function renderShortlistCard(job) {
           <h3>${escapeHtml(job.title || "Untitled role")}</h3>
           <p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(job.location || "Location unavailable")}</p>
           <p class="muted">${escapeHtml(job.source || "")} · ${escapeHtml(salaryLabel)} · Shortlisted ${escapeHtml(job.date_shortlisted || job.date_added || "")}</p>
-          <p>${scorePill(job.fit_score)} <span class="muted">${miniBreakdown(job)}</span></p>
+          <p><strong>Overall Fit</strong> ${scorePill(job.fit_score)} <span class="muted">${miniBreakdown(job)}</span></p>
+          <p class="muted">Overall Fit prioritizes the job using saved profile, role, location, salary and seniority signals. It is separate from Keywords Score.</p>
           <p class="muted">Résumé: ${escapeHtml(resumeStatus)}${resumePrevious}</p>
           ${resumeError}
           <p class="muted">Cover letter: ${escapeHtml(coverStatus)}${coverPrevious}</p>

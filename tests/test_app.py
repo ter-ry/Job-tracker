@@ -1900,6 +1900,30 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("python", missing)
         self.assertTrue(all("saved profile" not in item["evidence"] for item in report["matched"]))
 
+    def test_keywords_score_returns_bounded_source_evidence_and_actual_alias_spelling(self):
+        job = {
+            "title": "Software Engineer",
+            "job_description": "Requirements: Node.js and DevOps. Preferred: Kafka.",
+            "required_skills": "Node.js, DevOps",
+            "preferred_skills": "Kafka",
+        }
+        long_resume = "NodeJS, Express, REST APIs, PostgreSQL. Deployed cloud applications to production. " + ("Additional unrelated résumé detail. " * 30)
+        profile = {
+            "resume_text": long_resume,
+            "_resume_sections": [{"label": "Skills, Technologies", "text": long_resume}],
+        }
+        report = grounding.build_keywords_score_report(job, profile)
+        node = next(item for item in report["matched"] if item["normalized"] == "node.js")
+        self.assertEqual(node["match_type"], "equivalent")
+        self.assertEqual(node["found_as"], "nodejs")
+        self.assertEqual(node["source_section"], "Skills, Technologies")
+        self.assertLessEqual(len(node["evidence"]), 160)
+        self.assertNotIn("Additional unrelated", node["evidence"])
+        related = next(item for item in report["related"] if item["normalized"] == "devops")
+        self.assertLessEqual(len(related["evidence"]), 160)
+        kafka = next(item for item in report["missing"] if item["normalized"] == "kafka")
+        self.assertEqual(kafka["evidence"], "")
+
     def test_keywords_score_deduplicates_overlapping_aliases(self):
         job = {
             "title": "Web Engineer",
