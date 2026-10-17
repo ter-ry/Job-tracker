@@ -74,6 +74,7 @@ KEYWORD_VOCABULARY = [
     "c++", "c#", ".net", "node.js", "nodejs", "javascript", "typescript", "python", "java", "php", "html", "css", "sql",
     "flask", "react", "express", "jwt", "nginx", "linux", "windows", "debian", "ubuntu", "aws", "azure", "kafka",
     "figma", "jira", "git", "github", "bitbucket", "devops", "paas", "api", "apis", "rest api", "rest apis", "restful apis",
+    "java script",
     "database", "database design", "postgresql", "postgres", "backend", "back-end", "frontend", "front-end", "ai", "tcp", "tcp/ip",
     "ip networking", "design patterns", "development life cycle", "object oriented programming", "data solutions", "video analytics",
     "thermal cameras", "performance monitoring", "virtualization", "message queues", "gps mapping", "telematics",
@@ -237,7 +238,7 @@ def job_text(job: dict[str, Any]) -> str:
 
 
 def normalize_keyword(value: str) -> str:
-    clean = normalize_space(value).lower().strip(" .,:;()[]{}")
+    clean = normalize_space(value).lower().strip(" ,:;()[]{}")
     return KEYWORD_ALIASES.get(clean, clean)
 
 
@@ -252,17 +253,26 @@ def keyword_present(content: str, phrase: str) -> bool:
 
 def _keyword_requirement_type(job: dict[str, Any], term: str) -> str:
     sources = []
-    for field, kind in (("required_skills", "required"), ("responsibilities", "required"), ("preferred_skills", "preferred")):
+    for field, kind in (("required_skills", "required"), ("preferred_skills", "preferred")):
         value = str(job.get(field) or "")
         if value and keyword_present(value, term):
             sources.append(kind)
     description = str(job.get("job_description") or "")
-    for match in re.finditer(rf"(?<![A-Za-z0-9]){re.escape(term)}(?![A-Za-z0-9])", description, re.IGNORECASE):
-        context = description[max(0, match.start() - 180):match.end() + 120].lower()
-        if re.search(r"\b(preferred|nice to have|bonus|asset)\b", context):
+    section = "unclassified"
+    for line in description.splitlines():
+        clean = normalize_space(line).lower()
+        if re.search(r"\b(preferred|nice to have|bonus|assets?)\b\s*:?$", clean):
+            section = "preferred"
+        elif re.search(r"\b(required|requirements|minimum qualifications|qualifications)\b\s*:?$", clean):
+            section = "required"
+        if not keyword_present(line, term):
+            continue
+        if re.search(r"\b(preferred|nice to have|bonus|asset)\b\s*:", clean):
             sources.append("preferred")
-        elif re.search(r"\b(required|must have|minimum|qualifications|requirements)\b", context):
+        elif re.search(r"\b(required|requirements|must have|minimum qualifications|qualifications)\b\s*:", clean):
             sources.append("required")
+        elif section in {"required", "preferred"}:
+            sources.append(section)
     if "required" in sources:
         return "required"
     if "preferred" in sources:
@@ -291,7 +301,17 @@ def extract_job_keywords(job: dict[str, Any]) -> list[dict[str, Any]]:
         for field in ("required_skills", "preferred_skills", "responsibilities", "job_description"):
             if keyword_present(str(job.get(field) or ""), term) and field not in record["source_fields"]:
                 record["source_fields"].append(field)
-    return sorted(found.values(), key=lambda item: (item["requirement_type"] == "unclassified", item["normalized"]))
+    records = list(found.values())
+    redundant = set()
+    for shorter in records:
+        for longer in records:
+            if shorter is longer or shorter["normalized"] == longer["normalized"]:
+                continue
+            if len(longer["keyword"]) > len(shorter["keyword"]) and keyword_present(longer["keyword"], shorter["keyword"]):
+                redundant.add(shorter["normalized"])
+                break
+    records = [item for item in records if item["normalized"] not in redundant]
+    return sorted(records, key=lambda item: (item["requirement_type"] == "unclassified", item["normalized"]))
 
 
 def match_job_keywords_to_resume(job: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
@@ -323,10 +343,9 @@ def match_job_keywords_to_resume(job: dict[str, Any], profile: dict[str, Any]) -
 
 def build_keywords_score_report(job: dict[str, Any], profile: dict[str, Any], final_resume_text: str | None = None) -> dict[str, Any]:
     """Return an explainable keyword score; related evidence is never counted."""
-    if final_resume_text is None:
-        result = match_job_keywords_to_resume(job, profile)
-    else:
-        result = match_job_keywords_to_resume(job, {**profile, "resume_text": final_resume_text})
+    selected_resume = final_resume_text if final_resume_text is not None else str(profile.get("resume_text") or "")
+    selected_profile = {"resume_text": selected_resume} if selected_resume else profile
+    result = match_job_keywords_to_resume(job, selected_profile)
     inventory = extract_job_keywords(job)
     matched = result["matched"]
     required = [item for item in inventory if item["requirement_type"] == "required"]

@@ -891,14 +891,12 @@ function scoreItem(label, value) {
 function renderKeywordCoverage(report) {
   if (!report) return "";
   const score = report.keywords_score || {};
-  const required = report.required || {};
-  const preferred = report.preferred || {};
   const list = (items, empty) => Array.isArray(items) && items.length
     ? `<ul class="review-list">${items.map((item) => `<li><strong>${escapeHtml(item.requirement || "Requirement")}</strong><div>${escapeHtml(item.evidence || item.message || "")}</div></li>`).join("")}</ul>`
     : `<p class="muted">${escapeHtml(empty)}</p>`;
   const warnings = Array.isArray(report.warnings) && report.warnings.length
-    ? `<p class="risk medium"><strong>Review job fit</strong><br>${report.warnings.map(escapeHtml).join("<br>")}</p>`
-    : `<p class="muted">No configured review threshold was crossed.</p>`;
+    ? `<h4>Nontechnical job fit warnings</h4><p class="risk medium">${report.warnings.map(escapeHtml).join("<br>")}</p>`
+    : "";
   const eligibility = Array.isArray(report.eligibility_concerns) && report.eligibility_concerns.length
     ? `<h4>Eligibility concerns</h4>${list(report.eligibility_concerns, "None")}`
     : "";
@@ -922,14 +920,10 @@ function renderKeywordCoverage(report) {
   return `
     ${scoreSection}
     <section>
-      <h3>Job fit and keyword coverage</h3>
-      <p><strong>Required coverage:</strong> ${Number(required.coverage_percent || 0)}% · <strong>Preferred coverage:</strong> ${Number(preferred.coverage_percent || 0)}%</p>
+      <h3>Job fit warnings</h3>
       ${warnings}
-      <h4>Already covered</h4>${list(required.covered, "No required requirements directly covered.")}
-      <h4>Potential safe substitutions</h4>${list(required.potential_safe_substitutions, "None identified.")}
-      <h4>Not established</h4>${list(required.unsupported, "None identified.")}
+      ${warnings ? "" : `<p class="muted">No nontechnical job-fit warnings.</p>`}
       ${eligibility}
-      <p class="muted">${escapeHtml(report.heuristic_note || "Coverage is a review heuristic, not a hiring decision.")}</p>
     </section>
   `;
 }

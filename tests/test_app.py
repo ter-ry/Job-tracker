@@ -1882,6 +1882,47 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(report["required"]["matched"], 0)
         self.assertTrue(report["review_before_applying"])
 
+    def test_keywords_score_uses_only_selected_resume_text(self):
+        job = {
+            "title": "Software Engineer",
+            "required_skills": "Python, JavaScript",
+            "job_description": "Requirements: Python and JavaScript.",
+        }
+        profile = {
+            "work_experience": "Built Python services for the saved profile.",
+            "key_skills": "Python",
+            "resume_text": "Selected resume evidence: Built JavaScript interfaces.",
+        }
+        report = grounding.build_keywords_score_report(job, profile, final_resume_text=profile["resume_text"])
+        matched = {item["normalized"] for item in report["matched"]}
+        missing = {item["normalized"] for item in report["missing"]}
+        self.assertIn("javascript", matched)
+        self.assertIn("python", missing)
+        self.assertTrue(all("saved profile" not in item["evidence"] for item in report["matched"]))
+
+    def test_keywords_score_deduplicates_overlapping_aliases(self):
+        job = {
+            "title": "Web Engineer",
+            "job_description": "NodeJS and Node.js, Java Script, back-end and backend, front-end and frontend, RESTful APIs, C++, C#, .NET and SQL.",
+        }
+        inventory = grounding.extract_job_keywords(job)
+        normalized = [item["normalized"] for item in inventory]
+        self.assertEqual(len(normalized), len(set(normalized)))
+        for expected in {"node.js", "javascript", "backend", "frontend", "rest apis", "c++", "c#", ".net", "sql"}:
+            self.assertIn(expected, normalized)
+        self.assertNotIn("java", normalized)
+        self.assertNotIn("api", normalized)
+
+    def test_keywords_score_requires_explicit_requirement_sections(self):
+        job = {
+            "title": "Platform Engineer",
+            "job_description": "Responsibilities:\nBuild Kafka services.\nPreferred:\nFigma experience.\nRequirements:\nPython experience.",
+        }
+        inventory = {item["normalized"]: item for item in grounding.extract_job_keywords(job)}
+        self.assertEqual(inventory["kafka"]["requirement_type"], "unclassified")
+        self.assertEqual(inventory["figma"]["requirement_type"], "preferred")
+        self.assertEqual(inventory["python"]["requirement_type"], "required")
+
     def test_nodejs_alias_substitution_preserves_word_layout_and_reports_final_docx_coverage(self):
         master = Path(self.tmpdir.name) / "nodejs_alias_master.docx"
         document = Document()
