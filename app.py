@@ -34,6 +34,7 @@ from grounding import (
     classify_keyword_dump_reason,
     contains_contact_details,
     contains_resume_section_heading,
+    build_keywords_score_report,
     evidence_has_generation_source,
     is_corrupted_text,
     job_keywords,
@@ -1811,6 +1812,8 @@ def generate_and_store_shortlist_documents(job_id: int, kinds: set[str] | None =
                 output.get("tailoring_plan"),
                 final_resume_text=final_resume_text,
             )
+            output["keywords_score"] = build_keywords_score_report(job, profile, final_resume_text=final_resume_text)
+            output["keyword_coverage"]["keywords_score"] = output["keywords_score"]
         except (OSError, ValueError, zipfile.BadZipFile):
             pass
 
@@ -6539,6 +6542,8 @@ def generate_application_materials(
         "cover_letter_ok": cover_validation["ok"],
     }
     keyword_coverage = build_keyword_coverage_report(job, profile, semantic, tailoring_plan)
+    keywords_score = build_keywords_score_report(job, profile)
+    keyword_coverage["keywords_score"] = keywords_score
     if raise_on_validation:
         if not resume_validation["ok"]:
             conflicts = ", ".join(resume_validation["conflicting_phrases"]) or "empty or corrupted candidate evidence"
@@ -6559,6 +6564,7 @@ def generate_application_materials(
         "job_hash": generation_job_hash(job),
         "validation": validation,
         "keyword_coverage": keyword_coverage,
+        "keywords_score": keywords_score,
         "summary": summary,
         "skills_section": skills_section,
         "resume_bullets": grounded_resume_lines or resume_lines,

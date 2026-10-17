@@ -890,6 +890,7 @@ function scoreItem(label, value) {
 
 function renderKeywordCoverage(report) {
   if (!report) return "";
+  const score = report.keywords_score || {};
   const required = report.required || {};
   const preferred = report.preferred || {};
   const list = (items, empty) => Array.isArray(items) && items.length
@@ -901,7 +902,25 @@ function renderKeywordCoverage(report) {
   const eligibility = Array.isArray(report.eligibility_concerns) && report.eligibility_concerns.length
     ? `<h4>Eligibility concerns</h4>${list(report.eligibility_concerns, "None")}`
     : "";
+  const keywordItems = (items, empty) => Array.isArray(items) && items.length
+    ? `<ul class="review-list">${items.map((item) => `<li><strong>${escapeHtml(item.keyword || item.normalized || "Keyword")}</strong><div>${escapeHtml(item.evidence || "No résumé evidence recorded")}</div><span class="muted">${escapeHtml(item.match_type || item.requirement_type || "")}</span></li>`).join("")}</ul>`
+    : `<p class="muted">${escapeHtml(empty)}</p>`;
+  const preferredScore = score.preferred && score.preferred.status === "assessed"
+    ? `${Number(score.preferred.score_percent || 0)}% (${Number(score.preferred.matched || 0)}/${Number(score.preferred.total || 0)})`
+    : "Not assessed";
+  const scoreSection = score.total != null ? `
+    <section class="keywords-score-panel">
+      <h3>Keywords Score</h3>
+      <p><strong>${Number(score.score_percent || 0)}%</strong> · ${Number(score.matched_count || 0)}/${Number(score.total || 0)} eligible keywords matched</p>
+      <p><strong>Required:</strong> ${score.required && score.required.status === "assessed" ? `${Number(score.required.score_percent || 0)}% (${Number(score.required.matched || 0)}/${Number(score.required.total || 0)})` : "Not assessed"} · <strong>Preferred:</strong> ${preferredScore}</p>
+      ${score.review_before_applying ? `<p class="risk medium"><strong>Review job fit</strong><br>Coverage is below the configurable ${Number(score.review_threshold_percent || 70)}% review guideline.</p>` : `<p class="muted">No keyword coverage review warning.</p>`}
+      <h4>Matched</h4>${keywordItems(score.matched, "No exact or equivalent keyword matches.")}
+      <h4>Related evidence for review</h4>${keywordItems(score.related, "None identified.")}
+      <h4>Missing</h4>${keywordItems(score.missing, "No eligible keywords missing.")}
+      <p class="muted">${escapeHtml(score.heuristic_note || "Keyword coverage is a review heuristic, not a hiring decision.")}</p>
+    </section>` : "";
   return `
+    ${scoreSection}
     <section>
       <h3>Job fit and keyword coverage</h3>
       <p><strong>Required coverage:</strong> ${Number(required.coverage_percent || 0)}% · <strong>Preferred coverage:</strong> ${Number(preferred.coverage_percent || 0)}%</p>

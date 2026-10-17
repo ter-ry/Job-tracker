@@ -67,6 +67,39 @@ EQUIVALENT_TECHNOLOGY_TERMS = {
     "restful apis": "rest apis",
 }
 
+# This vocabulary is intentionally generic.  It is used for the transparent
+# Keywords Score inventory, not to manufacture résumé content or to encode a
+# particular job posting.
+KEYWORD_VOCABULARY = [
+    "c++", "c#", ".net", "node.js", "nodejs", "javascript", "typescript", "python", "java", "php", "html", "css", "sql",
+    "flask", "react", "express", "jwt", "nginx", "linux", "windows", "debian", "ubuntu", "aws", "azure", "kafka",
+    "figma", "jira", "git", "github", "bitbucket", "devops", "paas", "api", "apis", "rest api", "rest apis", "restful apis",
+    "database", "database design", "postgresql", "postgres", "backend", "back-end", "frontend", "front-end", "ai", "tcp", "tcp/ip",
+    "ip networking", "design patterns", "development life cycle", "object oriented programming", "data solutions", "video analytics",
+    "thermal cameras", "performance monitoring", "virtualization", "message queues", "gps mapping", "telematics",
+]
+
+KEYWORD_ALIASES = {
+    "nodejs": "node.js",
+    "java script": "javascript",
+    "backend": "backend",
+    "back-end": "backend",
+    "frontend": "frontend",
+    "front-end": "frontend",
+    "postgres": "postgresql",
+    "restful apis": "rest apis",
+    "rest api": "rest apis",
+    "apis": "api",
+}
+
+RELATED_KEYWORD_EVIDENCE = {
+    "data solutions": ("data", "workflow", "reporting", "analytics", "database", "models"),
+    "design patterns": ("object oriented", "oop", "software design"),
+    "development life cycle": ("designed", "developed", "deployed", "launched", "production"),
+    "devops": ("deployment", "deployed", "production", "ci/cd", "infrastructure", "aws", "azure"),
+    "paas": ("platform", "cloud", "multi-tenant"),
+}
+
 QUALITY_METADATA_TERMS = [
     "endobj",
     "obj",
@@ -201,6 +234,130 @@ def job_text(job: dict[str, Any]) -> str:
             for field in ["title", "required_skills", "preferred_skills", "responsibilities", "job_description"]
         )
     )
+
+
+def normalize_keyword(value: str) -> str:
+    clean = normalize_space(value).lower().strip(" .,:;()[]{}")
+    return KEYWORD_ALIASES.get(clean, clean)
+
+
+def keyword_present(content: str, phrase: str) -> bool:
+    """Match a keyword as a phrase, never as an unsafe substring."""
+    clean = normalize_space(phrase)
+    if not clean:
+        return False
+    pattern = rf"(?<![A-Za-z0-9]){re.escape(clean)}(?![A-Za-z0-9])"
+    return re.search(pattern, content or "", re.IGNORECASE) is not None
+
+
+def _keyword_requirement_type(job: dict[str, Any], term: str) -> str:
+    sources = []
+    for field, kind in (("required_skills", "required"), ("responsibilities", "required"), ("preferred_skills", "preferred")):
+        value = str(job.get(field) or "")
+        if value and keyword_present(value, term):
+            sources.append(kind)
+    description = str(job.get("job_description") or "")
+    for match in re.finditer(rf"(?<![A-Za-z0-9]){re.escape(term)}(?![A-Za-z0-9])", description, re.IGNORECASE):
+        context = description[max(0, match.start() - 180):match.end() + 120].lower()
+        if re.search(r"\b(preferred|nice to have|bonus|asset)\b", context):
+            sources.append("preferred")
+        elif re.search(r"\b(required|must have|minimum|qualifications|requirements)\b", context):
+            sources.append("required")
+    if "required" in sources:
+        return "required"
+    if "preferred" in sources:
+        return "preferred"
+    return "unclassified"
+
+
+def extract_job_keywords(job: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build a deduplicated, vocabulary-backed job keyword inventory."""
+    content = job_text(job)
+    found: dict[str, dict[str, Any]] = {}
+    for term in sorted(KEYWORD_VOCABULARY, key=len, reverse=True):
+        if not keyword_present(content, term):
+            continue
+        normalized = normalize_keyword(term)
+        record = found.setdefault(normalized, {
+            "keyword": term,
+            "normalized": normalized,
+            "category": "technical",
+            "requirement_type": "unclassified",
+            "source_fields": [],
+        })
+        requirement_type = _keyword_requirement_type(job, term)
+        if requirement_type == "required" or (requirement_type == "preferred" and record["requirement_type"] == "unclassified"):
+            record["requirement_type"] = requirement_type
+        for field in ("required_skills", "preferred_skills", "responsibilities", "job_description"):
+            if keyword_present(str(job.get(field) or ""), term) and field not in record["source_fields"]:
+                record["source_fields"].append(field)
+    return sorted(found.values(), key=lambda item: (item["requirement_type"] == "unclassified", item["normalized"]))
+
+
+def match_job_keywords_to_resume(job: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
+    evidence = build_candidate_evidence(profile)
+    full_text = evidence.get("full_text") or ""
+    records = {"matched": [], "related": [], "missing": []}
+    for keyword in extract_job_keywords(job):
+        normalized = keyword["normalized"]
+        exact = keyword_present(full_text, keyword["keyword"])
+        equivalent = not exact and any(
+            keyword_present(full_text, source) and normalize_keyword(source) == normalized
+            for source in [keyword["keyword"], normalized, *KEYWORD_ALIASES.keys(), *KEYWORD_ALIASES.values()]
+        )
+        evidence_text = next((section["text"] for section in evidence.get("sections", []) if keyword_present(section["text"], keyword["keyword"]) or keyword_present(section["text"], normalized)), "")
+        record = {**keyword, "match_type": "exact" if exact else "equivalent" if equivalent else "missing", "evidence": evidence_text}
+        if exact or equivalent:
+            records["matched"].append(record)
+            continue
+        related_terms = RELATED_KEYWORD_EVIDENCE.get(normalized, ())
+        related_evidence = next((section["text"] for section in evidence.get("sections", []) if any(keyword_present(section["text"], term) or term in section["text"].lower() for term in related_terms)), "")
+        if related_evidence:
+            record["match_type"] = "related_review"
+            record["evidence"] = related_evidence
+            records["related"].append(record)
+        else:
+            records["missing"].append(record)
+    return records
+
+
+def build_keywords_score_report(job: dict[str, Any], profile: dict[str, Any], final_resume_text: str | None = None) -> dict[str, Any]:
+    """Return an explainable keyword score; related evidence is never counted."""
+    if final_resume_text is None:
+        result = match_job_keywords_to_resume(job, profile)
+    else:
+        result = match_job_keywords_to_resume(job, {**profile, "resume_text": final_resume_text})
+    inventory = extract_job_keywords(job)
+    matched = result["matched"]
+    required = [item for item in inventory if item["requirement_type"] == "required"]
+    preferred = [item for item in inventory if item["requirement_type"] == "preferred"]
+
+    def subset(items: list[dict[str, Any]]) -> dict[str, Any]:
+        keys = {item["normalized"] for item in items}
+        hits = [item for item in matched if item["normalized"] in keys]
+        return {
+            "status": "assessed" if items else "not_assessed",
+            "matched": len(hits),
+            "total": len(items),
+            "score_percent": round(len(hits) / len(items) * 100) if items else None,
+        }
+
+    total = len(inventory)
+    report = {
+        "score_percent": round(len(matched) / total * 100) if total else 0,
+        "matched_count": len(matched),
+        "total": total,
+        "matched": matched,
+        "related": result["related"],
+        "missing": result["missing"],
+        "required": subset(required),
+        "preferred": subset(preferred),
+        "unclassified": sum(1 for item in inventory if item["requirement_type"] == "unclassified"),
+        "review_threshold_percent": 70,
+        "review_before_applying": bool(total and len(matched) / total * 100 < 70),
+        "heuristic_note": "Keyword coverage is a transparent review heuristic, not an ATS score or a claim that a candidate lacks a skill.",
+    }
+    return report
 
 
 def job_keywords(job: dict[str, Any], limit: int = 30) -> list[str]:
