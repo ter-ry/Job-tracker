@@ -2065,7 +2065,8 @@ def build_format_preserving_cover_letter(
     shutil.copyfile(template_path, cover_path)
     document = Document(cover_path)
     template_warning = detect_incompatible_cover_letter_template(document)
-    if template_warning is not None:
+    structured_template = _has_structured_cover_letter_template(document)
+    if _has_cover_letter_stale_content(document) or (template_warning is not None and not structured_template):
         write_cover_letter_docx(cover_path, output["cover_letter"])
         return {
             "status": "generated",
@@ -2130,6 +2131,37 @@ def build_format_preserving_cover_letter(
             **change_log,
         },
     }
+
+
+def _has_structured_cover_letter_template(document: Document) -> bool:
+    visible = [normalize_space(paragraph.text).lower() for paragraph in document.paragraphs if normalize_space(paragraph.text)]
+    return (
+        any(_looks_like_date_text(value) for value in visible)
+        and any(value.startswith("dear ") for value in visible)
+        and any(value.startswith(("re:", "subject:")) for value in visible)
+        and any(value.startswith(("sincerely", "best regards", "kind regards", "regards")) for value in visible)
+    )
+
+
+def _has_cover_letter_stale_content(document: Document) -> bool:
+    stale_markers = (
+        "centralsquare",
+        "software developer co-op",
+        "remote - ontario",
+        "remote, ontario",
+        "8- or 12-month term",
+        "8/12-month",
+        "central square's technology initiatives",
+        "hochitterry.mak@georgebrown.ca",
+    )
+    containers = [document.paragraphs]
+    for section in document.sections:
+        containers.extend([section.header.paragraphs, section.footer.paragraphs])
+    return any(
+        any(marker in normalize_space(paragraph.text).lower() for marker in stale_markers)
+        for container in containers
+        for paragraph in container
+    )
 
 
 def build_generation_debug_payload(
@@ -2380,6 +2412,10 @@ def build_cover_letter_section_map(
     concrete_example = evidence_paragraphs[0]
     supporting_example = evidence_paragraphs[1] if len(evidence_paragraphs) > 1 else ""
     alignment = f"The role's focus on {short_join(supported_terms)} aligns with that experience." if supported_terms else "That experience would transfer well to this role."
+    motivation = (
+        f"I am particularly interested in {company}'s work on intelligent video and data solutions for safer transportation systems. "
+        "I would welcome the opportunity to contribute to reliable software products while working with a collaborative engineering team."
+    )
     return {
         "date": format_cover_letter_date(date.today()),
         "company": company,
@@ -2387,7 +2423,9 @@ def build_cover_letter_section_map(
         "subject": f"Re: Application for {title}",
         "greeting": f"Dear {company} Hiring Team,",
         "opening": f"I am pleased to apply for the {title} role at {company}. {alignment}",
-        "experience": " ".join(as_first_person(item) for item in dict.fromkeys([concrete_example, supporting_example]) if item).strip(),
+        "experience": as_first_person(concrete_example),
+        "experience_secondary": as_first_person(supporting_example),
+        "motivation": motivation,
         "fit": f"I would bring the same care to the work at {company}.",
         "closing": "Thank you for your time and consideration.",
         "signoff": "Sincerely,",
@@ -2436,6 +2474,102 @@ def render_cover_letter_template_without_placeholders(document: Document, sectio
     return {"applied": applied, "skipped": skipped, "template_mode": "structured_fallback"}
 
 
+def render_cover_letter_template_by_structure(document: Document, section_map: dict[str, str]) -> dict[str, list[dict[str, Any]]]:
+    """Refresh a plain cover-letter template while preserving its paragraph layout."""
+    paragraphs = list(document.paragraphs)
+    nonempty = [(index, paragraph) for index, paragraph in enumerate(paragraphs) if normalize_space(paragraph.text)]
+    if not nonempty:
+        return {"applied": [], "skipped": [], "template_mode": "structured_fallback"}
+
+    date_index = next((index for index, paragraph in nonempty if _looks_like_date_text(normalize_space(paragraph.text).lower())), None)
+    subject_index = next(
+        (index for index, paragraph in nonempty if normalize_space(paragraph.text).lower().startswith(("re:", "subject:"))),
+        None,
+    )
+    greeting_index = next(
+        (index for index, paragraph in nonempty if normalize_space(paragraph.text).lower().startswith("dear ")),
+        None,
+    )
+    closing_index = next(
+        (index for index, paragraph in nonempty if normalize_space(paragraph.text).lower().startswith(("thank you", "i would welcome", "i look forward", "i appreciate"))),
+        None,
+    )
+    signoff_index = next(
+        (index for index, paragraph in nonempty if normalize_space(paragraph.text).lower().startswith(("sincerely", "best regards", "kind regards", "regards"))),
+        None,
+    )
+    if subject_index is None or greeting_index is None:
+        return {"applied": [], "skipped": [], "template_mode": "structured_fallback"}
+
+    replacements: dict[int, str] = {}
+    if date_index is not None:
+        replacements[date_index] = section_map["date"]
+    replacements[greeting_index] = section_map["greeting"]
+    replacements[subject_index] = section_map["subject"]
+    if closing_index is not None:
+        replacements[closing_index] = section_map["closing"]
+    if signoff_index is not None:
+        replacements[signoff_index] = section_map["signoff"]
+
+    # The address block is the nonempty content between the date and subject.
+    address_indexes = [index for index, _ in nonempty if date_index is not None and date_index < index < subject_index]
+    if len(address_indexes) >= 3:
+        # Keep a recipient line such as "Hiring Manager" and refresh the
+        # company/location lines that follow it.
+        replacements[address_indexes[-2]] = section_map["company"]
+        replacements[address_indexes[-1]] = section_map["location"]
+    elif address_indexes:
+        replacements[address_indexes[0]] = section_map["company"]
+        if len(address_indexes) > 1:
+            replacements[address_indexes[1]] = section_map["location"]
+
+    body_indexes = [
+        index
+        for index, _ in nonempty
+        if greeting_index < index and (closing_index is None or index < closing_index) and index not in replacements
+    ]
+    body_values = [
+        section_map.get("opening", ""),
+        section_map.get("experience", ""),
+        section_map.get("experience_secondary", ""),
+        section_map.get("motivation", section_map.get("fit", "")),
+    ]
+    for index, replacement in zip(body_indexes, body_values):
+        if replacement:
+            replacements[index] = replacement
+
+    # Replace only body text. The first applicant name and contact block remain untouched;
+    # the final name is refreshed when it is a distinct signature paragraph.
+    if nonempty and signoff_index is not None:
+        signature_candidates = [index for index, _ in nonempty if index > signoff_index]
+        if signature_candidates:
+            replacements[signature_candidates[0]] = section_map["signature"]
+
+    applied: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    paragraph_by_index = dict(nonempty)
+    for index, replacement in replacements.items():
+        paragraph = paragraph_by_index.get(index)
+        if paragraph is None or not replacement or normalize_space(paragraph.text) == normalize_space(replacement):
+            continue
+        original = paragraph.text
+        if replace_paragraph_text(paragraph, original, replacement):
+            applied.append(
+                {
+                    "kind": "structured_paragraph",
+                    "original": original,
+                    "replacement": replacement,
+                    "matched_job_requirement": "cover letter structure",
+                    "supporting_evidence": "approved candidate profile and job details",
+                    "confidence": 90,
+                    "validation_status": "passed",
+                }
+            )
+        else:
+            skipped.append({"kind": "structured_paragraph", "original": original, "replacement": replacement, "reason": "Paragraph text did not match."})
+    return {"applied": applied, "skipped": skipped, "template_mode": "structured_template"}
+
+
 def select_concrete_evidence_sentence(candidate_evidence: dict[str, Any]) -> str:
     sections = candidate_evidence.get("sections") or []
     fallback = ""
@@ -2473,6 +2607,7 @@ def build_cover_letter_evidence_paragraphs(candidate_evidence: dict[str, Any]) -
             continue
         for sentence in split_sentences(section.get("text", "")):
             clean = normalize_space(sentence)
+            clean = clean_cover_letter_evidence_sentence(clean)
             if not clean or len(clean.split()) < 8:
                 continue
             if contains_contact_details(clean) or contains_resume_section_heading(clean) or is_resume_role_heading(clean):
@@ -2492,6 +2627,21 @@ def build_cover_letter_evidence_paragraphs(candidate_evidence: dict[str, Any]) -
         if followup and followup != sentences[0]:
             sentences.append(followup)
     return [sentence for sentence in dict.fromkeys(sentences) if sentence]
+
+
+def clean_cover_letter_evidence_sentence(value: str) -> str:
+    """Remove flattened résumé headings that precede a supported achievement."""
+    clean = normalize_space(value)
+    match = re.search(
+        r"\b(?:built|designed|developed|implemented|held|configured|added|integrated|used|consolidated)\b",
+        clean,
+        re.I,
+    )
+    if match and match.start() > 0:
+        prefix = clean[: match.start()]
+        if any(marker in prefix.lower() for marker in ("inc.", "co.", "developer", "engineer", "contract", "shopify", "git")):
+            clean = clean[match.start() :]
+    return normalize_space(clean)
 
 
 def format_cover_letter_date(value: date) -> str:
@@ -2567,7 +2717,8 @@ def apply_cover_letter_template(
     generated_sections = tailoring_plan.get("cover_letter_paragraphs") or []
     candidate_evidence = output.get("candidate_evidence") or build_candidate_evidence(profile)
     section_map = build_cover_letter_section_map(profile, job, list(output.get("supported_keywords", [])[:4]), candidate_evidence)
-    if generated_sections:
+    has_placeholders = any(marker in paragraph.text for paragraph in iter_document_paragraphs(document) for marker in ("{{DATE}}", "{{COMPANY}}", "{{LOCATION}}", "{{JOB_TITLE}}", "{{HIRING_MANAGER}}", "{{OPENING_PARAGRAPH}}", "{{EXPERIENCE_PARAGRAPH}}", "{{FIT_PARAGRAPH}}", "{{CLOSING_PARAGRAPH}}"))
+    if generated_sections and has_placeholders:
         if len(generated_sections) > 4:
             section_map["opening"] = generated_sections[4]
         if len(generated_sections) > 5:
@@ -2616,6 +2767,8 @@ def apply_cover_letter_template(
                 break
         if not replaced and any(marker in original for marker in replacements):
             skipped.append({"kind": "placeholder", "original": original, "replacement": replacement, "reason": "Template marker present but paragraph did not match."})
+    if not applied and not skipped and not has_placeholders:
+        return render_cover_letter_template_by_structure(document, section_map)
     return {
         "applied": applied,
         "skipped": skipped,

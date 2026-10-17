@@ -1980,6 +1980,55 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(master_doc.paragraphs[-1].alignment, cover_doc.paragraphs[-1].alignment)
         self.assertEqual(master_doc.paragraphs[-1].text, cover_doc.paragraphs[-1].text)
 
+    def test_structured_style_template_replaces_role_specific_body_without_plain_fallback(self):
+        self.seed_profile_for_documents(with_template=True)
+        template = Path(self.tmpdir.name) / "pinterest_style_fixture.docx"
+        document = Document()
+        document.add_paragraph("Terry Mak")
+        document.add_paragraph("Toronto, ON")
+        document.add_paragraph("(647) 449-9669")
+        document.add_paragraph("terry.hcmak@gmail.com")
+        document.add_paragraph("")
+        document.add_paragraph("October 1, 2026")
+        document.add_paragraph("")
+        document.add_paragraph("Hiring Manager")
+        document.add_paragraph("Pinterest")
+        document.add_paragraph("Toronto, ON")
+        document.add_paragraph("Re: Software Engineer II, Web")
+        document.add_paragraph("Dear Hiring Manager,")
+        document.add_paragraph("I am writing to apply for a software role at Pinterest.")
+        document.add_paragraph("I designed a restaurant operations platform using supported technologies.")
+        document.add_paragraph("These experiences strengthened my ability to build maintainable web functionality.")
+        document.add_paragraph("I am particularly interested in Pinterest's engineering work.")
+        document.add_paragraph("")
+        document.add_paragraph("Sincerely,")
+        document.add_paragraph("Terry Mak")
+        document.save(template)
+        self.upload_cover_letter_template(template)
+
+        created = self.client.post(
+            "/api/shortlist",
+            json={
+                "company": "Gatekeeper Systems Inc",
+                "title": "Software Engineer",
+                "location": "Abbotsford, BC",
+                "job_description": "Build and support Python and SQL software applications.",
+                "required_skills": "Python, SQL",
+            },
+        ).get_json()
+        cover_path = Path(created["cover_letter_docx_path"])
+        cover = Document(cover_path)
+        paragraphs = [paragraph.text for paragraph in cover.paragraphs if paragraph.text.strip()]
+        joined = "\n".join(paragraphs)
+        self.assertEqual(created["cover_letter_generation_status"], "generated")
+        self.assertEqual(created["generation_debug"]["cover_result"]["output_path"], str(cover_path))
+        self.assertIn("Gatekeeper Systems Inc", joined)
+        self.assertIn("Dear Gatekeeper Systems Inc Hiring Team,", joined)
+        self.assertNotIn("Pinterest", joined)
+        self.assertNotIn("restaurant operations", joined.lower())
+        self.assertNotRegex(joined, r"[-–—]")
+        self.assertEqual(paragraphs[-2:], ["Sincerely,", "Terry Mak"])
+
     def test_cover_letter_validation_uses_body_boundaries_for_contact_details(self):
         evidence = grounding.build_candidate_evidence(self.software_profile())
         header_safe = (
