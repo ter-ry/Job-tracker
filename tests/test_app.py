@@ -2660,6 +2660,16 @@ class JobAssistantTest(unittest.TestCase):
         second_score = second_response.get_json()["keywords_score"]
         self.assertGreater(first_score["matched_count"], second_score["matched_count"])
 
+    def test_shortlist_uses_keywords_score_as_primary_display_metric(self):
+        source = (Path(__file__).parents[1] / "static" / "app.js").read_text(encoding="utf-8")
+        shortlist = source.split("function renderShortlistCard", 1)[1].split("async function regenerateShortlist", 1)[0]
+        discovery = source.split("function renderDiscoveryRow", 1)[1].split("function renderDiscoveryCard", 1)[0]
+        self.assertIn("Keywords Score", shortlist)
+        self.assertNotIn("Overall Fit</strong>", shortlist)
+        self.assertNotIn("miniBreakdown(job)", shortlist)
+        self.assertIn("Job Priority", discovery)
+        self.assertNotIn("Overall score", discovery)
+
     def test_selected_candidate_profile_isolated_from_legacy_and_other_profiles(self):
         self.seed_profile_for_documents(with_template=True)
         legacy = self.client.post(

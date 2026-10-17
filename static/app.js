@@ -1511,7 +1511,7 @@ function renderDiscoveryTable(jobs) {
     ["salary", "Salary"],
     ["posted_date", "Posted date"],
     ["work_arrangement", "Work arrangement"],
-    ["overall_score", "Overall score"],
+    ["overall_score", "Job Priority"],
     ["source", "Source"],
   ];
   return `
@@ -1546,7 +1546,7 @@ function renderDiscoveryRow(job, index) {
       <td>${escapeHtml(job.salary || "Salary unavailable")}</td>
       <td>${escapeHtml(job.posted_date || "Unknown")}</td>
       <td>${escapeHtml(job.work_arrangement || job.remote_type || "Unknown")}</td>
-      <td>${scorePill(job.overall_score || job.fit_score || 0)}</td>
+      <td><strong>Job Priority</strong><br>${scorePill(job.overall_score || job.fit_score || 0)}</td>
       <td>${escapeHtml(job.source || "JobSpy")}</td>
     </tr>
     <tr>
@@ -1583,14 +1583,14 @@ function renderDiscoveryCard(job, index) {
           <div class="badge-row">
             ${badge("Distance", distanceBadge(job))}
             ${badge("Salary", job.salary || "Unavailable")}
-            ${badge("Score", Number(job.overall_score || job.fit_score || 0))}
+            ${badge("Job Priority", Number(job.overall_score || job.fit_score || 0))}
             ${badge("Match", Number(job.match_score || 0))}
             ${badge("Source", job.source || "JobSpy")}
             ${badge("Posted", job.posted_date || "Unknown")}
             ${badge("Work", job.work_arrangement || job.remote_type || "Unknown")}
           </div>
         </div>
-        <div>${scorePill(job.overall_score || job.fit_score || 0)}${saved}</div>
+        <div><strong>Job Priority</strong><br>${scorePill(job.overall_score || job.fit_score || 0)}${saved}</div>
       </div>
       ${warnings}
       <div class="mini-breakdown">${miniBreakdown(job)}</div>
@@ -2053,8 +2053,6 @@ function renderShortlistCard(job) {
           <h3>${escapeHtml(job.title || "Untitled role")}</h3>
           <p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(job.location || "Location unavailable")}</p>
           <p class="muted">${escapeHtml(job.source || "")} · ${escapeHtml(salaryLabel)} · Shortlisted ${escapeHtml(job.date_shortlisted || job.date_added || "")}</p>
-          <p><strong>Overall Fit</strong> ${scorePill(job.fit_score)} <span class="muted">${miniBreakdown(job)}</span></p>
-          <p class="muted">Overall Fit prioritizes the job using saved profile, role, location, salary and seniority signals. It is separate from Keywords Score.</p>
           <p class="muted">Résumé: ${escapeHtml(resumeStatus)}${resumePrevious}</p>
           ${resumeError}
           <p class="muted">Cover letter: ${escapeHtml(coverStatus)}${coverPrevious}</p>
