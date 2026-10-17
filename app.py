@@ -2122,6 +2122,21 @@ def build_format_preserving_cover_letter(
     if any(classify_keyword_dump_reason(normalize_space(paragraph.text)) is not None for paragraph in reopened_cover.paragraphs):
         write_cover_letter_docx(cover_path, output["cover_letter"])
         reopened_cover = Document(cover_path)
+    residual = find_unreplaced_template_content(template_path, reopened_cover, profile)
+    if residual:
+        write_cover_letter_docx(cover_path, output["cover_letter"])
+        return {
+            "status": "generated",
+            "error": "",
+            "warning": f"Standard cover-letter formatting was used because template content remained after replacement: {residual}",
+            "change_log": {
+                "master_cover_letter_path": str(template_path),
+                "output_path": str(cover_path),
+                "applied": [],
+                "skipped": [{"kind": "template_residual", "original": residual, "reason": "Source template content remained in the generated document."}],
+                "template_mode": "standard_fallback_residual",
+            },
+        }
     return {
         "status": "generated",
         "error": "",
@@ -2162,6 +2177,38 @@ def _has_cover_letter_stale_content(document: Document) -> bool:
         for container in containers
         for paragraph in container
     )
+
+
+def find_unreplaced_template_content(template_path: Path, generated: Document, profile: dict[str, str]) -> str:
+    """Find exact source-template text that survived in body, headers, or footers."""
+    try:
+        source = Document(template_path)
+    except (OSError, ValueError, zipfile.BadZipFile):
+        return ""
+    generated_text = {
+        normalize_space(paragraph.text).lower()
+        for paragraph in iter_document_paragraphs(generated)
+        if normalize_space(paragraph.text)
+    }
+    allowed = {
+        normalize_space(text(profile.get("name"))).lower(),
+        normalize_space(text(profile.get("location"))).lower(),
+        "hiring manager",
+        "sincerely,",
+        "best regards,",
+        "kind regards,",
+        "regards,",
+    }
+    for paragraph in iter_document_paragraphs(source):
+        value = normalize_space(paragraph.text)
+        lowered = value.lower()
+        if not value or lowered in allowed or len(value) < 4:
+            continue
+        if contains_contact_details(value) or _looks_like_date_text(lowered) or "{{" in value:
+            continue
+        if lowered in generated_text:
+            return value[:160]
+    return ""
 
 
 def build_generation_debug_payload(
@@ -2405,24 +2452,25 @@ def build_cover_letter_section_map(
             text(job.get("job_description")),
         ]
     ).lower()
-    evidence_paragraphs = build_cover_letter_evidence_paragraphs(candidate_evidence)
     supported_terms = matching_evidence_terms(job, candidate_evidence, limit=3)
+    evidence_paragraphs = select_cover_letter_evidence(profile, job, [*focus, *supported_terms], candidate_evidence)
+    evidence_paragraphs = [clean_cover_letter_evidence_sentence(item) for item in evidence_paragraphs if clean_cover_letter_evidence_sentence(item)]
     if not evidence_paragraphs:
         evidence_paragraphs = [select_concrete_evidence_sentence(candidate_evidence)] if select_concrete_evidence_sentence(candidate_evidence) else []
     concrete_example = evidence_paragraphs[0]
     supporting_example = evidence_paragraphs[1] if len(evidence_paragraphs) > 1 else ""
-    alignment = f"The role's focus on {short_join(supported_terms)} aligns with that experience." if supported_terms else "That experience would transfer well to this role."
-    motivation = (
-        f"I am particularly interested in {company}'s work on intelligent video and data solutions for safer transportation systems. "
-        "I would welcome the opportunity to contribute to reliable software products while working with a collaborative engineering team."
-    )
+    if supported_terms:
+        opening = f"I am pleased to apply for the {title} role at {company}. My experience with {short_join(supported_terms)} includes building and supporting software tools and data workflows relevant to this role."
+    else:
+        opening = f"I am pleased to apply for the {title} role at {company}. My background includes practical experience relevant to the responsibilities described in this posting."
+    motivation = build_job_motivation(job)
     return {
         "date": format_cover_letter_date(date.today()),
         "company": company,
         "location": location,
         "subject": f"Re: Application for {title}",
         "greeting": f"Dear {company} Hiring Team,",
-        "opening": f"I am pleased to apply for the {title} role at {company}. {alignment}",
+        "opening": opening,
         "experience": as_first_person(concrete_example),
         "experience_secondary": as_first_person(supporting_example),
         "motivation": motivation,
@@ -2431,6 +2479,32 @@ def build_cover_letter_section_map(
         "signoff": "Sincerely,",
         "signature": text(profile.get("name") or ""),
     }
+
+
+def build_job_motivation(job: dict[str, Any]) -> str:
+    """Use only company or role context explicitly present in the current posting."""
+    company = text(job.get("company")) or "the company"
+    description = text(job.get("job_description"))
+    company_lower = company.lower()
+    for sentence in split_sentences(description):
+        clean = normalize_space(sentence).rstrip(".")
+        if company_lower not in clean.lower() or len(clean.split()) < 8:
+            continue
+        detail = re.sub(
+            rf"^{re.escape(company)}(?:\s*\([^)]*\))?\s+is\s+",
+            "",
+            clean,
+            flags=re.I,
+        ).strip()
+        if detail != clean:
+            return (
+                f"I am particularly interested in {company} because the posting describes it as {detail}. "
+                "I would welcome the opportunity to contribute to that work in a collaborative engineering team."
+            )
+    return (
+        "I am particularly interested in the opportunity to contribute to the responsibilities described in this posting. "
+        "I would welcome the chance to support the team with careful, reliable work."
+    )
 
 
 def render_cover_letter_template_without_placeholders(document: Document, section_map: dict[str, str]) -> dict[str, list[dict[str, Any]]]:
@@ -6904,7 +6978,7 @@ def select_cover_letter_evidence(
     focus: list[str],
     candidate_evidence: dict[str, Any],
 ) -> list[str]:
-    terms = focus[:4] or []
+    terms = list(dict.fromkeys([*focus, *matching_evidence_terms(job, candidate_evidence, limit=5)]))[:8]
     scored_snippets: list[tuple[int, int, str]] = []
     fallback_snippets: list[str] = []
     order = 0
@@ -6912,10 +6986,10 @@ def select_cover_letter_evidence(
         if section.get("field") == "resume_text":
             continue
         for sentence in split_sentences(section["text"]):
-            clean = normalize_space(sentence)
+            clean = clean_cover_letter_evidence_sentence(sentence)
             if not clean or len(clean) > 400:
                 continue
-            if contains_resume_section_heading(clean) or contains_contact_details(clean):
+            if contains_resume_section_heading(clean) or contains_contact_details(clean) or is_resume_role_heading(clean):
                 continue
             if classify_keyword_dump_reason(clean) is not None:
                 continue
@@ -6931,6 +7005,10 @@ def select_cover_letter_evidence(
             if "documentation" in lowered or "documented" in lowered:
                 score += 2
             if terms and any(contains_phrase(clean, term) or contains_phrase(term, clean) for term in terms):
+                score += 3
+            if section.get("field") == "projects":
+                score += 2
+            if any(char.isdigit() for char in clean):
                 score += 2
             if 8 <= len(clean.split()) <= 30:
                 score += 1
@@ -6949,11 +7027,14 @@ def select_cover_letter_evidence(
     return []
 
 
-def trim_cover_letter_evidence(value: str, limit: int = 180) -> str:
+def trim_cover_letter_evidence(value: str, limit: int = 260) -> str:
     clean = normalize_space(value)
     if len(clean) <= limit:
         return clean
-    return trim(clean, limit)
+    boundary = max(clean.rfind(".", 0, limit), clean.rfind("!", 0, limit), clean.rfind("?", 0, limit))
+    if boundary >= 80:
+        return clean[: boundary + 1]
+    return clean[:limit].rsplit(" ", 1)[0].rstrip(" ,;:") + "."
 
 
 def truncate_text(value: str, limit: int) -> str:

@@ -2029,6 +2029,35 @@ class JobAssistantTest(unittest.TestCase):
         self.assertNotRegex(joined, r"[-–—]")
         self.assertEqual(paragraphs[-2:], ["Sincerely,", "Terry Mak"])
 
+    def test_cover_letter_motivation_and_evidence_follow_each_job(self):
+        profile = {
+            "name": "Alex Rivera",
+            "key_skills": "Python, SQL, testing, documentation",
+            "work_experience": "Built internal reporting workflows with Python and SQL for operations teams.",
+            "projects": "Flowtally project: Added validation, migrations, and 25+ automated backend tests across reporting workflows.",
+            "resume_text": "Alex Rivera. Built internal reporting workflows with Python and SQL for operations teams. Flowtally project: Added validation, migrations, and 25+ automated backend tests across reporting workflows.",
+        }
+        gatekeeper = {
+            "company": "Gatekeeper Systems Inc",
+            "title": "Software Engineer",
+            "job_description": "Gatekeeper Systems Inc is a provider of intelligent video and data solutions for safer transportation. Build and test Python software.",
+            "required_skills": "Python, testing",
+        }
+        finance = {
+            "company": "LedgerWorks",
+            "title": "Software Engineer",
+            "job_description": "LedgerWorks is a financial software company building reporting and reconciliation tools. Develop Python services and document reliable workflows.",
+            "required_skills": "Python, reporting, documentation",
+        }
+        gatekeeper_map = app_module.build_cover_letter_section_map(profile, gatekeeper, [], grounding.build_candidate_evidence(profile))
+        finance_map = app_module.build_cover_letter_section_map(profile, finance, [], grounding.build_candidate_evidence(profile))
+        self.assertIn("safer transportation", gatekeeper_map["motivation"].lower())
+        self.assertNotIn("transportation", finance_map["motivation"].lower())
+        self.assertIn("financial software", finance_map["motivation"].lower())
+        self.assertIn("25+", gatekeeper_map["experience"] + gatekeeper_map["experience_secondary"])
+        self.assertNotIn("role's focus on", gatekeeper_map["opening"].lower())
+        self.assertNotIn("role's focus on", finance_map["opening"].lower())
+
     def test_cover_letter_validation_uses_body_boundaries_for_contact_details(self):
         evidence = grounding.build_candidate_evidence(self.software_profile())
         header_safe = (
