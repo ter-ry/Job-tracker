@@ -894,12 +894,9 @@ function renderKeywordCoverage(report) {
   const list = (items, empty) => Array.isArray(items) && items.length
     ? `<ul class="review-list">${items.map((item) => `<li><strong>${escapeHtml(item.requirement || "Requirement")}</strong><div>${escapeHtml(item.evidence || item.message || "")}</div></li>`).join("")}</ul>`
     : `<p class="muted">${escapeHtml(empty)}</p>`;
-  const warnings = Array.isArray(report.warnings) && report.warnings.length
-    ? `<h4>Nontechnical job fit warnings</h4><p class="risk medium">${report.warnings.map(escapeHtml).join("<br>")}</p>`
-    : "";
   const eligibility = Array.isArray(report.eligibility_concerns) && report.eligibility_concerns.length
     ? `<h4>Eligibility concerns</h4>${list(report.eligibility_concerns, "None")}`
-    : "";
+    : `<p class="muted">No nontechnical eligibility concerns.</p>`;
   const keywordItems = (items, empty) => Array.isArray(items) && items.length
     ? `<ul class="review-list">${items.map((item) => `<li><strong>${escapeHtml(item.keyword || item.normalized || "Keyword")}</strong><div>${escapeHtml(item.evidence || "No résumé evidence recorded")}</div><span class="muted">${escapeHtml(item.match_type || item.requirement_type || "")}</span></li>`).join("")}</ul>`
     : `<p class="muted">${escapeHtml(empty)}</p>`;
@@ -910,19 +907,18 @@ function renderKeywordCoverage(report) {
     <section class="keywords-score-panel">
       <h3>Keywords Score</h3>
       <p><strong>${Number(score.score_percent || 0)}%</strong> · ${Number(score.matched_count || 0)}/${Number(score.total || 0)} eligible keywords matched</p>
-      <p><strong>Required:</strong> ${score.required && score.required.status === "assessed" ? `${Number(score.required.score_percent || 0)}% (${Number(score.required.matched || 0)}/${Number(score.required.total || 0)})` : "Not assessed"} · <strong>Preferred:</strong> ${preferredScore}</p>
+      <p><strong>Required (explicitly classified only):</strong> ${score.required && score.required.status === "assessed" ? `${Number(score.required.score_percent || 0)}% (${Number(score.required.matched || 0)}/${Number(score.required.total || 0)})` : "Not assessed"} · <strong>Preferred:</strong> ${preferredScore}</p>
       ${score.review_before_applying ? `<p class="risk medium"><strong>Review job fit</strong><br>Coverage is below the configurable ${Number(score.review_threshold_percent || 70)}% review guideline.</p>` : `<p class="muted">No keyword coverage review warning.</p>`}
       <h4>Matched</h4>${keywordItems(score.matched, "No exact or equivalent keyword matches.")}
       <h4>Related evidence for review</h4>${keywordItems(score.related, "None identified.")}
       <h4>Missing</h4>${keywordItems(score.missing, "No eligible keywords missing.")}
+      <h4>Unclassified inventory</h4>${keywordItems(score.unclassified_keywords, "No unclassified keywords.")}
       <p class="muted">${escapeHtml(score.heuristic_note || "Keyword coverage is a review heuristic, not a hiring decision.")}</p>
     </section>` : "";
   return `
     ${scoreSection}
     <section>
-      <h3>Job fit warnings</h3>
-      ${warnings}
-      ${warnings ? "" : `<p class="muted">No nontechnical job-fit warnings.</p>`}
+      <h3>Nontechnical job fit</h3>
       ${eligibility}
     </section>
   `;

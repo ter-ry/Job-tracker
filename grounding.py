@@ -372,6 +372,7 @@ def build_keywords_score_report(job: dict[str, Any], profile: dict[str, Any], fi
         "required": subset(required),
         "preferred": subset(preferred),
         "unclassified": sum(1 for item in inventory if item["requirement_type"] == "unclassified"),
+        "unclassified_keywords": [item for item in inventory if item["requirement_type"] == "unclassified"],
         "review_threshold_percent": 70,
         "review_before_applying": bool(total and len(matched) / total * 100 < 70),
         "heuristic_note": "Keyword coverage is a transparent review heuristic, not an ATS score or a claim that a candidate lacks a skill.",
