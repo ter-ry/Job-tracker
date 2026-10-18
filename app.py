@@ -363,6 +363,13 @@ JOB_COLUMNS = {
     "generation_error": "TEXT NOT NULL DEFAULT ''",
     "generated_at": "TEXT NOT NULL DEFAULT ''",
     "profile_updated_at": "TEXT NOT NULL DEFAULT ''",
+    "discovery_first_seen_at": "TEXT NOT NULL DEFAULT ''",
+    "discovery_last_seen_at": "TEXT NOT NULL DEFAULT ''",
+    "discovery_seen_count": "INTEGER NOT NULL DEFAULT 0",
+    "discovery_state": "TEXT NOT NULL DEFAULT ''",
+    "discovery_last_search_id": "INTEGER NOT NULL DEFAULT 0",
+    "remote_eligibility": "TEXT NOT NULL DEFAULT 'unknown'",
+    "remote_eligibility_explanation": "TEXT NOT NULL DEFAULT ''",
 }
 
 PROFILE_COLUMNS = {
@@ -1035,6 +1042,119 @@ def create_app() -> Flask:
         save_discovery_preferences(search_key, preferences)
         return jsonify({"search_key": search_key, "preferences": preferences})
 
+    @app.get("/api/discovery/searches")
+    def saved_discovery_searches() -> Response:
+        rows = query_db("SELECT * FROM saved_search_profiles ORDER BY enabled DESC, name COLLATE NOCASE")
+        return jsonify([saved_search_to_dict(row) for row in rows])
+
+    @app.post("/api/discovery/searches")
+    def create_saved_discovery_search() -> Response:
+        try:
+            search = normalize_saved_search_payload(request.get_json(force=True) or {})
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        try:
+            cursor = get_db().execute(
+                """INSERT INTO saved_search_profiles
+                   (name, keywords, location, remote_preference, seniority, minimum_salary,
+                    enabled_sources_json, date_window, distance, interval_minutes, enabled)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["distance"], search["interval_minutes"], search["enabled"]],
+            )
+            get_db().commit()
+        except sqlite3.IntegrityError:
+            return jsonify({"error": "A saved search with that name already exists"}), 409
+        return jsonify(saved_search_to_dict(query_db("SELECT * FROM saved_search_profiles WHERE id = ?", [cursor.lastrowid], one=True))), 201
+
+    @app.put("/api/discovery/searches/<int:search_id>")
+    def update_saved_discovery_search(search_id: int) -> Response:
+        row = query_db("SELECT * FROM saved_search_profiles WHERE id = ?", [search_id], one=True)
+        if row is None:
+            return jsonify({"error": "Saved search not found"}), 404
+        try:
+            search = normalize_saved_search_payload(request.get_json(force=True) or {}, saved_search_to_dict(row))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        try:
+            get_db().execute(
+                """UPDATE saved_search_profiles SET name = ?, keywords = ?, location = ?, remote_preference = ?,
+                   seniority = ?, minimum_salary = ?, enabled_sources_json = ?, date_window = ?, distance = ?,
+                   interval_minutes = ?, enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["distance"], search["interval_minutes"], search["enabled"], search_id],
+            )
+            get_db().commit()
+        except sqlite3.IntegrityError:
+            return jsonify({"error": "A saved search with that name already exists"}), 409
+        return jsonify(saved_search_to_dict(query_db("SELECT * FROM saved_search_profiles WHERE id = ?", [search_id], one=True)))
+
+    @app.delete("/api/discovery/searches/<int:search_id>")
+    def delete_saved_discovery_search(search_id: int) -> Response:
+        get_db().execute("DELETE FROM saved_search_profiles WHERE id = ?", [search_id])
+        get_db().commit()
+        return jsonify({"ok": True})
+
+    @app.get("/api/discovery/inbox")
+    def discovery_inbox() -> Response:
+        rows = query_db(
+            """SELECT * FROM jobs WHERE discovery_first_seen_at <> '' AND discovery_state <> 'ignored'
+               ORDER BY discovery_state = 'new' DESC, discovery_last_seen_at DESC, id DESC LIMIT 500"""
+        )
+        return jsonify([job_to_dict(row) for row in rows])
+
+    @app.post("/api/discovery/inbox/<int:job_id>/review")
+    def review_discovery_job(job_id: int) -> Response:
+        row = query_db("SELECT * FROM jobs WHERE id = ? AND discovery_first_seen_at <> ''", [job_id], one=True)
+        if row is None:
+            return jsonify({"error": "Discovered job not found"}), 404
+        get_db().execute("UPDATE jobs SET discovery_state = 'reviewed', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
+        get_db().commit()
+        return jsonify(job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)))
+
+    @app.post("/api/discovery/inbox/<int:job_id>/ignore")
+    def ignore_discovery_job(job_id: int) -> Response:
+        row = query_db("SELECT * FROM jobs WHERE id = ? AND discovery_first_seen_at <> ''", [job_id], one=True)
+        if row is None:
+            return jsonify({"error": "Discovered job not found"}), 404
+        get_db().execute("UPDATE jobs SET discovery_state = 'ignored', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
+        get_db().commit()
+        return jsonify({"ok": True})
+
+    @app.get("/api/discovery/runs")
+    def discovery_runs() -> Response:
+        rows = query_db("SELECT * FROM discovery_run_history ORDER BY id DESC LIMIT 100")
+        return jsonify([dict(row) | {"source_outcomes": parse_json_object(row["source_outcomes_json"])} for row in rows])
+
+    @app.post("/api/discovery/searches/<int:search_id>/run")
+    def run_saved_discovery_search(search_id: int) -> Response:
+        row = query_db("SELECT * FROM saved_search_profiles WHERE id = ?", [search_id], one=True)
+        if row is None:
+            return jsonify({"error": "Saved search not found"}), 404
+        search = saved_search_to_dict(row)
+        run_id = create_discovery_run(search_id, "manual")
+        try:
+            result = run_discovery_pipeline(saved_search_to_discovery_payload(search), search_id=search_id, run_id=run_id)
+            finish_discovery_run(run_id, status="completed", fetched=result["total"], new_count=result["persisted"]["new"], duplicate_count=result["persisted"]["duplicate"], errors=len(result["errors"]), outcomes=result["source_diagnostics"])
+            now = datetime.now().isoformat(timespec="seconds")
+            next_run = (datetime.now() + timedelta(minutes=int(search["interval_minutes"]))).isoformat(timespec="seconds")
+            get_db().execute("UPDATE saved_search_profiles SET last_run_at = ?, next_run_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [now, next_run, search_id])
+            get_db().commit()
+            return jsonify({**result, "run_id": run_id, "search": saved_search_to_dict(query_db("SELECT * FROM saved_search_profiles WHERE id = ?", [search_id], one=True))})
+        except Exception as exc:
+            finish_discovery_run(run_id, status="failed", fetched=0, new_count=0, duplicate_count=0, errors=1, outcomes={}, error=str(exc))
+            return jsonify({"error": f"Discovery run failed: {exc}", "run_id": run_id}), 502
+
+    @app.get("/api/discovery/scheduler")
+    def discovery_scheduler_get() -> Response:
+        row = query_db("SELECT value FROM app_settings WHERE key = 'discovery_scheduler_enabled'", one=True)
+        return jsonify({"enabled": bool(row and as_bool(row["value"]))})
+
+    @app.put("/api/discovery/scheduler")
+    def discovery_scheduler_set() -> Response:
+        enabled = as_bool((request.get_json(silent=True) or {}).get("enabled"))
+        get_db().execute("INSERT INTO app_settings (key, value) VALUES ('discovery_scheduler_enabled', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", ["1" if enabled else "0"])
+        get_db().commit()
+        return jsonify({"enabled": enabled})
+
     @app.get("/api/discovery/results")
     def discovery_results_get() -> Response:
         search_key = text(request.args.get("search_key"))
@@ -1488,6 +1608,228 @@ def normalize_discovery_sources(value: Any) -> list[str]:
     selected = [text(source).lower() for source in value]
     clean = [source for source in selected if source in DISCOVERY_SOURCES]
     return clean or ["linkedin", "indeed"]
+
+
+def normalize_saved_search_payload(payload: dict[str, Any], existing: dict[str, Any] | None = None) -> dict[str, Any]:
+    existing = existing or {}
+    name = normalize_space(text(payload.get("name", existing.get("name"))))
+    keywords = normalize_space(text(payload.get("keywords", existing.get("keywords"))))
+    if not name or not keywords:
+        raise ValueError("A saved search name and job keywords are required")
+    date_window = normalize_choice(payload.get("date_window", existing.get("date_window")), set(DISCOVERY_DATE_WINDOWS)) or "14d"
+    remote_preference = normalize_choice(payload.get("remote_preference", existing.get("remote_preference")), {"", "remote", "hybrid", "on-site"})
+    interval_minutes = clamp_int_default(payload.get("interval_minutes", existing.get("interval_minutes")), 360, 15, 10080)
+    minimum_salary = clamp_int_default(payload.get("minimum_salary", existing.get("minimum_salary")), 0, 0, 1000000)
+    distance = clamp_int_default(payload.get("distance", existing.get("distance")), 50, 0, 1000)
+    existing_sources = existing.get("enabled_sources")
+    if not isinstance(existing_sources, list):
+        try:
+            existing_sources = json.loads(existing.get("enabled_sources_json") or "[]")
+        except (TypeError, json.JSONDecodeError):
+            existing_sources = []
+    enabled_sources = normalize_discovery_sources(payload.get("enabled_sources", existing_sources))
+    return {
+        "name": name,
+        "keywords": keywords,
+        "location": normalize_space(text(payload.get("location", existing.get("location")))),
+        "remote_preference": remote_preference,
+        "seniority": normalize_space(text(payload.get("seniority", existing.get("seniority")))),
+        "minimum_salary": minimum_salary,
+        "enabled_sources": enabled_sources,
+        "date_window": date_window,
+        "distance": distance,
+        "interval_minutes": interval_minutes,
+        "enabled": 1 if as_bool(payload.get("enabled", existing.get("enabled", False))) else 0,
+    }
+
+
+def saved_search_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:
+    if row is None:
+        return {}
+    data = dict(row)
+    data["enabled"] = bool(data.get("enabled"))
+    try:
+        sources = json.loads(data.get("enabled_sources_json") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        sources = []
+    data["enabled_sources"] = normalize_discovery_sources(sources)
+    data.pop("enabled_sources_json", None)
+    return data
+
+
+def saved_search_to_discovery_payload(search: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **search,
+        "enabled_sources": search.get("enabled_sources") or ["linkedin", "indeed"],
+        "search_depth": "standard",
+        "total_cap": 500,
+        "per_source_cap": 100,
+    }
+
+
+def discovery_remote_eligibility(job: dict[str, Any]) -> tuple[str, str]:
+    arrangement = normalize_space(text(job.get("remote_type"))).lower()
+    location = normalize_space(text(job.get("location"))).lower()
+    content = " ".join([arrangement, location, text(job.get("job_description"))]).lower()
+    restricted = any(term in content for term in ["us only", "u.s. only", "united states only", "must be authorized in the us", "canada not eligible"])
+    canadian = any(term in content for term in ["canada", "canadian", "ontario", "british columbia", "alberta", "quebec"]) or any(code in location for code in ["on", "bc", "ab", "qc"])
+    if restricted:
+        return "restricted", "Posting indicates eligibility is restricted outside Canada."
+    if "remote" in arrangement and canadian:
+        return "canadian_eligible", "Remote posting explicitly mentions Canadian eligibility or a Canadian location."
+    if "remote" in arrangement:
+        return "unknown", "Remote arrangement is known, but country eligibility is not stated."
+    return ("canadian_eligible", "Posting location is in Canada.") if canadian else ("unknown", "Canadian eligibility is not confirmed by the posting.")
+
+
+def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, run_id: int | None) -> dict[str, int]:
+    now = datetime.now().isoformat(timespec="seconds")
+    counts = {"new": 0, "duplicate": 0}
+    db = get_db()
+    for job in jobs:
+        match = find_existing_job_match(job)
+        if match is not None:
+            counts["duplicate"] += 1
+            db.execute(
+                """UPDATE jobs SET discovery_last_seen_at = ?, discovery_seen_count = discovery_seen_count + 1,
+                   discovery_last_search_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+                [now, int(search_id or 0), int(match["id"])],
+            )
+            continue
+        clean = {column: job.get(column, "") for column in JOB_COLUMNS}
+        clean["status"] = "Saved"
+        clean["date_added"] = clean.get("date_added") or date.today().isoformat()
+        clean["discovery_first_seen_at"] = now
+        clean["discovery_last_seen_at"] = now
+        clean["discovery_seen_count"] = 1
+        clean["discovery_state"] = "new"
+        clean["discovery_last_search_id"] = int(search_id or 0)
+        for column, value in list(clean.items()):
+            if isinstance(value, (dict, list, tuple)):
+                clean[column] = dumps_json(value, sort_keys=True)
+        db.execute(
+            f"INSERT INTO jobs ({', '.join(JOB_COLUMNS.keys())}) VALUES ({', '.join(['?'] * len(JOB_COLUMNS))})",
+            tuple(clean[column] for column in JOB_COLUMNS),
+        )
+        counts["new"] += 1
+    db.commit()
+    return counts
+
+
+def create_discovery_run(search_id: int | None, trigger: str) -> int:
+    cursor = get_db().execute("INSERT INTO discovery_run_history (search_id, trigger) VALUES (?, ?)", [search_id, trigger])
+    get_db().commit()
+    return int(cursor.lastrowid)
+
+
+def finish_discovery_run(run_id: int, *, status: str, fetched: int, new_count: int, duplicate_count: int, errors: int, outcomes: dict[str, Any], error: str = "") -> None:
+    get_db().execute(
+        """UPDATE discovery_run_history SET ended_at = CURRENT_TIMESTAMP, status = ?, fetched_count = ?,
+           new_count = ?, duplicate_count = ?, error_count = ?, source_outcomes_json = ?, error = ? WHERE id = ?""",
+        [status, fetched, new_count, duplicate_count, errors, dumps_json(outcomes, sort_keys=True), error, run_id],
+    )
+    get_db().commit()
+
+
+def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = None, run_id: int | None = None) -> dict[str, Any]:
+    """Run the existing JobSpy, enrichment, scoring and dedupe pipeline.
+
+    This is deliberately independent of Flask request handling so the worker can
+    invoke the same path while the browser is closed.
+    """
+    keywords = text(payload.get("keywords"))
+    if not keywords:
+        raise ValueError("Keywords are required")
+    search = discovery_search_config(payload)
+    profile = load_profile()
+    provider = get_geocoding_provider()
+    origin = profile_home_location(profile)
+    location_context = resolve_discovery_location_context(search["location"], profile, provider, use_cache=True)
+    search.update({
+        "original_location": location_context["original_input"],
+        "normalized_location": location_context["normalized_input"],
+        "distance_origin": location_context["distance_origin"],
+        "discovery_location": location_context["discovery_location"],
+        "location_resolution_method": location_context["resolution_method"],
+        "location_geocode": location_context["lookup"],
+    })
+    fetched = fetch_jobspy_jobs(
+        keywords=keywords,
+        location=search["discovery_location"],
+        distance=search["distance"],
+        remote_preference=search["remote_preference"],
+        results_wanted=search["per_source_cap"],
+        hours_old=search["hours_old"],
+        enabled_sources=search["enabled_sources"],
+        country_indeed="Canada",
+    )
+    existing_keys = existing_job_dedupe_keys()
+    seen_keys: set[str] = set()
+    jobs: list[dict[str, Any]] = []
+    duplicates = 0
+    filtered = 0
+    for raw_job in fetched.get("jobs", []):
+        clean = normalize_job_payload(jobspy_result_to_job_payload(raw_job))
+        clean, _ = geocode_discovery_job(clean, profile, origin, provider, use_cache=True)
+        clean = enrich_discovery_job(clean, profile, {"remote_rule": "remote_after_local"})
+        clean["source_job_id"] = text(raw_job.get("source_job_id"))
+        clean["posted_date"] = text(raw_job.get("posted_date"))
+        clean["description_available"] = bool(clean.get("job_description"))
+        clean["score_breakdown"] = parse_json_object(clean.get("score_breakdown"))
+        clean["warnings"] = discovery_warning_reasons(clean, keywords, search["location"])
+        clean["remote_eligibility"], clean["remote_eligibility_explanation"] = discovery_remote_eligibility(clean)
+        minimum_salary = clamp_int_default(payload.get("minimum_salary"), 0, 0, 1000000)
+        if minimum_salary and int(clean.get("salary_max") or 0) < minimum_salary:
+            clean["filtered_reason"] = f"Known salary is below the saved-search minimum of ${minimum_salary:,}."
+            filtered += 1
+            continue
+        seniority_filter = normalize_space(text(payload.get("seniority"))).lower()
+        if seniority_filter and text(clean.get("seniority_level")) and not any(term in text(clean.get("seniority_level")).lower() for term in re.split(r"[,;/]+", seniority_filter) if term.strip()):
+            clean["filtered_reason"] = "Posting seniority does not match the saved-search seniority preference."
+            filtered += 1
+            continue
+        clean["already_saved"] = bool(dedupe_keys(clean, clean.get("source_job_id")) & existing_keys)
+        keys = dedupe_keys(clean, clean.get("source_job_id"))
+        if keys & seen_keys:
+            duplicates += 1
+            continue
+        if clean["already_saved"]:
+            duplicates += 1
+            existing_match = find_existing_job_match(clean)
+            if existing_match is not None:
+                clean["saved_job_id"] = int(existing_match["id"])
+                clean["saved_job_status"] = text(existing_match["status"])
+        seen_keys.update(keys)
+        jobs.append(clean)
+    jobs = sort_discovery_jobs(jobs, "overall_score", "desc", "", "asc", "remote_after_local", "last")[: search["total_cap"]]
+    persisted = persist_discovery_jobs(jobs, search_id, run_id)
+    search_key = discovery_search_signature(payload)
+    metadata = {
+        "search_criteria": search,
+        "source_counts": fetched.get("source_counts", {}),
+        "source_errors": fetched.get("errors", {}),
+        "source_diagnostics": fetched.get("source_diagnostics", {}),
+        "duplicates_removed": duplicates,
+        "raw_jobs_returned": len(fetched.get("jobs", [])),
+        "displayed_jobs": len(jobs),
+        "filtered_by_saved_search": filtered,
+        "persisted": persisted,
+        "filtered": filtered,
+    }
+    save_discovery_search_run(search_key, search, metadata, fetched.get("jobs", []))
+    save_discovery_debug_run(search_key, {**payload, "search_id": search_id}, metadata, fetched.get("source_snapshots", {}))
+    return {
+        "jobs": jobs,
+        "errors": fetched.get("errors", {}),
+        "source_counts": fetched.get("source_counts", {}),
+        "source_diagnostics": fetched.get("source_diagnostics", {}),
+        "total": len(fetched.get("jobs", [])),
+        "visible_total": len(jobs),
+        "duplicates": duplicates,
+        "persisted": persisted,
+        "search_key": search_key,
+        "search": search,
+    }
 
 
 def analyse_saved_job(job: dict[str, Any]) -> Response:
@@ -5683,6 +6025,80 @@ def init_db() -> None:
         CREATE UNIQUE INDEX IF NOT EXISTS discovery_debug_runs_search_key_idx
         ON discovery_debug_runs(search_key)
         """
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS saved_search_profiles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            keywords TEXT NOT NULL DEFAULT '',
+            location TEXT NOT NULL DEFAULT '',
+            remote_preference TEXT NOT NULL DEFAULT '',
+            seniority TEXT NOT NULL DEFAULT '',
+            minimum_salary INTEGER NOT NULL DEFAULT 0,
+            enabled_sources_json TEXT NOT NULL DEFAULT '["linkedin", "indeed"]',
+            date_window TEXT NOT NULL DEFAULT '14d',
+            distance INTEGER NOT NULL DEFAULT 50,
+            interval_minutes INTEGER NOT NULL DEFAULT 360,
+            enabled INTEGER NOT NULL DEFAULT 0,
+            last_run_at TEXT NOT NULL DEFAULT '',
+            next_run_at TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS discovery_run_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            search_id INTEGER,
+            trigger TEXT NOT NULL DEFAULT 'manual',
+            started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            ended_at TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'running',
+            fetched_count INTEGER NOT NULL DEFAULT 0,
+            new_count INTEGER NOT NULL DEFAULT 0,
+            duplicate_count INTEGER NOT NULL DEFAULT 0,
+            error_count INTEGER NOT NULL DEFAULT 0,
+            source_outcomes_json TEXT NOT NULL DEFAULT '{}',
+            error TEXT NOT NULL DEFAULT '',
+            FOREIGN KEY(search_id) REFERENCES saved_search_profiles(id) ON DELETE SET NULL
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS discovery_worker_leases (
+            name TEXT PRIMARY KEY,
+            owner TEXT NOT NULL DEFAULT '',
+            acquired_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            expires_at TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    ensure_columns(
+        "saved_search_profiles",
+        {
+            "seniority": "TEXT NOT NULL DEFAULT ''",
+            "minimum_salary": "INTEGER NOT NULL DEFAULT 0",
+            "enabled_sources_json": "TEXT NOT NULL DEFAULT '[\"linkedin\", \"indeed\"]'",
+            "date_window": "TEXT NOT NULL DEFAULT '14d'",
+            "distance": "INTEGER NOT NULL DEFAULT 50",
+            "interval_minutes": "INTEGER NOT NULL DEFAULT 360",
+            "enabled": "INTEGER NOT NULL DEFAULT 0",
+            "last_run_at": "TEXT NOT NULL DEFAULT ''",
+            "next_run_at": "TEXT NOT NULL DEFAULT ''",
+        },
     )
     db.execute(
         """

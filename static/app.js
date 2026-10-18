@@ -105,6 +105,12 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("job-form").addEventListener("submit", saveJob);
   document.getElementById("profile-form").addEventListener("submit", saveProfile);
   document.getElementById("discovery-form").addEventListener("submit", searchDiscovery);
+  document.getElementById("saved-search-form").addEventListener("submit", saveSavedSearch);
+  document.getElementById("new-saved-search").addEventListener("click", () => toggleSavedSearchForm(true));
+  document.getElementById("cancel-saved-search").addEventListener("click", () => toggleSavedSearchForm(false));
+  document.getElementById("refresh-saved-searches").addEventListener("click", loadSavedSearches);
+  document.getElementById("refresh-discovery-inbox").addEventListener("click", loadDiscoveryInbox);
+  document.getElementById("toggle-discovery-scheduler").addEventListener("click", toggleDiscoveryScheduler);
   document.getElementById("csv-import-form").addEventListener("submit", importCsv);
   document.getElementById("discovery-test-sources").addEventListener("click", testJobSources);
   document.getElementById("refresh-shortlist").addEventListener("click", loadAll);
@@ -167,6 +173,9 @@ document.addEventListener("DOMContentLoaded", () => {
   applyDiscoverySearchDefaults();
   setDiscoveryControlsEnabled(false);
   loadAll();
+  loadSavedSearches();
+  loadDiscoveryInbox();
+  loadDiscoveryScheduler();
 });
 
 async function loadAll() {
@@ -202,6 +211,83 @@ async function loadAll() {
     toast(error.message);
   }
 }
+
+async function loadSavedSearches() {
+  const list = document.getElementById("saved-search-list");
+  if (!list) return;
+  try {
+    const searches = await api.get("/api/discovery/searches");
+    list.innerHTML = searches.length ? searches.map((search) => `
+      <article class="saved-search-row">
+        <div><strong>${escapeHtml(search.name)}</strong><span class="muted">${escapeHtml(search.keywords)} · ${escapeHtml(search.location || "Anywhere")}</span><span class="muted">${search.enabled ? "Scheduled" : "Manual only"} · ${escapeHtml((search.enabled_sources || []).map(sourceLabel).join(", "))}</span></div>
+        <div class="actions compact"><button class="button small" type="button" onclick="runSavedSearch(${search.id})">Run now</button><button class="button ghost small" type="button" onclick='editSavedSearch(${JSON.stringify(search).replaceAll("'", "&apos;")} )'>Edit</button></div>
+      </article>`).join("") : `<p class="muted">No saved searches yet.</p>`;
+  } catch (error) { list.innerHTML = `<p class="muted">${escapeHtml(error.message)}</p>`; }
+}
+
+function toggleSavedSearchForm(show) {
+  const form = document.getElementById("saved-search-form");
+  if (form) form.hidden = !show;
+  if (show) document.getElementById("saved-search-name").focus();
+}
+
+function editSavedSearch(search) {
+  toggleSavedSearchForm(true);
+  setValue("saved-search-id", search.id);
+  setValue("saved-search-name", search.name);
+  setValue("saved-search-keywords", search.keywords);
+  setValue("saved-search-location", search.location);
+  setValue("saved-search-remote", search.remote_preference);
+  setValue("saved-search-seniority", search.seniority);
+  setValue("saved-search-minimum-salary", search.minimum_salary || "");
+  setValue("saved-search-date-window", search.date_window || "14d");
+  setValue("saved-search-interval", search.interval_minutes || 360);
+  setChecked("saved-search-enabled", Boolean(search.enabled));
+  document.querySelectorAll('input[name="saved-search-source"]').forEach((input) => { input.checked = (search.enabled_sources || []).includes(input.value); });
+}
+
+async function saveSavedSearch(event) {
+  event.preventDefault();
+  const id = value("saved-search-id");
+  const body = {
+    name: value("saved-search-name"), keywords: value("saved-search-keywords"), location: value("saved-search-location"),
+    remote_preference: value("saved-search-remote"), seniority: value("saved-search-seniority"), minimum_salary: Number(value("saved-search-minimum-salary") || 0),
+    date_window: value("saved-search-date-window"), interval_minutes: Number(value("saved-search-interval") || 360), enabled: checked("saved-search-enabled"),
+    enabled_sources: [...document.querySelectorAll('input[name="saved-search-source"]:checked')].map((input) => input.value),
+  };
+  try {
+    await api.send(id ? `/api/discovery/searches/${id}` : "/api/discovery/searches", id ? "PUT" : "POST", body);
+    toast("Saved search updated"); toggleSavedSearchForm(false); await loadSavedSearches();
+  } catch (error) { toast(error.message); }
+}
+
+async function runSavedSearch(id) {
+  try { const result = await api.send(`/api/discovery/searches/${id}/run`, "POST", {}); toast(`Discovery found ${result.persisted.new} new and ${result.persisted.duplicate} existing jobs`); await Promise.all([loadSavedSearches(), loadDiscoveryInbox()]); }
+  catch (error) { toast(error.message); }
+}
+
+async function loadDiscoveryInbox() {
+  const target = document.getElementById("discovery-inbox");
+  if (!target) return;
+  try {
+    const jobs = await api.get("/api/discovery/inbox");
+    target.classList.toggle("empty", !jobs.length);
+    target.innerHTML = jobs.length ? jobs.map((job) => `<article class="inbox-row"><div><strong>${escapeHtml(job.title || "Untitled role")}</strong><span>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location unavailable")}</span><span class="muted">${escapeHtml(job.remote_eligibility || "unknown")} · ${escapeHtml(job.salary || "Salary unavailable")} · ${escapeHtml(job.source || "JobSpy")} · ${escapeHtml(job.posted_date || "date unknown")}</span></div><div><strong>Job Priority ${Number(job.overall_score || job.fit_score || 0)}</strong><span class="muted">Discovered ${escapeHtml(job.discovery_first_seen_at || "")}</span></div><div class="row-actions"><button class="button small" type="button" onclick="reviewInboxJob(${job.id})">Review</button><button class="button ghost small" type="button" onclick="saveInboxJob(${job.id})">Shortlist</button><button class="button ghost small" type="button" onclick="ignoreInboxJob(${job.id})">Ignore</button>${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open</a>` : ""}</div></article>`).join("") : "No discovered opportunities yet.";
+  } catch (error) { target.textContent = error.message; }
+}
+
+async function reviewInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/review`, "POST", {}); await loadDiscoveryInbox(); } catch (error) { toast(error.message); } }
+async function ignoreInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/ignore`, "POST", {}); await loadDiscoveryInbox(); } catch (error) { toast(error.message); } }
+async function saveInboxJob(id) {
+  try { const jobs = await api.get("/api/jobs"); const job = jobs.find((item) => Number(item.id) === Number(id)); if (!job) throw new Error("Job not found"); await api.send("/api/shortlist", "POST", job); toast("Job shortlisted"); await loadAll(); await loadDiscoveryInbox(); }
+  catch (error) { toast(error.message); }
+}
+
+async function loadDiscoveryScheduler() {
+  try { const result = await api.get("/api/discovery/scheduler"); updateDiscoverySchedulerButton(result.enabled); } catch (_) { /* older databases */ }
+}
+function updateDiscoverySchedulerButton(enabled) { setText("toggle-discovery-scheduler", enabled ? "Disable scheduler" : "Enable scheduler"); setText("discovery-scheduler-status", enabled ? "Enabled for due saved searches" : "Disabled"); }
+async function toggleDiscoveryScheduler() { try { const current = await api.get("/api/discovery/scheduler"); const result = await api.send("/api/discovery/scheduler", "PUT", { enabled: !current.enabled }); updateDiscoverySchedulerButton(result.enabled); } catch (error) { toast(error.message); } }
 
 function showCandidateProfileForm(profile = null) {
   const form = document.getElementById("candidate-profile-form");
