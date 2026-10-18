@@ -55,9 +55,24 @@ def _migration_002_candidate_documents(db: sqlite3.Connection) -> None:
     )
 
 
+def _migration_003_candidate_identity(db: sqlite3.Connection) -> None:
+    columns = {
+        "identity_mode": "TEXT NOT NULL DEFAULT 'shared'",
+        "applicant_name": "TEXT NOT NULL DEFAULT ''",
+        "applicant_email": "TEXT NOT NULL DEFAULT ''",
+        "applicant_phone": "TEXT NOT NULL DEFAULT ''",
+        "applicant_location": "TEXT NOT NULL DEFAULT ''",
+    }
+    existing = {row[1] for row in db.execute("PRAGMA table_info(candidate_profiles)")}
+    for name, definition in columns.items():
+        if name not in existing:
+            db.execute(f"ALTER TABLE candidate_profiles ADD COLUMN {name} {definition}")
+
+
 MIGRATIONS: tuple[tuple[int, str, Migration], ...] = (
     (1, "legacy baseline", _migration_001_baseline),
     (2, "candidate document profiles", _migration_002_candidate_documents),
+    (3, "candidate identity fields", _migration_003_candidate_identity),
 )
 
 

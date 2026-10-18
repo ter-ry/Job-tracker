@@ -57,6 +57,50 @@ TECHNICAL_TERMS = [
     "postgres",
 ]
 
+# These are spelling variants, not transferable skills.  Normalizing them only
+# for evidence checks permits a format-preserving terminology correction while
+# keeping the original claim and its scope intact.
+EQUIVALENT_TECHNOLOGY_TERMS = {
+    "nodejs": "node.js",
+    "java script": "javascript",
+    "postgres": "postgresql",
+    "restful apis": "rest apis",
+}
+
+# This vocabulary is intentionally generic.  It is used for the transparent
+# Keywords Score inventory, not to manufacture résumé content or to encode a
+# particular job posting.
+KEYWORD_VOCABULARY = [
+    "c++", "c#", ".net", "node.js", "nodejs", "javascript", "typescript", "python", "java", "php", "html", "css", "sql",
+    "flask", "react", "express", "jwt", "nginx", "linux", "windows", "debian", "ubuntu", "aws", "azure", "kafka",
+    "figma", "jira", "git", "github", "bitbucket", "devops", "paas", "api", "apis", "rest api", "rest apis", "restful apis",
+    "java script",
+    "database", "database design", "postgresql", "postgres", "backend", "back-end", "frontend", "front-end", "ai", "tcp", "tcp/ip",
+    "ip networking", "design patterns", "development life cycle", "object oriented programming", "data solutions", "video analytics",
+    "thermal cameras", "performance monitoring", "virtualization", "message queues", "gps mapping", "telematics",
+]
+
+KEYWORD_ALIASES = {
+    "nodejs": "node.js",
+    "java script": "javascript",
+    "backend": "backend",
+    "back-end": "backend",
+    "frontend": "frontend",
+    "front-end": "frontend",
+    "postgres": "postgresql",
+    "restful apis": "rest apis",
+    "rest api": "rest apis",
+    "apis": "api",
+}
+
+RELATED_KEYWORD_EVIDENCE = {
+    "data solutions": ("data", "workflow", "reporting", "analytics", "database", "models"),
+    "design patterns": ("object oriented", "oop", "software design"),
+    "development life cycle": ("designed", "developed", "deployed", "launched", "production"),
+    "devops": ("deployment", "deployed", "production", "ci/cd", "infrastructure", "aws", "azure"),
+    "paas": ("platform", "cloud", "multi-tenant"),
+}
+
 QUALITY_METADATA_TERMS = [
     "endobj",
     "obj",
@@ -139,22 +183,38 @@ def build_candidate_evidence(profile: dict[str, Any], extra_sections: list[dict[
             {
                 "field": str(item.get("source_field") or item.get("field") or "approved_evidence"),
                 "label": str(item.get("source_label") or item.get("label") or "approved evidence"),
-                "text": text_value,
+                "text": preserve_evidence_boundaries(text_value),
                 "id": item.get("id"),
                 "source_kind": str(item.get("source_kind") or "approved_evidence"),
                 "approved": True,
             }
         )
-    for field, label in PROFILE_EVIDENCE_FIELDS:
-        content = normalize_space(str(profile.get(field) or ""))
-        if field == "resume_text" and content and is_corrupted_text(content):
-            continue
-        if content:
-            sections.append({"field": field, "label": label, "text": content})
+    resume_sections = profile.get("_resume_sections")
+    if isinstance(resume_sections, list) and resume_sections:
+        for item in resume_sections:
+            if not isinstance(item, dict):
+                continue
+            value = preserve_evidence_boundaries(str(item.get("text") or item.get("content") or ""))
+            if value:
+                sections.append(
+                    {
+                        "field": "selected_resume",
+                        "label": str(item.get("label") or "Résumé"),
+                        "text": value,
+                    }
+                )
+    else:
+        for field, label in PROFILE_EVIDENCE_FIELDS:
+            content = str(profile.get(field) or "")
+            if field == "resume_text" and content and is_corrupted_text(content):
+                continue
+            if content:
+                sections.append({"field": field, "label": label, "text": preserve_evidence_boundaries(content)})
     full_text = normalize_space(" ".join(section["text"] for section in sections))
     skills = split_profile_skills(str(profile.get("key_skills") or ""))
     return {
         "sections": sections,
+        "units": evidence_units(sections),
         "full_text": full_text,
         "tokens": sorted(useful_tokens(full_text)),
         "skills": skills,
@@ -175,6 +235,43 @@ def build_candidate_evidence(profile: dict[str, Any], extra_sections: list[dict[
     }
 
 
+def preserve_evidence_boundaries(value: str) -> str:
+    """Normalize spacing without erasing résumé paragraph or line boundaries."""
+    return "\n".join(normalize_space(line) for line in str(value or "").splitlines() if normalize_space(line))
+
+
+def evidence_units(sections: list[dict[str, Any]]) -> list[dict[str, str]]:
+    units: list[dict[str, str]] = []
+    for section in sections:
+        for line in str(section.get("text") or "").splitlines():
+            clean_line = normalize_space(line)
+            if not clean_line:
+                continue
+            sentences = split_sentences(clean_line)
+            for sentence in sentences or [clean_line]:
+                units.append({"section": str(section.get("label") or "Résumé"), "text": sentence})
+    return units
+
+
+def evidence_snippet(value: str, phrase: str, minimum: int = 80, maximum: int = 160) -> str:
+    clean = normalize_space(value)
+    if len(clean) <= maximum:
+        return clean
+    match = re.search(re.escape(phrase), clean, re.IGNORECASE)
+    if not match:
+        return clean[: maximum - 1].rstrip() + "…"
+    start = max(0, match.start() - maximum // 3)
+    end = min(len(clean), start + maximum)
+    if end - start < minimum:
+        start = max(0, end - minimum)
+    snippet = clean[start:end].strip()
+    if start > 0:
+        snippet = "…" + snippet
+    if end < len(clean):
+        snippet += "…"
+    return snippet if len(snippet) <= maximum else snippet[: maximum - 1].rstrip() + "…"
+
+
 def evidence_has_generation_source(evidence: dict[str, Any]) -> bool:
     return len(str(evidence.get("full_text") or "")) >= 80
 
@@ -191,6 +288,165 @@ def job_text(job: dict[str, Any]) -> str:
             for field in ["title", "required_skills", "preferred_skills", "responsibilities", "job_description"]
         )
     )
+
+
+def normalize_keyword(value: str) -> str:
+    clean = normalize_space(value).lower().strip(" ,:;()[]{}")
+    return KEYWORD_ALIASES.get(clean, clean)
+
+
+def keyword_present(content: str, phrase: str) -> bool:
+    """Match a keyword as a phrase, never as an unsafe substring."""
+    clean = normalize_space(phrase)
+    if not clean:
+        return False
+    pattern = rf"(?<![A-Za-z0-9]){re.escape(clean)}(?![A-Za-z0-9])"
+    return re.search(pattern, content or "", re.IGNORECASE) is not None
+
+
+def _keyword_requirement_type(job: dict[str, Any], term: str) -> str:
+    sources = []
+    for field, kind in (("required_skills", "required"), ("preferred_skills", "preferred")):
+        value = str(job.get(field) or "")
+        if value and keyword_present(value, term):
+            sources.append(kind)
+    description = str(job.get("job_description") or "")
+    section = "unclassified"
+    for line in description.splitlines():
+        clean = normalize_space(line).lower()
+        if re.search(r"\b(preferred|nice to have|bonus|assets?)\b\s*:?$", clean):
+            section = "preferred"
+        elif re.search(r"\b(required|requirements|minimum qualifications|qualifications)\b\s*:?$", clean):
+            section = "required"
+        if not keyword_present(line, term):
+            continue
+        if re.search(r"\b(preferred|nice to have|bonus|asset)\b\s*:", clean):
+            sources.append("preferred")
+        elif re.search(r"\b(required|requirements|must have|minimum qualifications|qualifications)\b\s*:", clean):
+            sources.append("required")
+        elif section in {"required", "preferred"}:
+            sources.append(section)
+    if "required" in sources:
+        return "required"
+    if "preferred" in sources:
+        return "preferred"
+    return "unclassified"
+
+
+def extract_job_keywords(job: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build a deduplicated, vocabulary-backed job keyword inventory."""
+    content = job_text(job)
+    found: dict[str, dict[str, Any]] = {}
+    for term in sorted(KEYWORD_VOCABULARY, key=len, reverse=True):
+        if not keyword_present(content, term):
+            continue
+        normalized = normalize_keyword(term)
+        record = found.setdefault(normalized, {
+            "keyword": term,
+            "normalized": normalized,
+            "category": "technical",
+            "requirement_type": "unclassified",
+            "source_fields": [],
+        })
+        requirement_type = _keyword_requirement_type(job, term)
+        if requirement_type == "required" or (requirement_type == "preferred" and record["requirement_type"] == "unclassified"):
+            record["requirement_type"] = requirement_type
+        for field in ("required_skills", "preferred_skills", "responsibilities", "job_description"):
+            if keyword_present(str(job.get(field) or ""), term) and field not in record["source_fields"]:
+                record["source_fields"].append(field)
+    records = list(found.values())
+    redundant = set()
+    for shorter in records:
+        for longer in records:
+            if shorter is longer or shorter["normalized"] == longer["normalized"]:
+                continue
+            if len(longer["keyword"]) > len(shorter["keyword"]) and keyword_present(longer["keyword"], shorter["keyword"]):
+                redundant.add(shorter["normalized"])
+                break
+    records = [item for item in records if item["normalized"] not in redundant]
+    return sorted(records, key=lambda item: (item["requirement_type"] == "unclassified", item["normalized"]))
+
+
+def match_job_keywords_to_resume(job: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
+    evidence = build_candidate_evidence(profile)
+    full_text = evidence.get("full_text") or ""
+    units = evidence.get("units") or []
+    records = {"matched": [], "related": [], "missing": []}
+    for keyword in extract_job_keywords(job):
+        normalized = keyword["normalized"]
+        exact = keyword_present(full_text, keyword["keyword"])
+        equivalent = not exact and any(
+            keyword_present(full_text, source) and normalize_keyword(source) == normalized
+            for source in [keyword["keyword"], normalized, *KEYWORD_ALIASES.keys(), *KEYWORD_ALIASES.values()]
+        )
+        source_phrase = keyword["keyword"]
+        if equivalent and not exact:
+            source_phrase = next(
+                (candidate for candidate in [keyword["keyword"], normalized, *KEYWORD_ALIASES.keys(), *KEYWORD_ALIASES.values()] if keyword_present(full_text, candidate) and normalize_keyword(candidate) == normalized),
+                keyword["keyword"],
+            )
+        evidence_unit = next((unit for unit in units if keyword_present(unit["text"], source_phrase) or keyword_present(unit["text"], normalized)), None)
+        record = {
+            **keyword,
+            "match_type": "exact" if exact else "equivalent" if equivalent else "missing",
+            "found_as": source_phrase if exact or equivalent else "",
+            "source_section": evidence_unit.get("section", "Résumé") if evidence_unit else "Résumé",
+            "evidence": evidence_snippet(evidence_unit["text"], source_phrase) if evidence_unit and (exact or equivalent) else "",
+        }
+        if exact or equivalent:
+            records["matched"].append(record)
+            continue
+        related_terms = RELATED_KEYWORD_EVIDENCE.get(normalized, ())
+        related_unit = next((unit for unit in units if any(keyword_present(unit["text"], term) or term in unit["text"].lower() for term in related_terms)), None)
+        if related_unit:
+            record["match_type"] = "related_review"
+            record["source_section"] = related_unit.get("section", "Résumé")
+            record["evidence"] = evidence_snippet(related_unit["text"], next((term for term in related_terms if keyword_present(related_unit["text"], term)), related_terms[0] if related_terms else ""))
+            records["related"].append(record)
+        else:
+            records["missing"].append(record)
+    return records
+
+
+def build_keywords_score_report(job: dict[str, Any], profile: dict[str, Any], final_resume_text: str | None = None) -> dict[str, Any]:
+    """Return an explainable keyword score; related evidence is never counted."""
+    selected_resume = final_resume_text if final_resume_text is not None else str(profile.get("resume_text") or "")
+    selected_profile = {"resume_text": selected_resume} if selected_resume else profile
+    if profile.get("_resume_sections") and final_resume_text is None:
+        selected_profile["_resume_sections"] = profile["_resume_sections"]
+    result = match_job_keywords_to_resume(job, selected_profile)
+    inventory = extract_job_keywords(job)
+    matched = result["matched"]
+    required = [item for item in inventory if item["requirement_type"] == "required"]
+    preferred = [item for item in inventory if item["requirement_type"] == "preferred"]
+
+    def subset(items: list[dict[str, Any]]) -> dict[str, Any]:
+        keys = {item["normalized"] for item in items}
+        hits = [item for item in matched if item["normalized"] in keys]
+        return {
+            "status": "assessed" if items else "not_assessed",
+            "matched": len(hits),
+            "total": len(items),
+            "score_percent": round(len(hits) / len(items) * 100) if items else None,
+        }
+
+    total = len(inventory)
+    report = {
+        "score_percent": round(len(matched) / total * 100) if total else 0,
+        "matched_count": len(matched),
+        "total": total,
+        "matched": matched,
+        "related": result["related"],
+        "missing": result["missing"],
+        "required": subset(required),
+        "preferred": subset(preferred),
+        "unclassified": sum(1 for item in inventory if item["requirement_type"] == "unclassified"),
+        "unclassified_keywords": [item for item in inventory if item["requirement_type"] == "unclassified"],
+        "review_threshold_percent": 70,
+        "review_before_applying": bool(total and len(matched) / total * 100 < 70),
+        "heuristic_note": "Keyword coverage is a transparent review heuristic, not an ATS score or a claim that a candidate lacks a skill.",
+    }
+    return report
 
 
 def job_keywords(job: dict[str, Any], limit: int = 30) -> list[str]:
@@ -245,9 +501,9 @@ def classify_supported_skills(job: dict[str, Any], evidence: dict[str, Any]) -> 
 
 
 def evidence_supports_phrase(phrase: str, evidence: dict[str, Any]) -> bool:
-    clean = normalize_space(phrase).lower()
-    evidence_text = str(evidence.get("full_text") or "")
-    role_text = " ".join(evidence.get("preferred_roles") or [])
+    clean = normalize_equivalent_technology_terms(normalize_space(phrase).lower())
+    evidence_text = normalize_equivalent_technology_terms(str(evidence.get("full_text") or ""))
+    role_text = normalize_equivalent_technology_terms(" ".join(evidence.get("preferred_roles") or []))
     if not clean or len(clean) < 2:
         return False
     if contains_phrase(evidence_text, clean) or contains_phrase(role_text, clean):
@@ -257,6 +513,13 @@ def evidence_supports_phrase(phrase: str, evidence: dict[str, Any]) -> bool:
         return False
     evidence_tokens = set(evidence.get("tokens") or set()) | useful_tokens(role_text)
     return bool(phrase_tokens) and len(phrase_tokens & evidence_tokens) / len(phrase_tokens) >= 0.7
+
+
+def normalize_equivalent_technology_terms(value: str) -> str:
+    normalized = value.lower()
+    for source, target in EQUIVALENT_TECHNOLOGY_TERMS.items():
+        normalized = re.sub(rf"\b{re.escape(source)}\b", target, normalized)
+    return normalized
 
 
 def supporting_snippets(terms: list[str], evidence: dict[str, Any], limit: int = 4) -> list[str]:
@@ -283,9 +546,9 @@ def validate_generated_content(content: str, evidence: dict[str, Any], job: dict
         if contains_phrase(lower, term) and not evidence_supports_phrase(term, evidence):
             conflicts.append(term)
     role_words = useful_tokens(str(job.get("title") or ""))
-    candidate_roles = useful_tokens(" ".join(evidence.get("preferred_roles") or []))
-    if any(term in lower for term in ["software developer", "software engineer"]) and not ({"software", "developer", "engineer"} & candidate_roles):
-        conflicts.append("generated software role wording not supported by preferred roles")
+    for role_phrase in ("software developer", "software engineer"):
+        if role_phrase in lower and not evidence_supports_phrase(role_phrase, evidence):
+            conflicts.append(f"generated {role_phrase} wording is not supported by candidate evidence")
     empty_or_corrupted = not evidence_has_generation_source(evidence) or is_corrupted_text(str(evidence.get("full_text") or ""))
     return {
         "ok": not conflicts and not empty_or_corrupted,

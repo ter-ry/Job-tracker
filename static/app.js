@@ -10,6 +10,9 @@ const state = {
   discoveryMeta: {},
   discoveryView: "table",
   shortlist: [],
+  candidateProfiles: [],
+  generationSelections: {},
+  selectedCandidateProfileId: "",
 };
 
 const jobFields = [
@@ -56,6 +59,7 @@ const profileFields = [
   "work-experience",
   "resume-text",
   "cover-letter-template",
+  "cover-letter-no-dashes",
   "ollama-enabled",
   "ollama-base-url",
   "ollama-model",
@@ -116,6 +120,9 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("profile-test-location").addEventListener("click", testAndSaveLocation);
   document.getElementById("resume-upload").addEventListener("change", uploadResume);
   document.getElementById("cover-letter-template-upload").addEventListener("change", uploadCoverLetterTemplate);
+  document.getElementById("new-candidate-profile").addEventListener("click", () => showCandidateProfileForm());
+  document.getElementById("cancel-candidate-profile").addEventListener("click", hideCandidateProfileForm);
+  document.getElementById("candidate-profile-form").addEventListener("submit", saveCandidateProfile);
   document.getElementById("discovery-view-cards").addEventListener("click", () => setDiscoveryView("cards"));
   document.getElementById("discovery-view-table").addEventListener("click", () => setDiscoveryView("table"));
   document.getElementById("discovery-filter-toggle").addEventListener("click", toggleDiscoveryFilters);
@@ -164,31 +171,140 @@ document.addEventListener("DOMContentLoaded", () => {
 
 async function loadAll() {
   try {
-    const [jobs, dashboard, profile, ollamaHealth, evidence, systemHealth] = await Promise.all([
+    const [jobs, dashboard, profile, ollamaHealth, evidence, systemHealth, candidateProfiles] = await Promise.all([
       api.get("/api/jobs"),
       api.get("/api/dashboard"),
       api.get("/api/profile"),
       api.get("/api/ollama/health").catch((error) => ({ status: "error", summary: error.message })),
       api.get("/api/health").catch((error) => ({ status: "error", summary: error.message })),
       api.get("/api/evidence").catch(() => []),
+      api.get("/api/candidate-profiles").catch(() => []),
     ]);
     const shortlist = await api.get("/api/shortlist");
     state.jobs = jobs;
     state.profile = profile;
     state.evidence = evidence;
     state.shortlist = shortlist;
+    state.candidateProfiles = Array.isArray(candidateProfiles) ? candidateProfiles : [];
+    await hydrateGenerationSelections();
     state.systemHealth = systemHealth;
     renderDashboard(dashboard);
     renderPipelineDashboard(jobs);
     renderProfile(profile);
+    renderCandidateProfiles();
     renderTemplateStatus(profile);
     renderOllamaHealth(ollamaHealth);
     renderEvidenceLibrary(evidence);
     renderJobs();
     renderShortlist();
+    await refreshShortlistKeywordScores();
   } catch (error) {
     toast(error.message);
   }
+}
+
+function showCandidateProfileForm(profile = null) {
+  const form = document.getElementById("candidate-profile-form");
+  form.hidden = false;
+  form.dataset.profileId = profile?.id || "";
+  setText("candidate-profile-form-title", profile ? `Edit ${profile.name}` : "Create candidate profile");
+  document.getElementById("candidate-profile-name").value = profile?.name || "";
+  document.getElementById("candidate-profile-name").disabled = Boolean(profile);
+  document.getElementById("candidate-profile-identity-mode").value = profile?.identity_mode || "shared";
+  document.getElementById("candidate-profile-applicant-name").value = profile?.applicant_name || "";
+  document.getElementById("candidate-profile-applicant-email").value = profile?.applicant_email || "";
+  document.getElementById("candidate-profile-applicant-phone").value = profile?.applicant_phone || "";
+  document.getElementById("candidate-profile-applicant-location").value = profile?.applicant_location || "";
+}
+
+function hideCandidateProfileForm() {
+  const form = document.getElementById("candidate-profile-form");
+  form.hidden = true;
+  form.reset();
+  form.dataset.profileId = "";
+  document.getElementById("candidate-profile-name").disabled = false;
+}
+
+async function saveCandidateProfile(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const payload = {
+    name: value("candidate-profile-name"),
+    identity_mode: value("candidate-profile-identity-mode"),
+    applicant_name: value("candidate-profile-applicant-name"),
+    applicant_email: value("candidate-profile-applicant-email"),
+    applicant_phone: value("candidate-profile-applicant-phone"),
+    applicant_location: value("candidate-profile-applicant-location"),
+  };
+  try {
+    if (form.dataset.profileId) await api.send(`/api/candidate-profiles/${form.dataset.profileId}`, "PATCH", payload);
+    else await api.send("/api/candidate-profiles", "POST", payload);
+    hideCandidateProfileForm();
+    toast("Candidate profile saved");
+    await loadAll();
+  } catch (error) { toast(error.message); }
+}
+
+function renderCandidateProfiles() {
+  const list = document.getElementById("candidate-profile-list");
+  if (!list) return;
+  if (!state.candidateProfiles.length) {
+    list.innerHTML = '<p class="muted">No reusable candidate profiles yet.</p>';
+    document.getElementById("candidate-profile-documents").classList.add("empty");
+    document.getElementById("candidate-profile-documents").textContent = "Create a profile to add role-specific documents.";
+    return;
+  }
+  if (!state.selectedCandidateProfileId) state.selectedCandidateProfileId = String(state.candidateProfiles[0].id);
+  list.innerHTML = state.candidateProfiles.map((profile) => `
+    <article class="candidate-profile-card ${String(profile.id) === state.selectedCandidateProfileId ? "selected" : ""}">
+      <div><h3>${escapeHtml(profile.name)}</h3><p class="muted">${profile.identity_mode === "distinct" ? escapeHtml(profile.applicant_name || "Distinct identity not set") : "Uses active profile identity"}</p></div>
+      <div class="actions compact"><button class="button small ghost" type="button" onclick="selectCandidateProfile(${profile.id})">Manage documents</button><button class="button small ghost" type="button" onclick='showCandidateProfileForm(${JSON.stringify(profile).replaceAll("'", "&#39;")})'>Edit identity</button></div>
+    </article>`).join("");
+  renderCandidateProfileDocuments();
+}
+
+async function selectCandidateProfile(profileId) {
+  state.selectedCandidateProfileId = String(profileId);
+  renderCandidateProfiles();
+  await renderCandidateProfileDocuments();
+}
+
+async function renderCandidateProfileDocuments() {
+  const target = document.getElementById("candidate-profile-documents");
+  if (!target || !state.selectedCandidateProfileId) return;
+  const profile = state.candidateProfiles.find((item) => String(item.id) === state.selectedCandidateProfileId);
+  if (!profile) return;
+  try {
+    const documents = await api.get(`/api/candidate-profiles/${profile.id}/documents`);
+    const documentRows = (items, kind, label) => items.length ? items.map((item) => `<li><span>${escapeHtml(item.name)}${item.is_default ? " <strong>(default)</strong>" : ""}</span>${item.is_default ? "" : `<button class="button small ghost" type="button" onclick="setCandidateDefault(${profile.id}, '${kind}', ${item.id})">Set default</button>`}</li>`).join("") : `<li class="muted">No ${label} uploaded yet.</li>`;
+    target.classList.remove("empty");
+    target.innerHTML = `<div class="panel-header"><h3>${escapeHtml(profile.name)} documents</h3><span class="muted">Original DOCX files are kept in the application data directory.</span></div>
+      <div class="grid two"><label>Upload base résumé (.docx)<input id="candidate-resume-file" type="file" accept=".docx" onchange="uploadCandidateDocument(${profile.id}, 'resume', this)"></label><label>Upload cover letter template (.docx)<input id="candidate-cover-file" type="file" accept=".docx" onchange="uploadCandidateDocument(${profile.id}, 'cover', this)"></label></div>
+      <div class="grid two document-columns"><div><h4>Base résumés</h4><ul class="document-list">${documentRows(documents.resumes || [], "resume", "résumés")}</ul></div><div><h4>Cover letter templates</h4><ul class="document-list">${documentRows(documents.cover_letter_templates || [], "cover", "templates")}</ul></div></div>`;
+  } catch (error) { target.textContent = error.message; }
+}
+
+async function uploadCandidateDocument(profileId, kind, input) {
+  const file = input.files[0];
+  if (!file) return;
+  const data = new FormData();
+  data.append("file", file);
+  data.append("is_default", "true");
+  try {
+    const route = kind === "resume" ? "resumes" : "cover-letter-templates";
+    await api.upload(`/api/candidate-profiles/${profileId}/${route}/upload`, data);
+    toast("Document uploaded and selected as default");
+    await loadAll();
+  } catch (error) { toast(error.message); }
+}
+
+async function setCandidateDefault(profileId, kind, documentId) {
+  try {
+    const route = kind === "resume" ? "resumes" : "cover-letter-templates";
+    await api.send(`/api/candidate-profiles/${profileId}/${route}/${documentId}/default`, "POST", {});
+    toast("Default document updated");
+    await loadAll();
+  } catch (error) { toast(error.message); }
 }
 
 function switchTab(event) {
@@ -728,6 +844,7 @@ function renderGenerated(output) {
       <p><strong>Truthfully add:</strong> ${escapeHtml(output.missing_keywords.join(", ") || "None found")}</p>
       <p><strong>Do not add unsupported:</strong> ${escapeHtml(output.unsupported_keywords.join(", ") || "None")}</p>
     </section>
+    ${renderKeywordCoverage(output.keyword_coverage)}
     <section>
       <h3>Tailoring review</h3>
       <p><strong>Extracted phrases:</strong> ${escapeHtml((review.extracted_job_phrases || []).map((item) => item.phrase || item).join(", ") || "None")}</p>
@@ -770,6 +887,47 @@ function renderGenerated(output) {
 
 function scoreItem(label, value) {
   return `<div><span>${Number(value || 0)}</span><p>${escapeHtml(label)}</p></div>`;
+}
+
+function renderKeywordCoverage(report) {
+  if (!report) return "";
+  const score = report.keywords_score || {};
+  const list = (items, empty) => Array.isArray(items) && items.length
+    ? `<div class="keyword-records">${items.map((item) => {
+      const keyword = item.keyword || item.normalized || item.requirement || "Keyword";
+      const status = item.match_type === "equivalent" ? "Equivalent" : item.match_type === "exact" ? "Exact" : item.match_type === "related_review" ? "Related" : "Missing";
+      const category = item.requirement_type || "unclassified";
+      const detail = item.evidence
+        ? `<div class="keyword-evidence"><strong>Found as:</strong> ${escapeHtml(item.found_as || keyword)}<br><strong>Source:</strong> ${escapeHtml(item.source_section || "Résumé")}<br><strong>Evidence:</strong> ${escapeHtml(item.evidence)}</div>`
+        : `<div class="keyword-evidence muted">No résumé evidence recorded.</div>`;
+      return `<details class="keyword-record"><summary><span class="keyword-chip">${escapeHtml(keyword)}</span><span class="keyword-status">${escapeHtml(status)}</span><span class="keyword-category">${escapeHtml(category)}</span></summary>${detail}</details>`;
+    }).join("")}</div>`
+    : `<p class="muted">${escapeHtml(empty)}</p>`;
+  const eligibility = Array.isArray(report.eligibility_concerns) && report.eligibility_concerns.length
+    ? `<h4>Eligibility concerns</h4>${list(report.eligibility_concerns, "None")}`
+    : `<p class="muted">No nontechnical eligibility concerns.</p>`;
+  const preferredScore = score.preferred && score.preferred.status === "assessed"
+    ? `${Number(score.preferred.score_percent || 0)}% (${Number(score.preferred.matched || 0)}/${Number(score.preferred.total || 0)})`
+    : "Not assessed";
+  const scoreSection = score.total != null ? `
+    <section class="keywords-score-panel">
+      <h3>Keywords Score</h3>
+      <p><strong>${Number(score.score_percent || 0)}%</strong> · ${Number(score.matched_count || 0)}/${Number(score.total || 0)} eligible keywords matched</p>
+      <p><strong>Required (explicitly classified only):</strong> ${score.required && score.required.status === "assessed" ? `${Number(score.required.score_percent || 0)}% (${Number(score.required.matched || 0)}/${Number(score.required.total || 0)})` : "Not assessed"} · <strong>Preferred:</strong> ${preferredScore}</p>
+      <p class="muted">Keywords Score measures coverage in the selected résumé. Overall Fit is a separate job prioritization metric and may use the saved active profile.</p>
+      ${score.review_before_applying ? `<p class="risk medium"><strong>Review job fit</strong><br>Coverage is below the configurable ${Number(score.review_threshold_percent || 70)}% review guideline.</p>` : `<p class="muted">No keyword coverage review warning.</p>`}
+      <h4>Matched</h4>${list(score.matched, "No exact or equivalent keyword matches.")}
+      <h4>Related evidence for review</h4>${list(score.related, "None identified.")}
+      <h4>Missing</h4>${list(score.missing, "No eligible keywords missing.")}
+      <p class="muted">${escapeHtml(score.heuristic_note || "Keyword coverage is a review heuristic, not a hiring decision.")}</p>
+    </section>` : "";
+  return `
+    ${scoreSection}
+    <section>
+      <h3>Nontechnical job fit</h3>
+      ${eligibility}
+    </section>
+  `;
 }
 
 function renderReviewItems(items, includeMatch = false) {
@@ -1353,7 +1511,7 @@ function renderDiscoveryTable(jobs) {
     ["salary", "Salary"],
     ["posted_date", "Posted date"],
     ["work_arrangement", "Work arrangement"],
-    ["overall_score", "Overall score"],
+    ["overall_score", "Job Priority"],
     ["source", "Source"],
   ];
   return `
@@ -1388,7 +1546,7 @@ function renderDiscoveryRow(job, index) {
       <td>${escapeHtml(job.salary || "Salary unavailable")}</td>
       <td>${escapeHtml(job.posted_date || "Unknown")}</td>
       <td>${escapeHtml(job.work_arrangement || job.remote_type || "Unknown")}</td>
-      <td>${scorePill(job.overall_score || job.fit_score || 0)}</td>
+      <td><strong>Job Priority</strong><br>${scorePill(job.overall_score || job.fit_score || 0)}</td>
       <td>${escapeHtml(job.source || "JobSpy")}</td>
     </tr>
     <tr>
@@ -1425,14 +1583,14 @@ function renderDiscoveryCard(job, index) {
           <div class="badge-row">
             ${badge("Distance", distanceBadge(job))}
             ${badge("Salary", job.salary || "Unavailable")}
-            ${badge("Score", Number(job.overall_score || job.fit_score || 0))}
+            ${badge("Job Priority", Number(job.overall_score || job.fit_score || 0))}
             ${badge("Match", Number(job.match_score || 0))}
             ${badge("Source", job.source || "JobSpy")}
             ${badge("Posted", job.posted_date || "Unknown")}
             ${badge("Work", job.work_arrangement || job.remote_type || "Unknown")}
           </div>
         </div>
-        <div>${scorePill(job.overall_score || job.fit_score || 0)}${saved}</div>
+        <div><strong>Job Priority</strong><br>${scorePill(job.overall_score || job.fit_score || 0)}${saved}</div>
       </div>
       ${warnings}
       <div class="mini-breakdown">${miniBreakdown(job)}</div>
@@ -1709,6 +1867,38 @@ function renderShortlist() {
   container.innerHTML = state.shortlist.map(renderShortlistCard).join("");
 }
 
+async function refreshShortlistKeywordScores() {
+  await Promise.all(state.shortlist.map(async (job) => {
+    const selection = generationSelection(job.id);
+    selection.keywordScoreLoading = true;
+    selection.keywordScoreError = "";
+    try {
+      const result = await api.send(`/api/shortlist/${job.id}/keyword-score`, "POST", generationPayload(job.id));
+      selection.keywordScore = result.keywords_score || null;
+    } catch (error) {
+      selection.keywordScore = null;
+      selection.keywordScoreError = error.message;
+    } finally {
+      selection.keywordScoreLoading = false;
+    }
+  }));
+  renderShortlist();
+}
+
+async function hydrateGenerationSelections() {
+  await Promise.all(state.shortlist.map(async (job) => {
+    const selection = generationSelection(job.id);
+    if (!selection.profileId || selection.documents.resumes?.length || selection.documents.cover_letter_templates?.length) return;
+    try {
+      selection.documents = await api.get(`/api/candidate-profiles/${selection.profileId}/documents`);
+      selection.resumeId = String(selection.documents.resumes?.find((item) => item.is_default)?.id || selection.documents.resumes?.[0]?.id || "");
+      selection.coverLetterTemplateId = String(selection.documents.cover_letter_templates?.find((item) => item.is_default)?.id || selection.documents.cover_letter_templates?.[0]?.id || "");
+    } catch (error) {
+      // The shortlist remains usable if a candidate profile was removed while it was open.
+    }
+  }));
+}
+
 function renderTailoringChanges(job) {
   const changes = job.tailoring_changes || {};
   const resume = changes.resume || {};
@@ -1751,46 +1941,6 @@ function renderTailoringChanges(job) {
   `;
 }
 
-function renderShortlistCard(job) {
-  const resumeReady = job.resume_generation_status === "generated";
-  const coverReady = job.cover_letter_generation_status === "generated";
-  const salaryLabel = job.salary_source === "estimated" ? `${job.salary} (estimated)` : job.salary || "Salary unavailable";
-  const error = job.generation_error ? `<p class="risk high">${escapeHtml(job.generation_error)}</p>` : "";
-  return `
-    <section class="discovery-card">
-      <div class="discovery-card-main">
-        <div>
-          <h3>${escapeHtml(job.title || "Untitled role")}</h3>
-          <p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(job.location || "Location unavailable")}</p>
-          <p class="muted">${escapeHtml(job.source || "")} · ${escapeHtml(salaryLabel)} · Shortlisted ${escapeHtml(job.date_shortlisted || job.date_added || "")}</p>
-          <p>${scorePill(job.fit_score)} <span class="muted">${miniBreakdown(job)}</span></p>
-          <p class="muted">Resume: ${escapeHtml(job.resume_generation_status || "pending")} · Cover letter: ${escapeHtml(job.cover_letter_generation_status || "pending")}</p>
-          ${error}
-          ${renderTailoringChanges(job)}
-        </div>
-      </div>
-      <div class="row-actions">
-        ${job.url ? `<a class="button small ghost" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open job</a>` : ""}
-        <a class="button small ghost ${resumeReady ? "" : "disabled-link"}" href="/api/shortlist/${job.id}/resume">Download resume</a>
-        <a class="button small ghost ${coverReady ? "" : "disabled-link"}" href="/api/shortlist/${job.id}/cover-letter">Download cover letter</a>
-        <button class="button small ghost" type="button" onclick="regenerateShortlist(${job.id})">Regenerate documents</button>
-        <button class="button small ghost" type="button" onclick="markShortlistApplied(${job.id})">Mark applied</button>
-        <button class="button small ghost danger" type="button" onclick="removeShortlist(${job.id})">Remove</button>
-      </div>
-    </section>
-  `;
-}
-
-async function regenerateShortlist(id) {
-  try {
-    await api.send(`/api/shortlist/${id}/regenerate`, "POST", {});
-    toast("Documents regenerated");
-    await loadAll();
-  } catch (error) {
-    toast(error.message);
-  }
-}
-
 async function markShortlistApplied(id) {
   try {
     await api.send(`/api/shortlist/${id}/applied`, "POST", {});
@@ -1811,35 +1961,118 @@ async function removeShortlist(id) {
   }
 }
 
+function generationSelection(jobId) {
+  if (!state.generationSelections[jobId]) {
+    const first = state.candidateProfiles[0];
+    state.generationSelections[jobId] = { profileId: first ? String(first.id) : "", resumeId: "", coverLetterTemplateId: "", documents: { resumes: [], cover_letter_templates: [] }, keywordScore: null, keywordScoreError: "", keywordScoreLoading: false };
+  }
+  return state.generationSelections[jobId];
+}
+
+function generationPayload(jobId) {
+  const selection = generationSelection(jobId);
+  if (!selection.profileId) return {};
+  return {
+    candidate_profile_id: Number(selection.profileId),
+    ...(selection.resumeId ? { resume_id: Number(selection.resumeId) } : {}),
+    ...(selection.coverLetterTemplateId ? { cover_letter_template_id: Number(selection.coverLetterTemplateId) } : {}),
+  };
+}
+
+async function selectGenerationProfile(jobId, profileId) {
+  const selection = generationSelection(jobId);
+  selection.profileId = String(profileId || "");
+  selection.resumeId = "";
+  selection.coverLetterTemplateId = "";
+  selection.documents = { resumes: [], cover_letter_templates: [] };
+  selection.keywordScore = null;
+  if (selection.profileId) {
+    try {
+      selection.documents = await api.get(`/api/candidate-profiles/${selection.profileId}/documents`);
+      selection.resumeId = String(selection.documents.resumes?.find((item) => item.is_default)?.id || selection.documents.resumes?.[0]?.id || "");
+      selection.coverLetterTemplateId = String(selection.documents.cover_letter_templates?.find((item) => item.is_default)?.id || selection.documents.cover_letter_templates?.[0]?.id || "");
+    } catch (error) {
+      toast(error.message);
+    }
+  }
+  renderShortlist();
+  await refreshShortlistKeywordScores();
+}
+
+async function selectGenerationDocument(jobId, kind, value) {
+  const selection = generationSelection(jobId);
+  if (kind === "resume") selection.resumeId = String(value || "");
+  if (kind === "cover") selection.coverLetterTemplateId = String(value || "");
+  selection.keywordScore = null;
+  selection.keywordScoreError = "";
+  renderShortlist();
+  await refreshShortlistKeywordScores();
+}
+
+async function previewShortlist(id) {
+  const target = document.getElementById(`document-preview-${id}`);
+  if (!target) return;
+  try {
+    const preview = await api.get(`/api/shortlist/${id}/preview`);
+    target.classList.remove("empty");
+    target.innerHTML = `<h4>Generated preview</h4><h5>Résumé</h5><pre>${escapeHtml(preview.resume || "No résumé preview is available.")}</pre><h5>Cover letter</h5><pre>${escapeHtml(preview.cover_letter || "No cover letter preview is available.")}</pre>`;
+  } catch (error) {
+    target.textContent = error.message;
+  }
+}
+
+function documentSelectorOptions(items, selectedId, emptyLabel) {
+  if (!items.length) return `<option value="">${emptyLabel}</option>`;
+  return items.map((item) => `<option value="${escapeAttribute(item.id)}" ${String(item.id) === String(selectedId) ? "selected" : ""}>${escapeHtml(item.name || "Unnamed document")}</option>`).join("");
+}
+
 function renderShortlistCard(job) {
-  const resumeReady = job.resume_generation_status === "generated";
-  const coverReady = job.cover_letter_generation_status === "generated";
-  const salaryLabel = job.salary_source === "estimated" ? `${job.salary} (estimated)` : job.salary || "Salary unavailable";
+  const selection = generationSelection(job.id);
+  const profileOptions = [`<option value="" ${selection.profileId ? "" : "selected"}>Use active profile</option>`, ...state.candidateProfiles.map((profile) => `<option value="${escapeAttribute(profile.id)}" ${String(profile.id) === String(selection.profileId) ? "selected" : ""}>${escapeHtml(profile.name)}</option>`)].join("");
+  const resumeAvailable = Boolean(job.resume_docx_path);
+  const coverAvailable = Boolean(job.cover_letter_docx_path);
   const resumeStatus = job.resume_generation_status || "pending";
   const coverStatus = job.cover_letter_generation_status || "pending";
+  const resumePrevious = resumeStatus !== "generated" && resumeAvailable ? " · previous résumé available" : "";
+  const coverPrevious = coverStatus !== "generated" && coverAvailable ? " · previous cover letter available" : "";
   const resumeError = job.resume_generation_error ? `<p class="risk high">Resume error: ${escapeHtml(job.resume_generation_error)}</p>` : "";
   const coverError = job.cover_letter_generation_error ? `<p class="risk high">Cover letter error: ${escapeHtml(job.cover_letter_generation_error)}</p>` : "";
   const coverWarning = job.cover_letter_generation_warning ? `<p class="warning">Cover letter warning: ${escapeHtml(job.cover_letter_generation_warning)}</p>` : "";
+  const keywordScorePanel = selection.keywordScoreLoading
+    ? `<section class="keywords-score-panel"><h3>Keywords Score</h3><p class="muted">Reviewing the selected résumé…</p></section>`
+    : selection.keywordScoreError
+      ? `<section class="keywords-score-panel"><h3>Keywords Score</h3><p class="risk medium">${escapeHtml(selection.keywordScoreError)}</p></section>`
+      : selection.keywordScore
+        ? renderKeywordCoverage({ keywords_score: selection.keywordScore, eligibility_concerns: [] })
+        : `<section class="keywords-score-panel"><h3>Keywords Score</h3><p class="muted">Select a candidate profile and base résumé to inspect keyword coverage. This does not generate documents.</p></section>`;
+  const salaryLabel = job.salary_source === "estimated" ? `${job.salary} (estimated)` : job.salary || "Salary unavailable";
   return `
-    <section class="discovery-card">
+    <section class="discovery-card shortlist-card">
       <div class="discovery-card-main">
         <div>
           <h3>${escapeHtml(job.title || "Untitled role")}</h3>
-          <p><strong>${escapeHtml(job.company || "Unknown company")}</strong> Â· ${escapeHtml(job.location || "Location unavailable")}</p>
-          <p class="muted">${escapeHtml(job.source || "")} Â· ${escapeHtml(salaryLabel)} Â· Shortlisted ${escapeHtml(job.date_shortlisted || job.date_added || "")}</p>
-          <p>${scorePill(job.fit_score)} <span class="muted">${miniBreakdown(job)}</span></p>
-          <p class="muted">Resume: ${escapeHtml(resumeStatus)}${resumeReady ? " (ready)" : ""}</p>
+          <p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(job.location || "Location unavailable")}</p>
+          <p class="muted">${escapeHtml(job.source || "")} · ${escapeHtml(salaryLabel)} · Shortlisted ${escapeHtml(job.date_shortlisted || job.date_added || "")}</p>
+          <p class="muted">Résumé: ${escapeHtml(resumeStatus)}${resumePrevious}</p>
           ${resumeError}
-          <p class="muted">Cover letter: ${escapeHtml(coverStatus)}${coverReady ? " (ready)" : ""}</p>
-          ${coverError}
-          ${coverWarning}
+          <p class="muted">Cover letter: ${escapeHtml(coverStatus)}${coverPrevious}</p>
+          ${coverError}${coverWarning}
+          <div class="document-selection panel nested-panel">
+            <h4>Document selection</h4>
+            <label>Candidate profile<select onchange="selectGenerationProfile(${job.id}, this.value)">${profileOptions}</select></label>
+            <label>Base résumé<select onchange="selectGenerationDocument(${job.id}, 'resume', this.value)">${documentSelectorOptions(selection.documents.resumes || [], selection.resumeId, "Select a profile first")}</select></label>
+            <label>Cover letter template<select onchange="selectGenerationDocument(${job.id}, 'cover', this.value)">${documentSelectorOptions(selection.documents.cover_letter_templates || [], selection.coverLetterTemplateId, "Select a profile first")}</select></label>
+          </div>
+          ${keywordScorePanel}
+          <div id="document-preview-${job.id}" class="generated-output empty">Preview is available after generation.</div>
         </div>
       </div>
       <div class="row-actions">
         ${job.url ? `<a class="button small ghost" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open job</a>` : ""}
-        <a class="button small ghost ${resumeReady ? "" : "disabled-link"}" href="/api/shortlist/${job.id}/resume">Download resume</a>
-        <a class="button small ghost ${coverReady ? "" : "disabled-link"}" href="/api/shortlist/${job.id}/cover-letter">Download cover letter</a>
-        <button class="button small ghost" type="button" onclick="regenerateShortlistResume(${job.id})">Regenerate resume</button>
+        <a class="button small ghost ${resumeAvailable ? "" : "disabled-link"}" href="/api/shortlist/${job.id}/resume">Download résumé</a>
+        <a class="button small ghost ${coverAvailable ? "" : "disabled-link"}" href="/api/shortlist/${job.id}/cover-letter">Download cover letter</a>
+        <button class="button small ghost" type="button" onclick="previewShortlist(${job.id})">Preview documents</button>
+        <button class="button small ghost" type="button" onclick="regenerateShortlistResume(${job.id})">Regenerate résumé</button>
         <button class="button small ghost" type="button" onclick="regenerateShortlistCoverLetter(${job.id})">Regenerate cover letter</button>
         <button class="button small ghost" type="button" onclick="regenerateShortlist(${job.id})">Regenerate both</button>
         <button class="button small ghost" type="button" onclick="markShortlistApplied(${job.id})">Mark applied</button>
@@ -1850,32 +2083,31 @@ function renderShortlistCard(job) {
 }
 
 async function regenerateShortlist(id) {
-  try {
-    await api.send(`/api/shortlist/${id}/regenerate`, "POST", {});
-    toast("Documents regenerated");
-    await loadAll();
-  } catch (error) {
-    toast(error.message);
-  }
+  try { showGenerationOutcome(await api.send(`/api/shortlist/${id}/regenerate`, "POST", generationPayload(id)), ["resume", "cover_letter"]); await loadAll(); }
+  catch (error) { toast(error.message); await loadAll(); }
 }
 
 async function regenerateShortlistResume(id) {
-  try {
-    await api.send(`/api/shortlist/${id}/regenerate-resume`, "POST", {});
-    toast("Resume regenerated");
-    await loadAll();
-  } catch (error) {
-    toast(error.message);
-  }
+  try { showGenerationOutcome(await api.send(`/api/shortlist/${id}/regenerate-resume`, "POST", generationPayload(id)), ["resume"]); await loadAll(); }
+  catch (error) { toast(error.message); await loadAll(); }
 }
 
 async function regenerateShortlistCoverLetter(id) {
-  try {
-    await api.send(`/api/shortlist/${id}/regenerate-cover-letter`, "POST", {});
-    toast("Cover letter regenerated");
-    await loadAll();
-  } catch (error) {
-    toast(error.message);
+  try { showGenerationOutcome(await api.send(`/api/shortlist/${id}/regenerate-cover-letter`, "POST", generationPayload(id)), ["cover_letter"]); await loadAll(); }
+  catch (error) { toast(error.message); await loadAll(); }
+}
+
+function showGenerationOutcome(result, requestedKinds) {
+  const payload = result?.generation || result || {};
+  const statuses = requestedKinds.map((kind) => payload[kind] || payload[`${kind}_generation_status`] || "failed");
+  const generated = statuses.filter((status) => status === "generated").length;
+  const previous = requestedKinds.some((kind) => Boolean(payload[`${kind === "resume" ? "resume" : "cover_letter"}_docx_path`]));
+  if (generated === requestedKinds.length) {
+    toast(requestedKinds.length > 1 ? "Résumé and cover letter generated" : `${requestedKinds[0] === "resume" ? "Résumé" : "Cover letter"} generated`);
+  } else if (generated > 0) {
+    toast(`Partial generation: ${generated}/${requestedKinds.length} document generated${previous ? "; previous successful document remains available" : ""}`);
+  } else {
+    toast(`Generation failed${previous ? "; previous successful document remains available" : ""}`);
   }
 }
 

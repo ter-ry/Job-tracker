@@ -163,6 +163,58 @@ a {
   padding: 18px;
 }
 
+.candidate-profile-manager {
+  display: grid;
+  gap: 14px;
+}
+
+.candidate-profile-list {
+  display: grid;
+  gap: 10px;
+}
+
+.candidate-profile-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.candidate-profile-card.selected {
+  border-color: var(--accent);
+  background: var(--soft);
+}
+
+.profile-manager-form,
+.candidate-profile-documents {
+  display: grid;
+  gap: 12px;
+}
+
+.document-columns {
+  align-items: start;
+}
+
+.document-list {
+  display: grid;
+  gap: 8px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.document-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border-bottom: 1px solid var(--line);
+  padding: 7px 0;
+}
+
 .panel-header {
   display: flex;
   align-items: center;
@@ -604,10 +656,136 @@ th {
   gap: 14px;
 }
 
-.discovery-card-main > div:last-child {
+.discovery-results-panel .discovery-card-main > div:last-child {
   display: flex;
   align-items: flex-start;
   gap: 8px;
+}
+
+/* Shortlist cards use a stacked document workflow. Keep discovery result cards
+   on their existing layout without allowing this content wrapper to become a
+   horizontal flex row. */
+#shortlist-results:not(.empty) {
+  color: #ededed;
+}
+
+.shortlist-card {
+  gap: 12px;
+  width: 100%;
+  color: #ededed;
+}
+
+.shortlist-card .discovery-card-main {
+  display: block;
+  min-width: 0;
+}
+
+.shortlist-card .discovery-card-main > div:last-child {
+  display: block;
+  min-width: 0;
+}
+
+.shortlist-card h3,
+.shortlist-card h4,
+.shortlist-card h5 {
+  color: #f2f2f2;
+}
+
+.shortlist-card .document-selection {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 14px;
+  padding: 14px;
+  background: #111;
+  border-color: #2b2b2b;
+}
+
+.shortlist-card .document-selection h4 {
+  grid-column: 1 / -1;
+  margin: 0;
+}
+
+.shortlist-card .document-selection label {
+  min-width: 0;
+  color: #bdbdbd;
+}
+
+.shortlist-card .document-selection select {
+  min-width: 0;
+  width: 100%;
+  background: #0b0b0b;
+  border-color: #353535;
+  color: #ededed;
+}
+
+.shortlist-card .generated-output {
+  color: #ededed;
+}
+
+.shortlist-card .generated-output.empty {
+  min-height: 0;
+  margin-top: 12px;
+  padding: 12px;
+  color: #9d9d9d;
+}
+
+.shortlist-card .generated-output pre {
+  background: #151515;
+  color: #ededed;
+}
+
+.shortlist-card .row-actions {
+  border-top: 1px solid #242424;
+  padding-top: 12px;
+}
+
+.keywords-score-panel {
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid #292929;
+  border-radius: 10px;
+  background: #0d0d0d;
+}
+
+.keywords-score-panel > h3,
+.keywords-score-panel > h4 {
+  margin-top: 0;
+}
+
+.keyword-records {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.keyword-record {
+  min-width: 0;
+  border: 1px solid #292929;
+  border-radius: 7px;
+  background: #111;
+}
+
+.keyword-record summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  list-style: none;
+  padding: 5px 7px;
+  font-size: .82rem;
+}
+
+.keyword-record summary::-webkit-details-marker { display: none; }
+.keyword-chip { color: #f0f0f0; font-weight: 700; }
+.keyword-status,
+.keyword-category { color: #a8a8a8; font-size: .72rem; }
+.keyword-evidence { border-top: 1px solid #292929; padding: 8px; max-width: 420px; color: #d7d7d7; font-size: .8rem; line-height: 1.4; }
+
+@media (max-width: 900px) {
+  .shortlist-card .document-selection {
+    grid-template-columns: 1fr;
+  }
 }
 
 .warning-list,
