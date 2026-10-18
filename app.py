@@ -11,6 +11,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import urllib.error
 import urllib.request
 from urllib.parse import urlencode
@@ -370,6 +371,7 @@ JOB_COLUMNS = {
     "discovery_last_search_id": "INTEGER NOT NULL DEFAULT 0",
     "remote_eligibility": "TEXT NOT NULL DEFAULT 'unknown'",
     "remote_eligibility_explanation": "TEXT NOT NULL DEFAULT ''",
+    "discovery_salary_filter_status": "TEXT NOT NULL DEFAULT ''",
 }
 
 PROFILE_COLUMNS = {
@@ -1130,6 +1132,10 @@ def create_app() -> Flask:
         if row is None:
             return jsonify({"error": "Saved search not found"}), 404
         search = saved_search_to_dict(row)
+        owner = f"manual:{uuid.uuid4()}"
+        if not acquire_discovery_search_lease(search_id, owner):
+            return jsonify({"error": "This saved search is already running; try again when the active run completes."}), 409
+        heartbeat_stop, heartbeat_thread = start_discovery_search_lease_heartbeat(search_id, owner)
         run_id = create_discovery_run(search_id, "manual")
         try:
             result = run_discovery_pipeline(saved_search_to_discovery_payload(search), search_id=search_id, run_id=run_id)
@@ -1142,6 +1148,10 @@ def create_app() -> Flask:
         except Exception as exc:
             finish_discovery_run(run_id, status="failed", fetched=0, new_count=0, duplicate_count=0, errors=1, outcomes={}, error=str(exc))
             return jsonify({"error": f"Discovery run failed: {exc}", "run_id": run_id}), 502
+        finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=1)
+            release_discovery_search_lease(search_id, owner)
 
     @app.get("/api/discovery/scheduler")
     def discovery_scheduler_get() -> Response:
@@ -1670,16 +1680,32 @@ def saved_search_to_discovery_payload(search: dict[str, Any]) -> dict[str, Any]:
 def discovery_remote_eligibility(job: dict[str, Any]) -> tuple[str, str]:
     arrangement = normalize_space(text(job.get("remote_type"))).lower()
     location = normalize_space(text(job.get("location"))).lower()
-    content = " ".join([arrangement, location, text(job.get("job_description"))]).lower()
-    restricted = any(term in content for term in ["us only", "u.s. only", "united states only", "must be authorized in the us", "canada not eligible"])
-    canadian = any(term in content for term in ["canada", "canadian", "ontario", "british columbia", "alberta", "quebec"]) or any(code in location for code in ["on", "bc", "ab", "qc"])
+    description = normalize_space(text(job.get("job_description"))).lower()
+    content = " ".join([arrangement, location, description])
+    restricted = bool(re.search(
+        r"(?:canada|canadian)\s+(?:is\s+)?(?:excluded|not\s+eligible|not\s+allowed)|"
+        r"(?:us|u\.s\.|united states)\s+only|must\s+be\s+authorized\s+in\s+(?:the\s+)?(?:us|u\.s\.|united states)",
+        content,
+    ))
+    location_tokens = set(re.findall(r"[a-z]+", location))
+    canadian_province_phrases = {
+        "ontario", "quebec", "alberta", "manitoba", "saskatchewan", "nova scotia", "new brunswick",
+        "newfoundland", "newfoundland and labrador", "british columbia", "yukon", "northwest territories", "nunavut",
+    }
+    canadian_codes = {"on", "qc", "ab", "mb", "sk", "ns", "nb", "nl", "pe", "yt", "nt", "nu"}
+    location_confirms_canada = "canada" in location_tokens or any(phrase in location for phrase in canadian_province_phrases) or bool(location_tokens & canadian_codes)
+    explicit_canadian_eligibility = bool(re.search(
+        r"(?:remote|work|role|position|employees?|candidates?).{0,45}(?:in|from|within|across|eligible\s+in)\s+(?:the\s+)?canada|"
+        r"canadian\s+(?:eligible|candidates?|residents?)|eligible\s+to\s+work\s+in\s+canada",
+        description,
+    ))
     if restricted:
         return "restricted", "Posting indicates eligibility is restricted outside Canada."
-    if "remote" in arrangement and canadian:
+    if location_confirms_canada or explicit_canadian_eligibility:
         return "canadian_eligible", "Remote posting explicitly mentions Canadian eligibility or a Canadian location."
     if "remote" in arrangement:
         return "unknown", "Remote arrangement is known, but country eligibility is not stated."
-    return ("canadian_eligible", "Posting location is in Canada.") if canadian else ("unknown", "Canadian eligibility is not confirmed by the posting.")
+    return "unknown", "Canadian eligibility is not confirmed by the posting."
 
 
 def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, run_id: int | None) -> dict[str, int]:
@@ -1731,6 +1757,54 @@ def finish_discovery_run(run_id: int, *, status: str, fetched: int, new_count: i
     get_db().commit()
 
 
+DISCOVERY_LEASE_MINUTES = 10
+DISCOVERY_LEASE_RENEW_SECONDS = 30
+
+
+def acquire_discovery_search_lease(search_id: int, owner: str) -> bool:
+    now = datetime.now()
+    expires = now + timedelta(minutes=DISCOVERY_LEASE_MINUTES)
+    db = get_db()
+    db.execute("BEGIN IMMEDIATE")
+    row = db.execute("SELECT owner, expires_at FROM discovery_search_leases WHERE search_id = ?", [search_id]).fetchone()
+    if row and row["owner"] != owner and row["expires_at"] > now.isoformat(timespec="seconds"):
+        db.rollback()
+        return False
+    db.execute(
+        """INSERT INTO discovery_search_leases (search_id, owner, acquired_at, expires_at) VALUES (?, ?, ?, ?)
+           ON CONFLICT(search_id) DO UPDATE SET owner = excluded.owner, acquired_at = excluded.acquired_at, expires_at = excluded.expires_at""",
+        [search_id, owner, now.isoformat(timespec="seconds"), expires.isoformat(timespec="seconds")],
+    )
+    db.commit()
+    return True
+
+
+def release_discovery_search_lease(search_id: int, owner: str) -> None:
+    get_db().execute("DELETE FROM discovery_search_leases WHERE search_id = ? AND owner = ?", [search_id, owner])
+    get_db().commit()
+
+
+def start_discovery_search_lease_heartbeat(search_id: int, owner: str) -> tuple[threading.Event, threading.Thread]:
+    stop = threading.Event()
+
+    def renew() -> None:
+        while not stop.wait(DISCOVERY_LEASE_RENEW_SECONDS):
+            connection = sqlite3.connect(DB_PATH, timeout=5)
+            try:
+                expires = datetime.now() + timedelta(minutes=DISCOVERY_LEASE_MINUTES)
+                connection.execute(
+                    "UPDATE discovery_search_leases SET expires_at = ? WHERE search_id = ? AND owner = ?",
+                    [expires.isoformat(timespec="seconds"), search_id, owner],
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+    thread = threading.Thread(target=renew, name=f"discovery-lease-{search_id}", daemon=True)
+    thread.start()
+    return stop, thread
+
+
 def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = None, run_id: int | None = None) -> dict[str, Any]:
     """Run the existing JobSpy, enrichment, scoring and dedupe pipeline.
 
@@ -1779,7 +1853,12 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         clean["warnings"] = discovery_warning_reasons(clean, keywords, search["location"])
         clean["remote_eligibility"], clean["remote_eligibility_explanation"] = discovery_remote_eligibility(clean)
         minimum_salary = clamp_int_default(payload.get("minimum_salary"), 0, 0, 1000000)
-        if minimum_salary and int(clean.get("salary_max") or 0) < minimum_salary:
+        salary_source = text(clean.get("salary_source")).lower()
+        reliable_salary = salary_source in {"structured", "jobspy_text", "description"} and int(clean.get("salary_listed") or 0) == 1
+        clean["discovery_salary_filter_status"] = "not_configured" if not minimum_salary else ("known" if reliable_salary else "unknown")
+        if minimum_salary and not reliable_salary:
+            clean["warnings"].append("Compensation is missing or estimated; retained for review.")
+        if minimum_salary and reliable_salary and int(clean.get("salary_max") or 0) < minimum_salary:
             clean["filtered_reason"] = f"Known salary is below the saved-search minimum of ${minimum_salary:,}."
             filtered += 1
             continue
@@ -6074,6 +6153,17 @@ def init_db() -> None:
             owner TEXT NOT NULL DEFAULT '',
             acquired_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             expires_at TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS discovery_search_leases (
+            search_id INTEGER PRIMARY KEY,
+            owner TEXT NOT NULL DEFAULT '',
+            acquired_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            expires_at TEXT NOT NULL DEFAULT '',
+            FOREIGN KEY(search_id) REFERENCES saved_search_profiles(id) ON DELETE CASCADE
         )
         """
     )

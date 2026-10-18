@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import os
 import socket
+import sqlite3
 import sys
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -46,6 +48,23 @@ def release_lease(owner: str) -> None:
     app.get_db().commit()
 
 
+def start_worker_lease_heartbeat(owner: str) -> threading.Event:
+    stop = threading.Event()
+
+    def renew() -> None:
+        while not stop.wait(app.DISCOVERY_LEASE_RENEW_SECONDS):
+            connection = sqlite3.connect(app.DB_PATH, timeout=5)
+            try:
+                expires = datetime.now() + timedelta(minutes=LEASE_MINUTES)
+                connection.execute("UPDATE discovery_worker_leases SET expires_at = ? WHERE name = ? AND owner = ?", [expires.isoformat(timespec="seconds"), LEASE_NAME, owner])
+                connection.commit()
+            finally:
+                connection.close()
+
+    threading.Thread(target=renew, name="discovery-worker-lease", daemon=True).start()
+    return stop
+
+
 def run_due_searches() -> dict[str, int]:
     app.init_db()
     if not scheduler_enabled():
@@ -53,6 +72,7 @@ def run_due_searches() -> dict[str, int]:
     owner = f"{socket.gethostname()}:{os.getpid()}"
     if not acquire_lease(owner):
         return {"disabled": 0, "runs": 0, "errors": 0, "overlap_skipped": 1}
+    worker_heartbeat_stop = start_worker_lease_heartbeat(owner)
     counts = {"disabled": 0, "runs": 0, "errors": 0}
     try:
         now = datetime.now().isoformat(timespec="seconds")
@@ -61,6 +81,12 @@ def run_due_searches() -> dict[str, int]:
             [now],
         )
         for row in rows:
+            search_id = int(row["id"])
+            search_owner = f"scheduled:{owner}:{search_id}"
+            if not app.acquire_discovery_search_lease(search_id, search_owner):
+                counts["overlap_skipped"] = counts.get("overlap_skipped", 0) + 1
+                continue
+            search_heartbeat_stop, search_heartbeat_thread = app.start_discovery_search_lease_heartbeat(search_id, search_owner)
             run_id = app.create_discovery_run(int(row["id"]), "scheduled")
             try:
                 result = app.run_discovery_pipeline(app.saved_search_to_discovery_payload(app.saved_search_to_dict(row)), search_id=int(row["id"]), run_id=run_id)
@@ -72,7 +98,12 @@ def run_due_searches() -> dict[str, int]:
             except Exception as exc:
                 app.finish_discovery_run(run_id, status="failed", fetched=0, new_count=0, duplicate_count=0, errors=1, outcomes={}, error=str(exc))
                 counts["errors"] += 1
+            finally:
+                search_heartbeat_stop.set()
+                search_heartbeat_thread.join(timeout=1)
+                app.release_discovery_search_lease(search_id, search_owner)
     finally:
+        worker_heartbeat_stop.set()
         release_lease(owner)
     return counts
 
