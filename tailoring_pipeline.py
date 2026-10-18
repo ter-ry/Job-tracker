@@ -150,6 +150,7 @@ ACTION_VERBS = {
 
 def remove_cover_letter_dashes(value: str) -> str:
     """Apply the optional personal-letter punctuation preference."""
+    value = re.sub(r"(?<=\d)[-–—](?=\d)", " to ", value)
     return re.sub(r"\s+", " ", re.sub(r"[-–—]", " ", value)).strip()
 
 

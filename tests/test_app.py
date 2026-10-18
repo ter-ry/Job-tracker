@@ -2198,6 +2198,84 @@ class JobAssistantTest(unittest.TestCase):
         self.assertTrue(any("Flowtally" in item["original"] for item in artifact["change_log"]["preserved"]))
         self.assertTrue(any("Pinterest" in item["original"] and "Gatekeeper" in item["replacement"] for item in artifact["change_log"]["applied"]))
 
+    def test_selected_cover_template_missing_fails_without_generic_fallback(self):
+        self.seed_profile_for_documents(with_template=True)
+        missing_template = Path(self.tmpdir.name) / "missing-cover-letter.docx"
+        profile = {
+            "name": "Terry Mak",
+            "key_skills": "Python",
+            "work_experience": "Built Python software.",
+            "resume_text": "Terry Mak. Built Python software.",
+            "cover_letter_docx_template_path": str(missing_template),
+            "cover_letter_no_dashes": "true",
+        }
+        job = {
+            "company": "Gatekeeper Systems Inc",
+            "title": "Software Engineer",
+            "location": "Abbotsford, BC",
+            "job_description": "Build and support Python software.",
+        }
+        output = {"cover_letter": "A generated letter must never replace the selected template."}
+        output_path = Path(self.tmpdir.name) / "missing-cover-letter-output.docx"
+        artifact = app_module.build_format_preserving_cover_letter(job, profile, output, output_path)
+        self.assertEqual(artifact["status"], "failed")
+        self.assertEqual(artifact["change_log"]["template_mode"], "template_unavailable")
+        self.assertFalse(output_path.exists())
+
+    def test_shortlist_selected_cover_template_failure_preserves_previous_document(self):
+        self.seed_profile_for_documents(with_template=True)
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Selected Profile", "description": "Built Python software.", "identity_mode": "shared"}).get_json()
+        profile_id = profile["id"]
+        resume_document = Document()
+        resume_document.add_paragraph("Selected Profile")
+        resume_document.add_paragraph("Summary")
+        resume_document.add_paragraph("Software developer with Python experience.")
+        resume_document.add_paragraph("Experience")
+        resume_document.add_paragraph("Built Python software.")
+        resume_document.add_paragraph("Skills")
+        resume_document.add_paragraph("Python")
+        resume_bytes = io.BytesIO()
+        resume_document.save(resume_bytes)
+        resume_upload = self.client.post(
+            f"/api/candidate-profiles/{profile_id}/resumes/upload",
+            data={"file": (io.BytesIO(resume_bytes.getvalue()), "base-resume.docx")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(resume_upload.status_code, 201)
+        resume = resume_upload.get_json()
+        cover = self.client.post(
+            f"/api/candidate-profiles/{profile_id}/cover-letter-templates",
+            json={"name": "Missing template", "content": "Hiring Manager\\nExample Corp\\nRe: Developer\\nDear Hiring Manager,\\n{{OPENING_PARAGRAPH}}\\nSincerely,\\nTerry Mak"},
+        ).get_json()
+        with app_module.app.app_context():
+            app_module.get_db().execute("UPDATE cover_letter_templates SET docx_path = ? WHERE id = ?", [str(Path(self.tmpdir.name) / "missing.docx"), cover["id"]])
+            app_module.get_db().commit()
+        fake_output = {
+            "resume_text": "Selected Profile\nBuilt Python software.",
+            "cover_letter": "A generated letter",
+            "resume_validation": {"ok": True, "conflicting_phrases": []},
+            "matched_keywords": [],
+            "keyword_coverage": {},
+            "job_hash": "",
+            "candidate_evidence_hash": "",
+            "tailoring_plan": {},
+        }
+        with patch.object(app_module, "generate_application_materials", return_value=fake_output), patch.object(app_module, "profile_has_generation_source", return_value=True):
+            job = self.client.post(
+                "/api/shortlist",
+                json={
+                    "company": "Gatekeeper Systems Inc",
+                    "title": "Software Engineer",
+                    "job_description": "Build and support Python software.",
+                    "candidate_profile_id": profile_id,
+                    "resume_id": resume["id"],
+                    "cover_letter_template_id": cover["id"],
+                },
+            ).get_json()
+        self.assertEqual(job.get("cover_letter_generation_status"), "failed", job)
+        self.assertIn("template", job["cover_letter_generation_error"].lower())
+        self.assertEqual(job["cover_letter_docx_path"], "")
+
     def test_cover_letter_motivation_and_evidence_follow_each_job(self):
         profile = {
             "name": "Alex Rivera",
@@ -2268,55 +2346,11 @@ class JobAssistantTest(unittest.TestCase):
             "/api/shortlist",
             json=self.scotiabank_job(),
         ).get_json()
-        self.assertEqual(created["cover_letter_generation_status"], "generated")
-        self.assertIn("tailoring_changes", created)
-        # The approved résumé engine is substitution-only.  This fixture has
-        # no supported terminology alias to apply.  It may still reorder
-        # existing skills, but must not rewrite experience bullets or add
-        # unsupported content.
-        resume_changes = created["tailoring_changes"]["resume"]["applied"]
-        self.assertLessEqual(len(resume_changes), 1)
-        self.assertTrue(all(item["kind"] == "skills" for item in resume_changes))
-        resume_output = Document(io.BytesIO(Path(created["resume_docx_path"]).read_bytes()))
-        resume_text = "\n".join(paragraph.text for paragraph in resume_output.paragraphs)
-        self.assertIn("reduce manual data entry errors by 90%", resume_text)
-        self.assertGreaterEqual(len(created["tailoring_changes"]["cover_letter"]["applied"]), 1)
-        cover_path = Path(created["cover_letter_docx_path"])
+        self.assertEqual(created["cover_letter_generation_status"], "failed")
+        self.assertIn("incompatible", created["cover_letter_generation_error"].lower())
+        self.assertEqual(created["cover_letter_docx_path"], "")
+        self.assertEqual(created["tailoring_changes"]["cover_letter"]["template_mode"], "template_rejected")
         self.assertEqual(master_before, master_path.read_bytes())
-
-        cover_doc = Document(io.BytesIO(cover_path.read_bytes()))
-        paragraphs = [paragraph.text for paragraph in cover_doc.paragraphs if paragraph.text.strip()]
-        joined = "\n".join(paragraphs)
-        body_start = next(index for index, text in enumerate(paragraphs) if text.startswith("I am pleased"))
-        body_end = next(index for index, text in enumerate(paragraphs) if text.startswith("Thank you"))
-        body_paragraphs = paragraphs[body_start:body_end]
-        body_text = " ".join(body_paragraphs)
-        self.assertRegex(paragraphs[0], r"\b[A-Z][a-z]+ \d{1,2}, \d{4}\b")
-        self.assertIn("Scotiabank Hiring Team", joined)
-        self.assertIn("Dear Scotiabank Hiring Team,", joined)
-        self.assertIn("I am pleased to apply for the Software Developer role at Scotiabank", joined)
-        self.assertNotIn("CentralSquare", joined)
-        self.assertNotIn("Software Developer Co-op", joined)
-        self.assertNotIn("Remote - Ontario", joined)
-        self.assertNotIn("8- or 12-month term", joined)
-        self.assertNotIn("8/12-month", joined)
-        self.assertNotIn("saved profile", joined.lower())
-        self.assertNotIn("ATS-oriented", joined)
-        self.assertNotIn("grounded wording", joined)
-        self.assertNotIn("practical experience that aligns", joined.lower())
-        self.assertNotIn("together, these examples", joined.lower())
-        self.assertNotIn("Python, JavaScript, Flask, React, SQL, cloud, AWS, Azure, dashboards, automation, APIs, reporting. This is the kind of work I would bring to Scotiabank.", joined)
-        self.assertEqual(len(body_paragraphs), 3)
-        self.assertGreaterEqual(len(body_text.split()), 50)
-        self.assertLessEqual(len(body_text.split()), 260)
-        self.assertIn("I built Python automation", joined)
-        self.assertNotIn("Developer Intern at Northstar", joined)
-        self.assertEqual(sum(1 for text in paragraphs if re.search(r"\b[A-Z][a-z]+ \d{1,2}, \d{4}\b", text)), 1)
-        self.assertEqual(sum(1 for text in paragraphs if text == "Sincerely,"), 1)
-        self.assertEqual(paragraphs[-2], "Sincerely,")
-        self.assertEqual(paragraphs[-1], "Terry Mak")
-        self.assertIsNone(app_module.validate_cover_letter_document(cover_doc, self.scotiabank_job(), {"name": "Terry Mak"}))
-        self.assertTrue(created["generation_debug"].get("generated_at"))
 
     def test_scotiabank_cover_letter_rewrites_all_visible_template_content(self):
         self.seed_profile_for_documents(with_template=True)
@@ -2328,26 +2362,10 @@ class JobAssistantTest(unittest.TestCase):
             "/api/shortlist",
             json=self.scotiabank_job(),
         ).get_json()
-        cover_path = Path(created["cover_letter_docx_path"])
-        cover_doc = Document(io.BytesIO(cover_path.read_bytes()))
-        visible_text = "\n".join(paragraph.text for paragraph in app_module.iter_document_paragraphs(cover_doc) if paragraph.text.strip())
-
-        self.assertEqual(created["cover_letter_generation_status"], "generated")
-        self.assertNotIn("CentralSquare", visible_text)
-        self.assertNotIn("Software Developer Co-op", visible_text)
-        self.assertNotIn("Remote - Ontario", visible_text)
-        self.assertNotIn("8- or 12-month term", visible_text)
-        self.assertNotIn("hochitterry.mak@georgebrown.ca", visible_text)
-        self.assertIn("Scotiabank Hiring Team", visible_text)
-        self.assertIn("I am pleased to apply for the Software Developer role at Scotiabank", visible_text)
-        self.assertIn("I built Python automation", visible_text)
-        self.assertNotIn("Developer Intern at Northstar", visible_text)
-        self.assertNotIn("Retool and Google Docs", visible_text)
-        self.assertIsNone(app_module.validate_cover_letter_document(cover_doc, self.scotiabank_job(), {"name": "Terry Mak"}))
-
-        downloaded = self.client.get(f"/api/shortlist/{created['id']}/cover-letter")
-        self.assertEqual(downloaded.status_code, 200)
-        self.assertEqual(downloaded.data, cover_path.read_bytes())
+        self.assertEqual(created["cover_letter_generation_status"], "failed")
+        self.assertIn("incompatible", created["cover_letter_generation_error"].lower())
+        self.assertEqual(created["cover_letter_docx_path"], "")
+        self.assertEqual(created["tailoring_changes"]["cover_letter"]["template_mode"], "template_rejected")
 
     def test_cover_letter_validation_reports_hidden_metadata_location(self):
         source = self.build_cover_letter_template_fixture()
@@ -2435,7 +2453,7 @@ class JobAssistantTest(unittest.TestCase):
         )
         self.assertFalse(length_validation["ok"])
 
-    def test_cover_letter_template_falls_back_for_unrelated_retail_content(self):
+    def test_cover_letter_template_rejects_unrelated_retail_content_without_fallback(self):
         self.seed_profile_for_documents(with_template=True)
         retail_template = self.build_retail_cover_letter_fixture()
         payload = self.upload_cover_letter_template(retail_template)
@@ -2451,14 +2469,10 @@ class JobAssistantTest(unittest.TestCase):
                 "job_description": "Python Flask SQL React dashboards cloud automation",
             },
         ).get_json()
-        self.assertEqual(created["cover_letter_generation_status"], "generated")
-        self.assertIn("incompatible role-specific content", created["cover_letter_generation_warning"])
-
-        cover_doc = Document(io.BytesIO(Path(created["cover_letter_docx_path"]).read_bytes()))
-        cover_text = "\n".join(paragraph.text for paragraph in cover_doc.paragraphs)
-        self.assertNotIn("supermarket", cover_text.lower())
-        self.assertNotIn("customer service", cover_text.lower())
-        self.assertIn("Northstar Hiring Team", cover_text)
+        self.assertEqual(created["cover_letter_generation_status"], "failed")
+        self.assertIn("incompatible", created["cover_letter_generation_error"].lower())
+        self.assertEqual(created["cover_letter_docx_path"], "")
+        self.assertEqual(created["tailoring_changes"]["cover_letter"]["template_mode"], "template_rejected")
 
     def test_shortlist_restore_reuses_existing_row_and_regenerates_documents(self):
         self.seed_profile_for_documents(with_template=True)

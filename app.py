@@ -1696,10 +1696,19 @@ def generated_applications_dir() -> Path:
 def run_document_generation(kind: str, builder: Any) -> dict[str, Any]:
     try:
         result = DocumentGenerationService().generate(kind, builder)
-        if result.get("status") == "failed" and result.get("error"):
-            raise RuntimeError(result["error"])
         if not isinstance(result, dict):
             raise TypeError(f"{kind} builder returned an invalid result")
+        if result.get("status") == "failed":
+            result.setdefault(
+                "change_log",
+                {
+                    f"master_{kind}_path": "",
+                    "output_path": "",
+                    "applied": [],
+                    "skipped": [{"kind": kind, "original": "", "replacement": "", "reason": result.get("error", "Generation failed.")}],
+                },
+            )
+            return result
         if result.get("status") == "generated":
             output_path = text((result.get("change_log") or {}).get("output_path"))
             if not output_path or not Path(output_path).is_file():
@@ -2077,7 +2086,8 @@ def remove_dashes_from_document(document: Document) -> bool:
     changed = False
     for paragraph in iter_document_paragraphs(document):
         for run in paragraph.runs:
-            updated = re.sub(r"[-–—]", " ", run.text)
+            updated = re.sub(r"(?<=\d)[-–—](?=\d)", " to ", run.text)
+            updated = re.sub(r"[-–—]", " ", updated)
             if updated != run.text:
                 run.text = re.sub(r"[ \t]+", " ", updated)
                 changed = True
@@ -2092,7 +2102,7 @@ def build_format_preserving_cover_letter(
 ) -> dict[str, Any]:
     template_raw = text(profile.get("cover_letter_docx_template_path"))
     template_path = safe_local_path(template_raw)
-    if template_path is None or not template_path.exists():
+    if not template_raw:
         write_cover_letter_docx(cover_path, output["cover_letter"])
         return {
             "status": "generated",
@@ -2105,58 +2115,48 @@ def build_format_preserving_cover_letter(
                 "template_mode": "standard",
             },
         }
+    if template_path is None or not template_path.exists():
+        return {
+            "status": "failed",
+            "error": "The selected DOCX cover letter template is unavailable. Upload or select a readable cover letter template before generating.",
+            "change_log": {
+                "master_cover_letter_path": template_raw,
+                "output_path": str(cover_path),
+                "applied": [],
+                "skipped": [{"kind": "cover_letter_template", "original": "", "replacement": "", "reason": "Selected DOCX template is unavailable."}],
+                "template_mode": "template_unavailable",
+            },
+        }
 
     shutil.copyfile(template_path, cover_path)
     document = Document(cover_path)
     template_warning = detect_incompatible_cover_letter_template(document)
     structured_template = _has_structured_cover_letter_template(document)
     if _has_cover_letter_stale_content(document) or (template_warning is not None and not structured_template):
-        write_cover_letter_docx(cover_path, output["cover_letter"])
         return {
-            "status": "generated",
-            "error": "",
+            "status": "failed",
+            "error": template_warning or "The selected DOCX cover letter template was rejected because it contains incompatible or stale application content.",
             "warning": template_warning,
             "change_log": {
                 "master_cover_letter_path": str(template_path),
                 "output_path": str(cover_path),
-                "applied": [
-                    {
-                        "kind": "fallback",
-                        "original": "",
-                        "replacement": output["cover_letter"],
-                        "matched_job_requirement": "plain fallback",
-                        "supporting_evidence": "",
-                        "confidence": 80,
-                        "validation_status": "passed",
-                    }
-                ],
-                "skipped": [],
-                "template_mode": "standard_fallback",
+                "applied": [],
+                "skipped": [{"kind": "cover_letter_template", "original": "", "replacement": "", "reason": template_warning or "Template rejected."}],
+                "template_mode": "template_rejected",
             },
         }
     change_log = apply_cover_letter_template(document, job, profile, output)
     if not change_log.get("applied"):
-        write_cover_letter_docx(cover_path, output["cover_letter"])
         return {
-            "status": "generated",
-            "error": "",
+            "status": "failed",
+            "error": "The selected DOCX cover letter template could not be adapted safely. No generic replacement was used.",
             "warning": "",
             "change_log": {
                 "master_cover_letter_path": str(template_path),
                 "output_path": str(cover_path),
-                "applied": [
-                    {
-                        "kind": "fallback",
-                        "original": "",
-                        "replacement": output["cover_letter"],
-                        "matched_job_requirement": "plain fallback",
-                        "supporting_evidence": "",
-                        "confidence": 80,
-                        "validation_status": "passed",
-                    }
-                ],
-                "skipped": [],
-                "template_mode": "plain_fallback",
+                "applied": [],
+                "skipped": change_log.get("skipped", [{"kind": "cover_letter_template", "original": "", "replacement": "", "reason": "No safe template adaptation was applied."}]),
+                "template_mode": "template_rejected",
             },
         }
     if str(profile.get("cover_letter_no_dashes", "true")).strip().lower() not in {"0", "false", "no", "off"}:
@@ -2167,8 +2167,17 @@ def build_format_preserving_cover_letter(
         classify_keyword_dump_reason(normalize_space(paragraph.text)) is not None
         for paragraph in reopened_cover.paragraphs
     ):
-        write_cover_letter_docx(cover_path, output["cover_letter"])
-        reopened_cover = Document(cover_path)
+        return {
+            "status": "failed",
+            "error": "The selected DOCX cover letter template produced an unsafe keyword-dump paragraph. No generic replacement was used.",
+            "change_log": {
+                "master_cover_letter_path": str(template_path),
+                "output_path": str(cover_path),
+                "applied": [],
+                "skipped": [{"kind": "template_validation", "original": "", "replacement": "", "reason": "Keyword-dump content detected after adaptation."}],
+                "template_mode": "template_rejected",
+            },
+        }
     residual = find_unreplaced_template_content(
         template_path,
         reopened_cover,
@@ -2176,17 +2185,16 @@ def build_format_preserving_cover_letter(
         preserved_texts=change_log.get("preserved", []),
     )
     if residual:
-        write_cover_letter_docx(cover_path, output["cover_letter"])
         return {
-            "status": "generated",
-            "error": "",
+            "status": "failed",
+            "error": f"The selected DOCX cover letter template could not be fully adapted: {residual}",
             "warning": f"Standard cover-letter formatting was used because template content remained after replacement: {residual}",
             "change_log": {
                 "master_cover_letter_path": str(template_path),
                 "output_path": str(cover_path),
                 "applied": [],
                 "skipped": [{"kind": "template_residual", "original": residual, "reason": "Source template content remained in the generated document."}],
-                "template_mode": "standard_fallback_residual",
+                "template_mode": "template_rejected",
             },
         }
     return {
@@ -3017,7 +3025,7 @@ def apply_cover_letter_template(
         if not replaced and any(marker in original for marker in replacements):
             skipped.append({"kind": "placeholder", "original": original, "replacement": replacement, "reason": "Template marker present but paragraph did not match."})
     refresh_cover_letter_identity(document, section_map, applied)
-    if not applied and not skipped and not has_placeholders:
+    if not has_placeholders:
         return render_cover_letter_template_by_structure(document, section_map)
     return {
         "applied": applied,
@@ -6693,6 +6701,7 @@ def generate_application_materials(
                     cover_letter = suggestion
                     cover_validation = validate_cover_letter_output(cover_letter, candidate_evidence, job)
     if str(profile.get("cover_letter_no_dashes", "true")).strip().lower() not in {"0", "false", "no", "off"}:
+        cover_letter = re.sub(r"(?<=\d)[-–—](?=\d)", " to ", cover_letter)
         cover_letter = re.sub(r"[-–—]", " ", cover_letter)
         cover_letter = re.sub(r"[ \t]+", " ", cover_letter)
         cover_letter = re.sub(r" +\n", "\n", cover_letter)
