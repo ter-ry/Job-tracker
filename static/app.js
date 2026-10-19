@@ -249,7 +249,25 @@ function renderPreparationQueue() {
 }
 
 async function queueDiscoveryJob(id) {
-  try { await api.send("/api/preparation/queue", "POST", { job_id: id }); toast("Application package queued for review"); await loadPreparationQueue(); } catch (error) { toast(error.message); }
+  try {
+    const profiles = await api.get("/api/candidate-profiles");
+    if (!profiles.length) throw new Error("Create a candidate profile with a résumé and cover letter template before preparing this job.");
+    let profile = profiles.length === 1 ? profiles[0] : null;
+    if (!profile) {
+      const choices = profiles.map((item, index) => `${index + 1}. ${item.name}`).join("\n");
+      const selected = window.prompt(`Choose the candidate profile for this package by number:\n${choices}`);
+      const index = Number(selected) - 1;
+      profile = Number.isInteger(index) && profiles[index] ? profiles[index] : null;
+      if (!profile) throw new Error("Choose a valid candidate profile before preparing this job.");
+    }
+    const documents = await api.get(`/api/candidate-profiles/${profile.id}/documents`);
+    const resume = (documents.resumes || []).find((item) => item.is_default) || documents.resumes?.[0];
+    const cover = (documents.cover_letter_templates || []).find((item) => item.is_default) || documents.cover_letter_templates?.[0];
+    if (!resume || !cover) throw new Error(`Profile "${profile.name}" must have both a DOCX résumé and a DOCX cover letter template before preparing this job.`);
+    await api.send("/api/preparation/queue", "POST", { job_id: id, candidate_profile_id: profile.id, resume_id: resume.id, cover_letter_template_id: cover.id });
+    toast("Application package queued for review");
+    await loadPreparationQueue();
+  } catch (error) { toast(error.message); }
 }
 
 async function prepareQueueItem(id) {
@@ -307,7 +325,6 @@ function editSavedSearch(search) {
   setChecked("saved-search-auto-prepare", Boolean(search.auto_prepare_enabled));
   setValue("saved-search-auto-min-priority", search.auto_prepare_min_priority || 75);
   setValue("saved-search-auto-profile", search.auto_prepare_candidate_profile_id || "");
-  setChecked("saved-search-auto-require-canadian", search.auto_prepare_require_canadian !== false && search.auto_prepare_require_canadian !== 0);
   document.querySelectorAll('input[name="saved-search-source"]').forEach((input) => { input.checked = (search.enabled_sources || []).includes(input.value); });
 }
 
@@ -319,7 +336,7 @@ async function saveSavedSearch(event) {
     remote_preference: value("saved-search-remote"), seniority: value("saved-search-seniority"), minimum_salary: Number(value("saved-search-minimum-salary") || 0),
     date_window: value("saved-search-date-window"), interval_minutes: Number(value("saved-search-interval") || 360), enabled: checked("saved-search-enabled"),
     auto_prepare_enabled: checked("saved-search-auto-prepare"), auto_prepare_min_priority: Number(value("saved-search-auto-min-priority") || 75),
-    auto_prepare_candidate_profile_id: Number(value("saved-search-auto-profile") || 0), auto_prepare_require_canadian: checked("saved-search-auto-require-canadian"),
+    auto_prepare_candidate_profile_id: Number(value("saved-search-auto-profile") || 0),
     enabled_sources: [...document.querySelectorAll('input[name="saved-search-source"]:checked')].map((input) => input.value),
   };
   try {

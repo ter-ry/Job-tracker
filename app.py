@@ -1212,8 +1212,8 @@ def create_app() -> Flask:
         if job is None:
             return jsonify({"error": "Job not found"}), 404
         values: dict[str, Any] = {}
-        for kind, package_field, job_field in (("resume", "prepared_resume_path", "resume_docx_path"), ("cover_letter", "prepared_cover_letter_path", "cover_letter_docx_path")):
-            path = safe_generated_path(item[package_field] or job[job_field])
+        for kind, package_field in (("resume", "prepared_resume_path"), ("cover_letter", "prepared_cover_letter_path")):
+            path = safe_generated_path(item[package_field])
             values[kind] = ""
             if path and path.is_file():
                 try:

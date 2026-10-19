@@ -60,9 +60,9 @@
               <label>Interval (minutes)<input id="saved-search-interval" type="number" min="15" step="15" value="360"></label>
               <label class="checkline"><input id="saved-search-enabled" type="checkbox"> Enable scheduled search</label>
               <label class="checkline"><input id="saved-search-auto-prepare" type="checkbox"> Automatically prepare qualifying packages</label>
+              <p class="muted helper">Automatic preparation applies only to new discovery results. Unknown Canadian eligibility always requires manual confirmation; it is never bypassed by a saved-search setting.</p>
               <label>Minimum Job Priority<input id="saved-search-auto-min-priority" type="number" min="0" max="100" step="1" value="75"></label>
               <label>Preparation candidate profile<select id="saved-search-auto-profile"><option value="">Choose a profile when available</option></select></label>
-              <label class="checkline"><input id="saved-search-auto-require-canadian" type="checkbox" checked> Require confirmed Canadian eligibility</label>
               <fieldset class="source-picker"><legend>Sources</legend><label><input type="checkbox" name="saved-search-source" value="linkedin" checked> LinkedIn</label><label><input type="checkbox" name="saved-search-source" value="indeed" checked> Indeed</label><label><input type="checkbox" name="saved-search-source" value="google"> Google Jobs</label><label><input type="checkbox" name="saved-search-source" value="zip_recruiter"> ZipRecruiter</label></fieldset>
               <div class="actions"><button class="button" type="submit">Save search</button><button class="button ghost" type="button" id="cancel-saved-search">Cancel</button></div>
             </form>

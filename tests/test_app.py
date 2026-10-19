@@ -4043,6 +4043,55 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(response.status_code, 409)
         self.assertIn("ready_for_review", response.get_json()["error"])
 
+    def test_preparation_preview_uses_only_documents_belonging_to_package(self):
+        job = self.client.post("/api/jobs", json={"company": "Preview Co", "title": "Developer", "status": "shortlisted"}).get_json()
+        package_dir = app_module.generated_applications_dir() / str(job["id"])
+        package_dir.mkdir(parents=True, exist_ok=True)
+
+        def docx_bytes(text):
+            document = Document()
+            document.add_paragraph(text)
+            output = io.BytesIO()
+            document.save(output)
+            return output.getvalue()
+
+        current_resume = package_dir / "current-resume.docx"
+        current_cover = package_dir / "current-cover.docx"
+        package_resume = package_dir / "package-resume.docx"
+        package_cover = package_dir / "package-cover.docx"
+        current_resume.write_bytes(docx_bytes("CURRENT JOB DOCUMENT"))
+        current_cover.write_bytes(docx_bytes("CURRENT JOB COVER LETTER"))
+        package_resume.write_bytes(docx_bytes("PACKAGE RESUME"))
+        package_cover.write_bytes(docx_bytes("PACKAGE COVER LETTER"))
+        with app_module.app.app_context():
+            app_module.get_db().execute(
+                """INSERT INTO application_preparation_queue
+                   (job_id, status, resume_status, cover_letter_status, prepared_resume_path, prepared_cover_letter_path)
+                   VALUES (?, 'ready_for_review', 'generated', 'generated', ?, ?)""",
+                [job["id"], str(package_resume), str(package_cover)],
+            )
+            item_id = app_module.get_db().execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+            app_module.get_db().execute(
+                "UPDATE jobs SET resume_docx_path = ?, cover_letter_docx_path = ?, status = 'shortlisted' WHERE id = ?",
+                [str(current_resume), str(current_cover), job["id"]],
+            )
+            app_module.get_db().commit()
+
+        response = self.client.get(f"/api/preparation/{item_id}/preview")
+        self.assertEqual(response.status_code, 200)
+        preview = response.get_json()
+        self.assertEqual(preview["resume"], "PACKAGE RESUME")
+        self.assertEqual(preview["cover_letter"], "PACKAGE COVER LETTER")
+        self.assertNotIn("CURRENT JOB", preview["resume"] + preview["cover_letter"])
+
+    def test_manual_discovery_preparation_requires_explicit_profile_and_docx_pair(self):
+        frontend = Path(app_module.BASE_DIR, "static", "app.js").read_text(encoding="utf-8")
+        template = Path(app_module.BASE_DIR, "templates", "index.html").read_text(encoding="utf-8")
+        self.assertIn("Choose the candidate profile for this package by number", frontend)
+        self.assertIn("must have both a DOCX résumé and a DOCX cover letter template", frontend)
+        self.assertIn("Unknown Canadian eligibility always requires manual confirmation", template)
+        self.assertNotIn("saved-search-auto-require-canadian", template)
+
     def test_regeneration_does_not_reset_an_active_preparation_lease(self):
         job = self.client.post("/api/jobs", json={"company": "Lease Co", "title": "Developer"}).get_json()
         with app_module.app.app_context():
