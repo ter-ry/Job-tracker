@@ -16,7 +16,26 @@ The worker is independent of Flask and can run while the browser is closed. From
 .venv\Scripts\python.exe scripts\discovery_worker.py --once
 ```
 
-Enable the scheduler in the Discovery tab, then run the command from Windows Task Scheduler at a reasonable interval (for example every 15 minutes). The worker checks each enabled search's next-run time, records per-source outcomes and run history, and uses a SQLite lease to prevent duplicate workers or overlapping runs. Scheduler execution is disabled by default.
+Enable the database scheduler in the Discovery tab, then install the optional per-user Windows task once from PowerShell. The installer uses PowerShell ScheduledTasks cmdlets and is safe for repository and data paths containing spaces:
+
+```powershell
+.\scripts\install_discovery_task.ps1 -IntervalMinutes 15 -DataDir "C:\Users\ter23\Documents\Job tracker\data"
+```
+
+Remove it later with:
+
+```powershell
+.\scripts\uninstall_discovery_task.ps1
+```
+
+For isolated QA, use a separate task name and data directory. The installer is idempotent for that task name and does not alter another task:
+
+```powershell
+.\scripts\install_discovery_task.ps1 -TaskName "Job Tracker Discovery QA" -DataDir "C:\path\to\qa data"
+.\scripts\uninstall_discovery_task.ps1 -TaskName "Job Tracker Discovery QA"
+```
+
+The worker checks each enabled search's next-run time, records per-source outcomes and run history, and uses SQLite leases to prevent duplicate workers or overlapping runs. Scheduler execution is disabled by default.
 
 For a long-running local worker:
 

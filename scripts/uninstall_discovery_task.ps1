@@ -1,6 +1,13 @@
+param(
+    [string]$TaskName = "Job Tracker Discovery"
+)
+
 $ErrorActionPreference = "Stop"
-$taskName = "Job Tracker Discovery"
-schtasks.exe /Delete /TN $taskName /F | Out-Host
-if ($LASTEXITCODE -eq 0) { Write-Host "Removed '$taskName'." }
-elseif ($LASTEXITCODE -eq 1) { Write-Host "'$taskName' was not installed." }
-else { throw "Unable to remove the Windows task. Exit code $LASTEXITCODE" }
+try {
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if (-not $task) { Write-Host "'$TaskName' was not installed."; exit 0 }
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
+    Write-Host "Removed '$TaskName'."
+} catch {
+    throw "Unable to remove Windows task '$TaskName'. $($_.Exception.Message)"
+}

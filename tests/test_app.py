@@ -1054,7 +1054,11 @@ class JobAssistantTest(unittest.TestCase):
         uninstall = Path(app_module.BASE_DIR) / "scripts" / "uninstall_discovery_task.ps1"
         runner = Path(app_module.BASE_DIR) / "scripts" / "run_discovery_task.ps1"
         self.assertTrue(install.exists() and uninstall.exists() and runner.exists())
-        self.assertIn("schtasks.exe /Create", install.read_text(encoding="utf-8"))
+        install_text = install.read_text(encoding="utf-8")
+        self.assertIn("Register-ScheduledTask", install_text)
+        self.assertIn("[string]$TaskName", install_text)
+        self.assertNotIn("schtasks.exe /Create", install_text)
+        self.assertIn("Unregister-ScheduledTask", uninstall.read_text(encoding="utf-8"))
         self.assertIn("--once", runner.read_text(encoding="utf-8"))
 
     def test_remote_eligibility_requires_safe_location_or_explicit_canadian_statement(self):
