@@ -381,6 +381,11 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn('Analyze job and generate diagnostic suggestions', html)
         self.assertIn('Sort: distance', html)
         self.assertIn('Sort: posting date', html)
+        self.assertIn('id="pipeline-sort"', html)
+        self.assertIn('Strong qualification matches', html)
+        self.assertIn('data-start-pipeline-preparation', Path('static/app.js').read_text(encoding='utf-8'))
+        self.assertIn('Download résumé DOCX', Path('static/app.js').read_text(encoding='utf-8'))
+        self.assertIn('pipeline-matches-label', html)
 
     def test_jobspy_discovery_requires_keywords(self):
         response = self.client.post("/api/discovery/jobspy", json={"location": "Toronto"})

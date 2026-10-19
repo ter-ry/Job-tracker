@@ -33,10 +33,21 @@
           </div>
           <div class="pipeline-stats">
             <div><strong id="pipeline-discovered">0</strong><span>Discovered</span></div>
-            <div><strong id="pipeline-matches">0</strong><span>Strong matches</span></div>
+            <div><strong id="pipeline-matches">0</strong><span id="pipeline-matches-label">Strong qualification matches</span></div>
             <div><strong id="pipeline-ready">0</strong><span>Ready to review</span></div>
           </div>
           <div id="pipeline-filters" class="pipeline-filters" role="tablist" aria-label="Pipeline categories"></div>
+          <label class="pipeline-sort">Sort pipeline
+            <select id="pipeline-sort" aria-label="Sort pipeline">
+              <option value="qualification">Qualification fit</option>
+              <option value="priority">Job Priority</option>
+              <option value="salary">Salary</option>
+              <option value="distance">Distance</option>
+              <option value="posted">Date posted</option>
+              <option value="discovered">Date discovered</option>
+              <option value="deadline">Deadline</option>
+            </select>
+          </label>
           <div id="pipeline-cards" class="pipeline-cards" aria-live="polite">
             <p class="pipeline-empty">No saved jobs yet. Use Discovery to add jobs to the pipeline.</p>
           </div>

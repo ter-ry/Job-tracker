@@ -264,8 +264,13 @@ async function queueDiscoveryJob(id) {
     const resume = (documents.resumes || []).find((item) => item.is_default) || documents.resumes?.[0];
     const cover = (documents.cover_letter_templates || []).find((item) => item.is_default) || documents.cover_letter_templates?.[0];
     if (!resume || !cover) throw new Error(`Profile "${profile.name}" must have both a DOCX résumé and a DOCX cover letter template before preparing this job.`);
-    await api.send("/api/preparation/queue", "POST", { job_id: id, candidate_profile_id: profile.id, resume_id: resume.id, cover_letter_template_id: cover.id });
+    const item = await api.send("/api/preparation/queue", "POST", { job_id: id, candidate_profile_id: profile.id, resume_id: resume.id, cover_letter_template_id: cover.id });
     toast("Application package queued for review");
+    const job = state.jobs.find((entry) => Number(entry.id) === Number(id));
+    if (job) {
+      openPipelineJobDetails(id);
+      renderPipelinePreparationState(job, item, item.review_status === "manual_eligibility" ? "Manual eligibility review required" : "Queued for preparation");
+    }
     await loadPreparationQueue();
   } catch (error) { toast(error.message); }
 }
@@ -506,6 +511,37 @@ function renderDashboard(dashboard) {
 }
 
 let pipelineCategory = "All";
+let pipelineSort = "qualification";
+
+function normalizedPipelineSalary(job) {
+  const value = Number(job.salary_midpoint || job.salary_max || job.salary_min || 0);
+  if (!value) return null;
+  const currency = String(job.salary_currency || "CAD").toUpperCase();
+  const toCad = { CAD: 1, USD: 1.36, EUR: 1.48, GBP: 1.74, AUD: 0.9 };
+  return value * (toCad[currency] || 1);
+}
+
+function pipelineSortValue(job, mode) {
+  if (mode === "qualification") return Number(job.qualification_fit_score ?? -1);
+  if (mode === "priority") return Number(job.overall_score ?? -1);
+  if (mode === "salary") return normalizedPipelineSalary(job);
+  if (mode === "distance") return job.distance_km === "" || job.distance_km == null ? null : Number(job.distance_km);
+  if (mode === "posted") return job.posted_date ? Date.parse(job.posted_date) : null;
+  if (mode === "discovered") return job.discovery_first_seen_at ? Date.parse(job.discovery_first_seen_at) : null;
+  if (mode === "deadline") return job.deadline ? Date.parse(job.deadline) : null;
+  return null;
+}
+
+function sortPipelineJobs(items, mode) {
+  return [...items].sort((a, b) => {
+    const left = pipelineSortValue(a, mode);
+    const right = pipelineSortValue(b, mode);
+    if (left === null && right === null) return Number(a.id || 0) - Number(b.id || 0);
+    if (left === null) return 1;
+    if (right === null) return -1;
+    return mode === "distance" || mode === "deadline" ? left - right : right - left;
+  });
+}
 
 function renderPipelineDashboard(jobs) {
   const items = Array.isArray(jobs) ? jobs : [];
@@ -518,16 +554,21 @@ function renderPipelineDashboard(jobs) {
     pipelineCategory = button.dataset.category || "All";
     renderPipelineDashboard(items);
   }));
+  const sortControl = document.getElementById("pipeline-sort");
+  if (sortControl) {
+    sortControl.value = pipelineSort;
+    sortControl.onchange = (event) => { pipelineSort = event.target.value; renderPipelineDashboard(state.jobs); };
+  }
   const filtered = pipelineCategory === "All" ? items : items.filter((job) => String(job.role_type || "") === pipelineCategory);
   setText("pipeline-discovered", items.length);
-  setText("pipeline-matches", items.filter((job) => Number(job.fit_score || 0) >= 75).length);
+  setText("pipeline-matches", items.filter((job) => Number(job.qualification_fit_score || 0) >= 75).length);
   setText("pipeline-ready", items.filter((job) => ["ready_for_review"].includes(job.preparation_status)).length);
   const cards = document.getElementById("pipeline-cards");
   if (!filtered.length) {
     cards.innerHTML = `<p class="pipeline-empty">No saved jobs match this category.</p>`;
     return;
   }
-  cards.innerHTML = filtered.slice().sort((a, b) => Number(b.fit_score || 0) - Number(a.fit_score || 0)).map((job) => {
+  cards.innerHTML = sortPipelineJobs(filtered, pipelineSort).map((job) => {
     const score = Number(job.qualification_fit_score ?? job.fit_score ?? 0);
     const priority = Number(job.overall_score || 0);
     return `<article class="pipeline-card" data-job-id="${job.id}"><div><h3>${escapeHtml(job.title || "Untitled role")}</h3><p>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location not listed")}</p><p class="pipeline-subline">${escapeHtml(job.qualification_fit_label || "Qualification fit")}</p></div><div class="pipeline-score"><strong>${score}%</strong><span>Qualification fit</span><small>Job Priority ${priority}</small><button type="button" data-job-id="${job.id}" class="pipeline-action">View details</button></div></article>`;
@@ -553,6 +594,67 @@ function openPipelineJobDetails(id) {
   panel.querySelector("[data-prepare-job]").addEventListener("click", () => queueDiscoveryJob(id));
   panel.querySelector("[data-edit-job]").addEventListener("click", () => { panel.hidden = true; switchTab({ currentTarget: { dataset: { tab: "tracker" } } }); loadJob(job); });
   panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  const existingPreparation = state.preparationQueue.find((item) => Number(item.job_id) === Number(id));
+  if (existingPreparation) renderPipelinePreparationState(job, existingPreparation, existingPreparation.status === "approved" ? "Package approved; ready for your next manual step" : "Existing package status");
+}
+
+function renderPipelinePreparationState(job, item, message = "") {
+  const panel = document.getElementById("pipeline-job-details");
+  if (!panel || !item) return;
+  const status = String(item.status || "queued").replaceAll("_", " ");
+  const error = item.error || item.resume_error || item.cover_letter_error || "";
+  const ready = item.status === "ready_for_review";
+  const approved = item.status === "approved";
+  const manualEligibility = item.review_status === "manual_eligibility";
+  const wrapper = document.createElement("section");
+  wrapper.className = "pipeline-preparation-state";
+  wrapper.dataset.pipelinePreparation = item.id;
+  wrapper.innerHTML = `<h4>Application preparation</h4><p class="pipeline-preparation-status"><strong>${escapeHtml(status)}</strong>${message ? ` · ${escapeHtml(message)}` : ""}</p>${manualEligibility ? `<p class="muted">Canadian eligibility is unknown. Confirm it before document generation.</p><button class="button small" type="button" data-confirm-pipeline-eligibility>Confirm Canadian eligibility</button>` : error ? `<p class="risk high">${escapeHtml(error)}</p>` : ready || approved ? `<p class="muted">${approved ? "This package was approved for your next manual step. Nothing was submitted." : "Both documents are ready for your review. Nothing was submitted."}</p><div class="actions compact"><button class="button small" type="button" data-preview-pipeline-preparation>Preview documents</button><a class="button ghost small" href="/api/preparation/${item.id}/download/resume">Download résumé DOCX</a><a class="button ghost small" href="/api/preparation/${item.id}/download/cover-letter">Download cover letter DOCX</a>${approved ? "" : `<button class="button ghost small" type="button" data-approve-pipeline-preparation>Approve package</button>`}</div><div data-pipeline-preview></div>` : `<p class="muted">The package is queued and ready to start. Generation does not submit an application.</p><button class="button small" type="button" data-start-pipeline-preparation>Start preparation now</button>`}`;
+  panel.querySelector("[data-pipeline-preparation]")?.remove();
+  panel.appendChild(wrapper);
+  wrapper.querySelector("[data-confirm-pipeline-eligibility]")?.addEventListener("click", () => confirmPipelineEligibility(item.id, job.id));
+  wrapper.querySelector("[data-start-pipeline-preparation]")?.addEventListener("click", () => startPipelinePreparation(item.id, job.id));
+  wrapper.querySelector("[data-preview-pipeline-preparation]")?.addEventListener("click", () => previewPipelinePreparation(item.id));
+  wrapper.querySelector("[data-approve-pipeline-preparation]")?.addEventListener("click", () => approvePipelinePreparation(item.id, job.id));
+}
+
+async function startPipelinePreparation(itemId, jobId) {
+  const panel = document.getElementById("pipeline-job-details");
+  const state = panel?.querySelector("[data-pipeline-preparation]");
+  if (state) state.querySelector(".pipeline-preparation-status").innerHTML = "<strong>preparing</strong> · Generating the selected documents…";
+  try {
+    const item = await api.send(`/api/preparation/${itemId}/prepare`, "POST", {});
+    await loadAll();
+    openPipelineJobDetails(jobId);
+    const updatedJob = window.state.jobs.find((entry) => Number(entry.id) === Number(jobId));
+    if (updatedJob) renderPipelinePreparationState(updatedJob, item, item.status === "ready_for_review" ? "Documents generated successfully" : "Preparation finished");
+  } catch (error) {
+    if (state) state.insertAdjacentHTML("beforeend", `<p class="risk high">${escapeHtml(error.message)}</p>`);
+  }
+}
+
+async function confirmPipelineEligibility(itemId, jobId) {
+  if (!window.confirm("Confirm that this opportunity is eligible for work in Canada before preparing documents?")) return;
+  try { await api.send(`/api/preparation/${itemId}/eligibility-review`, "POST", { confirmed: true }); toast("Eligibility confirmed"); await loadAll(); openPipelineJobDetails(jobId); } catch (error) { toast(error.message); }
+}
+
+async function previewPipelinePreparation(itemId) {
+  try {
+    const result = await api.get(`/api/preparation/${itemId}/preview`);
+    const target = document.querySelector("[data-pipeline-preparation] [data-pipeline-preview]");
+    if (target) target.innerHTML = `<details class="preparation-preview" open><summary>Generated package preview</summary><h5>Résumé</h5><pre>${escapeHtml(result.resume || "Unavailable")}</pre><h5>Cover letter</h5><pre>${escapeHtml(result.cover_letter || "Unavailable")}</pre></details>`;
+  } catch (error) { toast(error.message); }
+}
+
+async function approvePipelinePreparation(itemId, jobId) {
+  try {
+    await api.send(`/api/preparation/${itemId}/review`, "POST", { action: "approve" });
+    toast("Package approved for your next manual step");
+    await loadAll();
+    openPipelineJobDetails(jobId);
+    const item = state.preparationQueue.find((entry) => Number(entry.job_id) === Number(jobId));
+    if (item) renderPipelinePreparationState(state.jobs.find((entry) => Number(entry.id) === Number(jobId)), item, "Package approved; ready for your next manual step");
+  } catch (error) { toast(error.message); }
 }
 
 function renderProfile(profile) {

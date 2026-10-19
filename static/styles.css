@@ -1111,6 +1111,8 @@ th {
 .pipeline-stats strong { font-size: clamp(1.8rem, 3vw, 2.35rem); }
 .pipeline-stats span { font-size: .9rem; }
 .pipeline-filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 12px; margin-bottom: 20px; }
+.pipeline-sort { display: inline-grid; gap: 5px; width: min(260px, 100%); margin-bottom: 16px; color: #cfcfcf; font-size: .8rem; }
+.pipeline-sort select { min-width: 0; }
 .pipeline-filter { border: 0; border-radius: 28px; background: transparent; color: #bcbcbc; cursor: pointer; font: inherit; font-weight: 700; padding: 10px 16px; }
 .pipeline-filter.active { background: #252525; color: #f4f4f4; }
 .pipeline-cards { display: grid; gap: 12px; }
@@ -1126,6 +1128,9 @@ th {
 .pipeline-card { cursor: pointer; }
 .pipeline-card small { color: #9d9d9d; font-size: .72rem; }
 .pipeline-job-details { margin-top: 16px; border: 1px solid #2a2a2a; border-radius: 14px; background: #0b0b0b; color: #f1f1f1; padding: 20px; }
+.pipeline-preparation-state { margin-top: 18px; border-top: 1px solid #2a2a2a; padding-top: 16px; color: #ededed; }
+.pipeline-preparation-state h4, .pipeline-preparation-state h5 { color: #f1f1f1; margin: 0 0 8px; }
+.pipeline-preparation-status { color: #ededed; }
 .pipeline-detail-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .pipeline-detail-header h3 { color: #f1f1f1; font-size: 1.3rem; margin-top: 4px; }
 .pipeline-detail-header p, .pipeline-detail-grid p, .pipeline-detail-links { color: #bdbdbd; }
@@ -1145,6 +1150,13 @@ body { background: #050505; color: #ededed; }
 .eyebrow, a { color: #d4d4d4; }
 input, select, textarea { background: #111; border-color: #303030; color: #eee; }
 .muted, label, .dashboard p { color: #9d9d9d; }
+.generated-output, .generated-output h3, .generated-output h4, .generated-output strong, .generated-output p, .generated-output li { color: #ededed; }
+.generated-output pre { background: #151515; color: #ededed; }
+.generated-output a { color: #e0e0e0; }
+.output-panel .button.ghost { background: #1b1b1b; border-color: #3b3b3b; color: #ededed; }
+.button.secondary, .button.ghost { background: #1b1b1b; border-color: #3b3b3b; color: #ededed; }
+.button.secondary:hover, .button.ghost:hover { background: #2a2a2a; color: #fff; }
+.output-panel label, .output-panel .muted, .output-panel .helper { color: #bdbdbd; }
 
 @media (max-width: 640px) {
   .pipeline-stats { gap: 24px; margin-left: 0; margin-right: 0; }
