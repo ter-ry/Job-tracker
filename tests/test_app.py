@@ -4,7 +4,7 @@ import io
 import re
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 import zipfile
@@ -4042,6 +4042,22 @@ class JobAssistantTest(unittest.TestCase):
         response = self.client.post(f"/api/preparation/{item_id}/review", json={"action": "approve"})
         self.assertEqual(response.status_code, 409)
         self.assertIn("ready_for_review", response.get_json()["error"])
+
+    def test_regeneration_does_not_reset_an_active_preparation_lease(self):
+        job = self.client.post("/api/jobs", json={"company": "Lease Co", "title": "Developer"}).get_json()
+        with app_module.app.app_context():
+            app_module.get_db().execute(
+                "INSERT INTO application_preparation_queue (job_id, status, lease_owner, lease_expires_at) VALUES (?, 'preparing', 'other-worker', ?)",
+                [job["id"], (datetime.now() + timedelta(minutes=10)).isoformat(timespec="seconds")],
+            )
+            app_module.get_db().commit()
+            item_id = app_module.get_db().execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+        response = self.client.post(f"/api/preparation/{item_id}/regenerate")
+        self.assertEqual(response.status_code, 409)
+        with app_module.app.app_context():
+            row = app_module.query_db("SELECT status, lease_owner FROM application_preparation_queue WHERE id = ?", [item_id], one=True)
+        self.assertEqual(row["status"], "preparing")
+        self.assertEqual(row["lease_owner"], "other-worker")
 
     def test_unknown_eligibility_requires_explicit_review_before_preparation(self):
         profile = self.client.post("/api/candidate-profiles", json={"name": "Eligibility QA", "identity_mode": "distinct", "applicant_name": "QA Applicant"}).get_json()
