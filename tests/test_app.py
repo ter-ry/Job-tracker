@@ -8,6 +8,7 @@ from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 import zipfile
+import urllib.error
 
 import app as app_module
 import grounding
@@ -1025,6 +1026,36 @@ class JobAssistantTest(unittest.TestCase):
         response = self.client.put("/api/discovery/scheduler", json={"enabled": True})
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.get_json()["enabled"])
+
+    def test_geocoding_rate_limit_is_cached_temporarily_and_does_not_retry_candidates(self):
+        class RateLimitedProvider:
+            name = "fake-nominatim"
+            def __init__(self):
+                self.calls = 0
+            def geocode(self, query, *, country="Canada"):
+                self.calls += 1
+                raise urllib.error.HTTPError("https://example.test", 429, "Too Many Requests", {}, None)
+
+        provider = RateLimitedProvider()
+        with app_module.app.app_context():
+            app_module.init_db()
+            first = app_module.geocode_location_value("Toronto, Ontario", lookup_type="job", provider=provider)
+            second = app_module.geocode_location_value("Toronto, Ontario", lookup_type="job", provider=provider)
+        self.assertEqual(first["status"], "rate_limited")
+        self.assertEqual(second["status"], "rate_limited")
+        self.assertEqual(provider.calls, 1)
+        self.assertIn("temporarily rate limited", second["error"])
+
+    def test_discovery_task_status_is_read_only_and_scripts_are_present(self):
+        response = self.client.get("/api/discovery/task-status")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("task_name", response.get_json())
+        install = Path(app_module.BASE_DIR) / "scripts" / "install_discovery_task.ps1"
+        uninstall = Path(app_module.BASE_DIR) / "scripts" / "uninstall_discovery_task.ps1"
+        runner = Path(app_module.BASE_DIR) / "scripts" / "run_discovery_task.ps1"
+        self.assertTrue(install.exists() and uninstall.exists() and runner.exists())
+        self.assertIn("schtasks.exe /Create", install.read_text(encoding="utf-8"))
+        self.assertIn("--once", runner.read_text(encoding="utf-8"))
 
     def test_remote_eligibility_requires_safe_location_or_explicit_canadian_statement(self):
         cases = [

@@ -62,7 +62,13 @@
               <fieldset class="source-picker"><legend>Sources</legend><label><input type="checkbox" name="saved-search-source" value="linkedin" checked> LinkedIn</label><label><input type="checkbox" name="saved-search-source" value="indeed" checked> Indeed</label><label><input type="checkbox" name="saved-search-source" value="google"> Google Jobs</label><label><input type="checkbox" name="saved-search-source" value="zip_recruiter"> ZipRecruiter</label></fieldset>
               <div class="actions"><button class="button" type="submit">Save search</button><button class="button ghost" type="button" id="cancel-saved-search">Cancel</button></div>
             </form>
-            <div class="actions compact"><button class="button ghost small" type="button" id="toggle-discovery-scheduler">Enable scheduler</button><span id="discovery-scheduler-status" class="muted helper"></span></div>
+            <div class="actions compact"><button class="button ghost small" type="button" id="toggle-discovery-scheduler">Enable database scheduler</button><span id="discovery-scheduler-status" class="muted helper"></span></div>
+            <div class="discovery-task-setup nested-panel">
+              <strong>Windows background task</strong>
+              <p class="muted helper">The database switch above does not install a Windows task. To opt in once, run <code>scripts\\install_discovery_task.ps1</code> from the repository. It runs the existing worker while Flask is closed.</p>
+              <div class="actions compact"><button class="button ghost small" type="button" id="refresh-discovery-task-status">Refresh task status</button><span id="discovery-task-status" class="muted helper">Checking…</span></div>
+              <p class="muted helper">To disable it later, run <code>scripts\\uninstall_discovery_task.ps1</code>. No administrator permission is normally required.</p>
+            </div>
           </section>
           <form id="discovery-form" class="panel discovery-search-panel">
             <div class="panel-header"><h2>Live job discovery</h2></div>

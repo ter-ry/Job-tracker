@@ -100,6 +100,8 @@ DISCOVERY_DATE_WINDOWS = {
 APP_SCHEMA_VERSION = 1
 CURRENT_DB_SCHEMA_VERSION = 3
 DISCOVERY_DEBUG_SNAPSHOT_LIMIT = 25
+GEOCODING_FAILURE_CACHE_SECONDS = 15 * 60
+DISCOVERY_TASK_NAME = "Job Tracker Discovery"
 TESTED_DEPENDENCY_VERSIONS = {
     "python-jobspy": "1.1.82",
     "pandas": "2.3.3",
@@ -1164,6 +1166,22 @@ def create_app() -> Flask:
         get_db().execute("INSERT INTO app_settings (key, value) VALUES ('discovery_scheduler_enabled', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", ["1" if enabled else "0"])
         get_db().commit()
         return jsonify({"enabled": enabled})
+
+    @app.get("/api/discovery/task-status")
+    def discovery_task_status() -> Response:
+        """Report the optional Windows Task Scheduler registration without changing it."""
+        if os.name != "nt":
+            return jsonify({"supported": False, "installed": False, "task_name": DISCOVERY_TASK_NAME, "message": "Windows Task Scheduler is available only on Windows."})
+        try:
+            result = subprocess.run(
+                ["schtasks.exe", "/Query", "/TN", DISCOVERY_TASK_NAME, "/FO", "LIST", "/V"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            installed = result.returncode == 0
+            output = result.stdout if installed else ""
+            return jsonify({"supported": True, "installed": installed, "task_name": DISCOVERY_TASK_NAME, "details": output, "message": "Installed" if installed else "Not installed. Run scripts\\install_discovery_task.ps1 once to opt in."})
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return jsonify({"supported": True, "installed": False, "task_name": DISCOVERY_TASK_NAME, "message": f"Task status unavailable: {exc}"})
 
     @app.get("/api/discovery/results")
     def discovery_results_get() -> Response:
@@ -5017,13 +5035,23 @@ def load_geocoding_cache(cache_key: str) -> dict[str, Any] | None:
     row = query_db("SELECT * FROM geocoding_cache WHERE cache_key = ?", [cache_key], one=True)
     if row is None:
         return None
+    success = bool(int(row["success"] or 0))
+    updated_at = text(row["updated_at"])
+    if not success and updated_at:
+        try:
+            age = (datetime.now() - datetime.fromisoformat(updated_at)).total_seconds()
+            if age >= GEOCODING_FAILURE_CACHE_SECONDS:
+                return None
+        except ValueError:
+            return None
     return {
         "cache_key": cache_key,
         "lookup_type": text(row["lookup_type"]),
         "query_text": text(row["query_text"]),
         "normalized_query": text(row["normalized_query"]),
         "provider": text(row["provider"]),
-        "success": bool(int(row["success"] or 0)),
+        "success": success,
+        "updated_at": updated_at,
         "result": parse_json_object(row["result_json"]),
     }
 
@@ -5080,7 +5108,16 @@ class NominatimGeocodingProvider(GeocodingProvider):
         }
 
 
+class DisabledGeocodingProvider(GeocodingProvider):
+    name = "disabled"
+
+    def geocode(self, query: str, *, country: str = "Canada") -> dict[str, Any]:
+        raise RuntimeError("Geocoding is disabled by configuration")
+
+
 def get_geocoding_provider() -> GeocodingProvider:
+    if text(os.environ.get("JOB_TRACKER_GEOCODING_PROVIDER")).lower() in {"none", "disabled", "off"}:
+        return DisabledGeocodingProvider()
     return NominatimGeocodingProvider()
 
 
@@ -5139,7 +5176,7 @@ def geocode_location_value(
             cached_result.update(
                 {
                     "ok": cached["success"],
-                    "status": "cached" if cached["success"] else "failed",
+                    "status": "cached" if cached["success"] else text(cached_result.get("status") or "failed"),
                     "original_input": raw,
                     "normalized_query": text(cached_result.get("normalized_query") or candidate["normalized_query"]),
                     "provider": text(cached_result.get("provider") or cached["provider"] or provider.name),
@@ -5149,6 +5186,8 @@ def geocode_location_value(
             if cached_result.get("ok"):
                 return cached_result
             errors.append(text(cached_result.get("error")) or "Cached geocoding failure.")
+            if cached_result.get("status") == "rate_limited":
+                break
             continue
         try:
             lookup = provider.geocode(candidate["query"], country="Canada")
@@ -5175,6 +5214,21 @@ def geocode_location_value(
             if use_cache:
                 save_geocoding_cache(cache_key, lookup_type, candidate["query"], candidate["normalized_query"], provider.name, result, True)
             return result
+        except urllib.error.HTTPError as exc:
+            rate_limited = exc.code == 429
+            error_message = "The location service is temporarily rate limited." if rate_limited else f"HTTP {exc.code}: geocoding unavailable."
+            failure = {
+                "ok": False, "status": "rate_limited" if rate_limited else "failed", "original_input": raw,
+                "normalized_query": candidate["normalized_query"], "latitude": "", "longitude": "",
+                "provider": provider.name, "confidence": 0, "precision": candidate["precision"],
+                "geocoded_at": datetime.now().isoformat(timespec="seconds"), "error": error_message,
+                "used_fallback": bool(candidate["used_postal_fallback"]), "cached": False,
+            }
+            if use_cache:
+                save_geocoding_cache(cache_key, lookup_type, candidate["query"], candidate["normalized_query"], provider.name, failure, False)
+            errors.append(error_message)
+            if rate_limited:
+                break
         except Exception as exc:
             error_message = f"{type(exc).__name__}: {exc}"
             failure = {
@@ -5197,7 +5251,7 @@ def geocode_location_value(
             errors.append(error_message)
     return {
         "ok": False,
-        "status": "failed",
+        "status": "rate_limited" if any("rate limited" in error.lower() for error in errors) else "failed",
         "original_input": raw,
         "normalized_query": candidates[-1]["normalized_query"],
         "latitude": "",
@@ -5206,7 +5260,7 @@ def geocode_location_value(
         "confidence": 0,
         "precision": candidates[-1]["precision"],
         "geocoded_at": datetime.now().isoformat(timespec="seconds"),
-        "error": "; ".join(dict.fromkeys(errors)) if errors else "Location could not be geocoded.",
+        "error": "The location service is temporarily rate limited." if any("rate limited" in error.lower() for error in errors) else ("Location enrichment is unavailable; distance remains unknown." if errors else "Location could not be geocoded."),
         "used_fallback": bool(candidates[-1]["used_postal_fallback"]),
         "cached": False,
     }

@@ -111,6 +111,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("refresh-saved-searches").addEventListener("click", loadSavedSearches);
   document.getElementById("refresh-discovery-inbox").addEventListener("click", loadDiscoveryInbox);
   document.getElementById("toggle-discovery-scheduler").addEventListener("click", toggleDiscoveryScheduler);
+  document.getElementById("refresh-discovery-task-status")?.addEventListener("click", loadDiscoveryTaskStatus);
   document.getElementById("csv-import-form").addEventListener("submit", importCsv);
   document.getElementById("discovery-test-sources").addEventListener("click", testJobSources);
   document.getElementById("refresh-shortlist").addEventListener("click", loadAll);
@@ -176,6 +177,7 @@ document.addEventListener("DOMContentLoaded", () => {
   loadSavedSearches();
   loadDiscoveryInbox();
   loadDiscoveryScheduler();
+  loadDiscoveryTaskStatus();
 });
 
 async function loadAll() {
@@ -286,8 +288,17 @@ async function saveInboxJob(id) {
 async function loadDiscoveryScheduler() {
   try { const result = await api.get("/api/discovery/scheduler"); updateDiscoverySchedulerButton(result.enabled); } catch (_) { /* older databases */ }
 }
-function updateDiscoverySchedulerButton(enabled) { setText("toggle-discovery-scheduler", enabled ? "Disable scheduler" : "Enable scheduler"); setText("discovery-scheduler-status", enabled ? "Enabled for due saved searches" : "Disabled"); }
+function updateDiscoverySchedulerButton(enabled) { setText("toggle-discovery-scheduler", enabled ? "Disable database scheduler" : "Enable database scheduler"); setText("discovery-scheduler-status", enabled ? "Enabled for due saved searches; Windows task is separate" : "Disabled"); }
 async function toggleDiscoveryScheduler() { try { const current = await api.get("/api/discovery/scheduler"); const result = await api.send("/api/discovery/scheduler", "PUT", { enabled: !current.enabled }); updateDiscoverySchedulerButton(result.enabled); } catch (error) { toast(error.message); } }
+async function loadDiscoveryTaskStatus() {
+  const target = document.getElementById("discovery-task-status");
+  if (!target) return;
+  try {
+    const result = await api.get("/api/discovery/task-status");
+    target.textContent = result.message || (result.installed ? "Installed" : "Not installed");
+    target.classList.toggle("task-installed", Boolean(result.installed));
+  } catch (error) { target.textContent = `Task status unavailable: ${error.message}`; }
+}
 
 function showCandidateProfileForm(profile = null) {
   const form = document.getElementById("candidate-profile-form");
@@ -1543,7 +1554,8 @@ function renderDiscoveryDiagnostics(diagnostics, visibleCount, totalCount) {
     details.push(`<li>${renderSourceDiagnostics(sourceDiagnostics)}</li>`);
   }
   if (Array.isArray(diagnostics.geocoding_errors) && diagnostics.geocoding_errors.length) {
-    details.push(`<li><strong>Geocoding errors:</strong> ${escapeHtml(diagnostics.geocoding_errors.join(" | "))}</li>`);
+    const rateLimited = diagnostics.geocoding_errors.some((error) => String(error).toLowerCase().includes("rate limited"));
+    details.push(`<li><strong>Location enrichment:</strong> ${rateLimited ? "The public location service is temporarily rate limited. Jobs were kept; distance is unknown until cached data or a later retry is available." : "Some locations could not be enriched. Jobs were kept with unknown distance."}</li>`);
   }
   if (totalCount > 0 && visibleCount === 0) {
     details.push("<li><strong>Local filters:</strong> Jobs were fetched, but the current local filters hide all visible results.</li>");
