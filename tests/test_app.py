@@ -8,6 +8,7 @@ from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 import zipfile
+import urllib.error
 
 import app as app_module
 import grounding
@@ -489,7 +490,8 @@ class JobAssistantTest(unittest.TestCase):
             },
             "source_snapshots": {"linkedin": [{"source": "linkedin", "title": "Software Developer", "company": "Northstar", "location": "Toronto, ON", "date_posted": "2026-06-19", "url": "https://example.com/1", "raw_field_types": {"title": "str"}}]},
         }
-        with patch.object(app_module, "get_geocoding_provider", return_value=provider), patch.object(app_module, "fetch_jobspy_jobs", return_value=fake):
+        location = {"original_input": "Toronto, Ontario", "normalized_input": "Toronto, Ontario", "distance_origin": "Toronto, Ontario", "discovery_location": "Toronto, ON", "resolution_method": "test", "lookup": {}}
+        with patch.object(app_module, "get_geocoding_provider", return_value=provider), patch.object(app_module, "resolve_discovery_location_context", return_value=location), patch.object(app_module, "fetch_jobspy_jobs", return_value=fake):
             response = self.client.post(
                 "/api/discovery/jobspy",
                 json={"keywords": "software developer", "location": "Toronto, ON", "enabled_sources": ["linkedin"], "bypass_cache": True},
@@ -980,6 +982,146 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(saved.get_json()["title"], "Cloud Support Analyst")
         self.assertTrue(second["jobs"][0]["already_saved"])
         self.assertEqual(second["duplicates"], 1)
+
+    def test_saved_discovery_searches_are_named_disabled_by_default_and_editable(self):
+        created = self.client.post(
+            "/api/discovery/searches",
+            json={"name": "Backend Developer", "keywords": "backend developer", "location": "Toronto", "enabled_sources": ["linkedin"], "interval_minutes": 60},
+        )
+        self.assertEqual(created.status_code, 201)
+        search = created.get_json()
+        self.assertFalse(search["enabled"])
+        self.assertEqual(search["enabled_sources"], ["linkedin"])
+        updated = self.client.put(f"/api/discovery/searches/{search['id']}", json={**search, "name": "Cloud Developer", "enabled": True})
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.get_json()["name"], "Cloud Developer")
+        self.assertTrue(updated.get_json()["enabled"])
+
+    def test_saved_discovery_run_persists_new_jobs_and_preserves_existing_status(self):
+        provider = FakeGeocodingProvider({"Toronto, Ontario, Canada": {"latitude": 43.65, "longitude": -79.38, "display_name": "Toronto, Ontario, Canada", "precision": "city"}})
+        fake = {
+            "jobs": [{"source_job_id": "saved-1", "title": "Backend Developer", "company": "Acme", "location": "Toronto, Ontario", "source": "linkedin", "job_url": "https://example.com/acme/1", "description": "Python SQL backend", "remote_type": "Hybrid"}],
+            "errors": {}, "source_counts": {"linkedin": 1}, "source_diagnostics": {"linkedin": {"success": True}}, "source_snapshots": {},
+        }
+        search = self.client.post("/api/discovery/searches", json={"name": "Backend", "keywords": "backend developer", "location": "Toronto, Ontario", "enabled_sources": ["linkedin"]}).get_json()
+        location = {"original_input": "Toronto, Ontario", "normalized_input": "Toronto, Ontario", "distance_origin": "Toronto, Ontario", "discovery_location": "Toronto, ON", "resolution_method": "test", "lookup": {}}
+        with patch.object(app_module, "get_geocoding_provider", return_value=provider), patch.object(app_module, "resolve_discovery_location_context", return_value=location), patch.object(app_module, "fetch_jobspy_jobs", return_value=fake):
+            first = self.client.post(f"/api/discovery/searches/{search['id']}/run")
+            self.assertEqual(first.status_code, 200, first.get_json())
+            self.assertEqual(first.get_json()["persisted"]["new"], 1)
+            job = self.client.get("/api/discovery/inbox").get_json()[0]
+            self.client.post(f"/api/discovery/inbox/{job['id']}/review")
+            second = self.client.post(f"/api/discovery/searches/{search['id']}/run")
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.get_json()["persisted"]["duplicate"], 1)
+        refreshed = self.client.get("/api/discovery/inbox").get_json()[0]
+        self.assertEqual(refreshed["discovery_state"], "reviewed")
+        self.assertEqual(len(self.client.get("/api/discovery/runs").get_json()), 2)
+
+    def test_discovery_scheduler_is_disabled_until_explicitly_enabled(self):
+        from scripts.discovery_worker import run_due_searches
+
+        with app_module.app.app_context():
+            self.assertEqual(run_due_searches()["disabled"], 1)
+        response = self.client.put("/api/discovery/scheduler", json={"enabled": True})
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["enabled"])
+
+    def test_geocoding_rate_limit_is_cached_temporarily_and_does_not_retry_candidates(self):
+        class RateLimitedProvider:
+            name = "fake-nominatim"
+            def __init__(self):
+                self.calls = 0
+            def geocode(self, query, *, country="Canada"):
+                self.calls += 1
+                raise urllib.error.HTTPError("https://example.test", 429, "Too Many Requests", {}, None)
+
+        provider = RateLimitedProvider()
+        with app_module.app.app_context():
+            app_module.init_db()
+            first = app_module.geocode_location_value("Toronto, Ontario", lookup_type="job", provider=provider)
+            second = app_module.geocode_location_value("Toronto, Ontario", lookup_type="job", provider=provider)
+        self.assertEqual(first["status"], "rate_limited")
+        self.assertEqual(second["status"], "rate_limited")
+        self.assertEqual(provider.calls, 1)
+        self.assertIn("temporarily rate limited", second["error"])
+
+    def test_discovery_task_status_is_read_only_and_scripts_are_present(self):
+        response = self.client.get("/api/discovery/task-status")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("task_name", response.get_json())
+        install = Path(app_module.BASE_DIR) / "scripts" / "install_discovery_task.ps1"
+        uninstall = Path(app_module.BASE_DIR) / "scripts" / "uninstall_discovery_task.ps1"
+        runner = Path(app_module.BASE_DIR) / "scripts" / "run_discovery_task.ps1"
+        self.assertTrue(install.exists() and uninstall.exists() and runner.exists())
+        install_text = install.read_text(encoding="utf-8")
+        self.assertIn("Register-ScheduledTask", install_text)
+        self.assertIn("[string]$TaskName", install_text)
+        self.assertNotIn("schtasks.exe /Create", install_text)
+        self.assertIn("Unregister-ScheduledTask", uninstall.read_text(encoding="utf-8"))
+        self.assertIn("--once", runner.read_text(encoding="utf-8"))
+
+    def test_remote_eligibility_requires_safe_location_or_explicit_canadian_statement(self):
+        cases = [
+            ({"remote_type": "Remote", "location": "London, UK"}, "unknown"),
+            ({"remote_type": "Remote", "location": "Remote US only"}, "restricted"),
+            ({"remote_type": "Remote", "location": "Remote Canada"}, "canadian_eligible"),
+            ({"remote_type": "Remote", "location": "Toronto, Ontario"}, "canadian_eligible"),
+            ({"remote_type": "Remote", "location": "Global"}, "unknown"),
+            ({"remote_type": "Remote", "location": "Toronto, Ontario", "job_description": "Canada excluded from this remote role."}, "restricted"),
+            ({"remote_type": "Remote", "location": "London, UK", "job_description": "Remote in Canada eligible."}, "canadian_eligible"),
+        ]
+        for job, expected in cases:
+            self.assertEqual(app_module.discovery_remote_eligibility(job)[0], expected, job)
+
+    def test_saved_search_salary_minimum_keeps_unknown_and_estimated_compensation(self):
+        location = {"original_input": "Toronto", "normalized_input": "Toronto", "distance_origin": "Toronto", "discovery_location": "Toronto, ON", "resolution_method": "test", "lookup": {}}
+        fake = {
+            "jobs": [
+                {"source_job_id": "below", "title": "Software Developer", "company": "Below", "location": "Toronto", "source": "linkedin", "job_url": "https://example.com/below", "salary_min": 50000, "salary_max": 60000, "description": "Python"},
+                {"source_job_id": "above", "title": "Software Developer", "company": "Above", "location": "Toronto", "source": "linkedin", "job_url": "https://example.com/above", "salary_min": 90000, "salary_max": 100000, "description": "Python"},
+                {"source_job_id": "missing", "title": "Software Developer", "company": "Missing", "location": "Toronto", "source": "linkedin", "job_url": "https://example.com/missing", "description": "Python"},
+                {"source_job_id": "estimated", "title": "Software Developer", "company": "Estimated", "location": "Toronto", "source": "linkedin", "job_url": "https://example.com/estimated", "salary_text": "Estimated market range", "description": "Python"},
+            ],
+            "errors": {}, "source_counts": {"linkedin": 4}, "source_diagnostics": {}, "source_snapshots": {},
+        }
+        search = self.client.post("/api/discovery/searches", json={"name": "Salary test", "keywords": "software developer", "location": "Toronto", "minimum_salary": 80000, "enabled_sources": ["linkedin"]}).get_json()
+        with patch.object(app_module, "get_geocoding_provider", return_value=FakeGeocodingProvider({})), patch.object(app_module, "resolve_discovery_location_context", return_value=location), patch.object(app_module, "fetch_jobspy_jobs", return_value=fake):
+            response = self.client.post(f"/api/discovery/searches/{search['id']}/run")
+        self.assertEqual(response.status_code, 200)
+        jobs = response.get_json()["jobs"]
+        self.assertEqual({job["company"] for job in jobs}, {"Above", "Missing", "Estimated"})
+        self.assertTrue(all(job["discovery_salary_filter_status"] in {"known", "unknown"} for job in jobs))
+
+    def test_manual_and_worker_runs_share_search_lease_and_heartbeat(self):
+        from scripts.discovery_worker import run_due_searches
+
+        search = self.client.post("/api/discovery/searches", json={"name": "Lease test", "keywords": "software developer", "enabled": True}).get_json()
+        with app_module.app.app_context():
+            app_module.init_db()
+            self.assertTrue(app_module.acquire_discovery_search_lease(search["id"], "manual-test"))
+            self.assertFalse(app_module.acquire_discovery_search_lease(search["id"], "scheduled-test"))
+            original_interval = app_module.DISCOVERY_LEASE_RENEW_SECONDS
+            app_module.DISCOVERY_LEASE_RENEW_SECONDS = 0.01
+            stop, thread = app_module.start_discovery_search_lease_heartbeat(search["id"], "manual-test")
+            try:
+                import time
+                time.sleep(0.04)
+                row = app_module.query_db("SELECT expires_at FROM discovery_search_leases WHERE search_id = ?", [search["id"]], one=True)
+                self.assertGreater(row["expires_at"], app_module.datetime.now().isoformat(timespec="seconds"))
+            finally:
+                app_module.DISCOVERY_LEASE_RENEW_SECONDS = original_interval
+                stop.set()
+                thread.join(timeout=1)
+                app_module.release_discovery_search_lease(search["id"], "manual-test")
+        with app_module.app.app_context(), patch.object(app_module, "run_discovery_pipeline", return_value={"total": 0, "persisted": {"new": 0, "duplicate": 0}, "errors": {}, "source_diagnostics": {}}):
+            app_module.get_db().execute("UPDATE saved_search_profiles SET enabled = 1, next_run_at = '' WHERE id = ?", [search["id"]])
+            app_module.get_db().execute("INSERT INTO app_settings (key, value) VALUES ('discovery_scheduler_enabled', '1') ON CONFLICT(key) DO UPDATE SET value = '1'")
+            app_module.get_db().commit()
+            first = run_due_searches()
+            second = run_due_searches()
+        self.assertEqual(first["runs"], 1)
+        self.assertEqual(second["runs"], 0)
 
     def test_discovery_salary_normalization_and_hourly_conversion(self):
         salary = app_module.determine_salary(

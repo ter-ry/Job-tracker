@@ -42,6 +42,34 @@
           </div>
         </section>
         <section class="workspace discovery-layout">
+          <section class="panel discovery-saved-searches">
+            <div class="panel-header">
+              <div><h2>Saved searches</h2><p class="muted helper">Scheduled discovery is off until you enable it.</p></div>
+              <div class="actions compact"><button class="button ghost small" type="button" id="refresh-saved-searches">Refresh</button><button class="button small" type="button" id="new-saved-search">New search</button></div>
+            </div>
+            <div id="saved-search-list" class="saved-search-list"></div>
+            <form id="saved-search-form" class="grid three" hidden>
+              <input type="hidden" id="saved-search-id">
+              <label>Name<input id="saved-search-name" required placeholder="Software Engineer"></label>
+              <label>Keywords<input id="saved-search-keywords" required placeholder="software engineer"></label>
+              <label>Location<input id="saved-search-location" placeholder="Toronto, Ontario"></label>
+              <label>Remote preference<select id="saved-search-remote"><option value="">Any</option><option value="remote">Remote</option><option value="hybrid">Hybrid</option><option value="on-site">On-site</option></select></label>
+              <label>Seniority<input id="saved-search-seniority" placeholder="junior, intermediate"></label>
+              <label>Minimum salary<input id="saved-search-minimum-salary" type="number" min="0" step="1000"></label>
+              <label>Posting recency<select id="saved-search-date-window"><option value="24h">24 hours</option><option value="3d">3 days</option><option value="7d">7 days</option><option value="14d" selected>14 days</option><option value="30d">30 days</option><option value="any">Any</option></select></label>
+              <label>Interval (minutes)<input id="saved-search-interval" type="number" min="15" step="15" value="360"></label>
+              <label class="checkline"><input id="saved-search-enabled" type="checkbox"> Enable scheduled search</label>
+              <fieldset class="source-picker"><legend>Sources</legend><label><input type="checkbox" name="saved-search-source" value="linkedin" checked> LinkedIn</label><label><input type="checkbox" name="saved-search-source" value="indeed" checked> Indeed</label><label><input type="checkbox" name="saved-search-source" value="google"> Google Jobs</label><label><input type="checkbox" name="saved-search-source" value="zip_recruiter"> ZipRecruiter</label></fieldset>
+              <div class="actions"><button class="button" type="submit">Save search</button><button class="button ghost" type="button" id="cancel-saved-search">Cancel</button></div>
+            </form>
+            <div class="actions compact"><button class="button ghost small" type="button" id="toggle-discovery-scheduler">Enable database scheduler</button><span id="discovery-scheduler-status" class="muted helper"></span></div>
+            <div class="discovery-task-setup nested-panel">
+              <strong>Windows background task</strong>
+              <p class="muted helper">The database switch above does not install a Windows task. To opt in once, run <code>scripts\\install_discovery_task.ps1</code> from the repository. It runs the existing worker while Flask is closed.</p>
+              <div class="actions compact"><button class="button ghost small" type="button" id="refresh-discovery-task-status">Refresh task status</button><span id="discovery-task-status" class="muted helper">Checking…</span></div>
+              <p class="muted helper">To disable it later, run <code>scripts\\uninstall_discovery_task.ps1</code>. No administrator permission is normally required.</p>
+            </div>
+          </section>
           <form id="discovery-form" class="panel discovery-search-panel">
             <div class="panel-header"><h2>Live job discovery</h2></div>
             <div class="grid two">
@@ -162,6 +190,11 @@
               </div>
             </div>
             <div id="discovery-results" class="generated-output empty">Search results will appear here.</div>
+          </section>
+
+          <section class="panel discovery-inbox-panel">
+            <div class="panel-header"><div><h2>Discovery inbox</h2><p class="muted helper">New opportunities remain saved, but are never shortlisted automatically.</p></div><button class="button ghost small" type="button" id="refresh-discovery-inbox">Refresh</button></div>
+            <div id="discovery-inbox" class="generated-output empty">No discovered opportunities yet.</div>
           </section>
 
           <form id="csv-import-form" class="panel discovery-secondary-panel">

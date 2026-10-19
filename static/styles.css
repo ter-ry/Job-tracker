@@ -342,6 +342,47 @@ legend {
   gap: 12px;
 }
 
+.discovery-saved-searches,
+.discovery-inbox-panel {
+  width: 100%;
+}
+
+.discovery-saved-searches #saved-search-form[hidden] {
+  display: none;
+}
+
+.saved-search-list,
+.discovery-inbox-panel .generated-output {
+  display: grid;
+  gap: 8px;
+}
+
+.saved-search-row,
+.inbox-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 14px;
+  align-items: center;
+  border-top: 1px solid var(--line);
+  padding: 12px 0;
+}
+
+.saved-search-row > div:first-child,
+.inbox-row > div:first-child,
+.inbox-row > div:nth-child(2) {
+  display: grid;
+  gap: 3px;
+}
+
+.inbox-row {
+  grid-template-columns: minmax(0, 1fr) auto auto;
+}
+
+.saved-search-row .actions,
+.inbox-row .row-actions {
+  justify-content: flex-end;
+}
+
 input,
 select,
 textarea {
@@ -640,6 +681,96 @@ th {
   padding-top: 12px;
 }
 
+/* Discovery is rendered inside the product's dark workspace. Keep its
+   controls and diagnostics readable even though the legacy light tokens are
+   still used by the other panels. */
+#discovery,
+#discovery .panel,
+#discovery .nested-panel,
+#discovery .generated-output {
+  --discovery-ink: #f1f1f1;
+  --discovery-muted: #a9a9a9;
+  --discovery-line: #2a2a2a;
+  background: #080808;
+  color: var(--discovery-ink);
+}
+
+#discovery .panel,
+#discovery .nested-panel {
+  border-color: var(--discovery-line);
+}
+
+#discovery h2,
+#discovery h3,
+#discovery h4,
+#discovery strong,
+#discovery th,
+#discovery td,
+#discovery label,
+#discovery legend,
+#discovery summary {
+  color: var(--discovery-ink);
+}
+
+#discovery p,
+#discovery .muted,
+#discovery .helper,
+#discovery th,
+#discovery .mini-breakdown {
+  color: var(--discovery-muted);
+}
+
+#discovery a,
+#discovery .button.ghost,
+#discovery .table-sort {
+  color: #d6d6d6;
+}
+
+#discovery input,
+#discovery select,
+#discovery textarea,
+#discovery .source-picker,
+#discovery .settings-block {
+  background: #0f0f0f;
+  border-color: #343434;
+  color: var(--discovery-ink);
+}
+
+#discovery input::placeholder,
+#discovery textarea::placeholder {
+  color: #777;
+}
+
+#discovery .discovery-summary,
+#discovery .discovery-card,
+#discovery th,
+#discovery td,
+#discovery .saved-search-row,
+#discovery .inbox-row {
+  border-color: var(--discovery-line);
+}
+
+#discovery .discovery-errors,
+#discovery .warning-list span {
+  background: #211b10;
+  color: #f0c98b;
+  border: 1px solid #5b431f;
+}
+
+#discovery .score,
+#discovery .badge,
+#discovery .score-grid div {
+  background: #171717;
+  color: var(--discovery-ink);
+}
+
+#discovery .discovery-task-setup {
+  margin-top: 12px;
+  background: #0d0d0d;
+}
+
+#discovery .task-installed { color: #9ed6a7; }
+
 .discovery-summary:first-child {
   border-top: 0;
   padding-top: 0;
@@ -864,6 +995,16 @@ th {
   .button,
   .tab {
     width: 100%;
+  }
+
+  .saved-search-row,
+  .inbox-row {
+    grid-template-columns: 1fr;
+  }
+
+  .saved-search-row .actions,
+  .inbox-row .row-actions {
+    justify-content: flex-start;
   }
 }
 
