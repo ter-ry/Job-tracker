@@ -512,6 +512,7 @@ function renderDashboard(dashboard) {
 
 let pipelineCategory = "All";
 let pipelineSort = "qualification";
+let pipelineDetailScrollY = 0;
 
 function normalizedPipelineSalary(job) {
   const value = Number(job.salary_midpoint || job.salary_max || job.salary_min || 0);
@@ -586,14 +587,23 @@ function openPipelineJobDetails(id) {
   const job = state.jobs.find((item) => Number(item.id) === Number(id));
   const panel = document.getElementById("pipeline-job-details");
   if (!job || !panel) return;
+  if (panel.hidden) pipelineDetailScrollY = window.scrollY;
   const requirements = [job.required_skills, job.preferred_skills, job.responsibilities].filter(Boolean).join("\n\n");
   const reasons = (job.qualification_fit_reasons || []).map((reason) => `<li>${escapeHtml(reason)}</li>`).join("") || "<li>Review the full posting and résumé evidence before applying.</li>";
-  panel.innerHTML = `<div class="pipeline-detail-header"><div><span class="eyebrow">Job details</span><h3>${escapeHtml(job.title || "Untitled role")}</h3><p>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location not listed")}</p></div><button class="button ghost small" type="button" data-close-job-details>Close</button></div><div class="pipeline-detail-grid"><div><strong>Qualification fit</strong><p class="pipeline-detail-score">${Number(job.qualification_fit_score ?? job.fit_score ?? 0)}% · ${escapeHtml(job.qualification_fit_label || "Review required")}</p><ul>${reasons}</ul></div><div><strong>Job Priority</strong><p>${Number(job.overall_score || 0)}</p><strong>Salary</strong><p>${escapeHtml(job.salary || "Not listed")}</p><strong>Posting date</strong><p>${escapeHtml(job.posted_date || "Not listed")}</p><strong>Deadline</strong><p>${escapeHtml(job.deadline || "Not listed")}</p></div></div><details open><summary>Requirements and responsibilities</summary><pre>${escapeHtml(requirements || "No structured requirements were stored.")}</pre></details><details><summary>Full job description</summary><pre>${escapeHtml(job.job_description || "No job description was stored.")}</pre></details><p class="pipeline-detail-links">${job.url ? `<a href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Original posting</a>` : "Original posting unavailable"}${job.application_url && job.application_url !== job.url ? ` · <a href="${escapeAttribute(job.application_url)}" target="_blank" rel="noreferrer">Application page</a>` : ""}</p><div class="actions"><button class="button" type="button" data-prepare-job="${job.id}">Prepare application</button><button class="button ghost" type="button" data-edit-job="${job.id}">Edit job</button></div>`;
+  panel.innerHTML = `<div class="pipeline-detail-header"><div><span class="eyebrow">Job details</span><h3 id="pipeline-detail-title">${escapeHtml(job.title || "Untitled role")}</h3><p>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location not listed")}</p></div><button class="button ghost small" type="button" data-close-job-details>Close</button></div><div class="pipeline-detail-grid"><div><strong>Qualification fit</strong><p class="pipeline-detail-score">${Number(job.qualification_fit_score ?? job.fit_score ?? 0)}% · ${escapeHtml(job.qualification_fit_label || "Review required")}</p><ul>${reasons}</ul></div><div><strong>Job Priority</strong><p>${Number(job.overall_score || 0)}</p><strong>Salary</strong><p>${escapeHtml(job.salary || "Not listed")}</p><strong>Posting date</strong><p>${escapeHtml(job.posted_date || "Not listed")}</p><strong>Deadline</strong><p>${escapeHtml(job.deadline || "Not listed")}</p></div></div><details open><summary>Requirements and responsibilities</summary><pre>${escapeHtml(requirements || "No structured requirements were stored.")}</pre></details><details><summary>Full job description</summary><pre>${escapeHtml(job.job_description || "No job description was stored.")}</pre></details><p class="pipeline-detail-links">${job.url ? `<a href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Original posting</a>` : "Original posting unavailable"}${job.application_url && job.application_url !== job.url ? ` · <a href="${escapeAttribute(job.application_url)}" target="_blank" rel="noreferrer">Application page</a>` : ""}</p><div class="actions"><button class="button" type="button" data-prepare-job="${job.id}">Prepare application</button><button class="button ghost" type="button" data-edit-job="${job.id}">Edit job</button></div>`;
+  panel.setAttribute("role", "dialog");
+  panel.setAttribute("aria-modal", "true");
+  panel.setAttribute("aria-labelledby", "pipeline-detail-title");
   panel.hidden = false;
-  panel.querySelector("[data-close-job-details]").addEventListener("click", () => { panel.hidden = true; });
+  panel.classList.add("is-open");
+  panel.querySelector("[data-close-job-details]").addEventListener("click", () => {
+    panel.hidden = true;
+    panel.classList.remove("is-open");
+    window.scrollTo({ top: pipelineDetailScrollY, behavior: "auto" });
+  });
   panel.querySelector("[data-prepare-job]").addEventListener("click", () => queueDiscoveryJob(id));
   panel.querySelector("[data-edit-job]").addEventListener("click", () => { panel.hidden = true; switchTab({ currentTarget: { dataset: { tab: "tracker" } } }); loadJob(job); });
-  panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  panel.querySelector("[data-close-job-details]").focus();
   const existingPreparation = state.preparationQueue.find((item) => Number(item.job_id) === Number(id));
   if (existingPreparation) renderPipelinePreparationState(job, existingPreparation, existingPreparation.status === "approved" ? "Package approved; ready for your next manual step" : "Existing package status");
 }
@@ -609,27 +619,49 @@ function renderPipelinePreparationState(job, item, message = "") {
   const wrapper = document.createElement("section");
   wrapper.className = "pipeline-preparation-state";
   wrapper.dataset.pipelinePreparation = item.id;
-  wrapper.innerHTML = `<h4>Application preparation</h4><p class="pipeline-preparation-status"><strong>${escapeHtml(status)}</strong>${message ? ` · ${escapeHtml(message)}` : ""}</p>${manualEligibility ? `<p class="muted">Canadian eligibility is unknown. Confirm it before document generation.</p><button class="button small" type="button" data-confirm-pipeline-eligibility>Confirm Canadian eligibility</button>` : error ? `<p class="risk high">${escapeHtml(error)}</p>` : ready || approved ? `<p class="muted">${approved ? "This package was approved for your next manual step. Nothing was submitted." : "Both documents are ready for your review. Nothing was submitted."}</p><div class="actions compact"><button class="button small" type="button" data-preview-pipeline-preparation>Preview documents</button><a class="button ghost small" href="/api/preparation/${item.id}/download/resume">Download résumé DOCX</a><a class="button ghost small" href="/api/preparation/${item.id}/download/cover-letter">Download cover letter DOCX</a>${approved ? "" : `<button class="button ghost small" type="button" data-approve-pipeline-preparation>Approve package</button>`}</div><div data-pipeline-preview></div>` : `<p class="muted">The package is queued and ready to start. Generation does not submit an application.</p><button class="button small" type="button" data-start-pipeline-preparation>Start preparation now</button>`}`;
+  wrapper.innerHTML = `<h4>Application preparation</h4><p class="pipeline-preparation-status"><strong>${escapeHtml(status)}</strong>${message ? ` · ${escapeHtml(message)}` : ""}</p>${manualEligibility ? `<p class="muted">Canadian eligibility is unknown. Confirm it before document generation.</p><button class="button small" type="button" data-confirm-pipeline-eligibility>Confirm Canadian eligibility</button>` : error ? `<p class="risk high">${escapeHtml(error)}</p><button class="button small" type="button" data-retry-pipeline-preparation>Retry preparation</button>` : ready || approved ? `<p class="muted">${approved ? "This package was approved for your next manual step. Nothing was submitted." : "Both documents are ready for your review. Nothing was submitted."}</p><div class="actions compact"><button class="button small" type="button" data-preview-pipeline-preparation>Preview documents</button><a class="button ghost small" href="/api/preparation/${item.id}/download/resume">Download résumé DOCX</a><a class="button ghost small" href="/api/preparation/${item.id}/download/cover-letter">Download cover letter DOCX</a>${approved ? "" : `<button class="button ghost small" type="button" data-approve-pipeline-preparation>Approve package</button>`}</div><div data-pipeline-preview></div>` : `<p class="muted">The package is queued and ready to start. Generation does not submit an application.</p><button class="button small" type="button" data-start-pipeline-preparation>Start preparation now</button>`}`;
   panel.querySelector("[data-pipeline-preparation]")?.remove();
   panel.appendChild(wrapper);
   wrapper.querySelector("[data-confirm-pipeline-eligibility]")?.addEventListener("click", () => confirmPipelineEligibility(item.id, job.id));
   wrapper.querySelector("[data-start-pipeline-preparation]")?.addEventListener("click", () => startPipelinePreparation(item.id, job.id));
+  wrapper.querySelector("[data-retry-pipeline-preparation]")?.addEventListener("click", () => retryPipelinePreparation(item.id, job.id));
   wrapper.querySelector("[data-preview-pipeline-preparation]")?.addEventListener("click", () => previewPipelinePreparation(item.id));
   wrapper.querySelector("[data-approve-pipeline-preparation]")?.addEventListener("click", () => approvePipelinePreparation(item.id, job.id));
 }
 
 async function startPipelinePreparation(itemId, jobId) {
   const panel = document.getElementById("pipeline-job-details");
-  const state = panel?.querySelector("[data-pipeline-preparation]");
-  if (state) state.querySelector(".pipeline-preparation-status").innerHTML = "<strong>preparing</strong> · Generating the selected documents…";
+  const preparationPanel = panel?.querySelector("[data-pipeline-preparation]");
+  if (preparationPanel) preparationPanel.querySelector(".pipeline-preparation-status").innerHTML = "<strong>preparing</strong> · Generating the selected documents…";
   try {
     const item = await api.send(`/api/preparation/${itemId}/prepare`, "POST", {});
     await loadAll();
     openPipelineJobDetails(jobId);
-    const updatedJob = window.state.jobs.find((entry) => Number(entry.id) === Number(jobId));
+    const updatedJob = state.jobs.find((entry) => Number(entry.id) === Number(jobId));
     if (updatedJob) renderPipelinePreparationState(updatedJob, item, item.status === "ready_for_review" ? "Documents generated successfully" : "Preparation finished");
   } catch (error) {
-    if (state) state.insertAdjacentHTML("beforeend", `<p class="risk high">${escapeHtml(error.message)}</p>`);
+    if (preparationPanel) {
+      preparationPanel.insertAdjacentHTML("beforeend", `<p class="risk high">${escapeHtml(error.message)}</p><button class="button small" type="button" data-retry-pipeline-preparation>Retry preparation</button>`);
+      preparationPanel.querySelector("[data-retry-pipeline-preparation]")?.addEventListener("click", () => retryPipelinePreparation(itemId, jobId));
+    }
+  }
+}
+
+async function retryPipelinePreparation(itemId, jobId) {
+  const panel = document.getElementById("pipeline-job-details");
+  const preparationPanel = panel?.querySelector("[data-pipeline-preparation]");
+  if (preparationPanel) preparationPanel.querySelector(".pipeline-preparation-status").innerHTML = "<strong>preparing</strong> · Retrying document generation…";
+  try {
+    const item = await api.send(`/api/preparation/${itemId}/regenerate`, "POST", {});
+    await loadAll();
+    openPipelineJobDetails(jobId);
+    const updatedJob = state.jobs.find((entry) => Number(entry.id) === Number(jobId));
+    if (updatedJob) renderPipelinePreparationState(updatedJob, item, item.status === "ready_for_review" ? "Documents generated successfully" : "Preparation finished");
+  } catch (error) {
+    if (preparationPanel) {
+      preparationPanel.insertAdjacentHTML("beforeend", `<p class="risk high">${escapeHtml(error.message)}</p><button class="button small" type="button" data-retry-pipeline-preparation>Retry preparation</button>`);
+      preparationPanel.querySelector("[data-retry-pipeline-preparation]")?.addEventListener("click", () => retryPipelinePreparation(itemId, jobId));
+    }
   }
 }
 

@@ -384,6 +384,9 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn('id="pipeline-sort"', html)
         self.assertIn('Strong qualification matches', html)
         self.assertIn('data-start-pipeline-preparation', Path('static/app.js').read_text(encoding='utf-8'))
+        self.assertIn('data-retry-pipeline-preparation', Path('static/app.js').read_text(encoding='utf-8'))
+        self.assertIn('pipeline-drawer-in', Path('static/styles.css').read_text(encoding='utf-8'))
+        self.assertNotIn('window.state.jobs', Path('static/app.js').read_text(encoding='utf-8'))
         self.assertIn('Download résumé DOCX', Path('static/app.js').read_text(encoding='utf-8'))
         self.assertIn('pipeline-matches-label', html)
 

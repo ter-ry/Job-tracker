@@ -1127,7 +1127,9 @@ th {
 .pipeline-empty { color: #9d9d9d; padding: 18px 0 4px; }
 .pipeline-card { cursor: pointer; }
 .pipeline-card small { color: #9d9d9d; font-size: .72rem; }
-.pipeline-job-details { margin-top: 16px; border: 1px solid #2a2a2a; border-radius: 14px; background: #0b0b0b; color: #f1f1f1; padding: 20px; }
+.pipeline-job-details { position: fixed; z-index: 40; top: 20px; right: 20px; width: min(560px, calc(100vw - 40px)); max-height: calc(100vh - 40px); overflow: auto; margin: 0; border: 1px solid #3a3a3a; border-radius: 14px; background: #0b0b0b; color: #f1f1f1; padding: 20px; box-shadow: 0 18px 60px rgba(0, 0, 0, .65); }
+.pipeline-job-details.is-open { animation: pipeline-drawer-in .16s ease-out; }
+@keyframes pipeline-drawer-in { from { opacity: 0; transform: translateX(16px); } to { opacity: 1; transform: translateX(0); } }
 .pipeline-preparation-state { margin-top: 18px; border-top: 1px solid #2a2a2a; padding-top: 16px; color: #ededed; }
 .pipeline-preparation-state h4, .pipeline-preparation-state h5 { color: #f1f1f1; margin: 0 0 8px; }
 .pipeline-preparation-status { color: #ededed; }
