@@ -149,6 +149,36 @@ class JobAssistantTest(unittest.TestCase):
         variants = self.client.get(f"/api/jobs/{job['id']}/resume-variants").get_json()
         self.assertIsInstance(variants, list)
 
+    def test_lakeview_qualification_fit_surfaces_stretch_reasons_without_changing_priority(self):
+        self.client.post(
+            "/api/profile",
+            json={
+                "name": "QA Applicant",
+                "resume_text": "Built Python Flask APIs and SQL reports for internal tools.",
+                "work_experience": "Software developer with three years of application experience.",
+                "maximum_required_years": "3",
+                "target_seniority_levels": "junior, intermediate",
+            },
+        )
+        job = self.client.post(
+            "/api/jobs",
+            json={
+                "company": "Lakeview Loan Servicing",
+                "title": "Backend Engineer",
+                "location": "Toronto",
+                "overall_score": 89,
+                "job_description": "Requirements: 3 to 5+ years of production backend experience, advanced distributed systems, Kafka and Kubernetes.",
+                "required_skills": "3 to 5+ years of production backend experience, advanced distributed systems, Kafka, Kubernetes",
+                "status": "Saved",
+            },
+        ).get_json()
+        self.assertEqual(job["overall_score"], 89)
+        self.assertLess(job["qualification_fit_score"], 75)
+        self.assertEqual(job["qualification_fit_label"], "Stretch opportunity")
+        reasons = " ".join(job["qualification_fit_reasons"])
+        self.assertIn("Not demonstrated", reasons)
+        self.assertIn("experience", reasons)
+
     def test_ollama_profile_defaults_and_overrides(self):
         with patch.dict(
             "os.environ",
@@ -347,6 +377,10 @@ class JobAssistantTest(unittest.TestCase):
         self.assertLess(html.index('id="discovery-sort-mode"'), html.index('id="discovery-results"'))
         self.assertLess(html.index('id="discovery-results"'), html.index('id="csv-import-form"'))
         self.assertIn('id="csv-import-form"', html)
+        self.assertIn('id="pipeline-job-details"', html)
+        self.assertIn('Analyze job and generate diagnostic suggestions', html)
+        self.assertIn('Sort: distance', html)
+        self.assertIn('Sort: posting date', html)
 
     def test_jobspy_discovery_requires_keywords(self):
         response = self.client.post("/api/discovery/jobspy", json={"location": "Toronto"})

@@ -40,6 +40,7 @@
           <div id="pipeline-cards" class="pipeline-cards" aria-live="polite">
             <p class="pipeline-empty">No saved jobs yet. Use Discovery to add jobs to the pipeline.</p>
           </div>
+          <aside id="pipeline-job-details" class="pipeline-job-details" hidden aria-live="polite"></aside>
         </section>
         <section class="workspace discovery-layout">
           <section class="panel discovery-saved-searches">
@@ -321,7 +322,7 @@
             <label>Job description<textarea id="job-description" rows="8"></textarea></label>
 
             <div class="actions">
-              <button class="button" type="button" id="generate">Generate tailored materials</button>
+              <button class="button" type="button" id="generate">Analyze job and generate diagnostic suggestions</button>
               <button class="button ghost" type="button" id="analyse-resume-match">Analyse resume match</button>
               <button class="button ghost" type="button" id="generate-local-draft">Generate local tailored draft</button>
               <button class="button ghost" type="button" id="rescore-current">Re-score current</button>
@@ -352,7 +353,10 @@
               <select id="sort-by">
                 <option value="fit">Sort: fit</option>
                 <option value="salary">Sort: salary</option>
+                <option value="distance">Sort: distance</option>
                 <option value="date">Sort: date added</option>
+                <option value="posted">Sort: posting date</option>
+                <option value="discovered">Sort: date discovered</option>
                 <option value="deadline">Sort: deadline</option>
                 <option value="location">Sort: location</option>
               </select>

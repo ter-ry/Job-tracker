@@ -92,6 +92,19 @@ def analyze_job_seniority(job: dict[str, Any]) -> dict[str, Any]:
     title_level, title_hits = detect_level(title)
     description_level, description_hits = detect_level(description)
     required_ranges, preferred_ranges, ambiguous_ranges = extract_experience_ranges(description)
+    required_field = str(job.get("required_skills") or "").lower()
+    preferred_field = str(job.get("preferred_skills") or "").lower()
+    if ambiguous_ranges:
+        still_ambiguous: list[ExperienceRange] = []
+        for item in ambiguous_ranges:
+            phrase = item.text.lower().replace(" ", "")
+            if phrase and phrase in required_field.replace(" ", ""):
+                required_ranges.append(ExperienceRange(item.minimum, item.maximum, "required", item.text))
+            elif phrase and phrase in preferred_field.replace(" ", ""):
+                preferred_ranges.append(ExperienceRange(item.minimum, item.maximum, "preferred", item.text))
+            else:
+                still_ambiguous.append(item)
+        ambiguous_ranges = still_ambiguous
     required_range = strongest_range(required_ranges)
     preferred_range = strongest_range(preferred_ranges)
     management_flag = contains_any(description, MANAGEMENT_TERMS) or contains_any(title, ["manager", "director"])
@@ -178,7 +191,7 @@ def extract_experience_ranges(content: str) -> tuple[list[ExperienceRange], list
         required.append(ExperienceRange(0, 0, "required", "no experience required"))
 
     range_pattern = re.compile(
-        r"(?P<a>\d{1,2})(?:\s*(?:\+|plus)|\s*(?:-|to|–)\s*(?P<b>\d{1,2}))?\s*(?:years?|yrs?)"
+        r"(?P<a>\d{1,2})(?:\s*(?:\+|plus)|\s*(?:-|to|–)\s*(?P<b>\d{1,2})(?:\s*(?:\+|plus))?)?\s*(?:years?|yrs?)"
         r"(?:\s+of)?\s+(?:professional\s+)?(?:work\s+)?(?:experience|development|engineering|programming)?",
         re.I,
     )

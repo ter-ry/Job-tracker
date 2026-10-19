@@ -185,7 +185,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
 async function loadAll() {
   try {
-    const [jobs, dashboard, profile, ollamaHealth, evidence, systemHealth, candidateProfiles] = await Promise.all([
+    const [jobs, dashboard, profile, ollamaHealth, systemHealth, evidence, candidateProfiles] = await Promise.all([
       api.get("/api/jobs"),
       api.get("/api/dashboard"),
       api.get("/api/profile"),
@@ -521,21 +521,38 @@ function renderPipelineDashboard(jobs) {
   const filtered = pipelineCategory === "All" ? items : items.filter((job) => String(job.role_type || "") === pipelineCategory);
   setText("pipeline-discovered", items.length);
   setText("pipeline-matches", items.filter((job) => Number(job.fit_score || 0) >= 75).length);
-  setText("pipeline-ready", items.filter((job) => ["Saved", "shortlisted", "Drafting"].includes(job.status)).length);
+  setText("pipeline-ready", items.filter((job) => ["ready_for_review"].includes(job.preparation_status)).length);
   const cards = document.getElementById("pipeline-cards");
   if (!filtered.length) {
     cards.innerHTML = `<p class="pipeline-empty">No saved jobs match this category.</p>`;
     return;
   }
   cards.innerHTML = filtered.slice().sort((a, b) => Number(b.fit_score || 0) - Number(a.fit_score || 0)).map((job) => {
-    const score = Number(job.fit_score || 0);
-    const action = ["Applied", "Interview", "Offer"].includes(job.status) ? "Track" : score >= 75 ? "Ready" : "Review";
-    return `<article class="pipeline-card"><div><h3>${escapeHtml(job.title || "Untitled role")}</h3><p>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location not listed")}</p><p class="pipeline-subline">Suggested résumé: ${escapeHtml(job.role_type || "General")}</p></div><div class="pipeline-score"><strong>${score}%</strong><span>Fit score</span><button type="button" data-job-id="${job.id}" class="pipeline-action">${action}</button></div></article>`;
+    const score = Number(job.qualification_fit_score ?? job.fit_score ?? 0);
+    const priority = Number(job.overall_score || 0);
+    return `<article class="pipeline-card" data-job-id="${job.id}"><div><h3>${escapeHtml(job.title || "Untitled role")}</h3><p>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location not listed")}</p><p class="pipeline-subline">${escapeHtml(job.qualification_fit_label || "Qualification fit")}</p></div><div class="pipeline-score"><strong>${score}%</strong><span>Qualification fit</span><small>Job Priority ${priority}</small><button type="button" data-job-id="${job.id}" class="pipeline-action">View details</button></div></article>`;
   }).join("");
-  cards.querySelectorAll(".pipeline-action").forEach((button) => button.addEventListener("click", () => {
-    const job = state.jobs.find((item) => String(item.id) === String(button.dataset.jobId));
-    if (job) { switchTab({ currentTarget: { dataset: { tab: "tracker" } } }); loadJob(job); }
+  cards.querySelectorAll(".pipeline-card").forEach((card) => card.addEventListener("click", (event) => {
+    if (event.target.closest("button, a")) return;
+    openPipelineJobDetails(Number(card.dataset.jobId));
   }));
+  cards.querySelectorAll(".pipeline-action").forEach((button) => button.addEventListener("click", () => {
+    openPipelineJobDetails(Number(button.dataset.jobId));
+  }));
+}
+
+function openPipelineJobDetails(id) {
+  const job = state.jobs.find((item) => Number(item.id) === Number(id));
+  const panel = document.getElementById("pipeline-job-details");
+  if (!job || !panel) return;
+  const requirements = [job.required_skills, job.preferred_skills, job.responsibilities].filter(Boolean).join("\n\n");
+  const reasons = (job.qualification_fit_reasons || []).map((reason) => `<li>${escapeHtml(reason)}</li>`).join("") || "<li>Review the full posting and résumé evidence before applying.</li>";
+  panel.innerHTML = `<div class="pipeline-detail-header"><div><span class="eyebrow">Job details</span><h3>${escapeHtml(job.title || "Untitled role")}</h3><p>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location not listed")}</p></div><button class="button ghost small" type="button" data-close-job-details>Close</button></div><div class="pipeline-detail-grid"><div><strong>Qualification fit</strong><p class="pipeline-detail-score">${Number(job.qualification_fit_score ?? job.fit_score ?? 0)}% · ${escapeHtml(job.qualification_fit_label || "Review required")}</p><ul>${reasons}</ul></div><div><strong>Job Priority</strong><p>${Number(job.overall_score || 0)}</p><strong>Salary</strong><p>${escapeHtml(job.salary || "Not listed")}</p><strong>Posting date</strong><p>${escapeHtml(job.posted_date || "Not listed")}</p><strong>Deadline</strong><p>${escapeHtml(job.deadline || "Not listed")}</p></div></div><details open><summary>Requirements and responsibilities</summary><pre>${escapeHtml(requirements || "No structured requirements were stored.")}</pre></details><details><summary>Full job description</summary><pre>${escapeHtml(job.job_description || "No job description was stored.")}</pre></details><p class="pipeline-detail-links">${job.url ? `<a href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Original posting</a>` : "Original posting unavailable"}${job.application_url && job.application_url !== job.url ? ` · <a href="${escapeAttribute(job.application_url)}" target="_blank" rel="noreferrer">Application page</a>` : ""}</p><div class="actions"><button class="button" type="button" data-prepare-job="${job.id}">Prepare application</button><button class="button ghost" type="button" data-edit-job="${job.id}">Edit job</button></div>`;
+  panel.hidden = false;
+  panel.querySelector("[data-close-job-details]").addEventListener("click", () => { panel.hidden = true; });
+  panel.querySelector("[data-prepare-job]").addEventListener("click", () => queueDiscoveryJob(id));
+  panel.querySelector("[data-edit-job]").addEventListener("click", () => { panel.hidden = true; switchTab({ currentTarget: { dataset: { tab: "tracker" } } }); loadJob(job); });
+  panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
 function renderProfile(profile) {
@@ -692,6 +709,9 @@ function sortJobs(jobs, sortBy) {
   const copy = [...jobs];
   const salaryNumber = (job) => Math.max(0, ...String(job.salary || "").match(/\d+/g)?.map(Number) || [0]);
   if (sortBy === "salary") return copy.sort((a, b) => salaryNumber(b) - salaryNumber(a));
+  if (sortBy === "distance") return copy.sort((a, b) => Number(a.distance_km || 999999) - Number(b.distance_km || 999999));
+  if (sortBy === "posted") return copy.sort((a, b) => String(b.posted_date || "").localeCompare(String(a.posted_date || "")));
+  if (sortBy === "discovered") return copy.sort((a, b) => String(b.discovery_first_seen_at || b.date_added || "").localeCompare(String(a.discovery_first_seen_at || a.date_added || "")));
   if (sortBy === "deadline") return copy.sort((a, b) => String(a.deadline || "9999").localeCompare(String(b.deadline || "9999")));
   if (sortBy === "location") return copy.sort((a, b) => String(a.location || "").localeCompare(String(b.location || "")));
   if (sortBy === "date") return copy.sort((a, b) => String(b.date_added || "").localeCompare(String(a.date_added || "")));
@@ -901,12 +921,8 @@ async function generateLocalDraft() {
     document.getElementById("generated-output").classList.remove("empty");
     document.getElementById("generated-output").innerHTML = `
       <section>
-        <h3>${escapeHtml(output.draft.label)}</h3>
+        <h3>Diagnostic résumé suggestions (not an application document)</h3>
         <pre>${escapeHtml(output.draft.text)}</pre>
-        <div class="export-row">
-          <a class="button small ghost" href="/export/${id}/resume.txt">Draft .txt</a>
-          <a class="button small ghost" href="/export/${id}/resume.docx">Draft .docx</a>
-        </div>
       </section>
     `;
     toast("Local tailored draft generated");
@@ -995,14 +1011,6 @@ async function generateForJob(id) {
 function renderGenerated(output) {
   const jobId = value("job-id");
   const review = output.tailoring_review || {};
-  const exportLinks = jobId
-    ? `<div class="export-row">
-        <a class="button small ghost" href="/export/${jobId}/cover_letter.txt">Cover .txt</a>
-        <a class="button small ghost" href="/export/${jobId}/cover_letter.docx">Cover .docx</a>
-        <a class="button small ghost" href="/export/${jobId}/resume.txt">Resume .txt</a>
-        <a class="button small ghost" href="/export/${jobId}/resume.docx">Resume .docx</a>
-      </div>`
-    : `<p class="muted">Save the job first to enable version history and document exports.</p>`;
   document.getElementById("generated-output").classList.remove("empty");
   document.getElementById("generated-output").innerHTML = `
     <section>
@@ -1042,10 +1050,9 @@ function renderGenerated(output) {
       </details>
     </section>
     <section>
-      <h3>Resume suggestions</h3>
+      <h3>Diagnostic résumé suggestions (not an application document)</h3>
       ${output.local_tailored_text ? `<pre>${escapeHtml(output.local_tailored_text)}</pre>` : ""}
       <pre>${escapeHtml(output.resume_text)}</pre>
-      ${exportLinks}
     </section>
     <section>
       <h3>Cover letter</h3>

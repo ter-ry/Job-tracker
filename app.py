@@ -7079,7 +7079,62 @@ def job_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:
     if job_id:
         data["tailoring_changes"] = load_tailoring_changes(job_id)
         data["generation_debug"] = load_generation_debug(job_id)
+        data.update(build_qualification_fit(data))
+        preparation = query_db(
+            "SELECT status FROM application_preparation_queue WHERE job_id = ? ORDER BY updated_at DESC, id DESC LIMIT 1",
+            [job_id],
+            one=True,
+        )
+        data["preparation_status"] = text(preparation["status"]) if preparation else ""
     return data
+
+
+def build_qualification_fit(job: dict[str, Any]) -> dict[str, Any]:
+    """Expose a transparent qualification view without changing Job Priority."""
+    try:
+        profile = load_profile()
+        semantic = analyze_resume_match(job, profile, cache_dir=semantic_cache_dir(), use_semantic=False)
+        analysis = analyze_job_seniority(job)
+        seniority = score_seniority_fit(profile, analysis)
+    except Exception:
+        return {"qualification_fit_score": 0, "qualification_fit_label": "Review required", "qualification_fit_reasons": ["Qualification fit could not be assessed."]}
+
+    profile_text = " ".join(text(profile.get(field)) for field in ("resume_text", "work_experience", "projects", "key_skills", "education")).lower()
+    raw_required = [normalize_space(item) for item in re.split(r"[,;\n]+", text(job.get("required_skills"))) if normalize_space(item)]
+    required_terms = raw_required if len(raw_required) > 1 else [item for item in job_keywords(job) if len(item) > 2]
+    required_terms = list(dict.fromkeys(required_terms))
+    matched = [term for term in required_terms if contains_phrase(profile_text, term)]
+    missing = [term for term in required_terms if term not in matched]
+    skill_score = round((len(matched) / len(required_terms)) * 100) if required_terms else clamp_int(semantic.get("scores", {}).get("required_skills"), 0, 100)
+    responsibility_score = clamp_int(semantic.get("scores", {}).get("responsibilities"), 0, 100)
+    score = round(skill_score * 0.5 + seniority.get("score", 0) * 0.35 + responsibility_score * 0.15)
+    required = analysis.get("required_experience") or {}
+    max_profile = None
+    try:
+        max_profile = float(text(profile.get("maximum_required_years")))
+    except (TypeError, ValueError):
+        pass
+    if required.get("maximum") and max_profile is not None and float(required["maximum"]) > max_profile:
+        score = min(score, 69)
+        seniority["stretch_role"] = True
+    reasons = []
+    if matched:
+        reasons.append(f"Supported requirements: {', '.join(matched[:5])}.")
+    if missing:
+        reasons.append(f"Not demonstrated in the selected profile: {', '.join(missing[:5])}.")
+    if required:
+        reasons.append(f"Posting experience requirement: {required.get('text', 'explicit experience requirement')}.")
+    if seniority.get("stretch_role"):
+        reasons.append("Stretch opportunity: the posting expects more experience or seniority than the selected profile establishes.")
+    label = "Strong qualification match" if score >= 75 and not seniority.get("stretch_role") else "Stretch opportunity" if seniority.get("stretch_role") or score < 60 else "Review qualification fit"
+    return {
+        "qualification_fit_score": clamp_int(score, 0, 100),
+        "qualification_fit_label": label,
+        "qualification_fit_reasons": reasons or ["Review the full posting and résumé evidence before applying."],
+        "qualification_fit_matched_requirements": matched,
+        "qualification_fit_missing_requirements": missing,
+        "qualification_fit_seniority": seniority,
+    }
 
 
 def load_tailoring_changes(job_id: int) -> dict[str, Any]:
