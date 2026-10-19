@@ -240,7 +240,7 @@ function renderPreparationQueue() {
     const matched = score.matched_count != null ? `${score.matched_count}/${score.total || 0}` : "not reviewed";
     const error = item.error || item.resume_error || item.cover_letter_error;
     const actions = item.status === "ready_for_review"
-      ? `<button class="button small" type="button" onclick="reviewPreparation(${item.id}, 'approve')">Approve package</button><button class="button ghost small" type="button" onclick="previewPreparation(${item.id})">Preview</button>`
+      ? `<button class="button small" type="button" onclick="reviewPreparation(${item.id}, 'approve')">Approve package</button><button class="button ghost small" type="button" onclick="previewPreparation(${item.id})">Preview</button>${job.resume_docx_path ? `<a class="button ghost small" href="/api/shortlist/${job.id}/resume">Download résumé</a>` : ""}${job.cover_letter_docx_path ? `<a class="button ghost small" href="/api/shortlist/${job.id}/cover-letter">Download cover letter</a>` : ""}`
       : item.status === "queued" || item.status === "failed"
         ? `<button class="button small" type="button" onclick="prepareQueueItem(${item.id})">${item.status === "failed" ? "Retry preparation" : "Prepare package"}</button>`
         : "";
