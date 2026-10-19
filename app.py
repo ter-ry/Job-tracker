@@ -73,6 +73,8 @@ DISCOVERY_SOURCES = ["linkedin", "indeed", "google", "zip_recruiter"]
 GENERATED_APPLICATIONS_DIRNAME = "generated_applications"
 SEMANTIC_CACHE_DIRNAME = "semantic_cache"
 RESTORABLE_SHORTLIST_STATUSES = {"Archived", "Rejected", "Saved", "Drafting"}
+PREPARATION_STATUSES = {"queued", "preparing", "ready_for_review", "approved", "skipped", "failed"}
+PREPARATION_LEASE_MINUTES = 10
 
 DISCOVERY_SCORE_WEIGHTS = {
     "skill_match": 35,
@@ -1061,9 +1063,11 @@ def create_app() -> Flask:
             cursor = get_db().execute(
                 """INSERT INTO saved_search_profiles
                    (name, keywords, location, remote_preference, seniority, minimum_salary,
-                    enabled_sources_json, date_window, distance, interval_minutes, enabled)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["distance"], search["interval_minutes"], search["enabled"]],
+                    enabled_sources_json, date_window, distance, interval_minutes, enabled,
+                    auto_prepare_enabled, auto_prepare_min_priority, auto_prepare_require_canadian,
+                    auto_prepare_candidate_profile_id, auto_prepare_resume_id, auto_prepare_cover_letter_template_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["distance"], search["interval_minutes"], search["enabled"], search["auto_prepare_enabled"], search["auto_prepare_min_priority"], search["auto_prepare_require_canadian"], search["auto_prepare_candidate_profile_id"], search["auto_prepare_resume_id"], search["auto_prepare_cover_letter_template_id"]],
             )
             get_db().commit()
         except sqlite3.IntegrityError:
@@ -1083,8 +1087,10 @@ def create_app() -> Flask:
             get_db().execute(
                 """UPDATE saved_search_profiles SET name = ?, keywords = ?, location = ?, remote_preference = ?,
                    seniority = ?, minimum_salary = ?, enabled_sources_json = ?, date_window = ?, distance = ?,
-                   interval_minutes = ?, enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
-                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["distance"], search["interval_minutes"], search["enabled"], search_id],
+                   interval_minutes = ?, enabled = ?, auto_prepare_enabled = ?, auto_prepare_min_priority = ?,
+                   auto_prepare_require_canadian = ?, auto_prepare_candidate_profile_id = ?, auto_prepare_resume_id = ?,
+                   auto_prepare_cover_letter_template_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["distance"], search["interval_minutes"], search["enabled"], search["auto_prepare_enabled"], search["auto_prepare_min_priority"], search["auto_prepare_require_canadian"], search["auto_prepare_candidate_profile_id"], search["auto_prepare_resume_id"], search["auto_prepare_cover_letter_template_id"], search_id],
             )
             get_db().commit()
         except sqlite3.IntegrityError:
@@ -1122,6 +1128,77 @@ def create_app() -> Flask:
         get_db().execute("UPDATE jobs SET discovery_state = 'ignored', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
         get_db().commit()
         return jsonify({"ok": True})
+
+    @app.get("/api/preparation/queue")
+    def preparation_queue() -> Response:
+        status = normalize_space(text(request.args.get("status")))
+        if status and status not in PREPARATION_STATUSES:
+            return jsonify({"error": "Unknown preparation status"}), 400
+        query = "SELECT * FROM application_preparation_queue"
+        args: list[Any] = []
+        if status:
+            query += " WHERE status = ?"
+            args.append(status)
+        query += " ORDER BY CASE status WHEN 'ready_for_review' THEN 0 WHEN 'preparing' THEN 1 WHEN 'queued' THEN 2 ELSE 3 END, updated_at DESC, id DESC LIMIT 250"
+        return jsonify([preparation_queue_to_dict(row) for row in query_db(query, args)])
+
+    @app.post("/api/preparation/queue")
+    def queue_preparation() -> Response:
+        payload = request.get_json(force=True) or {}
+        try:
+            item, duplicate = enqueue_application_preparation(int(payload.get("job_id") or 0), payload=payload)
+        except (TypeError, ValueError) as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({**item, "duplicate": duplicate}), 200 if duplicate else 201
+
+    @app.post("/api/preparation/<int:item_id>/prepare")
+    def prepare_queue_item(item_id: int) -> Response:
+        try:
+            return jsonify(prepare_application_queue_item(item_id, owner=f"manual:{uuid.uuid4()}"))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 409
+
+    @app.post("/api/preparation/<int:item_id>/regenerate")
+    def regenerate_queue_item(item_id: int) -> Response:
+        row = query_db("SELECT * FROM application_preparation_queue WHERE id = ?", [item_id], one=True)
+        if row is None:
+            return jsonify({"error": "Preparation queue item was not found"}), 404
+        _update_preparation_item(item_id, status="queued", review_status="pending", error="", resume_error="", cover_letter_error="")
+        try:
+            return jsonify(prepare_application_queue_item(item_id, owner=f"manual:{uuid.uuid4()}"))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 409
+
+    @app.post("/api/preparation/<int:item_id>/review")
+    def review_preparation_item(item_id: int) -> Response:
+        action = text((request.get_json(silent=True) or {}).get("action")).lower()
+        transitions = {"approve": ("approved", "approved"), "skip": ("skipped", "skipped"), "reject": ("skipped", "rejected")}
+        if action not in transitions:
+            return jsonify({"error": "Action must be approve, reject or skip"}), 400
+        row = query_db("SELECT * FROM application_preparation_queue WHERE id = ?", [item_id], one=True)
+        if row is None:
+            return jsonify({"error": "Preparation queue item was not found"}), 404
+        status, review_status = transitions[action]
+        return jsonify(_update_preparation_item(item_id, status=status, review_status=review_status))
+
+    @app.get("/api/preparation/<int:item_id>/preview")
+    def preparation_preview(item_id: int) -> Response:
+        item = query_db("SELECT * FROM application_preparation_queue WHERE id = ?", [item_id], one=True)
+        if item is None:
+            return jsonify({"error": "Preparation queue item was not found"}), 404
+        job = query_db("SELECT * FROM jobs WHERE id = ?", [item["job_id"]], one=True)
+        if job is None:
+            return jsonify({"error": "Job not found"}), 404
+        values: dict[str, Any] = {}
+        for kind, field in (("resume", "resume_docx_path"), ("cover_letter", "cover_letter_docx_path")):
+            path = safe_generated_path(job[field])
+            values[kind] = ""
+            if path and path.is_file():
+                try:
+                    values[kind] = "\n".join(paragraph.text for paragraph in iter_document_paragraphs(Document(io.BytesIO(path.read_bytes()))) if paragraph.text.strip())
+                except (OSError, ValueError, zipfile.BadZipFile):
+                    values[kind] = ""
+        return jsonify({"resume": values["resume"], "cover_letter": values["cover_letter"], "status": item["status"], "job_id": item["job_id"]})
 
     @app.get("/api/discovery/runs")
     def discovery_runs() -> Response:
@@ -1656,6 +1733,12 @@ def normalize_saved_search_payload(payload: dict[str, Any], existing: dict[str, 
         except (TypeError, json.JSONDecodeError):
             existing_sources = []
     enabled_sources = normalize_discovery_sources(payload.get("enabled_sources", existing_sources))
+    auto_prepare_enabled = 1 if as_bool(payload.get("auto_prepare_enabled", existing.get("auto_prepare_enabled", False))) else 0
+    auto_prepare_min_priority = clamp_int_default(payload.get("auto_prepare_min_priority", existing.get("auto_prepare_min_priority")), 75, 0, 100)
+    auto_prepare_require_canadian = 1 if as_bool(payload.get("auto_prepare_require_canadian", existing.get("auto_prepare_require_canadian", True))) else 0
+    auto_prepare_candidate_profile_id = clamp_int_default(payload.get("auto_prepare_candidate_profile_id", existing.get("auto_prepare_candidate_profile_id")), 0, 0, 10**9)
+    auto_prepare_resume_id = clamp_int_default(payload.get("auto_prepare_resume_id", existing.get("auto_prepare_resume_id")), 0, 0, 10**9)
+    auto_prepare_cover_letter_template_id = clamp_int_default(payload.get("auto_prepare_cover_letter_template_id", existing.get("auto_prepare_cover_letter_template_id")), 0, 0, 10**9)
     return {
         "name": name,
         "keywords": keywords,
@@ -1668,6 +1751,12 @@ def normalize_saved_search_payload(payload: dict[str, Any], existing: dict[str, 
         "distance": distance,
         "interval_minutes": interval_minutes,
         "enabled": 1 if as_bool(payload.get("enabled", existing.get("enabled", False))) else 0,
+        "auto_prepare_enabled": auto_prepare_enabled,
+        "auto_prepare_min_priority": auto_prepare_min_priority,
+        "auto_prepare_require_canadian": auto_prepare_require_canadian,
+        "auto_prepare_candidate_profile_id": auto_prepare_candidate_profile_id,
+        "auto_prepare_resume_id": auto_prepare_resume_id,
+        "auto_prepare_cover_letter_template_id": auto_prepare_cover_letter_template_id,
     }
 
 
@@ -1726,9 +1815,9 @@ def discovery_remote_eligibility(job: dict[str, Any]) -> tuple[str, str]:
     return "unknown", "Canadian eligibility is not confirmed by the posting."
 
 
-def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, run_id: int | None) -> dict[str, int]:
+def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, run_id: int | None) -> dict[str, Any]:
     now = datetime.now().isoformat(timespec="seconds")
-    counts = {"new": 0, "duplicate": 0}
+    counts: dict[str, Any] = {"new": 0, "duplicate": 0, "new_job_ids": []}
     db = get_db()
     for job in jobs:
         match = find_existing_job_match(job)
@@ -1756,6 +1845,7 @@ def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, ru
             tuple(clean[column] for column in JOB_COLUMNS),
         )
         counts["new"] += 1
+        counts["new_job_ids"].append(int(db.execute("SELECT last_insert_rowid()").fetchone()[0]))
     db.commit()
     return counts
 
@@ -1833,6 +1923,14 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
     if not keywords:
         raise ValueError("Keywords are required")
     search = discovery_search_config(payload)
+    search.update({
+        "auto_prepare_enabled": payload.get("auto_prepare_enabled", False),
+        "auto_prepare_min_priority": payload.get("auto_prepare_min_priority", 75),
+        "auto_prepare_require_canadian": payload.get("auto_prepare_require_canadian", True),
+        "auto_prepare_candidate_profile_id": payload.get("auto_prepare_candidate_profile_id", 0),
+        "auto_prepare_resume_id": payload.get("auto_prepare_resume_id", 0),
+        "auto_prepare_cover_letter_template_id": payload.get("auto_prepare_cover_letter_template_id", 0),
+    })
     profile = load_profile()
     provider = get_geocoding_provider()
     origin = profile_home_location(profile)
@@ -1900,6 +1998,7 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         jobs.append(clean)
     jobs = sort_discovery_jobs(jobs, "overall_score", "desc", "", "asc", "remote_after_local", "last")[: search["total_cap"]]
     persisted = persist_discovery_jobs(jobs, search_id, run_id)
+    auto_preparation_queued = enqueue_auto_preparation(search, persisted.get("new_job_ids", [])) if search_id else 0
     search_key = discovery_search_signature(payload)
     metadata = {
         "search_criteria": search,
@@ -1911,6 +2010,7 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         "displayed_jobs": len(jobs),
         "filtered_by_saved_search": filtered,
         "persisted": persisted,
+        "auto_preparation_queued": auto_preparation_queued,
         "filtered": filtered,
     }
     save_discovery_search_run(search_key, search, metadata, fetched.get("jobs", []))
@@ -2431,6 +2531,171 @@ def resolve_generation_profile(payload: dict[str, Any] | None) -> dict[str, Any]
     ]
     profile["_candidate_profile_id"] = str(profile_id)
     return profile
+
+
+def preparation_queue_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:
+    if row is None:
+        return {}
+    data = dict(row)
+    data["keywords_score"] = parse_json_object(data.pop("keywords_score_json", "{}"))
+    job = query_db("SELECT * FROM jobs WHERE id = ?", [data["job_id"]], one=True)
+    data["job"] = job_to_dict(job) if job else {}
+    return data
+
+
+def default_candidate_profile_id() -> int:
+    profiles = CandidateProfileStore(get_db()).list_profiles()
+    return int(profiles[0]["id"]) if profiles else 0
+
+
+def queue_profile_payload(payload: dict[str, Any] | None = None, *, search: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = payload or {}
+    search = search or {}
+    profile_id = payload.get("candidate_profile_id") or search.get("auto_prepare_candidate_profile_id") or default_candidate_profile_id()
+    if not profile_id:
+        raise ValueError("Select a candidate profile before preparing an application package")
+    result = {"candidate_profile_id": int(profile_id)}
+    resume_id = payload.get("resume_id") or search.get("auto_prepare_resume_id")
+    cover_id = payload.get("cover_letter_template_id") or search.get("auto_prepare_cover_letter_template_id")
+    if resume_id:
+        result["resume_id"] = int(resume_id)
+    if cover_id:
+        result["cover_letter_template_id"] = int(cover_id)
+    return result
+
+
+def preparation_eligibility(job: dict[str, Any], search: dict[str, Any]) -> tuple[bool, str, str]:
+    priority = int(job.get("overall_score") or job.get("fit_score") or 0)
+    minimum = int(search.get("auto_prepare_min_priority") or 75)
+    if priority < minimum:
+        return False, "priority_below_threshold", f"Job Priority {priority} is below the automatic preparation threshold of {minimum}."
+    eligibility = text(job.get("remote_eligibility")).lower() or "unknown"
+    if eligibility == "restricted":
+        return False, "explicitly_restricted", "Posting is explicitly restricted outside Canada."
+    if as_bool(search.get("auto_prepare_require_canadian", True)) and eligibility != "canadian_eligible":
+        if eligibility == "unknown":
+            return False, "manual_eligibility_review", "Canadian eligibility is unknown; review this opportunity manually before preparation."
+        return False, "eligibility_not_confirmed", "Canadian eligibility is not confirmed."
+    return True, "eligible", "Meets the saved search priority and eligibility criteria."
+
+
+def enqueue_application_preparation(job_id: int, payload: dict[str, Any] | None = None, *, search: dict[str, Any] | None = None) -> tuple[dict[str, Any], bool]:
+    job_row = query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)
+    if job_row is None:
+        raise ValueError("Job not found")
+    existing = query_db("SELECT * FROM application_preparation_queue WHERE job_id = ?", [job_id], one=True)
+    if existing is not None:
+        return preparation_queue_to_dict(existing), True
+    selection = queue_profile_payload(payload, search=search)
+    profile = resolve_generation_profile(selection)
+    job = job_to_dict(job_row)
+    if search is None:
+        eligible, reason, note = True, "manual", "Queued for manual preparation review."
+    else:
+        eligible, reason, note = preparation_eligibility(job, search)
+    review_status = "manual_eligibility" if reason == "manual_eligibility_review" else "pending"
+    keywords = {}
+    try:
+        keywords = build_keywords_score_report(job, profile)
+    except Exception:
+        keywords = {}
+    cursor = get_db().execute(
+        """INSERT INTO application_preparation_queue
+           (job_id, status, review_status, candidate_profile_id, resume_id, cover_letter_template_id,
+            job_priority, keywords_score_json, eligibility_note)
+           VALUES (?, 'queued', ?, ?, ?, ?, ?, ?, ?)""",
+        [job_id, review_status, int(selection["candidate_profile_id"]), int(selection.get("resume_id") or 0), int(selection.get("cover_letter_template_id") or 0), int(job.get("overall_score") or job.get("fit_score") or 0), dumps_json(keywords), note],
+    )
+    get_db().commit()
+    return preparation_queue_to_dict(query_db("SELECT * FROM application_preparation_queue WHERE id = ?", [cursor.lastrowid], one=True)), False
+
+
+def _update_preparation_item(item_id: int, **fields: Any) -> dict[str, Any]:
+    allowed = {"status", "review_status", "resume_status", "cover_letter_status", "resume_error", "cover_letter_error", "error", "keywords_score_json", "eligibility_note", "lease_owner", "lease_expires_at", "prepared_at"}
+    updates = {key: value for key, value in fields.items() if key in allowed}
+    if updates:
+        assignments = ", ".join(f"{key} = ?" for key in updates)
+        get_db().execute(f"UPDATE application_preparation_queue SET {assignments}, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [*updates.values(), item_id])
+        get_db().commit()
+    return preparation_queue_to_dict(query_db("SELECT * FROM application_preparation_queue WHERE id = ?", [item_id], one=True))
+
+
+def prepare_application_queue_item(item_id: int, *, owner: str = "manual") -> dict[str, Any]:
+    now = datetime.now()
+    expires = now + timedelta(minutes=PREPARATION_LEASE_MINUTES)
+    db = get_db()
+    db.execute("BEGIN IMMEDIATE")
+    row = db.execute("SELECT * FROM application_preparation_queue WHERE id = ?", [item_id]).fetchone()
+    if row is None:
+        db.rollback()
+        raise ValueError("Preparation queue item was not found")
+    if row["status"] == "preparing" and row["lease_owner"] != owner and row["lease_expires_at"] > now.isoformat(timespec="seconds"):
+        db.rollback()
+        raise ValueError("This application package is already being prepared")
+    db.execute("UPDATE application_preparation_queue SET status = 'preparing', lease_owner = ?, lease_expires_at = ?, error = '', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [owner, expires.isoformat(timespec="seconds"), item_id])
+    db.commit()
+    try:
+        row = query_db("SELECT * FROM application_preparation_queue WHERE id = ?", [item_id], one=True)
+        job = query_db("SELECT * FROM jobs WHERE id = ?", [row["job_id"]], one=True)
+        payload = {"candidate_profile_id": row["candidate_profile_id"]}
+        if row["resume_id"]:
+            payload["resume_id"] = row["resume_id"]
+        if row["cover_letter_template_id"]:
+            payload["cover_letter_template_id"] = row["cover_letter_template_id"]
+        profile = resolve_generation_profile(payload)
+        generation = generate_and_store_shortlist_documents(int(row["job_id"]), {"resume", "cover_letter"}, profile)
+        refreshed_job = query_db("SELECT * FROM jobs WHERE id = ?", [row["job_id"]], one=True)
+        resume_status = text(generation.get("resume")) or "failed"
+        cover_status = text(generation.get("cover_letter")) or "failed"
+        error = text(generation.get("error"))
+        keywords = build_keywords_score_report(job_to_dict(refreshed_job), profile)
+        status = "ready_for_review" if resume_status == "generated" and cover_status == "generated" else "failed"
+        return _update_preparation_item(item_id, status=status, review_status="pending", resume_status=resume_status, cover_letter_status=cover_status, resume_error=text(generation.get("resume_error")), cover_letter_error=text(generation.get("cover_letter_error")), error=error, keywords_score_json=dumps_json(keywords), lease_owner="", lease_expires_at="", prepared_at=datetime.now().isoformat(timespec="seconds"))
+    except Exception as exc:
+        return _update_preparation_item(item_id, status="failed", error=f"{type(exc).__name__}: {exc}", lease_owner="", lease_expires_at="")
+
+
+def process_preparation_queue(limit: int = 5, *, owner: str = "worker") -> dict[str, int]:
+    now = datetime.now().isoformat(timespec="seconds")
+    get_db().execute("UPDATE application_preparation_queue SET status = 'queued', lease_owner = '', lease_expires_at = '', updated_at = CURRENT_TIMESTAMP WHERE status = 'preparing' AND lease_expires_at <> '' AND lease_expires_at <= ?", [now])
+    get_db().commit()
+    rows = query_db("SELECT id FROM application_preparation_queue WHERE status = 'queued' AND review_status = 'pending' ORDER BY id LIMIT ?", [max(1, int(limit))])
+    counts = {"processed": 0, "ready": 0, "failed": 0}
+    for row in rows:
+        result = prepare_application_queue_item(int(row["id"]), owner=f"{owner}:{row['id']}")
+        counts["processed"] += 1
+        counts["ready" if result.get("status") == "ready_for_review" else "failed"] += 1
+    return counts
+
+
+def enqueue_auto_preparation(search: dict[str, Any], job_ids: list[int]) -> int:
+    if not as_bool(search.get("auto_prepare_enabled")):
+        return 0
+    created = 0
+    for job_id in job_ids:
+        row = query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)
+        if row is None:
+            continue
+        eligible, reason, note = preparation_eligibility(job_to_dict(row), search)
+        if reason == "explicitly_restricted" or reason == "priority_below_threshold":
+            continue
+        try:
+            item, duplicate = enqueue_application_preparation(job_id, search=search)
+            if not duplicate:
+                _update_preparation_item(item["id"], eligibility_note=note, review_status="pending" if eligible else "manual_eligibility")
+                created += 1
+        except ValueError as exc:
+            existing = query_db("SELECT id FROM application_preparation_queue WHERE job_id = ?", [job_id], one=True)
+            if existing is None:
+                get_db().execute(
+                    """INSERT INTO application_preparation_queue
+                       (job_id, status, review_status, job_priority, error, eligibility_note)
+                       VALUES (?, 'failed', 'pending', ?, ?, ?)""",
+                    [job_id, int(job_to_dict(row).get("overall_score") or job_to_dict(row).get("fit_score") or 0), str(exc), "Automatic preparation could not select a usable candidate profile or document."],
+                )
+                get_db().commit()
+                created += 1
+    return created
 
 
 def build_format_preserving_resume(
@@ -6242,7 +6507,40 @@ def init_db() -> None:
             "enabled": "INTEGER NOT NULL DEFAULT 0",
             "last_run_at": "TEXT NOT NULL DEFAULT ''",
             "next_run_at": "TEXT NOT NULL DEFAULT ''",
+            "auto_prepare_enabled": "INTEGER NOT NULL DEFAULT 0",
+            "auto_prepare_min_priority": "INTEGER NOT NULL DEFAULT 75",
+            "auto_prepare_require_canadian": "INTEGER NOT NULL DEFAULT 1",
+            "auto_prepare_candidate_profile_id": "INTEGER NOT NULL DEFAULT 0",
+            "auto_prepare_resume_id": "INTEGER NOT NULL DEFAULT 0",
+            "auto_prepare_cover_letter_template_id": "INTEGER NOT NULL DEFAULT 0",
         },
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS application_preparation_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id INTEGER NOT NULL UNIQUE,
+            status TEXT NOT NULL DEFAULT 'queued',
+            review_status TEXT NOT NULL DEFAULT 'pending',
+            candidate_profile_id INTEGER NOT NULL DEFAULT 0,
+            resume_id INTEGER NOT NULL DEFAULT 0,
+            cover_letter_template_id INTEGER NOT NULL DEFAULT 0,
+            job_priority INTEGER NOT NULL DEFAULT 0,
+            keywords_score_json TEXT NOT NULL DEFAULT '{}',
+            resume_status TEXT NOT NULL DEFAULT 'pending',
+            cover_letter_status TEXT NOT NULL DEFAULT 'pending',
+            resume_error TEXT NOT NULL DEFAULT '',
+            cover_letter_error TEXT NOT NULL DEFAULT '',
+            error TEXT NOT NULL DEFAULT '',
+            eligibility_note TEXT NOT NULL DEFAULT '',
+            lease_owner TEXT NOT NULL DEFAULT '',
+            lease_expires_at TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            prepared_at TEXT NOT NULL DEFAULT '',
+            FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+        )
+        """
     )
     db.execute(
         """

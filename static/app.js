@@ -10,6 +10,7 @@ const state = {
   discoveryMeta: {},
   discoveryView: "table",
   shortlist: [],
+  preparationQueue: [],
   candidateProfiles: [],
   generationSelections: {},
   selectedCandidateProfileId: "",
@@ -115,6 +116,8 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("csv-import-form").addEventListener("submit", importCsv);
   document.getElementById("discovery-test-sources").addEventListener("click", testJobSources);
   document.getElementById("refresh-shortlist").addEventListener("click", loadAll);
+  document.getElementById("refresh-preparation-queue")?.addEventListener("click", loadPreparationQueue);
+  document.getElementById("preparation-status-filter")?.addEventListener("change", loadPreparationQueue);
   document.getElementById("generate").addEventListener("click", generateMaterials);
   document.getElementById("analyse-resume-match").addEventListener("click", analyseResumeMatch);
   document.getElementById("generate-local-draft").addEventListener("click", generateLocalDraft);
@@ -196,6 +199,7 @@ async function loadAll() {
     state.profile = profile;
     state.evidence = evidence;
     state.shortlist = shortlist;
+    await loadPreparationQueue();
     state.candidateProfiles = Array.isArray(candidateProfiles) ? candidateProfiles : [];
     await hydrateGenerationSelections();
     state.systemHealth = systemHealth;
@@ -214,6 +218,52 @@ async function loadAll() {
   }
 }
 
+async function loadPreparationQueue() {
+  const target = document.getElementById("preparation-queue");
+  if (!target) return;
+  try {
+    const status = value("preparation-status-filter");
+    state.preparationQueue = await api.get(`/api/preparation/queue${status ? `?status=${encodeURIComponent(status)}` : ""}`);
+    renderPreparationQueue();
+  } catch (error) { target.textContent = error.message; }
+}
+
+function renderPreparationQueue() {
+  const target = document.getElementById("preparation-queue");
+  if (!target) return;
+  const items = Array.isArray(state.preparationQueue) ? state.preparationQueue : [];
+  target.classList.toggle("empty", !items.length);
+  if (!items.length) { target.textContent = "No application packages queued."; return; }
+  target.innerHTML = items.map((item) => {
+    const job = item.job || {};
+    const score = item.keywords_score || {};
+    const matched = score.matched_count != null ? `${score.matched_count}/${score.total || 0}` : "not reviewed";
+    const error = item.error || item.resume_error || item.cover_letter_error;
+    const actions = item.status === "ready_for_review"
+      ? `<button class="button small" type="button" onclick="reviewPreparation(${item.id}, 'approve')">Approve package</button><button class="button ghost small" type="button" onclick="previewPreparation(${item.id})">Preview</button>`
+      : item.status === "queued" || item.status === "failed"
+        ? `<button class="button small" type="button" onclick="prepareQueueItem(${item.id})">${item.status === "failed" ? "Retry preparation" : "Prepare package"}</button>`
+        : "";
+    return `<article class="preparation-row"><div class="preparation-main"><h3>${escapeHtml(job.title || "Untitled role")}</h3><p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(job.location || "Location unavailable")}</p><p class="muted">${escapeHtml(job.remote_eligibility || "unknown")} · ${escapeHtml(job.salary || "Salary unavailable")} · Job Priority ${Number(item.job_priority || 0)}</p><p class="muted">Profile ${escapeHtml(String(item.candidate_profile_id || "not selected"))} · Résumé ${escapeHtml(item.resume_status || "pending")} · Cover letter ${escapeHtml(item.cover_letter_status || "pending")}</p>${item.eligibility_note ? `<p class="muted">${escapeHtml(item.eligibility_note)}</p>` : ""}${error ? `<p class="risk high">${escapeHtml(error)}</p>` : ""}</div><div class="preparation-meta"><strong>${escapeHtml(item.status.replaceAll("_", " "))}</strong><span>Keywords Score ${escapeHtml(matched)}</span><div class="row-actions">${actions}${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open application</a>` : ""}<button class="button ghost small" type="button" onclick="reviewPreparation(${item.id}, 'skip')">Skip</button></div></div></article>`;
+  }).join("");
+}
+
+async function queueDiscoveryJob(id) {
+  try { await api.send("/api/preparation/queue", "POST", { job_id: id }); toast("Application package queued for review"); await loadPreparationQueue(); } catch (error) { toast(error.message); }
+}
+
+async function prepareQueueItem(id) {
+  try { const result = await api.send(`/api/preparation/${id}/prepare`, "POST", {}); toast(result.status === "ready_for_review" ? "Package ready for review" : "Package preparation failed"); await loadPreparationQueue(); } catch (error) { toast(error.message); }
+}
+
+async function reviewPreparation(id, action) {
+  try { await api.send(`/api/preparation/${id}/review`, "POST", { action }); toast(action === "approve" ? "Package approved for your next manual step" : "Package skipped"); await loadPreparationQueue(); } catch (error) { toast(error.message); }
+}
+
+async function previewPreparation(id) {
+  try { const result = await api.get(`/api/preparation/${id}/preview`); const target = document.getElementById("preparation-queue"); target.insertAdjacentHTML("afterbegin", `<details class="preparation-preview" open><summary>Document preview</summary><h4>Résumé</h4><pre>${escapeHtml(result.resume || "Unavailable")}</pre><h4>Cover letter</h4><pre>${escapeHtml(result.cover_letter || "Unavailable")}</pre></details>`); } catch (error) { toast(error.message); }
+}
+
 async function loadSavedSearches() {
   const list = document.getElementById("saved-search-list");
   if (!list) return;
@@ -221,7 +271,7 @@ async function loadSavedSearches() {
     const searches = await api.get("/api/discovery/searches");
     list.innerHTML = searches.length ? searches.map((search) => `
       <article class="saved-search-row">
-        <div><strong>${escapeHtml(search.name)}</strong><span class="muted">${escapeHtml(search.keywords)} · ${escapeHtml(search.location || "Anywhere")}</span><span class="muted">${search.enabled ? "Scheduled" : "Manual only"} · ${escapeHtml((search.enabled_sources || []).map(sourceLabel).join(", "))}</span></div>
+        <div><strong>${escapeHtml(search.name)}</strong><span class="muted">${escapeHtml(search.keywords)} · ${escapeHtml(search.location || "Anywhere")}</span><span class="muted">${search.enabled ? "Scheduled" : "Manual only"} · ${escapeHtml((search.enabled_sources || []).map(sourceLabel).join(", "))} · ${search.auto_prepare_enabled ? `Auto preparation at ${Number(search.auto_prepare_min_priority || 75)}+` : "Preparation manual"}</span></div>
         <div class="actions compact"><button class="button small" type="button" onclick="runSavedSearch(${search.id})">Run now</button><button class="button ghost small" type="button" onclick='editSavedSearch(${JSON.stringify(search).replaceAll("'", "&apos;")} )'>Edit</button></div>
       </article>`).join("") : `<p class="muted">No saved searches yet.</p>`;
   } catch (error) { list.innerHTML = `<p class="muted">${escapeHtml(error.message)}</p>`; }
@@ -245,6 +295,10 @@ function editSavedSearch(search) {
   setValue("saved-search-date-window", search.date_window || "14d");
   setValue("saved-search-interval", search.interval_minutes || 360);
   setChecked("saved-search-enabled", Boolean(search.enabled));
+  setChecked("saved-search-auto-prepare", Boolean(search.auto_prepare_enabled));
+  setValue("saved-search-auto-min-priority", search.auto_prepare_min_priority || 75);
+  setValue("saved-search-auto-profile", search.auto_prepare_candidate_profile_id || "");
+  setChecked("saved-search-auto-require-canadian", search.auto_prepare_require_canadian !== false && search.auto_prepare_require_canadian !== 0);
   document.querySelectorAll('input[name="saved-search-source"]').forEach((input) => { input.checked = (search.enabled_sources || []).includes(input.value); });
 }
 
@@ -255,6 +309,8 @@ async function saveSavedSearch(event) {
     name: value("saved-search-name"), keywords: value("saved-search-keywords"), location: value("saved-search-location"),
     remote_preference: value("saved-search-remote"), seniority: value("saved-search-seniority"), minimum_salary: Number(value("saved-search-minimum-salary") || 0),
     date_window: value("saved-search-date-window"), interval_minutes: Number(value("saved-search-interval") || 360), enabled: checked("saved-search-enabled"),
+    auto_prepare_enabled: checked("saved-search-auto-prepare"), auto_prepare_min_priority: Number(value("saved-search-auto-min-priority") || 75),
+    auto_prepare_candidate_profile_id: Number(value("saved-search-auto-profile") || 0), auto_prepare_require_canadian: checked("saved-search-auto-require-canadian"),
     enabled_sources: [...document.querySelectorAll('input[name="saved-search-source"]:checked')].map((input) => input.value),
   };
   try {
@@ -274,7 +330,7 @@ async function loadDiscoveryInbox() {
   try {
     const jobs = await api.get("/api/discovery/inbox");
     target.classList.toggle("empty", !jobs.length);
-    target.innerHTML = jobs.length ? jobs.map((job) => `<article class="inbox-row"><div><strong>${escapeHtml(job.title || "Untitled role")}</strong><span>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location unavailable")}</span><span class="muted">${escapeHtml(job.remote_eligibility || "unknown")} · ${escapeHtml(job.salary || "Salary unavailable")} · ${escapeHtml(job.source || "JobSpy")} · ${escapeHtml(job.posted_date || "date unknown")}</span></div><div><strong>Job Priority ${Number(job.overall_score || job.fit_score || 0)}</strong><span class="muted">Discovered ${escapeHtml(job.discovery_first_seen_at || "")}</span></div><div class="row-actions"><button class="button small" type="button" onclick="reviewInboxJob(${job.id})">Review</button><button class="button ghost small" type="button" onclick="saveInboxJob(${job.id})">Shortlist</button><button class="button ghost small" type="button" onclick="ignoreInboxJob(${job.id})">Ignore</button>${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open</a>` : ""}</div></article>`).join("") : "No discovered opportunities yet.";
+    target.innerHTML = jobs.length ? jobs.map((job) => `<article class="inbox-row"><div><strong>${escapeHtml(job.title || "Untitled role")}</strong><span>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location unavailable")}</span><span class="muted">${escapeHtml(job.remote_eligibility || "unknown")} · ${escapeHtml(job.salary || "Salary unavailable")} · ${escapeHtml(job.source || "JobSpy")} · ${escapeHtml(job.posted_date || "date unknown")}</span></div><div><strong>Job Priority ${Number(job.overall_score || job.fit_score || 0)}</strong><span class="muted">Discovered ${escapeHtml(job.discovery_first_seen_at || "")}</span></div><div class="row-actions"><button class="button small" type="button" onclick="reviewInboxJob(${job.id})">Review</button><button class="button ghost small" type="button" onclick="queueDiscoveryJob(${job.id})">Prepare package</button><button class="button ghost small" type="button" onclick="saveInboxJob(${job.id})">Shortlist</button><button class="button ghost small" type="button" onclick="ignoreInboxJob(${job.id})">Ignore</button>${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open</a>` : ""}</div></article>`).join("") : "No discovered opportunities yet.";
   } catch (error) { target.textContent = error.message; }
 }
 
@@ -352,6 +408,8 @@ function renderCandidateProfiles() {
     return;
   }
   if (!state.selectedCandidateProfileId) state.selectedCandidateProfileId = String(state.candidateProfiles[0].id);
+  const autoProfile = document.getElementById("saved-search-auto-profile");
+  if (autoProfile) autoProfile.innerHTML = `<option value="">Choose a profile when available</option>${state.candidateProfiles.map((profile) => `<option value="${escapeAttribute(profile.id)}">${escapeHtml(profile.name)}</option>`).join("")}`;
   list.innerHTML = state.candidateProfiles.map((profile) => `
     <article class="candidate-profile-card ${String(profile.id) === state.selectedCandidateProfileId ? "selected" : ""}">
       <div><h3>${escapeHtml(profile.name)}</h3><p class="muted">${profile.identity_mode === "distinct" ? escapeHtml(profile.applicant_name || "Distinct identity not set") : "Uses active profile identity"}</p></div>

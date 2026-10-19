@@ -3942,6 +3942,55 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(job["resume_generation_status"], "generated")
         self.assertTrue(Path(job["resume_docx_path"]).exists())
 
+    def test_application_preparation_queue_is_persistent_and_does_not_change_job_status(self):
+        profile = self.client.post(
+            "/api/candidate-profiles",
+            json={"name": "Phase B QA", "identity_mode": "distinct", "applicant_name": "QA Applicant"},
+        ).get_json()
+        document = Document()
+        document.add_paragraph("QA Applicant")
+        document.add_paragraph("Python and SQL experience")
+        buffer = io.BytesIO()
+        document.save(buffer)
+        uploaded = self.client.post(
+            f"/api/candidate-profiles/{profile['id']}/resumes/upload",
+            data={"file": (io.BytesIO(buffer.getvalue()), "qa.docx"), "is_default": "true"},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(uploaded.status_code, 201)
+        job = self.client.post("/api/jobs", json={"company": "QueueCo", "title": "Developer", "location": "Toronto", "overall_score": 88, "remote_eligibility": "canadian_eligible", "job_description": "Python SQL"}).get_json()
+        queued = self.client.post("/api/preparation/queue", json={"job_id": job["id"], "candidate_profile_id": profile["id"]})
+        self.assertEqual(queued.status_code, 201, queued.get_json())
+        item = queued.get_json()
+        duplicate = self.client.post("/api/preparation/queue", json={"job_id": job["id"], "candidate_profile_id": profile["id"]})
+        self.assertEqual(duplicate.status_code, 200)
+        self.assertTrue(duplicate.get_json()["duplicate"])
+        self.assertEqual(len(self.client.get("/api/preparation/queue").get_json()), 1)
+        self.assertEqual(self.client.get("/api/jobs").get_json()[0]["status"], "Saved")
+        with patch.object(app_module, "generate_and_store_shortlist_documents", return_value={"resume": "generated", "cover_letter": "generated", "error": ""}):
+            prepared = self.client.post(f"/api/preparation/{item['id']}/prepare")
+        self.assertEqual(prepared.status_code, 200, prepared.get_json())
+        self.assertEqual(prepared.get_json()["status"], "ready_for_review")
+        approved = self.client.post(f"/api/preparation/{item['id']}/review", json={"action": "approve"})
+        self.assertEqual(approved.status_code, 200)
+        self.assertEqual(approved.get_json()["status"], "approved")
+        self.assertEqual(self.client.get("/api/jobs").get_json()[0]["status"], "Saved")
+
+    def test_application_preparation_auto_eligibility_requires_priority_and_confirmed_canada(self):
+        search = {"auto_prepare_enabled": True, "auto_prepare_min_priority": 80, "auto_prepare_require_canadian": True}
+        eligible, reason, _ = app_module.preparation_eligibility({"overall_score": 90, "remote_eligibility": "canadian_eligible"}, search)
+        self.assertTrue(eligible)
+        self.assertEqual(reason, "eligible")
+        eligible, reason, _ = app_module.preparation_eligibility({"overall_score": 90, "remote_eligibility": "unknown"}, search)
+        self.assertFalse(eligible)
+        self.assertEqual(reason, "manual_eligibility_review")
+        eligible, reason, _ = app_module.preparation_eligibility({"overall_score": 90, "remote_eligibility": "restricted"}, search)
+        self.assertFalse(eligible)
+        self.assertEqual(reason, "explicitly_restricted")
+        eligible, reason, _ = app_module.preparation_eligibility({"overall_score": 70, "remote_eligibility": "canadian_eligible"}, search)
+        self.assertFalse(eligible)
+        self.assertEqual(reason, "priority_below_threshold")
+
 
 if __name__ == "__main__":
     unittest.main()

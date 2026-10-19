@@ -45,6 +45,18 @@ For a long-running local worker:
 
 The worker uses `JOB_TRACKER_DATA_DIR` when set, so QA runs can use an isolated database without touching the normal application data.
 
+## Phase B: application preparation
+
+Phase B adds a persistent review queue without changing the existing job status, Job Priority calculation, Keywords Score, or document engines. Discovery results can be queued manually from the inbox, or a saved search can opt into automatic preparation with a minimum Job Priority, a selected candidate profile, and confirmed Canadian eligibility. Explicitly restricted postings are excluded and unknown eligibility remains a manual review condition.
+
+The queue progresses through `queued`, `preparing`, `ready_for_review`, `approved`, `skipped`, and `failed`. Preparation runs the existing résumé and cover letter generation engines with the selected profile and stores actual errors. It never submits an application and never changes a job to Applied. The standalone worker processes eligible queued packages after discovery and can resume expired work through SQLite leases:
+
+```powershell
+.venv\Scripts\python.exe scripts\discovery_worker.py --once
+```
+
+The Shortlist tab contains the application preparation review queue. Users can inspect the generated documents, Keywords Score, errors and original application link, then approve or skip a package. Approval means the package is ready for the user's next manual application step; it is not a submission.
+
 ## API surface
 
 - `GET/POST /api/discovery/searches`
@@ -55,7 +67,12 @@ The worker uses `JOB_TRACKER_DATA_DIR` when set, so QA runs can use an isolated 
 - `POST /api/discovery/inbox/<id>/ignore`
 - `GET /api/discovery/runs`
 - `GET/PUT /api/discovery/scheduler`
+- `GET/POST /api/preparation/queue`
+- `POST /api/preparation/<id>/prepare`
+- `POST /api/preparation/<id>/regenerate`
+- `POST /api/preparation/<id>/review`
+- `GET /api/preparation/<id>/preview`
 
 Eligibility is deliberately conservative: Canadian eligible, explicitly restricted, and unknown are distinct states. Unknown eligibility is never treated as confirmed Canadian eligibility. Discovery errors are retained per source so a failed provider does not discard successful results from other providers.
 
-Phase B is intentionally out of scope: form filling, browser submission, CAPTCHA handling and automatic application submission are not implemented.
+Form filling, browser submission, CAPTCHA handling and automatic application submission remain out of scope for Phase B and are not implemented.
