@@ -75,6 +75,7 @@ SEMANTIC_CACHE_DIRNAME = "semantic_cache"
 RESTORABLE_SHORTLIST_STATUSES = {"Archived", "Rejected", "Saved", "Drafting"}
 PREPARATION_STATUSES = {"queued", "preparing", "ready_for_review", "approved", "skipped", "failed"}
 PREPARATION_LEASE_MINUTES = 10
+PREPARATION_LEASE_RENEW_SECONDS = 30
 
 DISCOVERY_SCORE_WEIGHTS = {
     "skill_match": 35,
@@ -1163,9 +1164,8 @@ def create_app() -> Flask:
         row = query_db("SELECT * FROM application_preparation_queue WHERE id = ?", [item_id], one=True)
         if row is None:
             return jsonify({"error": "Preparation queue item was not found"}), 404
-        _update_preparation_item(item_id, status="queued", review_status="pending", error="", resume_error="", cover_letter_error="")
         try:
-            return jsonify(prepare_application_queue_item(item_id, owner=f"manual:{uuid.uuid4()}"))
+            return jsonify(prepare_application_queue_item(item_id, owner=f"manual:{uuid.uuid4()}", allow_regenerate=True))
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 409
 
@@ -1179,7 +1179,29 @@ def create_app() -> Flask:
         if row is None:
             return jsonify({"error": "Preparation queue item was not found"}), 404
         status, review_status = transitions[action]
+        if action == "approve":
+            if row["status"] != "ready_for_review":
+                return jsonify({"error": "Only a package in ready_for_review status can be approved"}), 409
+            if row["resume_status"] != "generated" or row["cover_letter_status"] != "generated":
+                return jsonify({"error": "Both résumé and cover letter must be generated before approval"}), 409
+            if not text(row["prepared_resume_path"]) or not text(row["prepared_cover_letter_path"]):
+                return jsonify({"error": "This package has no recorded generated documents"}), 409
+            if not all(safe_generated_path(row[field]) and safe_generated_path(row[field]).is_file() for field in ("prepared_resume_path", "prepared_cover_letter_path")):
+                return jsonify({"error": "A generated document for this package is no longer available"}), 409
         return jsonify(_update_preparation_item(item_id, status=status, review_status=review_status))
+
+    @app.post("/api/preparation/<int:item_id>/eligibility-review")
+    def review_preparation_eligibility(item_id: int) -> Response:
+        payload = request.get_json(silent=True) or {}
+        row = query_db("SELECT * FROM application_preparation_queue WHERE id = ?", [item_id], one=True)
+        if row is None:
+            return jsonify({"error": "Preparation queue item was not found"}), 404
+        if row["review_status"] != "manual_eligibility":
+            return jsonify({"error": "This package does not require an eligibility review"}), 409
+        confirmed = as_bool(payload.get("confirmed"))
+        if not confirmed:
+            return jsonify(_update_preparation_item(item_id, status="skipped", review_status="rejected", eligibility_review_status="rejected", eligibility_note="Canadian eligibility was not confirmed by the user."))
+        return jsonify(_update_preparation_item(item_id, status="queued", review_status="pending", eligibility_review_status="confirmed", eligibility_note="Canadian eligibility was manually confirmed; preparation is ready to start."))
 
     @app.get("/api/preparation/<int:item_id>/preview")
     def preparation_preview(item_id: int) -> Response:
@@ -1190,8 +1212,8 @@ def create_app() -> Flask:
         if job is None:
             return jsonify({"error": "Job not found"}), 404
         values: dict[str, Any] = {}
-        for kind, field in (("resume", "resume_docx_path"), ("cover_letter", "cover_letter_docx_path")):
-            path = safe_generated_path(job[field])
+        for kind, package_field, job_field in (("resume", "prepared_resume_path", "resume_docx_path"), ("cover_letter", "prepared_cover_letter_path", "cover_letter_docx_path")):
+            path = safe_generated_path(item[package_field] or job[job_field])
             values[kind] = ""
             if path and path.is_file():
                 try:
@@ -1199,6 +1221,19 @@ def create_app() -> Flask:
                 except (OSError, ValueError, zipfile.BadZipFile):
                     values[kind] = ""
         return jsonify({"resume": values["resume"], "cover_letter": values["cover_letter"], "status": item["status"], "job_id": item["job_id"]})
+
+    @app.get("/api/preparation/<int:item_id>/download/<kind>")
+    def download_preparation_document(item_id: int, kind: str) -> Response:
+        if kind not in {"resume", "cover-letter"}:
+            return jsonify({"error": "Document kind must be resume or cover-letter"}), 400
+        item = query_db("SELECT * FROM application_preparation_queue WHERE id = ?", [item_id], one=True)
+        if item is None:
+            return jsonify({"error": "Preparation queue item was not found"}), 404
+        field = "prepared_resume_path" if kind == "resume" else "prepared_cover_letter_path"
+        path = safe_generated_path(item[field])
+        if path is None or not path.is_file():
+            return jsonify({"error": "The generated document for this package is unavailable"}), 404
+        return send_file(path, as_attachment=True, download_name=secure_filename(path.name) or "document.docx", mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
     @app.get("/api/discovery/runs")
     def discovery_runs() -> Response:
@@ -2515,6 +2550,8 @@ def resolve_generation_profile(payload: dict[str, Any] | None) -> dict[str, Any]
         "resume_docx_template_path": text((resume or {}).get("docx_path")),
         "cover_letter_template": text((cover or {}).get("content")),
         "cover_letter_docx_template_path": text((cover or {}).get("docx_path")),
+        "_resume_document_id": int((resume or {}).get("id") or 0),
+        "_cover_letter_template_id": int((cover or {}).get("id") or 0),
     })
     if structured_resume.get("summary"):
         profile["_source_summary"] = structured_resume["summary"]
@@ -2545,15 +2582,19 @@ def preparation_queue_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:
 
 def default_candidate_profile_id() -> int:
     profiles = CandidateProfileStore(get_db()).list_profiles()
-    return int(profiles[0]["id"]) if profiles else 0
+    confirmed = [profile for profile in profiles if int(profile.get("is_active") or 0) == 1]
+    return int(confirmed[0]["id"]) if len(confirmed) == 1 else 0
 
 
 def queue_profile_payload(payload: dict[str, Any] | None = None, *, search: dict[str, Any] | None = None) -> dict[str, Any]:
     payload = payload or {}
     search = search or {}
-    profile_id = payload.get("candidate_profile_id") or search.get("auto_prepare_candidate_profile_id") or default_candidate_profile_id()
+    automatic = bool(search)
+    profile_id = payload.get("candidate_profile_id") or search.get("auto_prepare_candidate_profile_id")
+    if not profile_id and not automatic:
+        profile_id = default_candidate_profile_id()
     if not profile_id:
-        raise ValueError("Select a candidate profile before preparing an application package")
+        raise ValueError("Select a candidate profile before preparing an application package; automatic preparation cannot choose one implicitly")
     result = {"candidate_profile_id": int(profile_id)}
     resume_id = payload.get("resume_id") or search.get("auto_prepare_resume_id")
     cover_id = payload.get("cover_letter_template_id") or search.get("auto_prepare_cover_letter_template_id")
@@ -2572,9 +2613,9 @@ def preparation_eligibility(job: dict[str, Any], search: dict[str, Any]) -> tupl
     eligibility = text(job.get("remote_eligibility")).lower() or "unknown"
     if eligibility == "restricted":
         return False, "explicitly_restricted", "Posting is explicitly restricted outside Canada."
-    if as_bool(search.get("auto_prepare_require_canadian", True)) and eligibility != "canadian_eligible":
-        if eligibility == "unknown":
-            return False, "manual_eligibility_review", "Canadian eligibility is unknown; review this opportunity manually before preparation."
+    if eligibility == "unknown":
+        return False, "manual_eligibility_review", "Canadian eligibility is unknown; review this opportunity manually before preparation."
+    if eligibility != "canadian_eligible":
         return False, "eligibility_not_confirmed", "Canadian eligibility is not confirmed."
     return True, "eligible", "Meets the saved search priority and eligibility criteria."
 
@@ -2588,9 +2629,17 @@ def enqueue_application_preparation(job_id: int, payload: dict[str, Any] | None 
         return preparation_queue_to_dict(existing), True
     selection = queue_profile_payload(payload, search=search)
     profile = resolve_generation_profile(selection)
+    if not profile or not safe_local_path(text(profile.get("resume_docx_template_path"))) or not safe_local_path(text(profile.get("resume_docx_template_path"))).is_file():
+        raise ValueError("The selected candidate profile résumé template is unavailable")
+    if not profile or not safe_local_path(text(profile.get("cover_letter_docx_template_path"))) or not safe_local_path(text(profile.get("cover_letter_docx_template_path"))).is_file():
+        raise ValueError("The selected candidate profile cover letter template is unavailable")
+    selection["resume_id"] = int(profile.get("_resume_document_id") or selection.get("resume_id") or 0)
+    selection["cover_letter_template_id"] = int(profile.get("_cover_letter_template_id") or selection.get("cover_letter_template_id") or 0)
     job = job_to_dict(job_row)
     if search is None:
-        eligible, reason, note = True, "manual", "Queued for manual preparation review."
+        eligible, reason, note = preparation_eligibility(job, {"auto_prepare_min_priority": 0})
+        if eligible:
+            reason, note = "manual", "Queued for manual preparation review."
     else:
         eligible, reason, note = preparation_eligibility(job, search)
     review_status = "manual_eligibility" if reason == "manual_eligibility_review" else "pending"
@@ -2601,17 +2650,17 @@ def enqueue_application_preparation(job_id: int, payload: dict[str, Any] | None 
         keywords = {}
     cursor = get_db().execute(
         """INSERT INTO application_preparation_queue
-           (job_id, status, review_status, candidate_profile_id, resume_id, cover_letter_template_id,
+           (job_id, status, review_status, eligibility_review_status, candidate_profile_id, resume_id, cover_letter_template_id,
             job_priority, keywords_score_json, eligibility_note)
-           VALUES (?, 'queued', ?, ?, ?, ?, ?, ?, ?)""",
-        [job_id, review_status, int(selection["candidate_profile_id"]), int(selection.get("resume_id") or 0), int(selection.get("cover_letter_template_id") or 0), int(job.get("overall_score") or job.get("fit_score") or 0), dumps_json(keywords), note],
+           VALUES (?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)""",
+        [job_id, review_status, "pending" if reason == "manual_eligibility_review" else "not_required", int(selection["candidate_profile_id"]), int(selection.get("resume_id") or 0), int(selection.get("cover_letter_template_id") or 0), int(job.get("overall_score") or job.get("fit_score") or 0), dumps_json(keywords), note],
     )
     get_db().commit()
     return preparation_queue_to_dict(query_db("SELECT * FROM application_preparation_queue WHERE id = ?", [cursor.lastrowid], one=True)), False
 
 
 def _update_preparation_item(item_id: int, **fields: Any) -> dict[str, Any]:
-    allowed = {"status", "review_status", "resume_status", "cover_letter_status", "resume_error", "cover_letter_error", "error", "keywords_score_json", "eligibility_note", "lease_owner", "lease_expires_at", "prepared_at"}
+    allowed = {"status", "review_status", "eligibility_review_status", "resume_status", "cover_letter_status", "resume_error", "cover_letter_error", "error", "keywords_score_json", "eligibility_note", "lease_owner", "lease_expires_at", "prepared_at", "prepared_resume_path", "prepared_cover_letter_path"}
     updates = {key: value for key, value in fields.items() if key in allowed}
     if updates:
         assignments = ", ".join(f"{key} = ?" for key in updates)
@@ -2620,7 +2669,25 @@ def _update_preparation_item(item_id: int, **fields: Any) -> dict[str, Any]:
     return preparation_queue_to_dict(query_db("SELECT * FROM application_preparation_queue WHERE id = ?", [item_id], one=True))
 
 
-def prepare_application_queue_item(item_id: int, *, owner: str = "manual") -> dict[str, Any]:
+def start_preparation_lease_heartbeat(item_id: int, owner: str) -> tuple[threading.Event, threading.Thread]:
+    stop = threading.Event()
+
+    def renew() -> None:
+        while not stop.wait(PREPARATION_LEASE_RENEW_SECONDS):
+            connection = sqlite3.connect(DB_PATH, timeout=5)
+            try:
+                expires = datetime.now() + timedelta(minutes=PREPARATION_LEASE_MINUTES)
+                connection.execute("UPDATE application_preparation_queue SET lease_expires_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'preparing' AND lease_owner = ?", [expires.isoformat(timespec="seconds"), item_id, owner])
+                connection.commit()
+            finally:
+                connection.close()
+
+    thread = threading.Thread(target=renew, name=f"preparation-lease-{item_id}", daemon=True)
+    thread.start()
+    return stop, thread
+
+
+def prepare_application_queue_item(item_id: int, *, owner: str = "manual", allow_regenerate: bool = False) -> dict[str, Any]:
     now = datetime.now()
     expires = now + timedelta(minutes=PREPARATION_LEASE_MINUTES)
     db = get_db()
@@ -2629,11 +2696,22 @@ def prepare_application_queue_item(item_id: int, *, owner: str = "manual") -> di
     if row is None:
         db.rollback()
         raise ValueError("Preparation queue item was not found")
+    if row["status"] == "approved":
+        db.rollback()
+        raise ValueError("Approved application packages cannot be regenerated")
+    if row["review_status"] == "manual_eligibility" or row["eligibility_review_status"] == "pending":
+        db.rollback()
+        raise ValueError("Confirm Canadian eligibility before preparing this application package")
+    allowed_statuses = {"queued", "failed", "ready_for_review", "skipped"} if allow_regenerate else {"queued", "failed"}
     if row["status"] == "preparing" and row["lease_owner"] != owner and row["lease_expires_at"] > now.isoformat(timespec="seconds"):
         db.rollback()
         raise ValueError("This application package is already being prepared")
+    if row["status"] != "preparing" and row["status"] not in allowed_statuses:
+        db.rollback()
+        raise ValueError(f"Cannot prepare an application package in {row['status']} status")
     db.execute("UPDATE application_preparation_queue SET status = 'preparing', lease_owner = ?, lease_expires_at = ?, error = '', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [owner, expires.isoformat(timespec="seconds"), item_id])
     db.commit()
+    stop, heartbeat = start_preparation_lease_heartbeat(item_id, owner)
     try:
         row = query_db("SELECT * FROM application_preparation_queue WHERE id = ?", [item_id], one=True)
         job = query_db("SELECT * FROM jobs WHERE id = ?", [row["job_id"]], one=True)
@@ -2649,10 +2727,27 @@ def prepare_application_queue_item(item_id: int, *, owner: str = "manual") -> di
         cover_status = text(generation.get("cover_letter")) or "failed"
         error = text(generation.get("error"))
         keywords = build_keywords_score_report(job_to_dict(refreshed_job), profile)
-        status = "ready_for_review" if resume_status == "generated" and cover_status == "generated" else "failed"
-        return _update_preparation_item(item_id, status=status, review_status="pending", resume_status=resume_status, cover_letter_status=cover_status, resume_error=text(generation.get("resume_error")), cover_letter_error=text(generation.get("cover_letter_error")), error=error, keywords_score_json=dumps_json(keywords), lease_owner="", lease_expires_at="", prepared_at=datetime.now().isoformat(timespec="seconds"))
+        resume_path = text(refreshed_job["resume_docx_path"])
+        cover_path = text(refreshed_job["cover_letter_docx_path"])
+        status = "ready_for_review" if resume_status == "generated" and cover_status == "generated" and safe_generated_path(resume_path) and safe_generated_path(resume_path).is_file() and safe_generated_path(cover_path) and safe_generated_path(cover_path).is_file() else "failed"
+        return _finish_preparation_item(item_id, owner, status=status, review_status="pending", resume_status=resume_status, cover_letter_status=cover_status, resume_error=text(generation.get("resume_error")), cover_letter_error=text(generation.get("cover_letter_error")), error=error, keywords_score_json=dumps_json(keywords), prepared_resume_path=resume_path if status == "ready_for_review" else text(row["prepared_resume_path"]), prepared_cover_letter_path=cover_path if status == "ready_for_review" else text(row["prepared_cover_letter_path"]), lease_owner="", lease_expires_at="", prepared_at=datetime.now().isoformat(timespec="seconds"))
     except Exception as exc:
-        return _update_preparation_item(item_id, status="failed", error=f"{type(exc).__name__}: {exc}", lease_owner="", lease_expires_at="")
+        return _finish_preparation_item(item_id, owner, status="failed", error=f"{type(exc).__name__}: {exc}", lease_owner="", lease_expires_at="")
+    finally:
+        stop.set()
+        heartbeat.join(timeout=2)
+
+
+def _finish_preparation_item(item_id: int, owner: str, **fields: Any) -> dict[str, Any]:
+    allowed = {"status", "review_status", "eligibility_review_status", "resume_status", "cover_letter_status", "resume_error", "cover_letter_error", "error", "keywords_score_json", "eligibility_note", "lease_owner", "lease_expires_at", "prepared_at", "prepared_resume_path", "prepared_cover_letter_path"}
+    updates = {key: value for key, value in fields.items() if key in allowed}
+    assignments = ", ".join(f"{key} = ?" for key in updates)
+    db = get_db()
+    cursor = db.execute(f"UPDATE application_preparation_queue SET {assignments}, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'preparing' AND lease_owner = ?", [*updates.values(), item_id, owner])
+    db.commit()
+    if cursor.rowcount == 0:
+        raise ValueError("Preparation lease was lost; stale worker output was not applied")
+    return preparation_queue_to_dict(query_db("SELECT * FROM application_preparation_queue WHERE id = ?", [item_id], one=True))
 
 
 def process_preparation_queue(limit: int = 5, *, owner: str = "worker") -> dict[str, int]:
@@ -6522,6 +6617,7 @@ def init_db() -> None:
             job_id INTEGER NOT NULL UNIQUE,
             status TEXT NOT NULL DEFAULT 'queued',
             review_status TEXT NOT NULL DEFAULT 'pending',
+            eligibility_review_status TEXT NOT NULL DEFAULT 'not_required',
             candidate_profile_id INTEGER NOT NULL DEFAULT 0,
             resume_id INTEGER NOT NULL DEFAULT 0,
             cover_letter_template_id INTEGER NOT NULL DEFAULT 0,
@@ -6538,9 +6634,19 @@ def init_db() -> None:
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             prepared_at TEXT NOT NULL DEFAULT '',
+            prepared_resume_path TEXT NOT NULL DEFAULT '',
+            prepared_cover_letter_path TEXT NOT NULL DEFAULT '',
             FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
         )
         """
+    )
+    ensure_columns(
+        "application_preparation_queue",
+        {
+            "eligibility_review_status": "TEXT NOT NULL DEFAULT 'not_required'",
+            "prepared_resume_path": "TEXT NOT NULL DEFAULT ''",
+            "prepared_cover_letter_path": "TEXT NOT NULL DEFAULT ''",
+        },
     )
     db.execute(
         """

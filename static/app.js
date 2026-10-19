@@ -240,9 +240,9 @@ function renderPreparationQueue() {
     const matched = score.matched_count != null ? `${score.matched_count}/${score.total || 0}` : "not reviewed";
     const error = item.error || item.resume_error || item.cover_letter_error;
     const actions = item.status === "ready_for_review"
-      ? `<button class="button small" type="button" onclick="reviewPreparation(${item.id}, 'approve')">Approve package</button><button class="button ghost small" type="button" onclick="previewPreparation(${item.id})">Preview</button>${job.resume_docx_path ? `<a class="button ghost small" href="/api/shortlist/${job.id}/resume">Download résumé</a>` : ""}${job.cover_letter_docx_path ? `<a class="button ghost small" href="/api/shortlist/${job.id}/cover-letter">Download cover letter</a>` : ""}`
+      ? `<button class="button small" type="button" onclick="reviewPreparation(${item.id}, 'approve')">Approve package</button><button class="button ghost small" type="button" onclick="previewPreparation(${item.id})">Preview</button><button class="button ghost small" type="button" onclick="regeneratePreparation(${item.id})">Regenerate</button>${item.prepared_resume_path ? `<a class="button ghost small" href="/api/preparation/${item.id}/download/resume">Download résumé</a>` : ""}${item.prepared_cover_letter_path ? `<a class="button ghost small" href="/api/preparation/${item.id}/download/cover-letter">Download cover letter</a>` : ""}`
       : item.status === "queued" || item.status === "failed"
-        ? `<button class="button small" type="button" onclick="prepareQueueItem(${item.id})">${item.status === "failed" ? "Retry preparation" : "Prepare package"}</button>`
+        ? `${item.review_status === "manual_eligibility" ? `<button class="button small" type="button" onclick="reviewEligibility(${item.id})">Confirm Canadian eligibility</button>` : `<button class="button small" type="button" onclick="prepareQueueItem(${item.id})">${item.status === "failed" ? "Retry preparation" : "Prepare package"}</button>`}`
         : "";
     return `<article class="preparation-row"><div class="preparation-main"><h3>${escapeHtml(job.title || "Untitled role")}</h3><p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(job.location || "Location unavailable")}</p><p class="muted">${escapeHtml(job.remote_eligibility || "unknown")} · ${escapeHtml(job.salary || "Salary unavailable")} · Job Priority ${Number(item.job_priority || 0)}</p><p class="muted">Profile ${escapeHtml(String(item.candidate_profile_id || "not selected"))} · Résumé ${escapeHtml(item.resume_status || "pending")} · Cover letter ${escapeHtml(item.cover_letter_status || "pending")}</p>${item.eligibility_note ? `<p class="muted">${escapeHtml(item.eligibility_note)}</p>` : ""}${error ? `<p class="risk high">${escapeHtml(error)}</p>` : ""}</div><div class="preparation-meta"><strong>${escapeHtml(item.status.replaceAll("_", " "))}</strong><span>Keywords Score ${escapeHtml(matched)}</span><div class="row-actions">${actions}${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open application</a>` : ""}<button class="button ghost small" type="button" onclick="reviewPreparation(${item.id}, 'skip')">Skip</button></div></div></article>`;
   }).join("");
@@ -254,6 +254,15 @@ async function queueDiscoveryJob(id) {
 
 async function prepareQueueItem(id) {
   try { const result = await api.send(`/api/preparation/${id}/prepare`, "POST", {}); toast(result.status === "ready_for_review" ? "Package ready for review" : "Package preparation failed"); await loadPreparationQueue(); } catch (error) { toast(error.message); }
+}
+
+async function regeneratePreparation(id) {
+  try { const result = await api.send(`/api/preparation/${id}/regenerate`, "POST", {}); toast(result.status === "ready_for_review" ? "Package regenerated for review" : "Package regeneration failed"); await loadPreparationQueue(); } catch (error) { toast(error.message); }
+}
+
+async function reviewEligibility(id) {
+  if (!window.confirm("Confirm that this opportunity is eligible for work in Canada before preparing documents?")) return;
+  try { await api.send(`/api/preparation/${id}/eligibility-review`, "POST", { confirmed: true }); toast("Eligibility confirmed; prepare the package when ready"); await loadPreparationQueue(); } catch (error) { toast(error.message); }
 }
 
 async function reviewPreparation(id, action) {
@@ -271,7 +280,7 @@ async function loadSavedSearches() {
     const searches = await api.get("/api/discovery/searches");
     list.innerHTML = searches.length ? searches.map((search) => `
       <article class="saved-search-row">
-        <div><strong>${escapeHtml(search.name)}</strong><span class="muted">${escapeHtml(search.keywords)} · ${escapeHtml(search.location || "Anywhere")}</span><span class="muted">${search.enabled ? "Scheduled" : "Manual only"} · ${escapeHtml((search.enabled_sources || []).map(sourceLabel).join(", "))} · ${search.auto_prepare_enabled ? `Auto preparation at ${Number(search.auto_prepare_min_priority || 75)}+` : "Preparation manual"}</span></div>
+        <div><strong>${escapeHtml(search.name)}</strong><span class="muted">${escapeHtml(search.keywords)} · ${escapeHtml(search.location || "Anywhere")}</span><span class="muted">${search.enabled ? "Scheduled" : "Manual only"} · ${escapeHtml((search.enabled_sources || []).map(sourceLabel).join(", "))} · ${search.auto_prepare_enabled ? `Auto preparation at ${Number(search.auto_prepare_min_priority || 75)}+ for new discovery results` : "Preparation manual"}</span></div>
         <div class="actions compact"><button class="button small" type="button" onclick="runSavedSearch(${search.id})">Run now</button><button class="button ghost small" type="button" onclick='editSavedSearch(${JSON.stringify(search).replaceAll("'", "&apos;")} )'>Edit</button></div>
       </article>`).join("") : `<p class="muted">No saved searches yet.</p>`;
   } catch (error) { list.innerHTML = `<p class="muted">${escapeHtml(error.message)}</p>`; }

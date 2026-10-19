@@ -3958,6 +3958,17 @@ class JobAssistantTest(unittest.TestCase):
             content_type="multipart/form-data",
         )
         self.assertEqual(uploaded.status_code, 201)
+        cover_document = Document()
+        cover_document.add_paragraph("QA Applicant")
+        cover_document.add_paragraph("I am applying to QueueCo for the Developer role.")
+        cover_buffer = io.BytesIO()
+        cover_document.save(cover_buffer)
+        cover_uploaded = self.client.post(
+            f"/api/candidate-profiles/{profile['id']}/cover-letter-templates/upload",
+            data={"file": (io.BytesIO(cover_buffer.getvalue()), "qa-cover.docx"), "is_default": "true"},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(cover_uploaded.status_code, 201)
         job = self.client.post("/api/jobs", json={"company": "QueueCo", "title": "Developer", "location": "Toronto", "overall_score": 88, "remote_eligibility": "canadian_eligible", "job_description": "Python SQL"}).get_json()
         queued = self.client.post("/api/preparation/queue", json={"job_id": job["id"], "candidate_profile_id": profile["id"]})
         self.assertEqual(queued.status_code, 201, queued.get_json())
@@ -3967,13 +3978,33 @@ class JobAssistantTest(unittest.TestCase):
         self.assertTrue(duplicate.get_json()["duplicate"])
         self.assertEqual(len(self.client.get("/api/preparation/queue").get_json()), 1)
         self.assertEqual(self.client.get("/api/jobs").get_json()[0]["status"], "Saved")
-        with patch.object(app_module, "generate_and_store_shortlist_documents", return_value={"resume": "generated", "cover_letter": "generated", "error": ""}):
+        generated_folder = app_module.generated_applications_dir() / str(job["id"])
+        generated_folder.mkdir(parents=True, exist_ok=True)
+        generated_resume = generated_folder / "queue-resume.docx"
+        generated_cover = generated_folder / "queue-cover.docx"
+        generated_resume.write_bytes(buffer.getvalue())
+        generated_cover.write_bytes(cover_buffer.getvalue())
+
+        def fake_prepare(job_id, kinds, profile):
+            with app_module.app.app_context():
+                app_module.get_db().execute(
+                    "UPDATE jobs SET resume_generation_status = 'generated', cover_letter_generation_status = 'generated', resume_docx_path = ?, cover_letter_docx_path = ? WHERE id = ?",
+                    [str(generated_resume), str(generated_cover), job_id],
+                )
+                app_module.get_db().commit()
+            return {"resume": "generated", "cover_letter": "generated", "error": ""}
+
+        with patch.object(app_module, "generate_and_store_shortlist_documents", side_effect=fake_prepare):
             prepared = self.client.post(f"/api/preparation/{item['id']}/prepare")
         self.assertEqual(prepared.status_code, 200, prepared.get_json())
         self.assertEqual(prepared.get_json()["status"], "ready_for_review")
         approved = self.client.post(f"/api/preparation/{item['id']}/review", json={"action": "approve"})
         self.assertEqual(approved.status_code, 200)
         self.assertEqual(approved.get_json()["status"], "approved")
+        self.assertEqual(self.client.get(f"/api/preparation/{item['id']}/preview").status_code, 200)
+        self.assertEqual(self.client.get(f"/api/preparation/{item['id']}/download/resume").status_code, 200)
+        self.assertEqual(self.client.get(f"/api/preparation/{item['id']}/download/cover-letter").status_code, 200)
+        self.assertEqual(self.client.post(f"/api/preparation/{item['id']}/regenerate").status_code, 409)
         self.assertEqual(self.client.get("/api/jobs").get_json()[0]["status"], "Saved")
 
     def test_application_preparation_auto_eligibility_requires_priority_and_confirmed_canada(self):
@@ -3990,6 +4021,50 @@ class JobAssistantTest(unittest.TestCase):
         eligible, reason, _ = app_module.preparation_eligibility({"overall_score": 70, "remote_eligibility": "canadian_eligible"}, search)
         self.assertFalse(eligible)
         self.assertEqual(reason, "priority_below_threshold")
+        for require_canadian in (True, False):
+            eligible, reason, _ = app_module.preparation_eligibility(
+                {"overall_score": 90, "remote_eligibility": "unknown"},
+                {"auto_prepare_min_priority": 80, "auto_prepare_require_canadian": require_canadian},
+            )
+            self.assertFalse(eligible)
+            self.assertEqual(reason, "manual_eligibility_review")
+
+    def test_automatic_preparation_never_chooses_first_profile_implicitly(self):
+        with self.assertRaisesRegex(ValueError, "automatic preparation cannot choose one implicitly"):
+            app_module.queue_profile_payload(search={"auto_prepare_enabled": True})
+
+    def test_preparation_approval_requires_ready_generated_package(self):
+        job = self.client.post("/api/jobs", json={"company": "Approval Co", "title": "Developer"}).get_json()
+        with app_module.app.app_context():
+            app_module.get_db().execute("INSERT INTO application_preparation_queue (job_id, status) VALUES (?, 'queued')", [job["id"]])
+            app_module.get_db().commit()
+            item_id = app_module.get_db().execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+        response = self.client.post(f"/api/preparation/{item_id}/review", json={"action": "approve"})
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("ready_for_review", response.get_json()["error"])
+
+    def test_unknown_eligibility_requires_explicit_review_before_preparation(self):
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Eligibility QA", "identity_mode": "distinct", "applicant_name": "QA Applicant"}).get_json()
+        resume = Document()
+        resume.add_paragraph("QA Applicant")
+        resume_bytes = io.BytesIO()
+        resume.save(resume_bytes)
+        self.client.post(f"/api/candidate-profiles/{profile['id']}/resumes/upload", data={"file": (io.BytesIO(resume_bytes.getvalue()), "resume.docx")}, content_type="multipart/form-data")
+        cover = Document()
+        cover.add_paragraph("QA Applicant")
+        cover_bytes = io.BytesIO()
+        cover.save(cover_bytes)
+        self.client.post(f"/api/candidate-profiles/{profile['id']}/cover-letter-templates/upload", data={"file": (io.BytesIO(cover_bytes.getvalue()), "cover.docx")}, content_type="multipart/form-data")
+        job = self.client.post("/api/jobs", json={"company": "Unknown Co", "title": "Developer", "overall_score": 90, "remote_eligibility": "unknown"}).get_json()
+        queued = self.client.post("/api/preparation/queue", json={"job_id": job["id"], "candidate_profile_id": profile["id"]})
+        self.assertEqual(queued.status_code, 201, queued.get_json())
+        item = queued.get_json()
+        self.assertEqual(item["review_status"], "manual_eligibility")
+        blocked = self.client.post(f"/api/preparation/{item['id']}/prepare")
+        self.assertEqual(blocked.status_code, 409)
+        reviewed = self.client.post(f"/api/preparation/{item['id']}/eligibility-review", json={"confirmed": True})
+        self.assertEqual(reviewed.status_code, 200)
+        self.assertEqual(reviewed.get_json()["eligibility_review_status"], "confirmed")
 
 
 if __name__ == "__main__":
