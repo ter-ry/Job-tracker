@@ -698,11 +698,16 @@ function renderPipelinePreparationState(job, item, message = "") {
   const error = item.error || item.resume_error || item.cover_letter_error || "";
   const ready = item.status === "ready_for_review";
   const approved = item.status === "approved";
+  const preparing = item.status === "preparing";
   const manualEligibility = item.review_status === "manual_eligibility";
+  const preparedAt = item.prepared_at ? `Last successful generation: ${new Date(item.prepared_at).toLocaleString()}` : "";
+  const resultNote = ready || approved
+    ? `<p class="muted">${approved ? "This package was approved for your next manual step. Nothing was submitted." : "Both documents are ready for your review. Nothing was submitted."}</p>${preparedAt ? `<p class="success-text">${escapeHtml(preparedAt)} · New document version created.</p>` : ""}`
+    : "";
   const wrapper = document.createElement("section");
   wrapper.className = "pipeline-preparation-state";
   wrapper.dataset.pipelinePreparation = item.id;
-  wrapper.innerHTML = `<h4>Application preparation</h4><p class="pipeline-preparation-status"><strong>${escapeHtml(status)}</strong>${message ? ` · ${escapeHtml(message)}` : ""}</p>${manualEligibility ? `<p class="muted">Canadian eligibility is unknown. Confirm it before document generation.</p><button class="button small" type="button" data-confirm-pipeline-eligibility>Confirm Canadian eligibility</button>` : error ? `<p class="risk high">${escapeHtml(error)}</p><button class="button small" type="button" data-retry-pipeline-preparation>Retry preparation</button>` : ready || approved ? `<p class="muted">${approved ? "This package was approved for your next manual step. Nothing was submitted." : "Both documents are ready for your review. Nothing was submitted."}</p><div class="actions compact"><button class="button small" type="button" data-preview-pipeline-preparation>Preview documents</button><a class="button ghost small" href="/api/preparation/${item.id}/download/resume">Download résumé DOCX</a><a class="button ghost small" href="/api/preparation/${item.id}/download/cover-letter">Download cover letter DOCX</a>${approved ? "" : `<button class="button ghost small" type="button" data-approve-pipeline-preparation>Approve package</button>`}</div><div data-pipeline-preview></div>` : `<p class="muted">The package is queued and ready to start. Generation does not submit an application.</p><button class="button small" type="button" data-start-pipeline-preparation>Start preparation now</button>`}`;
+  wrapper.innerHTML = `<h4>Application preparation</h4><p class="pipeline-preparation-status"><strong>${escapeHtml(preparing ? "Preparing documents" : status)}</strong>${message ? ` · ${escapeHtml(message)}` : ""}</p>${manualEligibility ? `<p class="muted">Canadian eligibility is unknown. Confirm it before document generation.</p><button class="button small" type="button" data-confirm-pipeline-eligibility>Confirm Canadian eligibility</button>` : error ? `<p class="risk high">${escapeHtml(error)}</p><button class="button small" type="button" data-retry-pipeline-preparation>Retry preparation</button>` : preparing ? `<p class="muted">Generating the selected résumé and cover letter. Please wait.</p><button class="button small" type="button" disabled>Preparing documents…</button>` : ready || approved ? `${resultNote}<div class="actions compact"><button class="button small" type="button" data-preview-pipeline-preparation>Preview documents</button><a class="button ghost small" href="/api/preparation/${item.id}/download/resume">Download résumé DOCX</a><a class="button ghost small" href="/api/preparation/${item.id}/download/cover-letter">Download cover letter DOCX</a>${approved ? "" : `<button class="button ghost small" type="button" data-approve-pipeline-preparation>Approve package</button>`}</div><div data-pipeline-preview></div>` : `<p class="muted">The package is queued and ready to start. Generation does not submit an application.</p><button class="button small" type="button" data-start-pipeline-preparation>Start preparation now</button>`}`;
   panel.querySelector("[data-pipeline-preparation]")?.remove();
   panel.appendChild(wrapper);
   wrapper.querySelector("[data-confirm-pipeline-eligibility]")?.addEventListener("click", () => confirmPipelineEligibility(item.id, job.id));
@@ -715,6 +720,8 @@ function renderPipelinePreparationState(job, item, message = "") {
 async function startPipelinePreparation(itemId, jobId) {
   const panel = document.getElementById("pipeline-job-details");
   const preparationPanel = panel?.querySelector("[data-pipeline-preparation]");
+  if (!preparationPanel || preparationPanel.dataset.busy === "true") return;
+  preparationPanel.dataset.busy = "true";
   if (preparationPanel) preparationPanel.querySelector(".pipeline-preparation-status").innerHTML = "<strong>preparing</strong> · Generating the selected documents…";
   try {
     const item = await api.send(`/api/preparation/${itemId}/prepare`, "POST", {});
@@ -724,6 +731,8 @@ async function startPipelinePreparation(itemId, jobId) {
     if (updatedJob) renderPipelinePreparationState(updatedJob, item, item.status === "ready_for_review" ? "Documents generated successfully" : "Preparation finished");
   } catch (error) {
     if (preparationPanel) {
+      preparationPanel.dataset.busy = "false";
+      preparationPanel.querySelector("[data-retry-pipeline-preparation]")?.remove();
       preparationPanel.insertAdjacentHTML("beforeend", `<p class="risk high">${escapeHtml(error.message)}</p><button class="button small" type="button" data-retry-pipeline-preparation>Retry preparation</button>`);
       preparationPanel.querySelector("[data-retry-pipeline-preparation]")?.addEventListener("click", () => retryPipelinePreparation(itemId, jobId));
     }
@@ -733,6 +742,8 @@ async function startPipelinePreparation(itemId, jobId) {
 async function retryPipelinePreparation(itemId, jobId) {
   const panel = document.getElementById("pipeline-job-details");
   const preparationPanel = panel?.querySelector("[data-pipeline-preparation]");
+  if (!preparationPanel || preparationPanel.dataset.busy === "true") return;
+  preparationPanel.dataset.busy = "true";
   if (preparationPanel) preparationPanel.querySelector(".pipeline-preparation-status").innerHTML = "<strong>preparing</strong> · Retrying document generation…";
   try {
     const item = await api.send(`/api/preparation/${itemId}/regenerate`, "POST", {});
@@ -742,6 +753,8 @@ async function retryPipelinePreparation(itemId, jobId) {
     if (updatedJob) renderPipelinePreparationState(updatedJob, item, item.status === "ready_for_review" ? "Documents generated successfully" : "Preparation finished");
   } catch (error) {
     if (preparationPanel) {
+      preparationPanel.dataset.busy = "false";
+      preparationPanel.querySelector("[data-retry-pipeline-preparation]")?.remove();
       preparationPanel.insertAdjacentHTML("beforeend", `<p class="risk high">${escapeHtml(error.message)}</p><button class="button small" type="button" data-retry-pipeline-preparation>Retry preparation</button>`);
       preparationPanel.querySelector("[data-retry-pipeline-preparation]")?.addEventListener("click", () => retryPipelinePreparation(itemId, jobId));
     }

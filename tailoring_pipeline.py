@@ -152,7 +152,7 @@ def remove_cover_letter_dashes(value: str) -> str:
     """Apply the optional personal-letter punctuation preference."""
     value = re.sub(r"(?<=\d)[-–—](?=\d)", " to ", value)
     value = re.sub(r"[-–—]", " ", value)
-    value = re.sub(r"\bhands\s+on\b", "practical experience", value, flags=re.I)
+    value = re.sub(r"\bhands\s+on\s+experience\b", "practical experience", value, flags=re.I)
     return re.sub(r"\s+", " ", value).strip()
 
 

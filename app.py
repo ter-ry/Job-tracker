@@ -2825,7 +2825,7 @@ def build_format_preserving_resume(
     candidate_path = resume_path.with_name(f"{resume_path.stem}.layout-check.docx")
     shutil.copyfile(template_path, candidate_path)
     document = Document(candidate_path)
-    identity_changed = replace_resume_identity(document, text(profile.get("name")))
+    identity_changed = replace_resume_identity(document, text(profile.get("name")), text(profile.get("email")))
     plan = build_resume_change_plan(document, job, profile, output)
     change_log = apply_resume_change_plan(document, plan)
     if identity_changed:
@@ -2847,7 +2847,7 @@ def build_format_preserving_resume(
         identity_candidate = resume_path.with_name(f"{resume_path.stem}.identity-check.docx")
         shutil.copyfile(template_path, identity_candidate)
         identity_document = Document(identity_candidate)
-        replace_resume_identity(identity_document, text(profile.get("name")))
+        replace_resume_identity(identity_document, text(profile.get("name")), text(profile.get("email")))
         identity_document.save(identity_candidate)
         identity_validation = compare_docx_layout(template_path, identity_candidate)
         if identity_validation.get("available") and identity_validation.get("verified"):
@@ -2883,21 +2883,26 @@ def build_format_preserving_resume(
     }
 
 
-def replace_resume_identity(document: Document, applicant_name: str) -> bool:
+def replace_resume_identity(document: Document, applicant_name: str, applicant_email: str = "") -> bool:
     """Replace only the leading name line, never unrelated résumé evidence."""
     applicant_name = normalize_space(applicant_name)
     if not applicant_name:
         return False
+    changed = False
     for paragraph in document.paragraphs:
         current = normalize_space(paragraph.text)
         if not current:
             continue
         if len(current.split()) <= 6 and not any(char in current for char in "@|:;•"):
             if current != applicant_name:
-                return replace_paragraph_text(paragraph, paragraph.text, applicant_name)
-            return False
+                changed = replace_paragraph_text(paragraph, paragraph.text, applicant_name) or changed
+            break
         break
-    return False
+    if applicant_email:
+        for paragraph in iter_document_paragraphs(document):
+            if "@" in (paragraph.text or "") and replace_cover_letter_email(paragraph, applicant_email):
+                changed = True
+    return changed
 
 
 def remove_dashes_from_document(document: Document) -> bool:
@@ -2906,7 +2911,7 @@ def remove_dashes_from_document(document: Document) -> bool:
         for run in paragraph.runs:
             updated = re.sub(r"(?<=\d)[-–—](?=\d)", " to ", run.text)
             updated = re.sub(r"[-–—]", " ", updated)
-            updated = re.sub(r"\bhands\s+on\b", "practical experience", updated, flags=re.I)
+            updated = re.sub(r"\bhands\s+on\s+experience\b", "practical experience", updated, flags=re.I)
             if updated != run.text:
                 run.text = re.sub(r"[ \t]+", " ", updated)
                 changed = True
@@ -3448,7 +3453,7 @@ def build_job_motivation(job: dict[str, Any], candidate_evidence: dict[str, Any]
             terms = short_join(supported)
             return (
                 f"I am particularly interested in the opportunity at {company} because the posting emphasizes {terms}. "
-                f"That focus connects directly with my documented experience using {terms}, and I would welcome the opportunity to contribute to the team."
+                "That focus connects directly with my documented experience, and I would welcome the opportunity to contribute to the team."
             )
     return (
         "I am particularly interested in the opportunity to contribute to the responsibilities described in this posting. "

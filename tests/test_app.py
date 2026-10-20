@@ -2535,6 +2535,7 @@ class JobAssistantTest(unittest.TestCase):
         lakeview_map = app_module.build_cover_letter_section_map(profile, lakeview, [], grounding.build_candidate_evidence(profile))
         self.assertIn("Python", lakeview_map["motivation"])
         self.assertIn("SQL", lakeview_map["motivation"])
+        self.assertEqual(lakeview_map["motivation"].lower().count("python"), 1)
         self.assertNotIn("Kafka", lakeview_map["motivation"])
         self.assertNotIn("Kubernetes", lakeview_map["motivation"])
 
@@ -2626,6 +2627,26 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(
             [rel.target_ref for rel in generated.paragraphs[1].part.rels.values() if rel.reltype.endswith("/hyperlink")],
             ["mailto:new@example.com"],
+        )
+
+    def test_resume_identity_uses_the_same_selected_email_as_cover_letter(self):
+        document = Document()
+        document.add_paragraph("Old Applicant")
+        contact = document.add_paragraph()
+        self.add_hyperlink(contact, "mailto:old@example.com", "old@example.com")
+        self.assertTrue(app_module.replace_resume_identity(document, "Alex Rivera", "alex@example.com"))
+        self.assertEqual(document.paragraphs[0].text, "Alex Rivera")
+        self.assertEqual(document.paragraphs[1].text, "alex@example.com")
+        self.assertNotIn("old@example.com", document.paragraphs[1].text)
+        self.assertEqual(
+            [rel.target_ref for rel in contact.part.rels.values() if rel.reltype.endswith("/hyperlink")],
+            ["mailto:alex@example.com"],
+        )
+
+    def test_no_dash_phrase_cleanup_does_not_duplicate_experience(self):
+        self.assertEqual(
+            tailoring_pipeline.remove_cover_letter_dashes("I have hands-on experience and tracked 50–250 SKUs."),
+            "I have practical experience and tracked 50 to 250 SKUs.",
         )
 
     def test_scotiabank_cover_letter_template_preserves_structure_and_replaces_stale_content(self):
@@ -4243,6 +4264,14 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("must have both a DOCX résumé and a DOCX cover letter template", frontend)
         self.assertIn("Unknown Canadian eligibility always requires manual confirmation", template)
         self.assertNotIn("saved-search-auto-require-canadian", template)
+
+    def test_pipeline_regeneration_feedback_is_visible_and_deduplicated(self):
+        frontend = Path(app_module.BASE_DIR, "static", "app.js").read_text(encoding="utf-8")
+        self.assertIn("Preparing documents", frontend)
+        self.assertIn("Last successful generation", frontend)
+        self.assertIn("New document version created", frontend)
+        self.assertIn("dataset.busy", frontend)
+        self.assertIn("prepared_at", frontend)
 
     def test_regeneration_does_not_reset_an_active_preparation_lease(self):
         job = self.client.post("/api/jobs", json={"company": "Lease Co", "title": "Developer"}).get_json()
