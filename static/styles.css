@@ -1009,7 +1009,7 @@ th {
   position: fixed;
   right: 18px;
   bottom: 18px;
-  z-index: 20;
+  z-index: 60;
   max-width: min(360px, calc(100vw - 36px));
   border-radius: 8px;
   background: var(--ink);

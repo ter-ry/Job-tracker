@@ -7124,6 +7124,8 @@ def build_qualification_fit(job: dict[str, Any]) -> dict[str, Any]:
         reasons.append(f"Not demonstrated in the selected profile: {', '.join(missing[:5])}.")
     if required:
         reasons.append(f"Posting experience requirement: {required.get('text', 'explicit experience requirement')}.")
+    if seniority.get("explanation"):
+        reasons.append(seniority["explanation"])
     if seniority.get("stretch_role"):
         reasons.append("Stretch opportunity: the posting expects more experience or seniority than the selected profile establishes.")
     label = "Strong qualification match" if score >= 75 and not seniority.get("stretch_role") else "Stretch opportunity" if seniority.get("stretch_role") or score < 60 else "Review qualification fit"

@@ -258,6 +258,7 @@ def score_seniority_fit(profile: dict[str, Any], analysis: dict[str, Any]) -> di
     required = analysis.get("required_experience") or {}
     required_min = required.get("minimum")
     required_max = required.get("maximum")
+    demonstrated_years = explicit_professional_years(profile)
     management = bool(analysis.get("management_role"))
     explanation: list[str] = []
     stretch = False
@@ -286,6 +287,15 @@ def score_seniority_fit(profile: dict[str, Any], analysis: dict[str, Any]) -> di
             stretch = over_by <= 1.5
             score -= 18 if stretch and stretch_allowed else 38
             explanation.append(f"Required experience starts at {required_min:g} years, above the saved maximum of {max_required:g}.")
+        elif demonstrated_years is not None and demonstrated_years < required_min:
+            gap = required_min - demonstrated_years
+            stretch = True
+            score -= 30 if gap >= 2 else 20
+            explanation.append(f"The résumé explicitly demonstrates {demonstrated_years:g} years of professional experience, below the required {required_min:g} years.")
+        elif demonstrated_years is None and max_required is None and required_min > 0:
+            stretch = True
+            score -= 30 if required_min >= 5 else 24
+            explanation.append(f"The résumé does not explicitly demonstrate the required {required_min:g} years of professional experience.")
         elif required_max is not None and required_max <= 2:
             score += 6
             explanation.append("Required experience is in the 0-2 year range.")
@@ -316,6 +326,18 @@ def parse_optional_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if number >= 0 else None
+
+
+def explicit_professional_years(profile: dict[str, Any]) -> float | None:
+    """Read only explicit professional-experience claims, never project durations."""
+    source = " ".join(str(profile.get(field) or "") for field in ("work_experience", "resume_text"))
+    number_words = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+    pattern = re.compile(r"\b(?P<number>\d+(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten)(?:\s*\+)?\s+years?\s+(?:of\s+)?(?:professional|production|software|engineering|programming|application)\s+experience\b", re.I)
+    matches: list[float] = []
+    for match in pattern.finditer(source):
+        raw = match.group("number").lower()
+        matches.append(float(number_words.get(raw, raw)))
+    return max(matches) if matches else None
 
 
 def parse_bool(value: Any) -> bool:

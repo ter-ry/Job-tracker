@@ -179,6 +179,21 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("Not demonstrated", reasons)
         self.assertIn("experience", reasons)
 
+    def test_qualification_fit_penalizes_missing_explicit_years_without_profile_maximum(self):
+        profile = {
+            "target_seniority_levels": "junior, intermediate",
+            "maximum_required_years": "",
+            "work_experience": "Built internal Python tools and APIs.",
+        }
+        analysis = seniority.analyze_job_seniority({
+            "title": "Backend Engineer",
+            "job_description": "Required: 3 to 5+ years of production backend experience and advanced distributed systems.",
+        })
+        fit = seniority.score_seniority_fit(profile, analysis)
+        self.assertTrue(fit["stretch_role"])
+        self.assertLess(fit["score"], 75)
+        self.assertIn("does not explicitly demonstrate", fit["explanation"])
+
     def test_ollama_profile_defaults_and_overrides(self):
         with patch.dict(
             "os.environ",
@@ -389,6 +404,10 @@ class JobAssistantTest(unittest.TestCase):
         self.assertNotIn('window.state.jobs', Path('static/app.js').read_text(encoding='utf-8'))
         self.assertIn('Download résumé DOCX', Path('static/app.js').read_text(encoding='utf-8'))
         self.assertIn('pipeline-matches-label', html)
+        self.assertIn('Checking requirements', Path('static/app.js').read_text(encoding='utf-8'))
+        self.assertIn('Configure candidate profile documents', Path('static/app.js').read_text(encoding='utf-8'))
+        self.assertIn('Candidate profile documents are separate from the legacy Profile documents', Path('static/app.js').read_text(encoding='utf-8'))
+        self.assertIn('z-index: 60', Path('static/styles.css').read_text(encoding='utf-8'))
 
     def test_jobspy_discovery_requires_keywords(self):
         response = self.client.post("/api/discovery/jobspy", json={"location": "Toronto"})

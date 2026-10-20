@@ -249,6 +249,33 @@ function renderPreparationQueue() {
 }
 
 async function queueDiscoveryJob(id) {
+  const showError = (message) => {
+    const job = state.jobs.find((entry) => Number(entry.id) === Number(id));
+    if (!job) return toast(message);
+    openPipelineJobDetails(id);
+    const panel = document.getElementById("pipeline-job-details");
+    const section = document.createElement("section");
+    section.className = "pipeline-preparation-state pipeline-preparation-error";
+    section.dataset.pipelinePreparationError = "true";
+    section.innerHTML = `<h4>Application preparation</h4><p class="pipeline-preparation-status"><strong>Not queued</strong></p><p class="risk high">${escapeHtml(message)}</p><p class="muted">Candidate profile documents are separate from the legacy Profile documents. Configure or upload the candidate profile résumé and cover letter template, then try again.</p><button class="button small" type="button" data-configure-pipeline-profile>Configure candidate profile documents</button>`;
+    panel?.querySelector("[data-pipeline-preparation-error]")?.remove();
+    panel?.appendChild(section);
+    section.querySelector("[data-configure-pipeline-profile]")?.addEventListener("click", () => {
+      panel.hidden = true;
+      panel.classList.remove("is-open");
+      switchTab({ currentTarget: { dataset: { tab: "profile" } } });
+    });
+  };
+  const panel = document.getElementById("pipeline-job-details");
+  if (panel && !panel.hidden) {
+    panel.querySelector("[data-pipeline-preparation-error]")?.remove();
+    const loading = document.createElement("section");
+    loading.className = "pipeline-preparation-state";
+    loading.dataset.pipelinePreparationLoading = "true";
+    loading.innerHTML = `<h4>Application preparation</h4><p class="pipeline-preparation-status"><strong>Checking requirements…</strong></p><p class="muted">Checking candidate profile documents before queueing. Nothing will be generated or submitted yet.</p>`;
+    panel.querySelector("[data-pipeline-preparation]")?.remove();
+    panel.appendChild(loading);
+  }
   try {
     const profiles = await api.get("/api/candidate-profiles");
     if (!profiles.length) throw new Error("Create a candidate profile with a résumé and cover letter template before preparing this job.");
@@ -272,7 +299,7 @@ async function queueDiscoveryJob(id) {
       renderPipelinePreparationState(job, item, item.review_status === "manual_eligibility" ? "Manual eligibility review required" : "Queued for preparation");
     }
     await loadPreparationQueue();
-  } catch (error) { toast(error.message); }
+  } catch (error) { showError(error.message); }
 }
 
 async function prepareQueueItem(id) {
