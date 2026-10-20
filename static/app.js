@@ -10,8 +10,11 @@ const state = {
   discoveryMeta: {},
   discoveryView: "table",
   shortlist: [],
+  preparationQueue: [],
+  preparationRegenerations: {},
   candidateProfiles: [],
   generationSelections: {},
+  shortlistRegenerations: {},
   selectedCandidateProfileId: "",
 };
 
@@ -75,7 +78,10 @@ const profileFields = [
 const api = {
   async get(path) {
     const response = await fetch(path);
-    if (!response.ok) throw new Error("Request failed");
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.error || `Request failed (${response.status})`);
+    }
     return response.json();
   },
   async send(path, method, body) {
@@ -115,6 +121,8 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("csv-import-form").addEventListener("submit", importCsv);
   document.getElementById("discovery-test-sources").addEventListener("click", testJobSources);
   document.getElementById("refresh-shortlist").addEventListener("click", loadAll);
+  document.getElementById("refresh-preparation-queue")?.addEventListener("click", loadPreparationQueue);
+  document.getElementById("preparation-status-filter")?.addEventListener("change", loadPreparationQueue);
   document.getElementById("generate").addEventListener("click", generateMaterials);
   document.getElementById("analyse-resume-match").addEventListener("click", analyseResumeMatch);
   document.getElementById("generate-local-draft").addEventListener("click", generateLocalDraft);
@@ -182,7 +190,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
 async function loadAll() {
   try {
-    const [jobs, dashboard, profile, ollamaHealth, evidence, systemHealth, candidateProfiles] = await Promise.all([
+    const [jobs, dashboard, profile, ollamaHealth, systemHealth, evidence, candidateProfiles] = await Promise.all([
       api.get("/api/jobs"),
       api.get("/api/dashboard"),
       api.get("/api/profile"),
@@ -196,6 +204,7 @@ async function loadAll() {
     state.profile = profile;
     state.evidence = evidence;
     state.shortlist = shortlist;
+    await loadPreparationQueue();
     state.candidateProfiles = Array.isArray(candidateProfiles) ? candidateProfiles : [];
     await hydrateGenerationSelections();
     state.systemHealth = systemHealth;
@@ -214,6 +223,133 @@ async function loadAll() {
   }
 }
 
+async function loadPreparationQueue() {
+  const target = document.getElementById("preparation-queue");
+  if (!target) return;
+  try {
+    const status = value("preparation-status-filter");
+    state.preparationQueue = await api.get(`/api/preparation/queue${status ? `?status=${encodeURIComponent(status)}` : ""}`);
+    renderPreparationQueue();
+  } catch (error) { target.textContent = error.message; }
+}
+
+function renderPreparationQueue() {
+  const target = document.getElementById("preparation-queue");
+  if (!target) return;
+  const items = Array.isArray(state.preparationQueue) ? state.preparationQueue : [];
+  target.classList.toggle("empty", !items.length);
+  if (!items.length) { target.textContent = "No application packages queued."; return; }
+  target.innerHTML = items.map((item) => {
+    const job = item.job || {};
+    const regeneration = state.preparationRegenerations[item.id] || {};
+    const regenerating = regeneration.status === "preparing";
+    const backendPreparing = item.status === "preparing";
+    const score = item.keywords_score || {};
+    const matched = score.matched_count != null ? `${score.matched_count}/${score.total || 0}` : "not reviewed";
+    const error = regeneration.status === "error" ? regeneration.message : item.error || item.resume_error || item.cover_letter_error;
+    const preparedAt = item.prepared_at || "";
+    const feedback = regenerating
+      ? `<section class="generation-feedback" aria-live="polite"><strong><span class="spinner" aria-hidden="true"></span> Regenerating...</strong><p>Generating résumé and cover letter. Please wait.</p></section>`
+      : backendPreparing
+        ? `<section class="generation-feedback" aria-live="polite"><strong><span class="spinner" aria-hidden="true"></span> Preparing documents...</strong><p>Document generation is in progress. Please wait.</p></section>`
+      : regeneration.status === "success"
+        ? `<section class="generation-feedback success" aria-live="polite"><strong>New document version ready</strong><p>The new résumé and cover letter are available below.</p>${preparedAt ? `<p class="muted">Completed ${escapeHtml(new Date(preparedAt).toLocaleString())}</p>` : ""}</section>`
+        : regeneration.status === "error"
+          ? `<section class="generation-feedback error" aria-live="assertive"><strong>Regeneration failed</strong><p>${escapeHtml(regeneration.message || "Document generation failed.")}</p><p class="muted">Retry when the issue is resolved.</p></section>`
+          : preparedAt && item.status === "ready_for_review"
+            ? `<section class="generation-feedback success"><strong>Package ready for review</strong><p class="muted">Last completed ${escapeHtml(new Date(preparedAt).toLocaleString())}</p></section>`
+            : "";
+    const actions = item.status === "ready_for_review"
+      ? `<button class="button small" type="button" onclick="reviewPreparation(${item.id}, 'approve')">Approve package</button><button class="button ghost small" type="button" onclick="previewPreparation(${item.id})">Preview</button><button class="button ghost small" type="button" ${regenerating ? "disabled" : ""} onclick="regeneratePreparation(${item.id})">${regenerating ? '<span class="spinner" aria-hidden="true"></span> Regenerating...' : "Regenerate"}</button>${item.prepared_resume_path ? `<a class="button ghost small" href="/api/preparation/${item.id}/download/resume">Download résumé</a>` : ""}${item.prepared_cover_letter_path ? `<a class="button ghost small" href="/api/preparation/${item.id}/download/cover-letter">Download cover letter</a>` : ""}`
+      : item.status === "queued" || item.status === "failed"
+        ? `${item.review_status === "manual_eligibility" ? `<button class="button small" type="button" onclick="reviewEligibility(${item.id})">Confirm Canadian eligibility</button>` : `<button class="button small" type="button" onclick="prepareQueueItem(${item.id})">${item.status === "failed" ? "Retry preparation" : "Prepare package"}</button>`}`
+        : "";
+    return `<article class="preparation-row" data-preparation-id="${item.id}"><div class="preparation-main"><h3>${escapeHtml(job.title || "Untitled role")}</h3><p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(job.location || "Location unavailable")}</p><p class="muted">${escapeHtml(job.remote_eligibility || "unknown")} · ${escapeHtml(job.salary || "Salary unavailable")} · Job Priority ${Number(item.job_priority || 0)}</p><p class="muted">Profile ${escapeHtml(String(item.candidate_profile_id || "not selected"))} · Résumé ${escapeHtml(item.resume_status || "pending")} · Cover letter ${escapeHtml(item.cover_letter_status || "pending")}</p>${item.eligibility_note ? `<p class="muted">${escapeHtml(item.eligibility_note)}</p>` : ""}${feedback}${error && regeneration.status !== "error" ? `<p class="risk high">${escapeHtml(error)}</p>` : ""}</div><div class="preparation-meta"><strong>${escapeHtml(item.status.replaceAll("_", " "))}</strong><span>Keywords Score ${escapeHtml(matched)}</span><div class="row-actions">${actions}${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open application</a>` : ""}<button class="button ghost small" type="button" onclick="reviewPreparation(${item.id}, 'skip')">Skip</button></div></div></article>`;
+  }).join("");
+}
+
+async function queueDiscoveryJob(id) {
+  const showError = (message) => {
+    const job = state.jobs.find((entry) => Number(entry.id) === Number(id));
+    if (!job) return toast(message);
+    openPipelineJobDetails(id);
+    const panel = document.getElementById("pipeline-job-details");
+    const section = document.createElement("section");
+    section.className = "pipeline-preparation-state pipeline-preparation-error";
+    section.dataset.pipelinePreparationError = "true";
+    section.innerHTML = `<h4>Application preparation</h4><p class="pipeline-preparation-status"><strong>Not queued</strong></p><p class="risk high">${escapeHtml(message)}</p><p class="muted">Candidate profile documents are separate from the legacy Profile documents. Configure or upload the candidate profile résumé and cover letter template, then try again.</p><button class="button small" type="button" data-configure-pipeline-profile>Configure candidate profile documents</button>`;
+    panel?.querySelector("[data-pipeline-preparation-error]")?.remove();
+    panel?.appendChild(section);
+    section.querySelector("[data-configure-pipeline-profile]")?.addEventListener("click", () => {
+      panel.hidden = true;
+      panel.classList.remove("is-open");
+      switchTab({ currentTarget: { dataset: { tab: "profile" } } });
+    });
+  };
+  const panel = document.getElementById("pipeline-job-details");
+  if (panel && !panel.hidden) {
+    panel.querySelector("[data-pipeline-preparation-error]")?.remove();
+    const loading = document.createElement("section");
+    loading.className = "pipeline-preparation-state";
+    loading.dataset.pipelinePreparationLoading = "true";
+    loading.innerHTML = `<h4>Application preparation</h4><p class="pipeline-preparation-status"><strong>Checking requirements…</strong></p><p class="muted">Checking candidate profile documents before queueing. Nothing will be generated or submitted yet.</p>`;
+    panel.querySelector("[data-pipeline-preparation]")?.remove();
+    panel.appendChild(loading);
+  }
+  try {
+    const profiles = await api.get("/api/candidate-profiles");
+    if (!profiles.length) throw new Error("Create a candidate profile with a résumé and cover letter template before preparing this job.");
+    let profile = profiles.length === 1 ? profiles[0] : null;
+    if (!profile) {
+      const choices = profiles.map((item, index) => `${index + 1}. ${item.name}`).join("\n");
+      const selected = window.prompt(`Choose the candidate profile for this package by number:\n${choices}`);
+      const index = Number(selected) - 1;
+      profile = Number.isInteger(index) && profiles[index] ? profiles[index] : null;
+      if (!profile) throw new Error("Choose a valid candidate profile before preparing this job.");
+    }
+    const documents = await api.get(`/api/candidate-profiles/${profile.id}/documents`);
+    const resume = (documents.resumes || []).find((item) => item.is_default) || documents.resumes?.[0];
+    const cover = (documents.cover_letter_templates || []).find((item) => item.is_default) || documents.cover_letter_templates?.[0];
+    if (!resume || !cover) throw new Error(`Profile "${profile.name}" must have both a DOCX résumé and a DOCX cover letter template before preparing this job.`);
+    const item = await api.send("/api/preparation/queue", "POST", { job_id: id, candidate_profile_id: profile.id, resume_id: resume.id, cover_letter_template_id: cover.id });
+    toast("Application package queued for review");
+    await loadPreparationQueue();
+    await focusPreparationPackage(item.id);
+  } catch (error) { showError(error.message); }
+}
+
+async function prepareQueueItem(id) {
+  try { const result = await api.send(`/api/preparation/${id}/prepare`, "POST", {}); toast(result.status === "ready_for_review" ? "Package ready for review" : "Package preparation failed"); await loadPreparationQueue(); } catch (error) { toast(error.message); }
+}
+
+async function regeneratePreparation(id) {
+  if (state.preparationRegenerations[id]?.status === "preparing") return;
+  state.preparationRegenerations[id] = { status: "preparing", startedAt: new Date().toISOString() };
+  renderPreparationQueue();
+  try {
+    const result = await api.send(`/api/preparation/${id}/regenerate`, "POST", {});
+    state.preparationRegenerations[id] = result.status === "ready_for_review"
+      ? { status: "success" }
+      : { status: "error", message: result.error || "Package regeneration failed." };
+  } catch (error) {
+    state.preparationRegenerations[id] = { status: "error", message: error.message || "Package regeneration failed." };
+  }
+  await loadPreparationQueue();
+}
+
+async function reviewEligibility(id) {
+  if (!window.confirm("Confirm that this opportunity is eligible for work in Canada before preparing documents?")) return;
+  try { await api.send(`/api/preparation/${id}/eligibility-review`, "POST", { confirmed: true }); toast("Eligibility confirmed; prepare the package when ready"); await loadPreparationQueue(); } catch (error) { toast(error.message); }
+}
+
+async function reviewPreparation(id, action) {
+  try { await api.send(`/api/preparation/${id}/review`, "POST", { action }); toast(action === "approve" ? "Package approved for your next manual step" : "Package skipped"); await loadPreparationQueue(); } catch (error) { toast(error.message); }
+}
+
+async function previewPreparation(id) {
+  try { const result = await api.get(`/api/preparation/${id}/preview`); const target = document.getElementById("preparation-queue"); target.insertAdjacentHTML("afterbegin", `<details class="preparation-preview" open><summary>Document preview</summary><h4>Résumé</h4><pre>${escapeHtml(result.resume || "Unavailable")}</pre><h4>Cover letter</h4><pre>${escapeHtml(result.cover_letter || "Unavailable")}</pre></details>`); } catch (error) { toast(error.message); }
+}
+
 async function loadSavedSearches() {
   const list = document.getElementById("saved-search-list");
   if (!list) return;
@@ -221,7 +357,7 @@ async function loadSavedSearches() {
     const searches = await api.get("/api/discovery/searches");
     list.innerHTML = searches.length ? searches.map((search) => `
       <article class="saved-search-row">
-        <div><strong>${escapeHtml(search.name)}</strong><span class="muted">${escapeHtml(search.keywords)} · ${escapeHtml(search.location || "Anywhere")}</span><span class="muted">${search.enabled ? "Scheduled" : "Manual only"} · ${escapeHtml((search.enabled_sources || []).map(sourceLabel).join(", "))}</span></div>
+        <div><strong>${escapeHtml(search.name)}</strong><span class="muted">${escapeHtml(search.keywords)} · ${escapeHtml(search.location || "Anywhere")}</span><span class="muted">${search.enabled ? "Scheduled" : "Manual only"} · ${escapeHtml((search.enabled_sources || []).map(sourceLabel).join(", "))} · ${search.auto_prepare_enabled ? `Auto preparation at ${Number(search.auto_prepare_min_priority || 75)}+ for new discovery results` : "Preparation manual"}</span></div>
         <div class="actions compact"><button class="button small" type="button" onclick="runSavedSearch(${search.id})">Run now</button><button class="button ghost small" type="button" onclick='editSavedSearch(${JSON.stringify(search).replaceAll("'", "&apos;")} )'>Edit</button></div>
       </article>`).join("") : `<p class="muted">No saved searches yet.</p>`;
   } catch (error) { list.innerHTML = `<p class="muted">${escapeHtml(error.message)}</p>`; }
@@ -245,6 +381,9 @@ function editSavedSearch(search) {
   setValue("saved-search-date-window", search.date_window || "14d");
   setValue("saved-search-interval", search.interval_minutes || 360);
   setChecked("saved-search-enabled", Boolean(search.enabled));
+  setChecked("saved-search-auto-prepare", Boolean(search.auto_prepare_enabled));
+  setValue("saved-search-auto-min-priority", search.auto_prepare_min_priority || 75);
+  setValue("saved-search-auto-profile", search.auto_prepare_candidate_profile_id || "");
   document.querySelectorAll('input[name="saved-search-source"]').forEach((input) => { input.checked = (search.enabled_sources || []).includes(input.value); });
 }
 
@@ -255,6 +394,8 @@ async function saveSavedSearch(event) {
     name: value("saved-search-name"), keywords: value("saved-search-keywords"), location: value("saved-search-location"),
     remote_preference: value("saved-search-remote"), seniority: value("saved-search-seniority"), minimum_salary: Number(value("saved-search-minimum-salary") || 0),
     date_window: value("saved-search-date-window"), interval_minutes: Number(value("saved-search-interval") || 360), enabled: checked("saved-search-enabled"),
+    auto_prepare_enabled: checked("saved-search-auto-prepare"), auto_prepare_min_priority: Number(value("saved-search-auto-min-priority") || 75),
+    auto_prepare_candidate_profile_id: Number(value("saved-search-auto-profile") || 0),
     enabled_sources: [...document.querySelectorAll('input[name="saved-search-source"]:checked')].map((input) => input.value),
   };
   try {
@@ -274,7 +415,7 @@ async function loadDiscoveryInbox() {
   try {
     const jobs = await api.get("/api/discovery/inbox");
     target.classList.toggle("empty", !jobs.length);
-    target.innerHTML = jobs.length ? jobs.map((job) => `<article class="inbox-row"><div><strong>${escapeHtml(job.title || "Untitled role")}</strong><span>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location unavailable")}</span><span class="muted">${escapeHtml(job.remote_eligibility || "unknown")} · ${escapeHtml(job.salary || "Salary unavailable")} · ${escapeHtml(job.source || "JobSpy")} · ${escapeHtml(job.posted_date || "date unknown")}</span></div><div><strong>Job Priority ${Number(job.overall_score || job.fit_score || 0)}</strong><span class="muted">Discovered ${escapeHtml(job.discovery_first_seen_at || "")}</span></div><div class="row-actions"><button class="button small" type="button" onclick="reviewInboxJob(${job.id})">Review</button><button class="button ghost small" type="button" onclick="saveInboxJob(${job.id})">Shortlist</button><button class="button ghost small" type="button" onclick="ignoreInboxJob(${job.id})">Ignore</button>${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open</a>` : ""}</div></article>`).join("") : "No discovered opportunities yet.";
+    target.innerHTML = jobs.length ? jobs.map((job) => `<article class="inbox-row"><div><strong>${escapeHtml(job.title || "Untitled role")}</strong><span>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location unavailable")}</span><span class="muted">${escapeHtml(job.remote_eligibility || "unknown")} · ${escapeHtml(job.salary || "Salary unavailable")} · ${escapeHtml(job.source || "JobSpy")} · ${escapeHtml(job.posted_date || "date unknown")}</span></div><div><strong>Job Priority ${Number(job.overall_score || job.fit_score || 0)}</strong><span class="muted">Discovered ${escapeHtml(job.discovery_first_seen_at || "")}</span></div><div class="row-actions"><button class="button small" type="button" onclick="reviewInboxJob(${job.id})">Review</button><button class="button ghost small" type="button" onclick="queueDiscoveryJob(${job.id})">Prepare package</button><button class="button ghost small" type="button" onclick="saveInboxJob(${job.id})">Shortlist</button><button class="button ghost small" type="button" onclick="ignoreInboxJob(${job.id})">Ignore</button>${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open</a>` : ""}</div></article>`).join("") : "No discovered opportunities yet.";
   } catch (error) { target.textContent = error.message; }
 }
 
@@ -303,8 +444,11 @@ async function loadDiscoveryTaskStatus() {
 function showCandidateProfileForm(profile = null) {
   const form = document.getElementById("candidate-profile-form");
   form.hidden = false;
+  const error = document.getElementById("candidate-profile-form-error");
+  if (error) { error.hidden = true; error.textContent = ""; }
   form.dataset.profileId = profile?.id || "";
   setText("candidate-profile-form-title", profile ? `Edit ${profile.name}` : "Create candidate profile");
+  setText("candidate-profile-submit", profile ? "Save candidate profile" : "Create candidate profile");
   document.getElementById("candidate-profile-name").value = profile?.name || "";
   document.getElementById("candidate-profile-name").disabled = Boolean(profile);
   document.getElementById("candidate-profile-identity-mode").value = profile?.identity_mode || "shared";
@@ -320,11 +464,34 @@ function hideCandidateProfileForm() {
   form.reset();
   form.dataset.profileId = "";
   document.getElementById("candidate-profile-name").disabled = false;
+  setText("candidate-profile-submit", "Create candidate profile");
+}
+
+function setCandidateProfileFormError(message) {
+  const target = document.getElementById("candidate-profile-form-error");
+  if (!target) return;
+  target.textContent = message || "";
+  target.hidden = !message;
 }
 
 async function saveCandidateProfile(event) {
   event.preventDefault();
   const form = event.currentTarget;
+  if (form.dataset.submitting === "true") return;
+  setCandidateProfileFormError("");
+  const nameField = document.getElementById("candidate-profile-name");
+  if (!nameField.value.trim()) {
+    nameField.setCustomValidity("Enter a profile label.");
+    nameField.reportValidity();
+    nameField.setCustomValidity("");
+    setCandidateProfileFormError("Profile label is required.");
+    return;
+  }
+  if (!form.checkValidity()) {
+    form.reportValidity();
+    setCandidateProfileFormError("Check the highlighted fields and try again.");
+    return;
+  }
   const payload = {
     name: value("candidate-profile-name"),
     identity_mode: value("candidate-profile-identity-mode"),
@@ -333,13 +500,40 @@ async function saveCandidateProfile(event) {
     applicant_phone: value("candidate-profile-applicant-phone"),
     applicant_location: value("candidate-profile-applicant-location"),
   };
+  const submit = document.getElementById("candidate-profile-submit");
+  form.dataset.submitting = "true";
+  if (submit) { submit.disabled = true; submit.textContent = "Saving candidate profile…"; }
   try {
-    if (form.dataset.profileId) await api.send(`/api/candidate-profiles/${form.dataset.profileId}`, "PATCH", payload);
-    else await api.send("/api/candidate-profiles", "POST", payload);
+    const saved = form.dataset.profileId
+      ? await api.send(`/api/candidate-profiles/${form.dataset.profileId}`, "PATCH", payload)
+      : await api.send("/api/candidate-profiles", "POST", payload);
+    const selectedId = String(saved.id || form.dataset.profileId);
     hideCandidateProfileForm();
-    toast("Candidate profile saved");
-    await loadAll();
-  } catch (error) { toast(error.message); }
+    try {
+      await refreshCandidateProfiles(selectedId);
+      toast("Candidate profile saved");
+    } catch (error) {
+      showCandidateProfileForm({ ...payload, id: selectedId });
+      setCandidateProfileFormError(`Profile saved, but the candidate profile list could not be refreshed: ${error.message}. Use Refresh or reload the page.`);
+    }
+  } catch (error) {
+    setCandidateProfileFormError(`Candidate profile was not saved: ${error.message}`);
+  } finally {
+    form.dataset.submitting = "false";
+    if (submit) { submit.disabled = false; submit.textContent = form.dataset.profileId ? "Save candidate profile" : "Create candidate profile"; }
+  }
+}
+
+async function refreshCandidateProfiles(selectId = "") {
+  const profiles = await api.get("/api/candidate-profiles");
+  state.candidateProfiles = Array.isArray(profiles) ? profiles : [];
+  if (selectId && state.candidateProfiles.some((profile) => String(profile.id) === String(selectId))) {
+    state.selectedCandidateProfileId = String(selectId);
+  } else if (!state.candidateProfiles.some((profile) => String(profile.id) === state.selectedCandidateProfileId)) {
+    state.selectedCandidateProfileId = state.candidateProfiles[0] ? String(state.candidateProfiles[0].id) : "";
+  }
+  renderCandidateProfiles();
+  if (state.selectedCandidateProfileId) await renderCandidateProfileDocuments();
 }
 
 function renderCandidateProfiles() {
@@ -352,6 +546,8 @@ function renderCandidateProfiles() {
     return;
   }
   if (!state.selectedCandidateProfileId) state.selectedCandidateProfileId = String(state.candidateProfiles[0].id);
+  const autoProfile = document.getElementById("saved-search-auto-profile");
+  if (autoProfile) autoProfile.innerHTML = `<option value="">Choose a profile when available</option>${state.candidateProfiles.map((profile) => `<option value="${escapeAttribute(profile.id)}">${escapeHtml(profile.name)}</option>`).join("")}`;
   list.innerHTML = state.candidateProfiles.map((profile) => `
     <article class="candidate-profile-card ${String(profile.id) === state.selectedCandidateProfileId ? "selected" : ""}">
       <div><h3>${escapeHtml(profile.name)}</h3><p class="muted">${profile.identity_mode === "distinct" ? escapeHtml(profile.applicant_name || "Distinct identity not set") : "Uses active profile identity"}</p></div>
@@ -410,6 +606,20 @@ function switchTab(event) {
   document.querySelectorAll(".tab-panel").forEach((panel) => panel.classList.toggle("active", panel.id === target));
 }
 
+async function focusPreparationPackage(itemId) {
+  const filter = document.getElementById("preparation-status-filter");
+  if (filter && filter.value) {
+    filter.value = "";
+    await loadPreparationQueue();
+  }
+  document.querySelector('[data-tab="shortlist"]')?.click();
+  const item = document.querySelector(`[data-preparation-id="${itemId}"]`);
+  if (!item) return;
+  item.classList.add("preparation-row-highlight");
+  item.scrollIntoView({ behavior: "smooth", block: "center" });
+  window.setTimeout(() => item.classList.remove("preparation-row-highlight"), 4000);
+}
+
 function renderDashboard(dashboard) {
   setText("jobs-saved", dashboard.jobs_saved);
   setText("applications-this-week", dashboard.applications_this_week);
@@ -422,6 +632,38 @@ function renderDashboard(dashboard) {
 }
 
 let pipelineCategory = "All";
+let pipelineSort = "qualification";
+let pipelineDetailScrollY = 0;
+
+function normalizedPipelineSalary(job) {
+  const value = Number(job.salary_midpoint || job.salary_max || job.salary_min || 0);
+  if (!value) return null;
+  const currency = String(job.salary_currency || "CAD").toUpperCase();
+  const toCad = { CAD: 1, USD: 1.36, EUR: 1.48, GBP: 1.74, AUD: 0.9 };
+  return value * (toCad[currency] || 1);
+}
+
+function pipelineSortValue(job, mode) {
+  if (mode === "qualification") return Number(job.qualification_fit_score ?? -1);
+  if (mode === "priority") return Number(job.overall_score ?? -1);
+  if (mode === "salary") return normalizedPipelineSalary(job);
+  if (mode === "distance") return job.distance_km === "" || job.distance_km == null ? null : Number(job.distance_km);
+  if (mode === "posted") return job.posted_date ? Date.parse(job.posted_date) : null;
+  if (mode === "discovered") return job.discovery_first_seen_at ? Date.parse(job.discovery_first_seen_at) : null;
+  if (mode === "deadline") return job.deadline ? Date.parse(job.deadline) : null;
+  return null;
+}
+
+function sortPipelineJobs(items, mode) {
+  return [...items].sort((a, b) => {
+    const left = pipelineSortValue(a, mode);
+    const right = pipelineSortValue(b, mode);
+    if (left === null && right === null) return Number(a.id || 0) - Number(b.id || 0);
+    if (left === null) return 1;
+    if (right === null) return -1;
+    return mode === "distance" || mode === "deadline" ? left - right : right - left;
+  });
+}
 
 function renderPipelineDashboard(jobs) {
   const items = Array.isArray(jobs) ? jobs : [];
@@ -434,24 +676,80 @@ function renderPipelineDashboard(jobs) {
     pipelineCategory = button.dataset.category || "All";
     renderPipelineDashboard(items);
   }));
+  const sortControl = document.getElementById("pipeline-sort");
+  if (sortControl) {
+    sortControl.value = pipelineSort;
+    sortControl.onchange = (event) => { pipelineSort = event.target.value; renderPipelineDashboard(state.jobs); };
+  }
   const filtered = pipelineCategory === "All" ? items : items.filter((job) => String(job.role_type || "") === pipelineCategory);
   setText("pipeline-discovered", items.length);
-  setText("pipeline-matches", items.filter((job) => Number(job.fit_score || 0) >= 75).length);
-  setText("pipeline-ready", items.filter((job) => ["Saved", "shortlisted", "Drafting"].includes(job.status)).length);
+  setText("pipeline-matches", items.filter((job) => Number(job.qualification_fit_score || 0) >= 75).length);
+  setText("pipeline-ready", items.filter((job) => ["ready_for_review"].includes(job.preparation_status)).length);
   const cards = document.getElementById("pipeline-cards");
   if (!filtered.length) {
     cards.innerHTML = `<p class="pipeline-empty">No saved jobs match this category.</p>`;
     return;
   }
-  cards.innerHTML = filtered.slice().sort((a, b) => Number(b.fit_score || 0) - Number(a.fit_score || 0)).map((job) => {
-    const score = Number(job.fit_score || 0);
-    const action = ["Applied", "Interview", "Offer"].includes(job.status) ? "Track" : score >= 75 ? "Ready" : "Review";
-    return `<article class="pipeline-card"><div><h3>${escapeHtml(job.title || "Untitled role")}</h3><p>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location not listed")}</p><p class="pipeline-subline">Suggested résumé: ${escapeHtml(job.role_type || "General")}</p></div><div class="pipeline-score"><strong>${score}%</strong><span>Fit score</span><button type="button" data-job-id="${job.id}" class="pipeline-action">${action}</button></div></article>`;
+  cards.innerHTML = sortPipelineJobs(filtered, pipelineSort).map((job) => {
+    const score = Number(job.qualification_fit_score ?? job.fit_score ?? 0);
+    const priority = Number(job.overall_score || 0);
+    return `<article class="pipeline-card" data-job-id="${job.id}"><div><h3>${escapeHtml(job.title || "Untitled role")}</h3><p>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location not listed")}</p><p class="pipeline-subline">${escapeHtml(job.qualification_fit_label || "Qualification fit")}</p></div><div class="pipeline-score"><strong>${score}%</strong><span>Qualification fit</span><small>Job Priority ${priority}</small><button type="button" data-job-id="${job.id}" class="pipeline-action">View details</button></div></article>`;
   }).join("");
-  cards.querySelectorAll(".pipeline-action").forEach((button) => button.addEventListener("click", () => {
-    const job = state.jobs.find((item) => String(item.id) === String(button.dataset.jobId));
-    if (job) { switchTab({ currentTarget: { dataset: { tab: "tracker" } } }); loadJob(job); }
+  cards.querySelectorAll(".pipeline-card").forEach((card) => card.addEventListener("click", (event) => {
+    if (event.target.closest("button, a")) return;
+    openPipelineJobDetails(Number(card.dataset.jobId));
   }));
+  cards.querySelectorAll(".pipeline-action").forEach((button) => button.addEventListener("click", () => {
+    openPipelineJobDetails(Number(button.dataset.jobId));
+  }));
+}
+
+function openPipelineJobDetails(id) {
+  const job = state.jobs.find((item) => Number(item.id) === Number(id));
+  const panel = document.getElementById("pipeline-job-details");
+  if (!job || !panel) return;
+  if (panel.hidden) pipelineDetailScrollY = window.scrollY;
+  const requirements = [job.required_skills, job.preferred_skills, job.responsibilities].filter(Boolean).join("\n\n");
+  const reasons = (job.qualification_fit_reasons || []).map((reason) => `<li>${escapeHtml(reason)}</li>`).join("") || "<li>Review the full posting and résumé evidence before applying.</li>";
+  panel.innerHTML = `<div class="pipeline-detail-header"><div><span class="eyebrow">Job details</span><h3 id="pipeline-detail-title">${escapeHtml(job.title || "Untitled role")}</h3><p>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location not listed")}</p></div><button class="button ghost small" type="button" data-close-job-details>Close</button></div><div class="pipeline-detail-grid"><div><strong>Qualification fit</strong><p class="pipeline-detail-score">${Number(job.qualification_fit_score ?? job.fit_score ?? 0)}% · ${escapeHtml(job.qualification_fit_label || "Review required")}</p><ul>${reasons}</ul></div><div><strong>Job Priority</strong><p>${Number(job.overall_score || 0)}</p><strong>Salary</strong><p>${escapeHtml(job.salary || "Not listed")}</p><strong>Posting date</strong><p>${escapeHtml(job.posted_date || "Not listed")}</p><strong>Deadline</strong><p>${escapeHtml(job.deadline || "Not listed")}</p></div></div><details open><summary>Requirements and responsibilities</summary><pre>${escapeHtml(requirements || "No structured requirements were stored.")}</pre></details><details><summary>Full job description</summary><pre>${escapeHtml(job.job_description || "No job description was stored.")}</pre></details><p class="pipeline-detail-links">${job.url ? `<a href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Original posting</a>` : "Original posting unavailable"}${job.application_url && job.application_url !== job.url ? ` · <a href="${escapeAttribute(job.application_url)}" target="_blank" rel="noreferrer">Application page</a>` : ""}</p><div class="actions"><button class="button" type="button" data-prepare-job="${job.id}">Prepare application</button><button class="button ghost" type="button" data-edit-job="${job.id}">Edit job</button></div>`;
+  panel.setAttribute("role", "dialog");
+  panel.setAttribute("aria-modal", "true");
+  panel.setAttribute("aria-labelledby", "pipeline-detail-title");
+  panel.hidden = false;
+  panel.classList.add("is-open");
+  panel.querySelector("[data-close-job-details]").addEventListener("click", () => {
+    panel.hidden = true;
+    panel.classList.remove("is-open");
+    window.scrollTo({ top: pipelineDetailScrollY, behavior: "auto" });
+  });
+  panel.querySelector("[data-prepare-job]").addEventListener("click", () => queueDiscoveryJob(id));
+  panel.querySelector("[data-edit-job]").addEventListener("click", () => { panel.hidden = true; switchTab({ currentTarget: { dataset: { tab: "tracker" } } }); loadJob(job); });
+  panel.querySelector("[data-close-job-details]").focus();
+  const existingPreparation = state.preparationQueue.find((item) => Number(item.job_id) === Number(id));
+  if (existingPreparation) renderPipelinePreparationState(job, existingPreparation);
+}
+
+function renderPipelinePreparationState(_job, item) {
+  const panel = document.getElementById("pipeline-job-details");
+  if (!panel || !item) return;
+  const status = String(item.status || "queued").replaceAll("_", " ");
+  const preparedAt = item.prepared_at ? `Last successful generation: ${new Date(item.prepared_at).toLocaleString()}` : "";
+  const wrapper = document.createElement("section");
+  wrapper.className = "pipeline-preparation-state";
+  wrapper.dataset.pipelinePreparation = item.id;
+  const message = item.status === "approved"
+    ? "Approved for your next manual step. Nothing was submitted."
+    : item.status === "ready_for_review"
+      ? "Documents are ready for review."
+      : item.status === "preparing"
+        ? "Document generation is in progress."
+        : item.status === "failed"
+          ? "Preparation needs attention."
+          : "Package is queued; generation is managed in the application queue.";
+  wrapper.innerHTML = `<h4>Application package</h4><p class="pipeline-preparation-status"><strong>${escapeHtml(status)}</strong></p><p class="muted">${escapeHtml(message)}</p>${preparedAt ? `<p class="success-text">${escapeHtml(preparedAt)}</p>` : ""}<button class="button small" type="button" data-view-application-package>View application package</button>`;
+  panel.querySelector("[data-pipeline-preparation]")?.remove();
+  panel.appendChild(wrapper);
+  wrapper.querySelector("[data-view-application-package]")?.addEventListener("click", () => focusPreparationPackage(item.id));
 }
 
 function renderProfile(profile) {
@@ -608,6 +906,9 @@ function sortJobs(jobs, sortBy) {
   const copy = [...jobs];
   const salaryNumber = (job) => Math.max(0, ...String(job.salary || "").match(/\d+/g)?.map(Number) || [0]);
   if (sortBy === "salary") return copy.sort((a, b) => salaryNumber(b) - salaryNumber(a));
+  if (sortBy === "distance") return copy.sort((a, b) => Number(a.distance_km || 999999) - Number(b.distance_km || 999999));
+  if (sortBy === "posted") return copy.sort((a, b) => String(b.posted_date || "").localeCompare(String(a.posted_date || "")));
+  if (sortBy === "discovered") return copy.sort((a, b) => String(b.discovery_first_seen_at || b.date_added || "").localeCompare(String(a.discovery_first_seen_at || a.date_added || "")));
   if (sortBy === "deadline") return copy.sort((a, b) => String(a.deadline || "9999").localeCompare(String(b.deadline || "9999")));
   if (sortBy === "location") return copy.sort((a, b) => String(a.location || "").localeCompare(String(b.location || "")));
   if (sortBy === "date") return copy.sort((a, b) => String(b.date_added || "").localeCompare(String(a.date_added || "")));
@@ -817,12 +1118,8 @@ async function generateLocalDraft() {
     document.getElementById("generated-output").classList.remove("empty");
     document.getElementById("generated-output").innerHTML = `
       <section>
-        <h3>${escapeHtml(output.draft.label)}</h3>
+        <h3>Diagnostic résumé suggestions (not an application document)</h3>
         <pre>${escapeHtml(output.draft.text)}</pre>
-        <div class="export-row">
-          <a class="button small ghost" href="/export/${id}/resume.txt">Draft .txt</a>
-          <a class="button small ghost" href="/export/${id}/resume.docx">Draft .docx</a>
-        </div>
       </section>
     `;
     toast("Local tailored draft generated");
@@ -911,14 +1208,6 @@ async function generateForJob(id) {
 function renderGenerated(output) {
   const jobId = value("job-id");
   const review = output.tailoring_review || {};
-  const exportLinks = jobId
-    ? `<div class="export-row">
-        <a class="button small ghost" href="/export/${jobId}/cover_letter.txt">Cover .txt</a>
-        <a class="button small ghost" href="/export/${jobId}/cover_letter.docx">Cover .docx</a>
-        <a class="button small ghost" href="/export/${jobId}/resume.txt">Resume .txt</a>
-        <a class="button small ghost" href="/export/${jobId}/resume.docx">Resume .docx</a>
-      </div>`
-    : `<p class="muted">Save the job first to enable version history and document exports.</p>`;
   document.getElementById("generated-output").classList.remove("empty");
   document.getElementById("generated-output").innerHTML = `
     <section>
@@ -958,10 +1247,9 @@ function renderGenerated(output) {
       </details>
     </section>
     <section>
-      <h3>Resume suggestions</h3>
+      <h3>Diagnostic résumé suggestions (not an application document)</h3>
       ${output.local_tailored_text ? `<pre>${escapeHtml(output.local_tailored_text)}</pre>` : ""}
       <pre>${escapeHtml(output.resume_text)}</pre>
-      ${exportLinks}
     </section>
     <section>
       <h3>Cover letter</h3>
@@ -2126,6 +2414,8 @@ function documentSelectorOptions(items, selectedId, emptyLabel) {
 
 function renderShortlistCard(job) {
   const selection = generationSelection(job.id);
+  const regeneration = state.shortlistRegenerations[job.id] || {};
+  const regenerating = regeneration.status === "preparing";
   const profileOptions = [`<option value="" ${selection.profileId ? "" : "selected"}>Use active profile</option>`, ...state.candidateProfiles.map((profile) => `<option value="${escapeAttribute(profile.id)}" ${String(profile.id) === String(selection.profileId) ? "selected" : ""}>${escapeHtml(profile.name)}</option>`)].join("");
   const resumeAvailable = Boolean(job.resume_docx_path);
   const coverAvailable = Boolean(job.cover_letter_docx_path);
@@ -2136,6 +2426,16 @@ function renderShortlistCard(job) {
   const resumeError = job.resume_generation_error ? `<p class="risk high">Resume error: ${escapeHtml(job.resume_generation_error)}</p>` : "";
   const coverError = job.cover_letter_generation_error ? `<p class="risk high">Cover letter error: ${escapeHtml(job.cover_letter_generation_error)}</p>` : "";
   const coverWarning = job.cover_letter_generation_warning ? `<p class="warning">Cover letter warning: ${escapeHtml(job.cover_letter_generation_warning)}</p>` : "";
+  const backendGeneratedAt = job.generated_at || job.generation_debug?.generated_at || "";
+  const generationFeedback = regenerating
+    ? `<section class="generation-feedback" aria-live="polite"><strong><span class="spinner" aria-hidden="true"></span> Regenerating...</strong><p>Generating résumé and cover letter. Please wait.</p>${regeneration.startedAt ? `<p class="muted">Started ${escapeHtml(new Date(regeneration.startedAt).toLocaleTimeString())}</p>` : ""}</section>`
+    : regeneration.status === "success"
+      ? `<section class="generation-feedback success" aria-live="polite"><strong>New document version ready</strong><p>${escapeHtml(regeneration.message || "Résumé and cover letter generated successfully.")}</p>${backendGeneratedAt ? `<p class="muted">Completed ${escapeHtml(new Date(backendGeneratedAt).toLocaleString())}</p>` : ""}</section>`
+      : regeneration.status === "error"
+        ? `<section class="generation-feedback error" aria-live="assertive"><strong>Regeneration failed</strong><p>${escapeHtml(regeneration.message || "Document generation failed.")}</p><p class="muted">Correct the issue and try again.</p></section>`
+        : backendGeneratedAt && resumeStatus === "generated" && coverStatus === "generated"
+          ? `<section class="generation-feedback success"><strong>New document version ready</strong><p class="muted">Completed ${escapeHtml(new Date(backendGeneratedAt).toLocaleString())}</p></section>`
+          : "";
   const keywordScorePanel = selection.keywordScoreLoading
     ? `<section class="keywords-score-panel"><h3>Keywords Score</h3><p class="muted">Reviewing the selected résumé…</p></section>`
     : selection.keywordScoreError
@@ -2155,6 +2455,7 @@ function renderShortlistCard(job) {
           ${resumeError}
           <p class="muted">Cover letter: ${escapeHtml(coverStatus)}${coverPrevious}</p>
           ${coverError}${coverWarning}
+          ${generationFeedback}
           <div class="document-selection panel nested-panel">
             <h4>Document selection</h4>
             <label>Candidate profile<select onchange="selectGenerationProfile(${job.id}, this.value)">${profileOptions}</select></label>
@@ -2170,9 +2471,9 @@ function renderShortlistCard(job) {
         <a class="button small ghost ${resumeAvailable ? "" : "disabled-link"}" href="/api/shortlist/${job.id}/resume">Download résumé</a>
         <a class="button small ghost ${coverAvailable ? "" : "disabled-link"}" href="/api/shortlist/${job.id}/cover-letter">Download cover letter</a>
         <button class="button small ghost" type="button" onclick="previewShortlist(${job.id})">Preview documents</button>
-        <button class="button small ghost" type="button" onclick="regenerateShortlistResume(${job.id})">Regenerate résumé</button>
-        <button class="button small ghost" type="button" onclick="regenerateShortlistCoverLetter(${job.id})">Regenerate cover letter</button>
-        <button class="button small ghost" type="button" onclick="regenerateShortlist(${job.id})">Regenerate both</button>
+        <button class="button small ghost" type="button" ${regenerating ? "disabled" : ""} onclick="regenerateShortlistResume(${job.id})">${regenerating ? "Regenerating..." : "Regenerate résumé"}</button>
+        <button class="button small ghost" type="button" ${regenerating ? "disabled" : ""} onclick="regenerateShortlistCoverLetter(${job.id})">${regenerating ? "Regenerating..." : "Regenerate cover letter"}</button>
+        <button class="button small ghost" type="button" ${regenerating ? "disabled" : ""} onclick="regenerateShortlist(${job.id})">${regenerating ? "Regenerating..." : "Regenerate both"}</button>
         <button class="button small ghost" type="button" onclick="markShortlistApplied(${job.id})">Mark applied</button>
         <button class="button small ghost danger" type="button" onclick="removeShortlist(${job.id})">Remove</button>
       </div>
@@ -2181,18 +2482,39 @@ function renderShortlistCard(job) {
 }
 
 async function regenerateShortlist(id) {
-  try { showGenerationOutcome(await api.send(`/api/shortlist/${id}/regenerate`, "POST", generationPayload(id)), ["resume", "cover_letter"]); await loadAll(); }
-  catch (error) { toast(error.message); await loadAll(); }
+  await runShortlistRegeneration(id, "both", `/api/shortlist/${id}/regenerate`);
 }
 
 async function regenerateShortlistResume(id) {
-  try { showGenerationOutcome(await api.send(`/api/shortlist/${id}/regenerate-resume`, "POST", generationPayload(id)), ["resume"]); await loadAll(); }
-  catch (error) { toast(error.message); await loadAll(); }
+  await runShortlistRegeneration(id, "resume", `/api/shortlist/${id}/regenerate-resume`);
 }
 
 async function regenerateShortlistCoverLetter(id) {
-  try { showGenerationOutcome(await api.send(`/api/shortlist/${id}/regenerate-cover-letter`, "POST", generationPayload(id)), ["cover_letter"]); await loadAll(); }
-  catch (error) { toast(error.message); await loadAll(); }
+  await runShortlistRegeneration(id, "cover_letter", `/api/shortlist/${id}/regenerate-cover-letter`);
+}
+
+async function runShortlistRegeneration(id, kind, endpoint) {
+  const current = state.shortlistRegenerations[id];
+  if (current?.status === "preparing") return;
+  state.shortlistRegenerations[id] = { status: "preparing", startedAt: new Date().toISOString(), kind };
+  renderShortlist();
+  try {
+    const result = await api.send(endpoint, "POST", generationPayload(id));
+    const payload = result?.generation || result || {};
+    const requestedKinds = kind === "both" ? ["resume", "cover_letter"] : [kind];
+    const statuses = requestedKinds.map((item) => payload[item] || payload[`${item}_generation_status`] || "failed");
+    const generated = statuses.filter((status) => status === "generated").length;
+    const generatedAt = result.generated_at || payload.generated_at || result.generation_debug?.generated_at || payload.generation_debug?.generated_at || "";
+    if (generated === requestedKinds.length) {
+      state.shortlistRegenerations[id] = { status: "success", message: "The new document version was created.", generatedAt, kind };
+    } else {
+      state.shortlistRegenerations[id] = { status: "error", message: payload.error || result.error || "One or more documents could not be generated.", generatedAt, kind };
+    }
+    await loadAll();
+  } catch (error) {
+    state.shortlistRegenerations[id] = { status: "error", message: error.message || "Document generation failed.", kind };
+    await loadAll();
+  }
 }
 
 function showGenerationOutcome(result, requestedKinds) {

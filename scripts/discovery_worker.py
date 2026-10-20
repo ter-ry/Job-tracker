@@ -73,7 +73,7 @@ def run_due_searches() -> dict[str, int]:
     if not acquire_lease(owner):
         return {"disabled": 0, "runs": 0, "errors": 0, "overlap_skipped": 1}
     worker_heartbeat_stop = start_worker_lease_heartbeat(owner)
-    counts = {"disabled": 0, "runs": 0, "errors": 0}
+    counts = {"disabled": 0, "runs": 0, "errors": 0, "preparation_processed": 0, "preparation_ready": 0, "preparation_failed": 0}
     try:
         now = datetime.now().isoformat(timespec="seconds")
         rows = app.query_db(
@@ -102,6 +102,10 @@ def run_due_searches() -> dict[str, int]:
                 search_heartbeat_stop.set()
                 search_heartbeat_thread.join(timeout=1)
                 app.release_discovery_search_lease(search_id, search_owner)
+        preparation = app.process_preparation_queue(limit=5, owner=f"preparation:{owner}")
+        counts["preparation_processed"] = preparation["processed"]
+        counts["preparation_ready"] = preparation["ready"]
+        counts["preparation_failed"] = preparation["failed"]
     finally:
         worker_heartbeat_stop.set()
         release_lease(owner)

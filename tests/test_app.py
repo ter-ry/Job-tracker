@@ -4,7 +4,7 @@ import io
 import re
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 import zipfile
@@ -148,6 +148,51 @@ class JobAssistantTest(unittest.TestCase):
         self.assertTrue(analysis["matched_evidence"])
         variants = self.client.get(f"/api/jobs/{job['id']}/resume-variants").get_json()
         self.assertIsInstance(variants, list)
+
+    def test_lakeview_qualification_fit_surfaces_stretch_reasons_without_changing_priority(self):
+        self.client.post(
+            "/api/profile",
+            json={
+                "name": "QA Applicant",
+                "resume_text": "Built Python Flask APIs and SQL reports for internal tools.",
+                "work_experience": "Software developer with three years of application experience.",
+                "maximum_required_years": "3",
+                "target_seniority_levels": "junior, intermediate",
+            },
+        )
+        job = self.client.post(
+            "/api/jobs",
+            json={
+                "company": "Lakeview Loan Servicing",
+                "title": "Backend Engineer",
+                "location": "Toronto",
+                "overall_score": 89,
+                "job_description": "Requirements: 3 to 5+ years of production backend experience, advanced distributed systems, Kafka and Kubernetes.",
+                "required_skills": "3 to 5+ years of production backend experience, advanced distributed systems, Kafka, Kubernetes",
+                "status": "Saved",
+            },
+        ).get_json()
+        self.assertEqual(job["overall_score"], 89)
+        self.assertLess(job["qualification_fit_score"], 75)
+        self.assertEqual(job["qualification_fit_label"], "Stretch opportunity")
+        reasons = " ".join(job["qualification_fit_reasons"])
+        self.assertIn("Not demonstrated", reasons)
+        self.assertIn("experience", reasons)
+
+    def test_qualification_fit_penalizes_missing_explicit_years_without_profile_maximum(self):
+        profile = {
+            "target_seniority_levels": "junior, intermediate",
+            "maximum_required_years": "",
+            "work_experience": "Built internal Python tools and APIs.",
+        }
+        analysis = seniority.analyze_job_seniority({
+            "title": "Backend Engineer",
+            "job_description": "Required: 3 to 5+ years of production backend experience and advanced distributed systems.",
+        })
+        fit = seniority.score_seniority_fit(profile, analysis)
+        self.assertTrue(fit["stretch_role"])
+        self.assertLess(fit["score"], 75)
+        self.assertIn("does not explicitly demonstrate", fit["explanation"])
 
     def test_ollama_profile_defaults_and_overrides(self):
         with patch.dict(
@@ -347,6 +392,42 @@ class JobAssistantTest(unittest.TestCase):
         self.assertLess(html.index('id="discovery-sort-mode"'), html.index('id="discovery-results"'))
         self.assertLess(html.index('id="discovery-results"'), html.index('id="csv-import-form"'))
         self.assertIn('id="csv-import-form"', html)
+        self.assertIn('id="pipeline-job-details"', html)
+        self.assertIn('Analyze job and generate diagnostic suggestions', html)
+        self.assertIn('Sort: distance', html)
+        self.assertIn('Sort: posting date', html)
+        self.assertIn('id="pipeline-sort"', html)
+        self.assertIn('Strong qualification matches', html)
+        self.assertIn('data-view-application-package', Path('static/app.js').read_text(encoding='utf-8'))
+        self.assertIn('focusPreparationPackage', Path('static/app.js').read_text(encoding='utf-8'))
+        self.assertNotIn('data-start-pipeline-preparation', Path('static/app.js').read_text(encoding='utf-8'))
+        self.assertNotIn('data-retry-pipeline-preparation', Path('static/app.js').read_text(encoding='utf-8'))
+        self.assertIn('pipeline-drawer-in', Path('static/styles.css').read_text(encoding='utf-8'))
+        self.assertNotIn('window.state.jobs', Path('static/app.js').read_text(encoding='utf-8'))
+        self.assertNotIn('Download résumé DOCX', Path('static/app.js').read_text(encoding='utf-8'))
+        self.assertIn('pipeline-matches-label', html)
+        self.assertIn('Create candidate profile', html)
+        self.assertIn('candidate-profile-form-error', html)
+        self.assertIn('.candidate-profile-manager [hidden]', Path('static/styles.css').read_text(encoding='utf-8'))
+        self.assertIn('refreshCandidateProfiles', Path('static/app.js').read_text(encoding='utf-8'))
+
+    def test_candidate_profile_creation_is_committed_and_returned_by_list_endpoint(self):
+        response = self.client.post(
+            "/api/candidate-profiles",
+            json={"name": "Software Engineering", "identity_mode": "shared"},
+        )
+        self.assertEqual(response.status_code, 201)
+        profile_id = response.get_json()["id"]
+        self.assertIsInstance(profile_id, int)
+        profiles = self.client.get("/api/candidate-profiles")
+        self.assertEqual(profiles.status_code, 200)
+        saved = next(profile for profile in profiles.get_json() if profile["id"] == profile_id)
+        self.assertEqual(saved["name"], "Software Engineering")
+        self.assertEqual(saved["identity_mode"], "shared")
+        self.assertIn('Checking requirements', Path('static/app.js').read_text(encoding='utf-8'))
+        self.assertIn('Configure candidate profile documents', Path('static/app.js').read_text(encoding='utf-8'))
+        self.assertIn('Candidate profile documents are separate from the legacy Profile documents', Path('static/app.js').read_text(encoding='utf-8'))
+        self.assertIn('z-index: 60', Path('static/styles.css').read_text(encoding='utf-8'))
 
     def test_jobspy_discovery_requires_keywords(self):
         response = self.client.post("/api/discovery/jobspy", json={"location": "Toronto"})
@@ -2340,6 +2421,46 @@ class JobAssistantTest(unittest.TestCase):
         self.assertTrue(any("Flowtally" in item["original"] for item in artifact["change_log"]["preserved"]))
         self.assertTrue(any("Pinterest" in item["original"] and "Gatekeeper" in item["replacement"] for item in artifact["change_log"]["applied"]))
 
+    def test_structured_template_replaces_selected_identity_email_hyperlink(self):
+        template = Path(self.tmpdir.name) / "structured_hyperlinked_identity.docx"
+        document = Document()
+        document.add_paragraph("Template Applicant")
+        contact = document.add_paragraph()
+        self.add_hyperlink(contact, "mailto:template@example.com", "template@example.com")
+        document.add_paragraph("October 1, 2026")
+        document.add_paragraph("Hiring Manager")
+        document.add_paragraph("Old Company")
+        document.add_paragraph("Toronto, ON")
+        document.add_paragraph("Re: Software Engineer")
+        document.add_paragraph("Dear Hiring Manager,")
+        document.add_paragraph("I built supported software systems and automated tests.")
+        document.add_paragraph("I would welcome the opportunity to contribute.")
+        document.add_paragraph("Sincerely,")
+        document.add_paragraph("Template Applicant")
+        document.save(template)
+        profile = {
+            "name": "Terry Mak",
+            "email": "terry.hcmak@gmail.com",
+            "work_experience": "Built supported software systems and automated tests.",
+            "resume_text": "Terry Mak. Built supported software systems and automated tests.",
+            "cover_letter_docx_template_path": str(template),
+            "cover_letter_no_dashes": "true",
+        }
+        job = {"company": "Lakeview Loan Servicing", "title": "Backend Engineer", "location": "Toronto, Ontario", "job_description": "Build Python APIs and automated tests."}
+        output = app_module.generate_application_materials(job, profile, raise_on_validation=False)
+        output_path = Path(self.tmpdir.name) / "structured_hyperlinked_identity_output.docx"
+        artifact = app_module.build_format_preserving_cover_letter(job, profile, output, output_path)
+        self.assertEqual(artifact["status"], "generated", artifact)
+        generated = Document(output_path)
+        generated_text = "\n".join(paragraph.text for paragraph in app_module.iter_document_paragraphs(generated))
+        self.assertEqual(generated_text.count("terry.hcmak@gmail.com"), 1)
+        self.assertNotIn("template@example.com", generated_text)
+        self.assertIn("Terry Mak", generated_text)
+        self.assertEqual(
+            [rel.target_ref for rel in generated.paragraphs[1].part.rels.values() if rel.reltype.endswith("/hyperlink")],
+            ["mailto:terry.hcmak@gmail.com"],
+        )
+
     def test_selected_cover_template_missing_fails_without_generic_fallback(self):
         self.seed_profile_for_documents(with_template=True)
         missing_template = Path(self.tmpdir.name) / "missing-cover-letter.docx"
@@ -2447,6 +2568,19 @@ class JobAssistantTest(unittest.TestCase):
         self.assertNotIn("role's focus on", gatekeeper_map["opening"].lower())
         self.assertNotIn("role's focus on", finance_map["opening"].lower())
 
+        lakeview = {
+            "company": "Lakeview Loan Servicing",
+            "title": "Backend Engineer",
+            "job_description": "Build Python and Flask APIs with PostgreSQL, authentication, permissions, migrations, validation, and automated testing.",
+            "required_skills": "Python, Flask, PostgreSQL, APIs, testing",
+        }
+        lakeview_map = app_module.build_cover_letter_section_map(profile, lakeview, [], grounding.build_candidate_evidence(profile))
+        self.assertIn("Python", lakeview_map["motivation"])
+        self.assertIn("SQL", lakeview_map["motivation"])
+        self.assertEqual(lakeview_map["motivation"].lower().count("python"), 1)
+        self.assertNotIn("Kafka", lakeview_map["motivation"])
+        self.assertNotIn("Kubernetes", lakeview_map["motivation"])
+
     def test_cover_letter_validation_uses_body_boundaries_for_contact_details(self):
         evidence = grounding.build_candidate_evidence(self.software_profile())
         header_safe = (
@@ -2475,6 +2609,87 @@ class JobAssistantTest(unittest.TestCase):
         body_validation = grounding.validate_cover_letter_output(body_leak, evidence, self.software_job())
         self.assertFalse(body_validation["ok"])
         self.assertTrue(any("Contact details detected in body paragraph" in item for item in body_validation["conflicting_phrases"]))
+
+    def test_cover_letter_email_hyperlink_is_replaced_atomically(self):
+        document = Document()
+        contact = document.add_paragraph()
+        contact.add_run("Email: ")
+        self.add_hyperlink(contact, "mailto:old@example.com", "old@example.com")
+        split_contact = document.add_paragraph()
+        split_contact.add_run("old")
+        split_contact.add_run("@example")
+        split_contact.add_run(".com")
+
+        self.assertTrue(app_module.replace_cover_letter_email(contact, "new@example.com"))
+        self.assertTrue(app_module.replace_cover_letter_email(split_contact, "new@example.com"))
+        self.assertEqual(contact.text, "Email: new@example.com")
+        self.assertEqual(split_contact.text, "new@example.com")
+        self.assertEqual(
+            [rel.target_ref for rel in contact.part.rels.values() if rel.reltype.endswith("/hyperlink")],
+            ["mailto:new@example.com"],
+        )
+        self.assertEqual(len(app_module.EMAIL_PATTERN.findall(contact.text)), 1)
+        self.assertEqual(len(app_module.EMAIL_PATTERN.findall(split_contact.text)), 1)
+
+    def test_format_preserving_cover_letter_updates_hyperlinked_identity_and_keeps_range_natural(self):
+        source = Path(self.tmpdir.name) / "hyperlinked_cover_letter.docx"
+        document = Document()
+        heading = document.add_paragraph("Terry Mak")
+        contact = document.add_paragraph()
+        self.add_hyperlink(contact, "mailto:ter23rymhc@gmail.com", "ter23rymhc@gmail.com")
+        document.add_paragraph("May 1, 2024")
+        document.add_paragraph("Old Company")
+        document.add_paragraph("Toronto, Ontario")
+        document.add_paragraph("Dear Old Company Hiring Team,")
+        document.add_paragraph("Re: Application for Software Engineer")
+        document.add_paragraph("I am pleased to apply for the Software Engineer role at Old Company.")
+        document.add_paragraph("I tracked 50–250 SKUs and built Python and Flask tools.")
+        document.add_paragraph("My experience would support this team.")
+        document.add_paragraph("Thank you for your consideration.")
+        document.add_paragraph("Sincerely,")
+        document.add_paragraph("Terry Mak")
+        document.save(source)
+
+        output_path = Path(self.tmpdir.name) / "generated_cover_letter.docx"
+        profile = {"name": "Terry Mak", "email": "terry.hcmak@gmail.com", "cover_letter_docx_template_path": str(source), "cover_letter_no_dashes": "true"}
+        job = {"company": "Lakeview Loan Servicing", "title": "Backend Engineer", "location": "Toronto, Ontario", "job_description": "Build Python and Flask APIs with PostgreSQL and automated testing."}
+        result = app_module.build_format_preserving_cover_letter(
+            job,
+            profile,
+            {"cover_letter": "", "candidate_evidence": grounding.build_candidate_evidence({"work_experience": "Built Python and Flask APIs with PostgreSQL and automated testing for internal operations workflows."})},
+            output_path,
+        )
+        self.assertEqual(result["status"], "generated", result)
+        generated = Document(output_path)
+        generated_text = "\n".join(paragraph.text for paragraph in app_module.iter_document_paragraphs(generated))
+        self.assertEqual(generated_text.count("terry.hcmak@gmail.com"), 1)
+        self.assertNotIn("ter23rymhc@gmail.com", generated_text)
+        self.assertIn("50 to 250 SKUs", generated_text)
+        self.assertNotIn("50–250", generated_text)
+        self.assertEqual(
+            [rel.target_ref for rel in generated.paragraphs[1].part.rels.values() if rel.reltype.endswith("/hyperlink")],
+            ["mailto:terry.hcmak@gmail.com"],
+        )
+
+    def test_resume_identity_uses_the_same_selected_email_as_cover_letter(self):
+        document = Document()
+        document.add_paragraph("Old Applicant")
+        contact = document.add_paragraph()
+        self.add_hyperlink(contact, "mailto:ter23rymhc@gmail.com", "ter23rymhc@gmail.com")
+        self.assertTrue(app_module.replace_resume_identity(document, "Terry Mak", "terry.hcmak@gmail.com"))
+        self.assertEqual(document.paragraphs[0].text, "Terry Mak")
+        self.assertEqual(document.paragraphs[1].text, "terry.hcmak@gmail.com")
+        self.assertNotIn("ter23rymhc@gmail.com", document.paragraphs[1].text)
+        self.assertEqual(
+            [rel.target_ref for rel in contact.part.rels.values() if rel.reltype.endswith("/hyperlink")],
+            ["mailto:terry.hcmak@gmail.com"],
+        )
+
+    def test_no_dash_phrase_cleanup_does_not_duplicate_experience(self):
+        self.assertEqual(
+            tailoring_pipeline.remove_cover_letter_dashes("I have hands-on experience and tracked 50–250 SKUs."),
+            "I have practical experience and tracked 50 to 250 SKUs.",
+        )
 
     def test_scotiabank_cover_letter_template_preserves_structure_and_replaces_stale_content(self):
         self.seed_profile_for_documents(with_template=True)
@@ -3941,6 +4156,213 @@ class JobAssistantTest(unittest.TestCase):
         job = regenerated.get_json()
         self.assertEqual(job["resume_generation_status"], "generated")
         self.assertTrue(Path(job["resume_docx_path"]).exists())
+
+    def test_application_preparation_queue_is_persistent_and_does_not_change_job_status(self):
+        profile = self.client.post(
+            "/api/candidate-profiles",
+            json={"name": "Phase B QA", "identity_mode": "distinct", "applicant_name": "QA Applicant"},
+        ).get_json()
+        document = Document()
+        document.add_paragraph("QA Applicant")
+        document.add_paragraph("Python and SQL experience")
+        buffer = io.BytesIO()
+        document.save(buffer)
+        uploaded = self.client.post(
+            f"/api/candidate-profiles/{profile['id']}/resumes/upload",
+            data={"file": (io.BytesIO(buffer.getvalue()), "qa.docx"), "is_default": "true"},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(uploaded.status_code, 201)
+        cover_document = Document()
+        cover_document.add_paragraph("QA Applicant")
+        cover_document.add_paragraph("I am applying to QueueCo for the Developer role.")
+        cover_buffer = io.BytesIO()
+        cover_document.save(cover_buffer)
+        cover_uploaded = self.client.post(
+            f"/api/candidate-profiles/{profile['id']}/cover-letter-templates/upload",
+            data={"file": (io.BytesIO(cover_buffer.getvalue()), "qa-cover.docx"), "is_default": "true"},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(cover_uploaded.status_code, 201)
+        job = self.client.post("/api/jobs", json={"company": "QueueCo", "title": "Developer", "location": "Toronto", "overall_score": 88, "remote_eligibility": "canadian_eligible", "job_description": "Python SQL"}).get_json()
+        queued = self.client.post("/api/preparation/queue", json={"job_id": job["id"], "candidate_profile_id": profile["id"]})
+        self.assertEqual(queued.status_code, 201, queued.get_json())
+        item = queued.get_json()
+        duplicate = self.client.post("/api/preparation/queue", json={"job_id": job["id"], "candidate_profile_id": profile["id"]})
+        self.assertEqual(duplicate.status_code, 200)
+        self.assertTrue(duplicate.get_json()["duplicate"])
+        self.assertEqual(len(self.client.get("/api/preparation/queue").get_json()), 1)
+        self.assertEqual(self.client.get("/api/jobs").get_json()[0]["status"], "Saved")
+        generated_folder = app_module.generated_applications_dir() / str(job["id"])
+        generated_folder.mkdir(parents=True, exist_ok=True)
+        generated_resume = generated_folder / "queue-resume.docx"
+        generated_cover = generated_folder / "queue-cover.docx"
+        generated_resume.write_bytes(buffer.getvalue())
+        generated_cover.write_bytes(cover_buffer.getvalue())
+
+        def fake_prepare(job_id, kinds, profile):
+            with app_module.app.app_context():
+                app_module.get_db().execute(
+                    "UPDATE jobs SET resume_generation_status = 'generated', cover_letter_generation_status = 'generated', resume_docx_path = ?, cover_letter_docx_path = ? WHERE id = ?",
+                    [str(generated_resume), str(generated_cover), job_id],
+                )
+                app_module.get_db().commit()
+            return {"resume": "generated", "cover_letter": "generated", "error": ""}
+
+        with patch.object(app_module, "generate_and_store_shortlist_documents", side_effect=fake_prepare):
+            prepared = self.client.post(f"/api/preparation/{item['id']}/prepare")
+        self.assertEqual(prepared.status_code, 200, prepared.get_json())
+        self.assertEqual(prepared.get_json()["status"], "ready_for_review")
+        approved = self.client.post(f"/api/preparation/{item['id']}/review", json={"action": "approve"})
+        self.assertEqual(approved.status_code, 200)
+        self.assertEqual(approved.get_json()["status"], "approved")
+        self.assertEqual(self.client.get(f"/api/preparation/{item['id']}/preview").status_code, 200)
+        self.assertEqual(self.client.get(f"/api/preparation/{item['id']}/download/resume").status_code, 200)
+        self.assertEqual(self.client.get(f"/api/preparation/{item['id']}/download/cover-letter").status_code, 200)
+        self.assertEqual(self.client.post(f"/api/preparation/{item['id']}/regenerate").status_code, 409)
+        self.assertEqual(self.client.get("/api/jobs").get_json()[0]["status"], "Saved")
+
+    def test_application_preparation_auto_eligibility_requires_priority_and_confirmed_canada(self):
+        search = {"auto_prepare_enabled": True, "auto_prepare_min_priority": 80, "auto_prepare_require_canadian": True}
+        eligible, reason, _ = app_module.preparation_eligibility({"overall_score": 90, "remote_eligibility": "canadian_eligible"}, search)
+        self.assertTrue(eligible)
+        self.assertEqual(reason, "eligible")
+        eligible, reason, _ = app_module.preparation_eligibility({"overall_score": 90, "remote_eligibility": "unknown"}, search)
+        self.assertFalse(eligible)
+        self.assertEqual(reason, "manual_eligibility_review")
+        eligible, reason, _ = app_module.preparation_eligibility({"overall_score": 90, "remote_eligibility": "restricted"}, search)
+        self.assertFalse(eligible)
+        self.assertEqual(reason, "explicitly_restricted")
+        eligible, reason, _ = app_module.preparation_eligibility({"overall_score": 70, "remote_eligibility": "canadian_eligible"}, search)
+        self.assertFalse(eligible)
+        self.assertEqual(reason, "priority_below_threshold")
+        for require_canadian in (True, False):
+            eligible, reason, _ = app_module.preparation_eligibility(
+                {"overall_score": 90, "remote_eligibility": "unknown"},
+                {"auto_prepare_min_priority": 80, "auto_prepare_require_canadian": require_canadian},
+            )
+            self.assertFalse(eligible)
+            self.assertEqual(reason, "manual_eligibility_review")
+
+    def test_automatic_preparation_never_chooses_first_profile_implicitly(self):
+        with self.assertRaisesRegex(ValueError, "automatic preparation cannot choose one implicitly"):
+            app_module.queue_profile_payload(search={"auto_prepare_enabled": True})
+
+    def test_preparation_approval_requires_ready_generated_package(self):
+        job = self.client.post("/api/jobs", json={"company": "Approval Co", "title": "Developer"}).get_json()
+        with app_module.app.app_context():
+            app_module.get_db().execute("INSERT INTO application_preparation_queue (job_id, status) VALUES (?, 'queued')", [job["id"]])
+            app_module.get_db().commit()
+            item_id = app_module.get_db().execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+        response = self.client.post(f"/api/preparation/{item_id}/review", json={"action": "approve"})
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("ready_for_review", response.get_json()["error"])
+
+    def test_preparation_preview_uses_only_documents_belonging_to_package(self):
+        job = self.client.post("/api/jobs", json={"company": "Preview Co", "title": "Developer", "status": "shortlisted"}).get_json()
+        package_dir = app_module.generated_applications_dir() / str(job["id"])
+        package_dir.mkdir(parents=True, exist_ok=True)
+
+        def docx_bytes(text):
+            document = Document()
+            document.add_paragraph(text)
+            output = io.BytesIO()
+            document.save(output)
+            return output.getvalue()
+
+        current_resume = package_dir / "current-resume.docx"
+        current_cover = package_dir / "current-cover.docx"
+        package_resume = package_dir / "package-resume.docx"
+        package_cover = package_dir / "package-cover.docx"
+        current_resume.write_bytes(docx_bytes("CURRENT JOB DOCUMENT"))
+        current_cover.write_bytes(docx_bytes("CURRENT JOB COVER LETTER"))
+        package_resume.write_bytes(docx_bytes("PACKAGE RESUME"))
+        package_cover.write_bytes(docx_bytes("PACKAGE COVER LETTER"))
+        with app_module.app.app_context():
+            app_module.get_db().execute(
+                """INSERT INTO application_preparation_queue
+                   (job_id, status, resume_status, cover_letter_status, prepared_resume_path, prepared_cover_letter_path)
+                   VALUES (?, 'ready_for_review', 'generated', 'generated', ?, ?)""",
+                [job["id"], str(package_resume), str(package_cover)],
+            )
+            item_id = app_module.get_db().execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+            app_module.get_db().execute(
+                "UPDATE jobs SET resume_docx_path = ?, cover_letter_docx_path = ?, status = 'shortlisted' WHERE id = ?",
+                [str(current_resume), str(current_cover), job["id"]],
+            )
+            app_module.get_db().commit()
+
+        response = self.client.get(f"/api/preparation/{item_id}/preview")
+        self.assertEqual(response.status_code, 200)
+        preview = response.get_json()
+        self.assertEqual(preview["resume"], "PACKAGE RESUME")
+        self.assertEqual(preview["cover_letter"], "PACKAGE COVER LETTER")
+        self.assertNotIn("CURRENT JOB", preview["resume"] + preview["cover_letter"])
+
+    def test_manual_discovery_preparation_requires_explicit_profile_and_docx_pair(self):
+        frontend = Path(app_module.BASE_DIR, "static", "app.js").read_text(encoding="utf-8")
+        template = Path(app_module.BASE_DIR, "templates", "index.html").read_text(encoding="utf-8")
+        self.assertIn("Choose the candidate profile for this package by number", frontend)
+        self.assertIn("must have both a DOCX résumé and a DOCX cover letter template", frontend)
+        self.assertIn("Unknown Canadian eligibility always requires manual confirmation", template)
+        self.assertNotIn("saved-search-auto-require-canadian", template)
+
+    def test_pipeline_regeneration_feedback_is_visible_and_deduplicated(self):
+        frontend = Path(app_module.BASE_DIR, "static", "app.js").read_text(encoding="utf-8")
+        self.assertIn("Preparing documents", frontend)
+        self.assertIn("Last successful generation", frontend)
+        self.assertIn("New document version ready", frontend)
+        self.assertIn("data-view-application-package", frontend)
+        self.assertIn("prepared_at", frontend)
+
+    def test_preparation_queue_regeneration_has_persistent_busy_success_and_error_states(self):
+        frontend = Path(app_module.BASE_DIR, "static", "app.js").read_text(encoding="utf-8")
+        self.assertIn("preparationRegenerations", frontend)
+        self.assertIn("/api/preparation/${id}/regenerate", frontend)
+        self.assertIn("Regenerating...", frontend)
+        self.assertIn("Generating résumé and cover letter. Please wait.", frontend)
+        self.assertIn("New document version ready", frontend)
+        self.assertIn("Retry when the issue is resolved.", frontend)
+        self.assertIn("preparedAt", frontend)
+
+    def test_regeneration_does_not_reset_an_active_preparation_lease(self):
+        job = self.client.post("/api/jobs", json={"company": "Lease Co", "title": "Developer"}).get_json()
+        with app_module.app.app_context():
+            app_module.get_db().execute(
+                "INSERT INTO application_preparation_queue (job_id, status, lease_owner, lease_expires_at) VALUES (?, 'preparing', 'other-worker', ?)",
+                [job["id"], (datetime.now() + timedelta(minutes=10)).isoformat(timespec="seconds")],
+            )
+            app_module.get_db().commit()
+            item_id = app_module.get_db().execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+        response = self.client.post(f"/api/preparation/{item_id}/regenerate")
+        self.assertEqual(response.status_code, 409)
+        with app_module.app.app_context():
+            row = app_module.query_db("SELECT status, lease_owner FROM application_preparation_queue WHERE id = ?", [item_id], one=True)
+        self.assertEqual(row["status"], "preparing")
+        self.assertEqual(row["lease_owner"], "other-worker")
+
+    def test_unknown_eligibility_requires_explicit_review_before_preparation(self):
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Eligibility QA", "identity_mode": "distinct", "applicant_name": "QA Applicant"}).get_json()
+        resume = Document()
+        resume.add_paragraph("QA Applicant")
+        resume_bytes = io.BytesIO()
+        resume.save(resume_bytes)
+        self.client.post(f"/api/candidate-profiles/{profile['id']}/resumes/upload", data={"file": (io.BytesIO(resume_bytes.getvalue()), "resume.docx")}, content_type="multipart/form-data")
+        cover = Document()
+        cover.add_paragraph("QA Applicant")
+        cover_bytes = io.BytesIO()
+        cover.save(cover_bytes)
+        self.client.post(f"/api/candidate-profiles/{profile['id']}/cover-letter-templates/upload", data={"file": (io.BytesIO(cover_bytes.getvalue()), "cover.docx")}, content_type="multipart/form-data")
+        job = self.client.post("/api/jobs", json={"company": "Unknown Co", "title": "Developer", "overall_score": 90, "remote_eligibility": "unknown"}).get_json()
+        queued = self.client.post("/api/preparation/queue", json={"job_id": job["id"], "candidate_profile_id": profile["id"]})
+        self.assertEqual(queued.status_code, 201, queued.get_json())
+        item = queued.get_json()
+        self.assertEqual(item["review_status"], "manual_eligibility")
+        blocked = self.client.post(f"/api/preparation/{item['id']}/prepare")
+        self.assertEqual(blocked.status_code, 409)
+        reviewed = self.client.post(f"/api/preparation/{item['id']}/eligibility-review", json={"confirmed": True})
+        self.assertEqual(reviewed.status_code, 200)
+        self.assertEqual(reviewed.get_json()["eligibility_review_status"], "confirmed")
 
 
 if __name__ == "__main__":

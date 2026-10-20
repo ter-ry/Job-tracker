@@ -33,13 +33,25 @@
           </div>
           <div class="pipeline-stats">
             <div><strong id="pipeline-discovered">0</strong><span>Discovered</span></div>
-            <div><strong id="pipeline-matches">0</strong><span>Strong matches</span></div>
+            <div><strong id="pipeline-matches">0</strong><span id="pipeline-matches-label">Strong qualification matches</span></div>
             <div><strong id="pipeline-ready">0</strong><span>Ready to review</span></div>
           </div>
           <div id="pipeline-filters" class="pipeline-filters" role="tablist" aria-label="Pipeline categories"></div>
+          <label class="pipeline-sort">Sort pipeline
+            <select id="pipeline-sort" aria-label="Sort pipeline">
+              <option value="qualification">Qualification fit</option>
+              <option value="priority">Job Priority</option>
+              <option value="salary">Salary</option>
+              <option value="distance">Distance</option>
+              <option value="posted">Date posted</option>
+              <option value="discovered">Date discovered</option>
+              <option value="deadline">Deadline</option>
+            </select>
+          </label>
           <div id="pipeline-cards" class="pipeline-cards" aria-live="polite">
             <p class="pipeline-empty">No saved jobs yet. Use Discovery to add jobs to the pipeline.</p>
           </div>
+          <aside id="pipeline-job-details" class="pipeline-job-details" hidden aria-live="polite"></aside>
         </section>
         <section class="workspace discovery-layout">
           <section class="panel discovery-saved-searches">
@@ -59,6 +71,10 @@
               <label>Posting recency<select id="saved-search-date-window"><option value="24h">24 hours</option><option value="3d">3 days</option><option value="7d">7 days</option><option value="14d" selected>14 days</option><option value="30d">30 days</option><option value="any">Any</option></select></label>
               <label>Interval (minutes)<input id="saved-search-interval" type="number" min="15" step="15" value="360"></label>
               <label class="checkline"><input id="saved-search-enabled" type="checkbox"> Enable scheduled search</label>
+              <label class="checkline"><input id="saved-search-auto-prepare" type="checkbox"> Automatically prepare qualifying packages</label>
+              <p class="muted helper">Automatic preparation applies only to new discovery results. Unknown Canadian eligibility always requires manual confirmation; it is never bypassed by a saved-search setting.</p>
+              <label>Minimum Job Priority<input id="saved-search-auto-min-priority" type="number" min="0" max="100" step="1" value="75"></label>
+              <label>Preparation candidate profile<select id="saved-search-auto-profile"><option value="">Choose a profile when available</option></select></label>
               <fieldset class="source-picker"><legend>Sources</legend><label><input type="checkbox" name="saved-search-source" value="linkedin" checked> LinkedIn</label><label><input type="checkbox" name="saved-search-source" value="indeed" checked> Indeed</label><label><input type="checkbox" name="saved-search-source" value="google"> Google Jobs</label><label><input type="checkbox" name="saved-search-source" value="zip_recruiter"> ZipRecruiter</label></fieldset>
               <div class="actions"><button class="button" type="submit">Save search</button><button class="button ghost" type="button" id="cancel-saved-search">Cancel</button></div>
             </form>
@@ -209,6 +225,10 @@
       </section>
 
       <section id="shortlist" class="tab-panel">
+        <section class="panel preparation-queue-panel">
+          <div class="panel-header"><div><h2>Application preparation queue</h2><p class="muted helper">Packages are prepared for review only. Nothing is submitted automatically.</p></div><div class="actions compact"><select id="preparation-status-filter"><option value="">All queue items</option><option value="ready_for_review">Ready for review</option><option value="queued">Queued</option><option value="preparing">Preparing</option><option value="failed">Failed</option><option value="approved">Approved</option><option value="skipped">Skipped</option></select><button class="button ghost small" type="button" id="refresh-preparation-queue">Refresh</button></div></div>
+          <div id="preparation-queue" class="generated-output empty">No application packages queued.</div>
+        </section>
         <section class="panel">
           <div class="panel-header">
             <h2>Shortlist</h2>
@@ -313,7 +333,7 @@
             <label>Job description<textarea id="job-description" rows="8"></textarea></label>
 
             <div class="actions">
-              <button class="button" type="button" id="generate">Generate tailored materials</button>
+              <button class="button" type="button" id="generate">Analyze job and generate diagnostic suggestions</button>
               <button class="button ghost" type="button" id="analyse-resume-match">Analyse resume match</button>
               <button class="button ghost" type="button" id="generate-local-draft">Generate local tailored draft</button>
               <button class="button ghost" type="button" id="rescore-current">Re-score current</button>
@@ -344,7 +364,10 @@
               <select id="sort-by">
                 <option value="fit">Sort: fit</option>
                 <option value="salary">Sort: salary</option>
+                <option value="distance">Sort: distance</option>
                 <option value="date">Sort: date added</option>
+                <option value="posted">Sort: posting date</option>
+                <option value="discovered">Sort: date discovered</option>
                 <option value="deadline">Sort: deadline</option>
                 <option value="location">Sort: location</option>
               </select>
@@ -375,11 +398,12 @@
         <section class="panel candidate-profile-manager">
           <div class="panel-header">
             <div><h2>Candidate profiles</h2><p class="muted helper">Keep role-specific documents and applicant identity separate from the active matching profile.</p></div>
-            <button class="button" type="button" id="new-candidate-profile">Create profile</button>
+            <button class="button" type="button" id="new-candidate-profile">New candidate profile</button>
           </div>
           <div id="candidate-profile-list" class="candidate-profile-list"></div>
           <form id="candidate-profile-form" class="nested-panel profile-manager-form" hidden>
             <h3 id="candidate-profile-form-title">Create candidate profile</h3>
+            <p id="candidate-profile-form-error" class="risk high" role="alert" hidden></p>
             <div class="grid three">
               <label>Profile label<input id="candidate-profile-name" required placeholder="Software Engineering"></label>
               <label>Identity mode<select id="candidate-profile-identity-mode"><option value="shared">Use active profile identity</option><option value="distinct">Use a distinct applicant identity</option></select></label>
@@ -388,7 +412,7 @@
               <label>Phone<input id="candidate-profile-applicant-phone"></label>
               <label>Location<input id="candidate-profile-applicant-location"></label>
             </div>
-            <div class="actions compact"><button class="button" type="submit">Save profile</button><button class="button ghost" type="button" id="cancel-candidate-profile">Cancel</button></div>
+            <div class="actions compact"><button class="button" type="submit" id="candidate-profile-submit">Create candidate profile</button><button class="button ghost" type="button" id="cancel-candidate-profile">Cancel</button></div>
           </form>
           <div id="candidate-profile-documents" class="candidate-profile-documents empty">Select a candidate profile to manage its documents.</div>
         </section>
