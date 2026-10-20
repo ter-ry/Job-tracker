@@ -194,6 +194,10 @@ a {
   gap: 12px;
 }
 
+.candidate-profile-manager [hidden] {
+  display: none !important;
+}
+
 .document-columns {
   align-items: start;
 }

@@ -404,6 +404,24 @@ class JobAssistantTest(unittest.TestCase):
         self.assertNotIn('window.state.jobs', Path('static/app.js').read_text(encoding='utf-8'))
         self.assertIn('Download résumé DOCX', Path('static/app.js').read_text(encoding='utf-8'))
         self.assertIn('pipeline-matches-label', html)
+        self.assertIn('Create candidate profile', html)
+        self.assertIn('candidate-profile-form-error', html)
+        self.assertIn('.candidate-profile-manager [hidden]', Path('static/styles.css').read_text(encoding='utf-8'))
+        self.assertIn('refreshCandidateProfiles', Path('static/app.js').read_text(encoding='utf-8'))
+
+    def test_candidate_profile_creation_is_committed_and_returned_by_list_endpoint(self):
+        response = self.client.post(
+            "/api/candidate-profiles",
+            json={"name": "Software Engineering", "identity_mode": "shared"},
+        )
+        self.assertEqual(response.status_code, 201)
+        profile_id = response.get_json()["id"]
+        self.assertIsInstance(profile_id, int)
+        profiles = self.client.get("/api/candidate-profiles")
+        self.assertEqual(profiles.status_code, 200)
+        saved = next(profile for profile in profiles.get_json() if profile["id"] == profile_id)
+        self.assertEqual(saved["name"], "Software Engineering")
+        self.assertEqual(saved["identity_mode"], "shared")
         self.assertIn('Checking requirements', Path('static/app.js').read_text(encoding='utf-8'))
         self.assertIn('Configure candidate profile documents', Path('static/app.js').read_text(encoding='utf-8'))
         self.assertIn('Candidate profile documents are separate from the legacy Profile documents', Path('static/app.js').read_text(encoding='utf-8'))

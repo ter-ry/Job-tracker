@@ -76,7 +76,10 @@ const profileFields = [
 const api = {
   async get(path) {
     const response = await fetch(path);
-    if (!response.ok) throw new Error("Request failed");
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.error || `Request failed (${response.status})`);
+    }
     return response.json();
   },
   async send(path, method, body) {
@@ -417,8 +420,11 @@ async function loadDiscoveryTaskStatus() {
 function showCandidateProfileForm(profile = null) {
   const form = document.getElementById("candidate-profile-form");
   form.hidden = false;
+  const error = document.getElementById("candidate-profile-form-error");
+  if (error) { error.hidden = true; error.textContent = ""; }
   form.dataset.profileId = profile?.id || "";
   setText("candidate-profile-form-title", profile ? `Edit ${profile.name}` : "Create candidate profile");
+  setText("candidate-profile-submit", profile ? "Save candidate profile" : "Create candidate profile");
   document.getElementById("candidate-profile-name").value = profile?.name || "";
   document.getElementById("candidate-profile-name").disabled = Boolean(profile);
   document.getElementById("candidate-profile-identity-mode").value = profile?.identity_mode || "shared";
@@ -434,11 +440,34 @@ function hideCandidateProfileForm() {
   form.reset();
   form.dataset.profileId = "";
   document.getElementById("candidate-profile-name").disabled = false;
+  setText("candidate-profile-submit", "Create candidate profile");
+}
+
+function setCandidateProfileFormError(message) {
+  const target = document.getElementById("candidate-profile-form-error");
+  if (!target) return;
+  target.textContent = message || "";
+  target.hidden = !message;
 }
 
 async function saveCandidateProfile(event) {
   event.preventDefault();
   const form = event.currentTarget;
+  if (form.dataset.submitting === "true") return;
+  setCandidateProfileFormError("");
+  const nameField = document.getElementById("candidate-profile-name");
+  if (!nameField.value.trim()) {
+    nameField.setCustomValidity("Enter a profile label.");
+    nameField.reportValidity();
+    nameField.setCustomValidity("");
+    setCandidateProfileFormError("Profile label is required.");
+    return;
+  }
+  if (!form.checkValidity()) {
+    form.reportValidity();
+    setCandidateProfileFormError("Check the highlighted fields and try again.");
+    return;
+  }
   const payload = {
     name: value("candidate-profile-name"),
     identity_mode: value("candidate-profile-identity-mode"),
@@ -447,13 +476,40 @@ async function saveCandidateProfile(event) {
     applicant_phone: value("candidate-profile-applicant-phone"),
     applicant_location: value("candidate-profile-applicant-location"),
   };
+  const submit = document.getElementById("candidate-profile-submit");
+  form.dataset.submitting = "true";
+  if (submit) { submit.disabled = true; submit.textContent = "Saving candidate profile…"; }
   try {
-    if (form.dataset.profileId) await api.send(`/api/candidate-profiles/${form.dataset.profileId}`, "PATCH", payload);
-    else await api.send("/api/candidate-profiles", "POST", payload);
+    const saved = form.dataset.profileId
+      ? await api.send(`/api/candidate-profiles/${form.dataset.profileId}`, "PATCH", payload)
+      : await api.send("/api/candidate-profiles", "POST", payload);
+    const selectedId = String(saved.id || form.dataset.profileId);
     hideCandidateProfileForm();
-    toast("Candidate profile saved");
-    await loadAll();
-  } catch (error) { toast(error.message); }
+    try {
+      await refreshCandidateProfiles(selectedId);
+      toast("Candidate profile saved");
+    } catch (error) {
+      showCandidateProfileForm({ ...payload, id: selectedId });
+      setCandidateProfileFormError(`Profile saved, but the candidate profile list could not be refreshed: ${error.message}. Use Refresh or reload the page.`);
+    }
+  } catch (error) {
+    setCandidateProfileFormError(`Candidate profile was not saved: ${error.message}`);
+  } finally {
+    form.dataset.submitting = "false";
+    if (submit) { submit.disabled = false; submit.textContent = form.dataset.profileId ? "Save candidate profile" : "Create candidate profile"; }
+  }
+}
+
+async function refreshCandidateProfiles(selectId = "") {
+  const profiles = await api.get("/api/candidate-profiles");
+  state.candidateProfiles = Array.isArray(profiles) ? profiles : [];
+  if (selectId && state.candidateProfiles.some((profile) => String(profile.id) === String(selectId))) {
+    state.selectedCandidateProfileId = String(selectId);
+  } else if (!state.candidateProfiles.some((profile) => String(profile.id) === state.selectedCandidateProfileId)) {
+    state.selectedCandidateProfileId = state.candidateProfiles[0] ? String(state.candidateProfiles[0].id) : "";
+  }
+  renderCandidateProfiles();
+  if (state.selectedCandidateProfileId) await renderCandidateProfileDocuments();
 }
 
 function renderCandidateProfiles() {
