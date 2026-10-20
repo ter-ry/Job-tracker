@@ -4313,6 +4313,16 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("dataset.busy", frontend)
         self.assertIn("prepared_at", frontend)
 
+    def test_preparation_queue_regeneration_has_persistent_busy_success_and_error_states(self):
+        frontend = Path(app_module.BASE_DIR, "static", "app.js").read_text(encoding="utf-8")
+        self.assertIn("preparationRegenerations", frontend)
+        self.assertIn("/api/preparation/${id}/regenerate", frontend)
+        self.assertIn("Regenerating...", frontend)
+        self.assertIn("Generating résumé and cover letter. Please wait.", frontend)
+        self.assertIn("New document version ready", frontend)
+        self.assertIn("Retry when the issue is resolved.", frontend)
+        self.assertIn("preparedAt", frontend)
+
     def test_regeneration_does_not_reset_an_active_preparation_lease(self):
         job = self.client.post("/api/jobs", json={"company": "Lease Co", "title": "Developer"}).get_json()
         with app_module.app.app_context():

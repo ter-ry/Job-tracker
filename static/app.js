@@ -11,6 +11,7 @@ const state = {
   discoveryView: "table",
   shortlist: [],
   preparationQueue: [],
+  preparationRegenerations: {},
   candidateProfiles: [],
   generationSelections: {},
   shortlistRegenerations: {},
@@ -240,15 +241,30 @@ function renderPreparationQueue() {
   if (!items.length) { target.textContent = "No application packages queued."; return; }
   target.innerHTML = items.map((item) => {
     const job = item.job || {};
+    const regeneration = state.preparationRegenerations[item.id] || {};
+    const regenerating = regeneration.status === "preparing";
+    const backendPreparing = item.status === "preparing";
     const score = item.keywords_score || {};
     const matched = score.matched_count != null ? `${score.matched_count}/${score.total || 0}` : "not reviewed";
-    const error = item.error || item.resume_error || item.cover_letter_error;
+    const error = regeneration.status === "error" ? regeneration.message : item.error || item.resume_error || item.cover_letter_error;
+    const preparedAt = item.prepared_at || "";
+    const feedback = regenerating
+      ? `<section class="generation-feedback" aria-live="polite"><strong><span class="spinner" aria-hidden="true"></span> Regenerating...</strong><p>Generating résumé and cover letter. Please wait.</p></section>`
+      : backendPreparing
+        ? `<section class="generation-feedback" aria-live="polite"><strong><span class="spinner" aria-hidden="true"></span> Preparing documents...</strong><p>Document generation is in progress. Please wait.</p></section>`
+      : regeneration.status === "success"
+        ? `<section class="generation-feedback success" aria-live="polite"><strong>New document version ready</strong><p>The new résumé and cover letter are available below.</p>${preparedAt ? `<p class="muted">Completed ${escapeHtml(new Date(preparedAt).toLocaleString())}</p>` : ""}</section>`
+        : regeneration.status === "error"
+          ? `<section class="generation-feedback error" aria-live="assertive"><strong>Regeneration failed</strong><p>${escapeHtml(regeneration.message || "Document generation failed.")}</p><p class="muted">Retry when the issue is resolved.</p></section>`
+          : preparedAt && item.status === "ready_for_review"
+            ? `<section class="generation-feedback success"><strong>Package ready for review</strong><p class="muted">Last completed ${escapeHtml(new Date(preparedAt).toLocaleString())}</p></section>`
+            : "";
     const actions = item.status === "ready_for_review"
-      ? `<button class="button small" type="button" onclick="reviewPreparation(${item.id}, 'approve')">Approve package</button><button class="button ghost small" type="button" onclick="previewPreparation(${item.id})">Preview</button><button class="button ghost small" type="button" onclick="regeneratePreparation(${item.id})">Regenerate</button>${item.prepared_resume_path ? `<a class="button ghost small" href="/api/preparation/${item.id}/download/resume">Download résumé</a>` : ""}${item.prepared_cover_letter_path ? `<a class="button ghost small" href="/api/preparation/${item.id}/download/cover-letter">Download cover letter</a>` : ""}`
+      ? `<button class="button small" type="button" onclick="reviewPreparation(${item.id}, 'approve')">Approve package</button><button class="button ghost small" type="button" onclick="previewPreparation(${item.id})">Preview</button><button class="button ghost small" type="button" ${regenerating ? "disabled" : ""} onclick="regeneratePreparation(${item.id})">${regenerating ? '<span class="spinner" aria-hidden="true"></span> Regenerating...' : "Regenerate"}</button>${item.prepared_resume_path ? `<a class="button ghost small" href="/api/preparation/${item.id}/download/resume">Download résumé</a>` : ""}${item.prepared_cover_letter_path ? `<a class="button ghost small" href="/api/preparation/${item.id}/download/cover-letter">Download cover letter</a>` : ""}`
       : item.status === "queued" || item.status === "failed"
         ? `${item.review_status === "manual_eligibility" ? `<button class="button small" type="button" onclick="reviewEligibility(${item.id})">Confirm Canadian eligibility</button>` : `<button class="button small" type="button" onclick="prepareQueueItem(${item.id})">${item.status === "failed" ? "Retry preparation" : "Prepare package"}</button>`}`
         : "";
-    return `<article class="preparation-row"><div class="preparation-main"><h3>${escapeHtml(job.title || "Untitled role")}</h3><p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(job.location || "Location unavailable")}</p><p class="muted">${escapeHtml(job.remote_eligibility || "unknown")} · ${escapeHtml(job.salary || "Salary unavailable")} · Job Priority ${Number(item.job_priority || 0)}</p><p class="muted">Profile ${escapeHtml(String(item.candidate_profile_id || "not selected"))} · Résumé ${escapeHtml(item.resume_status || "pending")} · Cover letter ${escapeHtml(item.cover_letter_status || "pending")}</p>${item.eligibility_note ? `<p class="muted">${escapeHtml(item.eligibility_note)}</p>` : ""}${error ? `<p class="risk high">${escapeHtml(error)}</p>` : ""}</div><div class="preparation-meta"><strong>${escapeHtml(item.status.replaceAll("_", " "))}</strong><span>Keywords Score ${escapeHtml(matched)}</span><div class="row-actions">${actions}${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open application</a>` : ""}<button class="button ghost small" type="button" onclick="reviewPreparation(${item.id}, 'skip')">Skip</button></div></div></article>`;
+    return `<article class="preparation-row"><div class="preparation-main"><h3>${escapeHtml(job.title || "Untitled role")}</h3><p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(job.location || "Location unavailable")}</p><p class="muted">${escapeHtml(job.remote_eligibility || "unknown")} · ${escapeHtml(job.salary || "Salary unavailable")} · Job Priority ${Number(item.job_priority || 0)}</p><p class="muted">Profile ${escapeHtml(String(item.candidate_profile_id || "not selected"))} · Résumé ${escapeHtml(item.resume_status || "pending")} · Cover letter ${escapeHtml(item.cover_letter_status || "pending")}</p>${item.eligibility_note ? `<p class="muted">${escapeHtml(item.eligibility_note)}</p>` : ""}${feedback}${error && regeneration.status !== "error" ? `<p class="risk high">${escapeHtml(error)}</p>` : ""}</div><div class="preparation-meta"><strong>${escapeHtml(item.status.replaceAll("_", " "))}</strong><span>Keywords Score ${escapeHtml(matched)}</span><div class="row-actions">${actions}${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open application</a>` : ""}<button class="button ghost small" type="button" onclick="reviewPreparation(${item.id}, 'skip')">Skip</button></div></div></article>`;
   }).join("");
 }
 
@@ -311,7 +327,18 @@ async function prepareQueueItem(id) {
 }
 
 async function regeneratePreparation(id) {
-  try { const result = await api.send(`/api/preparation/${id}/regenerate`, "POST", {}); toast(result.status === "ready_for_review" ? "Package regenerated for review" : "Package regeneration failed"); await loadPreparationQueue(); } catch (error) { toast(error.message); }
+  if (state.preparationRegenerations[id]?.status === "preparing") return;
+  state.preparationRegenerations[id] = { status: "preparing", startedAt: new Date().toISOString() };
+  renderPreparationQueue();
+  try {
+    const result = await api.send(`/api/preparation/${id}/regenerate`, "POST", {});
+    state.preparationRegenerations[id] = result.status === "ready_for_review"
+      ? { status: "success" }
+      : { status: "error", message: result.error || "Package regeneration failed." };
+  } catch (error) {
+    state.preparationRegenerations[id] = { status: "error", message: error.message || "Package regeneration failed." };
+  }
+  await loadPreparationQueue();
 }
 
 async function reviewEligibility(id) {

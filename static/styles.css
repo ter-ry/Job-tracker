@@ -892,6 +892,30 @@ th {
   border-top: 1px solid #292929;
 }
 
+.generation-feedback {
+  margin-top: 10px;
+  border: 1px solid #3a3a3a;
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: #111;
+}
+
+.generation-feedback.success { border-color: rgba(74, 222, 128, 0.45); }
+.generation-feedback.error { border-color: rgba(248, 113, 113, 0.55); }
+.generation-feedback p { margin: 4px 0 0; }
+.spinner {
+  display: inline-block;
+  width: 0.8rem;
+  height: 0.8rem;
+  margin-right: 0.25rem;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 999px;
+  animation: preparation-spin 0.8s linear infinite;
+  vertical-align: -0.1rem;
+}
+@keyframes preparation-spin { to { transform: rotate(360deg); } }
+
 .preparation-main,
 .preparation-meta {
   display: grid;
