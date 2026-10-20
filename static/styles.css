@@ -903,6 +903,11 @@ th {
 .generation-feedback.success { border-color: rgba(74, 222, 128, 0.45); }
 .generation-feedback.error { border-color: rgba(248, 113, 113, 0.55); }
 .generation-feedback p { margin: 4px 0 0; }
+.preparation-row-highlight {
+  outline: 2px solid #f4f4f4;
+  outline-offset: 3px;
+  background: #181818;
+}
 .spinner {
   display: inline-block;
   width: 0.8rem;
