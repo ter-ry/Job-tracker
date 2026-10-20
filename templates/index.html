@@ -229,6 +229,18 @@
           <div class="panel-header"><div><h2>Application preparation queue</h2><p class="muted helper">Packages are prepared for review only. Nothing is submitted automatically.</p></div><div class="actions compact"><select id="preparation-status-filter"><option value="">All queue items</option><option value="ready_for_review">Ready for review</option><option value="queued">Queued</option><option value="preparing">Preparing</option><option value="failed">Failed</option><option value="approved">Approved</option><option value="skipped">Skipped</option></select><button class="button ghost small" type="button" id="refresh-preparation-queue">Refresh</button></div></div>
           <div id="preparation-queue" class="generated-output empty">No application packages queued.</div>
         </section>
+        <section id="tailoring-studio" class="panel tailoring-studio-panel" hidden>
+          <div class="panel-header"><div><h2>Résumé tailoring studio</h2><p id="tailoring-studio-subtitle" class="muted helper">Review grounded keyword opportunities and edit a copied résumé draft.</p></div><button class="button ghost small" type="button" id="close-tailoring-studio">Close studio</button></div>
+          <p id="tailoring-studio-error" class="risk high" role="alert" hidden></p>
+          <div class="tailoring-studio-grid">
+            <div class="tailoring-controls">
+              <section class="nested-panel"><h3>Keyword coverage</h3><div id="tailoring-score-summary"></div><div id="tailoring-keywords" class="tailoring-keywords"></div></section>
+              <section class="nested-panel"><h3>Selected résumé bullet</h3><p id="tailoring-selected-original" class="muted">Select a keyword and then choose an existing bullet to edit.</p><label>Proposed wording<textarea id="tailoring-proposed-text" rows="5" placeholder="Choose an existing bullet first"></textarea></label><div class="actions compact"><button class="button ghost small" type="button" id="tailoring-ai-improve">AI Improve</button><button class="button small" type="button" id="tailoring-apply">Apply</button><button class="button ghost small" type="button" id="tailoring-leave-unchanged">Leave unchanged</button></div><p id="tailoring-edit-status" class="muted helper" aria-live="polite"></p></section>
+              <section class="nested-panel"><h3>Résumé bullets</h3><div id="tailoring-bullets" class="tailoring-bullets"></div></section>
+            </div>
+            <div class="tailoring-preview"><section class="nested-panel"><h3>Draft preview</h3><p id="tailoring-layout-status" class="muted helper">Preview is approximate until Word layout validation is available.</p><pre id="tailoring-preview-text" class="generated-output"></pre></section></div>
+          </div>
+        </section>
         <section class="panel">
           <div class="panel-header">
             <h2>Shortlist</h2>
@@ -415,6 +427,7 @@
             <div class="actions compact"><button class="button" type="submit" id="candidate-profile-submit">Create candidate profile</button><button class="button ghost" type="button" id="cancel-candidate-profile">Cancel</button></div>
           </form>
           <div id="candidate-profile-documents" class="candidate-profile-documents empty">Select a candidate profile to manage its documents.</div>
+          <section class="nested-panel keyword-memory-manager"><div class="panel-header"><div><h3>Experience and keyword memory</h3><p class="muted helper">Profile-scoped confirmations are suggestions only and never add unsupported résumé claims.</p></div><button class="button ghost small" type="button" id="refresh-keyword-memory">Refresh</button></div><div id="keyword-memory-list" class="generated-output empty">Select a candidate profile to manage memory.</div></section>
         </section>
         <form id="profile-form" class="panel">
           <div class="panel-header">

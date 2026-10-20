@@ -410,6 +410,9 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn('candidate-profile-form-error', html)
         self.assertIn('.candidate-profile-manager [hidden]', Path('static/styles.css').read_text(encoding='utf-8'))
         self.assertIn('refreshCandidateProfiles', Path('static/app.js').read_text(encoding='utf-8'))
+        self.assertIn('openTailoringStudio', Path('static/app.js').read_text(encoding='utf-8'))
+        self.assertIn('tailoring-studio', html)
+        self.assertIn('keyword-memory-list', html)
 
     def test_candidate_profile_creation_is_committed_and_returned_by_list_endpoint(self):
         response = self.client.post(
@@ -424,6 +427,48 @@ class JobAssistantTest(unittest.TestCase):
         saved = next(profile for profile in profiles.get_json() if profile["id"] == profile_id)
         self.assertEqual(saved["name"], "Software Engineering")
         self.assertEqual(saved["identity_mode"], "shared")
+
+    def test_tailoring_studio_analyzes_selected_resume_and_applies_copy_edit(self):
+        self.client.post("/api/profile", json={"name": "Terry Mak", "email": "terry@example.com"})
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Software Engineering", "identity_mode": "shared"}).get_json()
+        document = Document()
+        document.add_heading("Terry Mak", level=1)
+        document.add_paragraph("Experience")
+        bullet = document.add_paragraph("Built Python automation for internal reporting.", style="List Bullet")
+        bullet.runs[0].font.bold = True
+        document.add_paragraph("Skills")
+        document.add_paragraph("Python, SQL, Flask")
+        buffer = io.BytesIO()
+        document.save(buffer)
+        upload = self.client.post(
+            f"/api/candidate-profiles/{profile['id']}/resumes/upload",
+            data={"file": (io.BytesIO(buffer.getvalue()), "base.docx"), "is_default": "true"},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(upload.status_code, 201)
+        resume_id = upload.get_json()["id"]
+        job = self.client.post("/api/jobs", json={"company": "Example Co", "title": "Backend Developer", "job_description": "Python and REST APIs required. Kafka preferred."}).get_json()
+        workspace = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume_id}")
+        self.assertEqual(workspace.status_code, 200, workspace.get_json())
+        body = workspace.get_json()
+        self.assertGreaterEqual(body["keywords"]["matched_count"], 1)
+        editable = next(item for item in body["bullets"] if item["editable"])
+        result = self.client.post(f"/api/tailoring/drafts/{body['draft']['id']}/apply", json={"paragraph_index": editable["paragraph_index"], "original_text": editable["text"], "proposed_text": "Built Python and REST API automation for internal reporting.", "operation": "edit"})
+        self.assertEqual(result.status_code, 200, result.get_json())
+        self.assertIn("REST API", result.get_json()["text"])
+        refreshed = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume_id}").get_json()
+        self.assertGreaterEqual(refreshed["keywords"]["matched_count"], body["keywords"]["matched_count"])
+        self.assertNotIn("REST API", app_module.extract_docx_text(Path(upload.get_json()["path"]).read_bytes()))
+
+    def test_tailoring_keyword_memory_is_profile_scoped_and_editable(self):
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Backend"}).get_json()
+        saved = self.client.post(f"/api/candidate-profiles/{profile['id']}/keyword-memory", json={"keyword": "Kafka", "status": "no"})
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(saved.get_json()["status"], "no")
+        listed = self.client.get(f"/api/candidate-profiles/{profile['id']}/keyword-memory").get_json()
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(self.client.delete(f"/api/candidate-profiles/{profile['id']}/keyword-memory/kafka").status_code, 200)
+        self.assertEqual(self.client.get(f"/api/candidate-profiles/{profile['id']}/keyword-memory").get_json(), [])
         self.assertIn('Checking requirements', Path('static/app.js').read_text(encoding='utf-8'))
         self.assertIn('Configure candidate profile documents', Path('static/app.js').read_text(encoding='utf-8'))
         self.assertIn('Candidate profile documents are separate from the legacy Profile documents', Path('static/app.js').read_text(encoding='utf-8'))

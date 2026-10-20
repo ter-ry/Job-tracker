@@ -16,6 +16,7 @@ const state = {
   generationSelections: {},
   shortlistRegenerations: {},
   selectedCandidateProfileId: "",
+  tailoring: { draftId: null, jobId: null, profileId: null, resumeId: null, data: null, selectedParagraph: null, selectedKeyword: null },
 };
 
 const jobFields = [
@@ -122,6 +123,11 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("discovery-test-sources").addEventListener("click", testJobSources);
   document.getElementById("refresh-shortlist").addEventListener("click", loadAll);
   document.getElementById("refresh-preparation-queue")?.addEventListener("click", loadPreparationQueue);
+  document.getElementById("close-tailoring-studio")?.addEventListener("click", closeTailoringStudio);
+  document.getElementById("tailoring-apply")?.addEventListener("click", applyTailoringEdit);
+  document.getElementById("tailoring-leave-unchanged")?.addEventListener("click", leaveTailoringUnchanged);
+  document.getElementById("tailoring-ai-improve")?.addEventListener("click", improveTailoringEdit);
+  document.getElementById("refresh-keyword-memory")?.addEventListener("click", loadKeywordMemory);
   document.getElementById("preparation-status-filter")?.addEventListener("change", loadPreparationQueue);
   document.getElementById("generate").addEventListener("click", generateMaterials);
   document.getElementById("analyse-resume-match").addEventListener("click", analyseResumeMatch);
@@ -212,6 +218,7 @@ async function loadAll() {
     renderPipelineDashboard(jobs);
     renderProfile(profile);
     renderCandidateProfiles();
+    await loadKeywordMemory();
     renderTemplateStatus(profile);
     renderOllamaHealth(ollamaHealth);
     renderEvidenceLibrary(evidence);
@@ -231,6 +238,128 @@ async function loadPreparationQueue() {
     state.preparationQueue = await api.get(`/api/preparation/queue${status ? `?status=${encodeURIComponent(status)}` : ""}`);
     renderPreparationQueue();
   } catch (error) { target.textContent = error.message; }
+}
+
+async function openTailoringStudio(jobId, profileId, resumeId) {
+  const studio = document.getElementById("tailoring-studio");
+  const error = document.getElementById("tailoring-studio-error");
+  if (!studio) return;
+  studio.hidden = false;
+  if (error) { error.hidden = true; error.textContent = ""; }
+  document.getElementById("tailoring-studio-subtitle").textContent = "Loading the selected résumé and job requirements…";
+  studio.scrollIntoView({ behavior: "smooth", block: "start" });
+  try {
+    const data = await api.get(`/api/tailoring/${jobId}/workspace?candidate_profile_id=${encodeURIComponent(profileId)}&resume_id=${encodeURIComponent(resumeId)}`);
+    state.tailoring = { draftId: data.draft.id, jobId, profileId, resumeId, data, selectedParagraph: null, selectedKeyword: null };
+    renderTailoringStudio();
+  } catch (requestError) {
+    if (error) { error.hidden = false; error.textContent = requestError.message; }
+  }
+}
+
+function closeTailoringStudio() {
+  const studio = document.getElementById("tailoring-studio");
+  if (studio) studio.hidden = true;
+  state.tailoring = { draftId: null, jobId: null, profileId: null, resumeId: null, data: null, selectedParagraph: null, selectedKeyword: null };
+}
+
+function renderTailoringStudio() {
+  const data = state.tailoring.data;
+  if (!data) return;
+  document.getElementById("tailoring-studio-subtitle").textContent = `${data.job.company || "Employer"} · ${data.job.title || "Role"} · ${data.resume.name || "Selected résumé"}`;
+  const original = data.original_keywords || {};
+  const current = data.keywords || {};
+  const delta = Number(current.score_percent || 0) - Number(original.score_percent || 0);
+  document.getElementById("tailoring-score-summary").innerHTML = `<p><strong>Original coverage:</strong> ${Number(original.score_percent || 0)}% (${Number(original.matched_count || 0)}/${Number(original.total || 0)})</p><p><strong>Current draft:</strong> ${Number(current.score_percent || 0)}% (${Number(current.matched_count || 0)}/${Number(current.total || 0)}) <span class="badge">${delta >= 0 ? "+" : ""}${delta} points</span></p><p class="muted helper">This is a transparent keyword heuristic, not an ATS score. Unapplied suggestions are excluded.</p>`;
+  const records = [...(current.matched || []), ...(current.related || []), ...(current.missing || [])];
+  document.getElementById("tailoring-keywords").innerHTML = records.map((item, index) => {
+    const memory = item.memory || {};
+    const status = memory.status === "yes" ? "Previously confirmed" : memory.status === "no" ? "No experience, previously confirmed" : item.match_type === "missing" ? "Experience unknown" : item.match_type === "related_review" ? "Related evidence" : "Found in current résumé";
+    return `<button class="tailoring-keyword ${item.match_type}" type="button" data-keyword-index="${index}"><strong>${escapeHtml(item.keyword)}</strong><span>${escapeHtml(status)}</span></button>`;
+  }).join("") || `<p class="muted">No significant keywords were extracted from this job description.</p>`;
+  document.querySelectorAll("[data-keyword-index]").forEach((button) => button.addEventListener("click", () => {
+    const item = records[Number(button.dataset.keywordIndex)];
+    state.tailoring.selectedKeyword = item;
+    document.querySelectorAll(".tailoring-keyword").forEach((entry) => entry.classList.remove("selected"));
+    button.classList.add("selected");
+    document.getElementById("tailoring-edit-status").textContent = item.match_type === "missing" ? "Select an existing résumé bullet to make a grounded edit, or record your experience status in Profile." : `Reviewing ${item.keyword}. Choose the actual bullet you want to work on.`;
+  }));
+  const bullets = data.bullets || [];
+  document.getElementById("tailoring-bullets").innerHTML = bullets.map((bullet) => `<button class="tailoring-bullet ${bullet.editable ? "editable" : ""}" type="button" ${bullet.editable ? "" : "disabled"} data-paragraph-index="${bullet.paragraph_index}"><span class="muted">${escapeHtml(bullet.section)}</span><span>${escapeHtml(bullet.text)}</span></button>`).join("") || `<p class="muted">No editable résumé bullets were found in this document.</p>`;
+  document.querySelectorAll("[data-paragraph-index]").forEach((button) => button.addEventListener("click", () => selectTailoringParagraph(Number(button.dataset.paragraphIndex))));
+  document.getElementById("tailoring-preview-text").textContent = data.preview?.text || "";
+  const layout = data.preview?.layout || {};
+  document.getElementById("tailoring-layout-status").textContent = layout.available ? (layout.verified ? "Word layout check passed: paragraph lines and page count are unchanged." : "Word layout check found a change. Review the draft before approving it.") : "Preview is approximate until Word layout validation is available.";
+}
+
+function selectTailoringParagraph(index) {
+  const bullet = (state.tailoring.data?.bullets || []).find((item) => Number(item.paragraph_index) === index);
+  if (!bullet) return;
+  state.tailoring.selectedParagraph = bullet;
+  document.querySelectorAll(".tailoring-bullet").forEach((entry) => entry.classList.toggle("selected", Number(entry.dataset.paragraphIndex) === index));
+  document.getElementById("tailoring-selected-original").textContent = bullet.text;
+  document.getElementById("tailoring-proposed-text").value = bullet.text;
+  document.getElementById("tailoring-edit-status").textContent = "This is a copied draft. Apply only wording you approve.";
+}
+
+async function applyTailoringEdit() {
+  const bullet = state.tailoring.selectedParagraph;
+  if (!bullet) return toast("Select an existing résumé bullet first");
+  const proposed = document.getElementById("tailoring-proposed-text").value.trim();
+  if (!proposed) return toast("Enter proposed wording or choose Leave unchanged");
+  await submitTailoringChange({ paragraph_index: bullet.paragraph_index, original_text: bullet.text, proposed_text: proposed, operation: "edit" });
+}
+
+async function leaveTailoringUnchanged() {
+  const bullet = state.tailoring.selectedParagraph;
+  if (!bullet) return toast("Select an existing résumé bullet first");
+  await submitTailoringChange({ paragraph_index: bullet.paragraph_index, operation: "leave_unchanged" });
+}
+
+async function submitTailoringChange(payload) {
+  try {
+    const result = await api.send(`/api/tailoring/drafts/${state.tailoring.draftId}/apply`, "POST", payload);
+    document.getElementById("tailoring-edit-status").textContent = result.layout?.verified ? "Applied to the copied draft. Word layout validation passed." : `Applied to the copied draft. ${result.layout?.reason || "Layout validation is approximate."}`;
+    await openTailoringStudio(state.tailoring.jobId, state.tailoring.profileId, state.tailoring.resumeId);
+  } catch (error) { document.getElementById("tailoring-edit-status").textContent = error.message; }
+}
+
+async function improveTailoringEdit() {
+  const bullet = state.tailoring.selectedParagraph;
+  if (!bullet) return toast("Select an existing résumé bullet first");
+  const button = document.getElementById("tailoring-ai-improve");
+  button.disabled = true;
+  button.textContent = "Improving…";
+  try {
+    const suggestion = await api.send(`/api/tailoring/drafts/${state.tailoring.draftId}/improve`, "POST", { original_text: bullet.text });
+    document.getElementById("tailoring-proposed-text").value = suggestion.proposed_text || bullet.text;
+    document.getElementById("tailoring-edit-status").textContent = suggestion.message || "AI suggestion loaded for review. It has not been applied.";
+  } catch (error) { document.getElementById("tailoring-edit-status").textContent = error.message; }
+  finally { button.disabled = false; button.textContent = "AI Improve"; }
+}
+
+async function loadKeywordMemory() {
+  const target = document.getElementById("keyword-memory-list");
+  const profileId = state.selectedCandidateProfileId;
+  if (!target || !profileId) return;
+  try {
+    const items = await api.get(`/api/candidate-profiles/${profileId}/keyword-memory`);
+    target.innerHTML = items.length ? items.map((item) => `<div class="memory-row"><strong>${escapeHtml(item.keyword || item.normalized_keyword)}</strong><select aria-label="Memory status for ${escapeAttribute(item.keyword || item.normalized_keyword)}" onchange="saveKeywordMemory('${escapeAttribute(item.normalized_keyword)}', '${escapeAttribute(item.keyword || item.normalized_keyword)}', this.value)"><option value="unknown" ${item.status === "unknown" ? "selected" : ""}>Unknown</option><option value="yes" ${item.status === "yes" ? "selected" : ""}>Confirmed experience</option><option value="no" ${item.status === "no" ? "selected" : ""}>No experience</option></select><button class="button ghost small" type="button" onclick="deleteKeywordMemory('${escapeAttribute(item.normalized_keyword)}')">Delete</button></div>`).join("") : "<p class=\"muted\">No saved keyword confirmations yet.</p>";
+  } catch (error) { target.textContent = error.message; }
+}
+
+async function saveKeywordMemory(normalized, keyword, status) {
+  const profileId = state.selectedCandidateProfileId;
+  if (!profileId) return;
+  await api.send(`/api/candidate-profiles/${profileId}/keyword-memory`, "POST", { keyword, status });
+  await loadKeywordMemory();
+}
+
+async function deleteKeywordMemory(keyword) {
+  const profileId = state.selectedCandidateProfileId;
+  if (!profileId) return;
+  await api.send(`/api/candidate-profiles/${profileId}/keyword-memory/${encodeURIComponent(keyword)}`, "DELETE", {});
+  await loadKeywordMemory();
 }
 
 function renderPreparationQueue() {
@@ -264,7 +393,8 @@ function renderPreparationQueue() {
       : item.status === "queued" || item.status === "failed"
         ? `${item.review_status === "manual_eligibility" ? `<button class="button small" type="button" onclick="reviewEligibility(${item.id})">Confirm Canadian eligibility</button>` : `<button class="button small" type="button" onclick="prepareQueueItem(${item.id})">${item.status === "failed" ? "Retry preparation" : "Prepare package"}</button>`}`
         : "";
-    return `<article class="preparation-row" data-preparation-id="${item.id}"><div class="preparation-main"><h3>${escapeHtml(job.title || "Untitled role")}</h3><p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(job.location || "Location unavailable")}</p><p class="muted">${escapeHtml(job.remote_eligibility || "unknown")} · ${escapeHtml(job.salary || "Salary unavailable")} · Job Priority ${Number(item.job_priority || 0)}</p><p class="muted">Profile ${escapeHtml(String(item.candidate_profile_id || "not selected"))} · Résumé ${escapeHtml(item.resume_status || "pending")} · Cover letter ${escapeHtml(item.cover_letter_status || "pending")}</p>${item.eligibility_note ? `<p class="muted">${escapeHtml(item.eligibility_note)}</p>` : ""}${feedback}${error && regeneration.status !== "error" ? `<p class="risk high">${escapeHtml(error)}</p>` : ""}</div><div class="preparation-meta"><strong>${escapeHtml(item.status.replaceAll("_", " "))}</strong><span>Keywords Score ${escapeHtml(matched)}</span><div class="row-actions">${actions}${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open application</a>` : ""}<button class="button ghost small" type="button" onclick="reviewPreparation(${item.id}, 'skip')">Skip</button></div></div></article>`;
+    const tailorAction = item.candidate_profile_id && item.resume_id ? `<button class="button ghost small" type="button" onclick="openTailoringStudio(${job.id}, ${item.candidate_profile_id}, ${item.resume_id})">Tailor résumé</button>` : "";
+    return `<article class="preparation-row" data-preparation-id="${item.id}"><div class="preparation-main"><h3>${escapeHtml(job.title || "Untitled role")}</h3><p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(job.location || "Location unavailable")}</p><p class="muted">${escapeHtml(job.remote_eligibility || "unknown")} · ${escapeHtml(job.salary || "Salary unavailable")} · Job Priority ${Number(item.job_priority || 0)}</p><p class="muted">Profile ${escapeHtml(String(item.candidate_profile_id || "not selected"))} · Résumé ${escapeHtml(item.resume_status || "pending")} · Cover letter ${escapeHtml(item.cover_letter_status || "pending")}</p>${item.eligibility_note ? `<p class="muted">${escapeHtml(item.eligibility_note)}</p>` : ""}${feedback}${error && regeneration.status !== "error" ? `<p class="risk high">${escapeHtml(error)}</p>` : ""}</div><div class="preparation-meta"><strong>${escapeHtml(item.status.replaceAll("_", " "))}</strong><span>Keywords Score ${escapeHtml(matched)}</span><div class="row-actions">${tailorAction}${actions}${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open application</a>` : ""}<button class="button ghost small" type="button" onclick="reviewPreparation(${item.id}, 'skip')">Skip</button></div></div></article>`;
   }).join("");
 }
 

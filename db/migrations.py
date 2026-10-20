@@ -69,10 +69,50 @@ def _migration_003_candidate_identity(db: sqlite3.Connection) -> None:
             db.execute(f"ALTER TABLE candidate_profiles ADD COLUMN {name} {definition}")
 
 
+def _migration_004_tailoring_studio(db: sqlite3.Connection) -> None:
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS tailoring_drafts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id INTEGER NOT NULL,
+            candidate_profile_id INTEGER NOT NULL,
+            resume_id INTEGER NOT NULL,
+            source_path TEXT NOT NULL DEFAULT '',
+            draft_path TEXT NOT NULL DEFAULT '',
+            changes_json TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL DEFAULT 'draft',
+            layout_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(job_id, candidate_profile_id, resume_id),
+            FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS tailoring_drafts_job_idx ON tailoring_drafts(job_id);
+        CREATE TABLE IF NOT EXISTS keyword_memory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            candidate_profile_id INTEGER NOT NULL,
+            normalized_keyword TEXT NOT NULL,
+            keyword TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'unknown',
+            project_employer TEXT NOT NULL DEFAULT '',
+            supporting_bullet TEXT NOT NULL DEFAULT '',
+            source_fingerprint TEXT NOT NULL DEFAULT '',
+            approved_replacement TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(candidate_profile_id, normalized_keyword),
+            FOREIGN KEY(candidate_profile_id) REFERENCES candidate_profiles(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS keyword_memory_profile_idx ON keyword_memory(candidate_profile_id);
+        """
+    )
+
+
 MIGRATIONS: tuple[tuple[int, str, Migration], ...] = (
     (1, "legacy baseline", _migration_001_baseline),
     (2, "candidate document profiles", _migration_002_candidate_documents),
     (3, "candidate identity fields", _migration_003_candidate_identity),
+    (4, "interactive tailoring studio", _migration_004_tailoring_studio),
 )
 
 
