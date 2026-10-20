@@ -127,6 +127,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("tailoring-apply")?.addEventListener("click", applyTailoringEdit);
   document.getElementById("tailoring-leave-unchanged")?.addEventListener("click", leaveTailoringUnchanged);
   document.getElementById("tailoring-ai-improve")?.addEventListener("click", improveTailoringEdit);
+  document.getElementById("tailoring-approve")?.addEventListener("click", approveTailoringDraft);
   document.getElementById("refresh-keyword-memory")?.addEventListener("click", loadKeywordMemory);
   document.getElementById("preparation-status-filter")?.addEventListener("change", loadPreparationQueue);
   document.getElementById("generate").addEventListener("click", generateMaterials);
@@ -283,6 +284,7 @@ function renderTailoringStudio() {
     document.querySelectorAll(".tailoring-keyword").forEach((entry) => entry.classList.remove("selected"));
     button.classList.add("selected");
     document.getElementById("tailoring-edit-status").textContent = item.match_type === "missing" ? "Select an existing résumé bullet to make a grounded edit, or record your experience status in Profile." : `Reviewing ${item.keyword}. Choose the actual bullet you want to work on.`;
+    renderTailoringKeywordActions();
   }));
   const bullets = data.bullets || [];
   document.getElementById("tailoring-bullets").innerHTML = bullets.map((bullet) => `<button class="tailoring-bullet ${bullet.editable ? "editable" : ""}" type="button" ${bullet.editable ? "" : "disabled"} data-paragraph-index="${bullet.paragraph_index}"><span class="muted">${escapeHtml(bullet.section)}</span><span>${escapeHtml(bullet.text)}</span></button>`).join("") || `<p class="muted">No editable résumé bullets were found in this document.</p>`;
@@ -300,6 +302,46 @@ function selectTailoringParagraph(index) {
   document.getElementById("tailoring-selected-original").textContent = bullet.text;
   document.getElementById("tailoring-proposed-text").value = bullet.text;
   document.getElementById("tailoring-edit-status").textContent = "This is a copied draft. Apply only wording you approve.";
+  renderTailoringKeywordActions();
+}
+
+function renderTailoringKeywordActions() {
+  const target = document.getElementById("tailoring-keyword-actions");
+  const keyword = state.tailoring.selectedKeyword;
+  if (!target || !keyword) return;
+  const memory = keyword.memory || {};
+  const bullet = state.tailoring.selectedParagraph;
+  target.innerHTML = `<button class="button ghost small" type="button" data-memory-status="yes">Yes, I have this experience</button><button class="button ghost small" type="button" data-memory-status="no">No experience</button><button class="button ghost small" type="button" data-memory-status="unknown">Skip</button>${memory.status === "yes" && memory.approved_replacement && bullet ? '<button class="button small" type="button" data-apply-memory>Apply previously approved suggestion</button>' : ""}${memory.status === "yes" && memory.approved_replacement ? '<span class="muted helper">Previously approved suggestion available.</span>' : ""}`;
+  target.querySelectorAll("[data-memory-status]").forEach((button) => button.addEventListener("click", () => saveTailoringKeywordMemory(button.dataset.memoryStatus)));
+  target.querySelector("[data-apply-memory]")?.addEventListener("click", applyTailoringMemory);
+}
+
+async function saveTailoringKeywordMemory(status) {
+  const keyword = state.tailoring.selectedKeyword;
+  if (!keyword) return;
+  const bullet = state.tailoring.selectedParagraph;
+  try {
+    await api.send(`/api/candidate-profiles/${state.tailoring.profileId}/keyword-memory`, "POST", { keyword: keyword.keyword, status, supporting_bullet: bullet?.text || "", source_fingerprint: bullet?.text ? await digestText(bullet.text) : "", approved_replacement: status === "yes" ? (document.getElementById("tailoring-proposed-text").value.trim() || bullet?.text || "") : "" });
+    await openTailoringStudio(state.tailoring.jobId, state.tailoring.profileId, state.tailoring.resumeId);
+    document.getElementById("tailoring-edit-status").textContent = status === "yes" ? "Experience confirmed for this profile. The suggestion is still subject to review." : status === "no" ? "No experience saved for this profile; it will not prompt an addition by default." : "Keyword skipped for now.";
+  } catch (error) { document.getElementById("tailoring-edit-status").textContent = error.message; }
+}
+
+async function digestText(value) {
+  if (!window.crypto?.subtle) return "";
+  const bytes = new TextEncoder().encode(value);
+  const digest = await window.crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("").slice(0, 24);
+}
+
+async function applyTailoringMemory() {
+  const keyword = state.tailoring.selectedKeyword;
+  const bullet = state.tailoring.selectedParagraph;
+  if (!keyword || !bullet) return;
+  try {
+    await api.send(`/api/tailoring/drafts/${state.tailoring.draftId}/apply-memory`, "POST", { keyword: keyword.keyword, paragraph_index: bullet.paragraph_index });
+    await openTailoringStudio(state.tailoring.jobId, state.tailoring.profileId, state.tailoring.resumeId);
+  } catch (error) { document.getElementById("tailoring-edit-status").textContent = error.message; }
 }
 
 async function applyTailoringEdit() {
@@ -324,6 +366,24 @@ async function submitTailoringChange(payload) {
   } catch (error) { document.getElementById("tailoring-edit-status").textContent = error.message; }
 }
 
+async function approveTailoringDraft() {
+  if (!state.tailoring.draftId) return;
+  const packageItem = state.preparationQueue.find((item) => Number(item.job_id) === Number(state.tailoring.jobId) && Number(item.candidate_profile_id) === Number(state.tailoring.profileId) && Number(item.resume_id) === Number(state.tailoring.resumeId));
+  if (!packageItem) {
+    document.getElementById("tailoring-edit-status").textContent = "Queue this job with the selected candidate profile and résumé before approving the tailored résumé.";
+    return;
+  }
+  const button = document.getElementById("tailoring-approve");
+  button.disabled = true;
+  try {
+    const result = await api.send(`/api/tailoring/drafts/${state.tailoring.draftId}/approve`, "POST", { preparation_id: packageItem.id });
+    document.getElementById("tailoring-edit-status").textContent = result.preparation?.status === "ready_for_review" ? "Approved tailored résumé is now the package download." : "Tailored résumé approved for this package. Prepare the package to generate its cover letter.";
+    await loadPreparationQueue();
+    await openTailoringStudio(state.tailoring.jobId, state.tailoring.profileId, state.tailoring.resumeId);
+  } catch (error) { document.getElementById("tailoring-edit-status").textContent = error.message; }
+  finally { button.disabled = false; }
+}
+
 async function improveTailoringEdit() {
   const bullet = state.tailoring.selectedParagraph;
   if (!bullet) return toast("Select an existing résumé bullet first");
@@ -331,7 +391,7 @@ async function improveTailoringEdit() {
   button.disabled = true;
   button.textContent = "Improving…";
   try {
-    const suggestion = await api.send(`/api/tailoring/drafts/${state.tailoring.draftId}/improve`, "POST", { original_text: bullet.text });
+    const suggestion = await api.send(`/api/tailoring/drafts/${state.tailoring.draftId}/improve`, "POST", { original_text: bullet.text, keyword: state.tailoring.selectedKeyword?.keyword || "" });
     document.getElementById("tailoring-proposed-text").value = suggestion.proposed_text || bullet.text;
     document.getElementById("tailoring-edit-status").textContent = suggestion.message || "AI suggestion loaded for review. It has not been applied.";
   } catch (error) { document.getElementById("tailoring-edit-status").textContent = error.message; }

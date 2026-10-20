@@ -9,10 +9,12 @@ The first Phase C slice is profile and job scoped. It never edits the selected m
 3. Review the extracted job keyword inventory and original versus current résumé coverage.
 4. Select an editable résumé bullet, revise it, and choose **Apply**. The change is written only to the copied draft DOCX.
 5. Review the text preview and the layout result. Word COM measurements are used when available; otherwise the preview is explicitly approximate.
-6. Optionally request an Ollama suggestion. Suggestions are never applied automatically.
-7. Manage profile scoped confirmed experience and no experience records under Profile.
+6. Approve the copied résumé for the matching application package. The approved DOCX is copied into that package and becomes its résumé download; the source résumé and other packages are unchanged.
+7. Optionally request an Ollama suggestion. Suggestions are never applied automatically, and structured responses are accepted only when they contain a usable proposed_bullet.
+8. Manage profile scoped confirmed experience and no experience records under Profile, or use the direct Yes, No and Skip actions beside a keyword.
+9. Reuse a previously approved suggestion only after selecting a matching source bullet. A source fingerprint mismatch requires manual review.
 
-The existing document generation and Keywords Score algorithms remain unchanged. The current first slice supports editing or replacing an existing bullet and leaving it unchanged. Add and move operations, full draft approval handoff into the preparation package, and a richer Word rendering pane remain follow-up work.
+The existing document generation and Keywords Score algorithms remain unchanged. The current slice supports editing or replacing an existing bullet, repeated edits, leaving it unchanged, and handing an approved copied DOCX into the matching preparation package. Add and move operations and a richer Word rendering pane remain follow-up work.
 
 ## Safety boundaries
 
