@@ -13,6 +13,7 @@ const state = {
   preparationQueue: [],
   candidateProfiles: [],
   generationSelections: {},
+  shortlistRegenerations: {},
   selectedCandidateProfileId: "",
 };
 
@@ -2447,6 +2448,8 @@ function documentSelectorOptions(items, selectedId, emptyLabel) {
 
 function renderShortlistCard(job) {
   const selection = generationSelection(job.id);
+  const regeneration = state.shortlistRegenerations[job.id] || {};
+  const regenerating = regeneration.status === "preparing";
   const profileOptions = [`<option value="" ${selection.profileId ? "" : "selected"}>Use active profile</option>`, ...state.candidateProfiles.map((profile) => `<option value="${escapeAttribute(profile.id)}" ${String(profile.id) === String(selection.profileId) ? "selected" : ""}>${escapeHtml(profile.name)}</option>`)].join("");
   const resumeAvailable = Boolean(job.resume_docx_path);
   const coverAvailable = Boolean(job.cover_letter_docx_path);
@@ -2457,6 +2460,16 @@ function renderShortlistCard(job) {
   const resumeError = job.resume_generation_error ? `<p class="risk high">Resume error: ${escapeHtml(job.resume_generation_error)}</p>` : "";
   const coverError = job.cover_letter_generation_error ? `<p class="risk high">Cover letter error: ${escapeHtml(job.cover_letter_generation_error)}</p>` : "";
   const coverWarning = job.cover_letter_generation_warning ? `<p class="warning">Cover letter warning: ${escapeHtml(job.cover_letter_generation_warning)}</p>` : "";
+  const backendGeneratedAt = job.generated_at || job.generation_debug?.generated_at || "";
+  const generationFeedback = regenerating
+    ? `<section class="generation-feedback" aria-live="polite"><strong><span class="spinner" aria-hidden="true"></span> Regenerating...</strong><p>Generating résumé and cover letter. Please wait.</p>${regeneration.startedAt ? `<p class="muted">Started ${escapeHtml(new Date(regeneration.startedAt).toLocaleTimeString())}</p>` : ""}</section>`
+    : regeneration.status === "success"
+      ? `<section class="generation-feedback success" aria-live="polite"><strong>New document version ready</strong><p>${escapeHtml(regeneration.message || "Résumé and cover letter generated successfully.")}</p>${backendGeneratedAt ? `<p class="muted">Completed ${escapeHtml(new Date(backendGeneratedAt).toLocaleString())}</p>` : ""}</section>`
+      : regeneration.status === "error"
+        ? `<section class="generation-feedback error" aria-live="assertive"><strong>Regeneration failed</strong><p>${escapeHtml(regeneration.message || "Document generation failed.")}</p><p class="muted">Correct the issue and try again.</p></section>`
+        : backendGeneratedAt && resumeStatus === "generated" && coverStatus === "generated"
+          ? `<section class="generation-feedback success"><strong>New document version ready</strong><p class="muted">Completed ${escapeHtml(new Date(backendGeneratedAt).toLocaleString())}</p></section>`
+          : "";
   const keywordScorePanel = selection.keywordScoreLoading
     ? `<section class="keywords-score-panel"><h3>Keywords Score</h3><p class="muted">Reviewing the selected résumé…</p></section>`
     : selection.keywordScoreError
@@ -2476,6 +2489,7 @@ function renderShortlistCard(job) {
           ${resumeError}
           <p class="muted">Cover letter: ${escapeHtml(coverStatus)}${coverPrevious}</p>
           ${coverError}${coverWarning}
+          ${generationFeedback}
           <div class="document-selection panel nested-panel">
             <h4>Document selection</h4>
             <label>Candidate profile<select onchange="selectGenerationProfile(${job.id}, this.value)">${profileOptions}</select></label>
@@ -2491,9 +2505,9 @@ function renderShortlistCard(job) {
         <a class="button small ghost ${resumeAvailable ? "" : "disabled-link"}" href="/api/shortlist/${job.id}/resume">Download résumé</a>
         <a class="button small ghost ${coverAvailable ? "" : "disabled-link"}" href="/api/shortlist/${job.id}/cover-letter">Download cover letter</a>
         <button class="button small ghost" type="button" onclick="previewShortlist(${job.id})">Preview documents</button>
-        <button class="button small ghost" type="button" onclick="regenerateShortlistResume(${job.id})">Regenerate résumé</button>
-        <button class="button small ghost" type="button" onclick="regenerateShortlistCoverLetter(${job.id})">Regenerate cover letter</button>
-        <button class="button small ghost" type="button" onclick="regenerateShortlist(${job.id})">Regenerate both</button>
+        <button class="button small ghost" type="button" ${regenerating ? "disabled" : ""} onclick="regenerateShortlistResume(${job.id})">${regenerating ? "Regenerating..." : "Regenerate résumé"}</button>
+        <button class="button small ghost" type="button" ${regenerating ? "disabled" : ""} onclick="regenerateShortlistCoverLetter(${job.id})">${regenerating ? "Regenerating..." : "Regenerate cover letter"}</button>
+        <button class="button small ghost" type="button" ${regenerating ? "disabled" : ""} onclick="regenerateShortlist(${job.id})">${regenerating ? "Regenerating..." : "Regenerate both"}</button>
         <button class="button small ghost" type="button" onclick="markShortlistApplied(${job.id})">Mark applied</button>
         <button class="button small ghost danger" type="button" onclick="removeShortlist(${job.id})">Remove</button>
       </div>
@@ -2502,18 +2516,39 @@ function renderShortlistCard(job) {
 }
 
 async function regenerateShortlist(id) {
-  try { showGenerationOutcome(await api.send(`/api/shortlist/${id}/regenerate`, "POST", generationPayload(id)), ["resume", "cover_letter"]); await loadAll(); }
-  catch (error) { toast(error.message); await loadAll(); }
+  await runShortlistRegeneration(id, "both", `/api/shortlist/${id}/regenerate`);
 }
 
 async function regenerateShortlistResume(id) {
-  try { showGenerationOutcome(await api.send(`/api/shortlist/${id}/regenerate-resume`, "POST", generationPayload(id)), ["resume"]); await loadAll(); }
-  catch (error) { toast(error.message); await loadAll(); }
+  await runShortlistRegeneration(id, "resume", `/api/shortlist/${id}/regenerate-resume`);
 }
 
 async function regenerateShortlistCoverLetter(id) {
-  try { showGenerationOutcome(await api.send(`/api/shortlist/${id}/regenerate-cover-letter`, "POST", generationPayload(id)), ["cover_letter"]); await loadAll(); }
-  catch (error) { toast(error.message); await loadAll(); }
+  await runShortlistRegeneration(id, "cover_letter", `/api/shortlist/${id}/regenerate-cover-letter`);
+}
+
+async function runShortlistRegeneration(id, kind, endpoint) {
+  const current = state.shortlistRegenerations[id];
+  if (current?.status === "preparing") return;
+  state.shortlistRegenerations[id] = { status: "preparing", startedAt: new Date().toISOString(), kind };
+  renderShortlist();
+  try {
+    const result = await api.send(endpoint, "POST", generationPayload(id));
+    const payload = result?.generation || result || {};
+    const requestedKinds = kind === "both" ? ["resume", "cover_letter"] : [kind];
+    const statuses = requestedKinds.map((item) => payload[item] || payload[`${item}_generation_status`] || "failed");
+    const generated = statuses.filter((status) => status === "generated").length;
+    const generatedAt = result.generated_at || payload.generated_at || result.generation_debug?.generated_at || payload.generation_debug?.generated_at || "";
+    if (generated === requestedKinds.length) {
+      state.shortlistRegenerations[id] = { status: "success", message: "The new document version was created.", generatedAt, kind };
+    } else {
+      state.shortlistRegenerations[id] = { status: "error", message: payload.error || result.error || "One or more documents could not be generated.", generatedAt, kind };
+    }
+    await loadAll();
+  } catch (error) {
+    state.shortlistRegenerations[id] = { status: "error", message: error.message || "Document generation failed.", kind };
+    await loadAll();
+  }
 }
 
 function showGenerationOutcome(result, requestedKinds) {

@@ -2419,6 +2419,46 @@ class JobAssistantTest(unittest.TestCase):
         self.assertTrue(any("Flowtally" in item["original"] for item in artifact["change_log"]["preserved"]))
         self.assertTrue(any("Pinterest" in item["original"] and "Gatekeeper" in item["replacement"] for item in artifact["change_log"]["applied"]))
 
+    def test_structured_template_replaces_selected_identity_email_hyperlink(self):
+        template = Path(self.tmpdir.name) / "structured_hyperlinked_identity.docx"
+        document = Document()
+        document.add_paragraph("Template Applicant")
+        contact = document.add_paragraph()
+        self.add_hyperlink(contact, "mailto:template@example.com", "template@example.com")
+        document.add_paragraph("October 1, 2026")
+        document.add_paragraph("Hiring Manager")
+        document.add_paragraph("Old Company")
+        document.add_paragraph("Toronto, ON")
+        document.add_paragraph("Re: Software Engineer")
+        document.add_paragraph("Dear Hiring Manager,")
+        document.add_paragraph("I built supported software systems and automated tests.")
+        document.add_paragraph("I would welcome the opportunity to contribute.")
+        document.add_paragraph("Sincerely,")
+        document.add_paragraph("Template Applicant")
+        document.save(template)
+        profile = {
+            "name": "Terry Mak",
+            "email": "terry.hcmak@gmail.com",
+            "work_experience": "Built supported software systems and automated tests.",
+            "resume_text": "Terry Mak. Built supported software systems and automated tests.",
+            "cover_letter_docx_template_path": str(template),
+            "cover_letter_no_dashes": "true",
+        }
+        job = {"company": "Lakeview Loan Servicing", "title": "Backend Engineer", "location": "Toronto, Ontario", "job_description": "Build Python APIs and automated tests."}
+        output = app_module.generate_application_materials(job, profile, raise_on_validation=False)
+        output_path = Path(self.tmpdir.name) / "structured_hyperlinked_identity_output.docx"
+        artifact = app_module.build_format_preserving_cover_letter(job, profile, output, output_path)
+        self.assertEqual(artifact["status"], "generated", artifact)
+        generated = Document(output_path)
+        generated_text = "\n".join(paragraph.text for paragraph in app_module.iter_document_paragraphs(generated))
+        self.assertEqual(generated_text.count("terry.hcmak@gmail.com"), 1)
+        self.assertNotIn("template@example.com", generated_text)
+        self.assertIn("Terry Mak", generated_text)
+        self.assertEqual(
+            [rel.target_ref for rel in generated.paragraphs[1].part.rels.values() if rel.reltype.endswith("/hyperlink")],
+            ["mailto:terry.hcmak@gmail.com"],
+        )
+
     def test_selected_cover_template_missing_fails_without_generic_fallback(self):
         self.seed_profile_for_documents(with_template=True)
         missing_template = Path(self.tmpdir.name) / "missing-cover-letter.docx"

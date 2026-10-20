@@ -3609,6 +3609,9 @@ def render_cover_letter_template_by_structure(document: Document, section_map: d
     if subject_index is None or greeting_index is None:
         return {"applied": [], "skipped": [], "template_mode": "structured_fallback"}
 
+    applied: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+
     replacements: dict[int, str] = {}
     if date_index is not None:
         replacements[date_index] = section_map["date"]
@@ -3699,8 +3702,6 @@ def render_cover_letter_template_by_structure(document: Document, section_map: d
         if signature_candidates:
             replacements[signature_candidates[0]] = section_map["signature"]
 
-    applied: list[dict[str, Any]] = []
-    skipped: list[dict[str, Any]] = []
     for index, replacement in replacements.items():
         paragraph = paragraph_by_index.get(index)
         if paragraph is None or not replacement or normalize_space(paragraph.text) == normalize_space(replacement):
