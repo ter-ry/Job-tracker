@@ -2594,7 +2594,7 @@ class JobAssistantTest(unittest.TestCase):
         document = Document()
         heading = document.add_paragraph("Terry Mak")
         contact = document.add_paragraph()
-        self.add_hyperlink(contact, "mailto:old@example.com", "old@example.com")
+        self.add_hyperlink(contact, "mailto:ter23rymhc@gmail.com", "ter23rymhc@gmail.com")
         document.add_paragraph("May 1, 2024")
         document.add_paragraph("Old Company")
         document.add_paragraph("Toronto, Ontario")
@@ -2609,7 +2609,7 @@ class JobAssistantTest(unittest.TestCase):
         document.save(source)
 
         output_path = Path(self.tmpdir.name) / "generated_cover_letter.docx"
-        profile = {"name": "Terry Mak", "email": "new@example.com", "cover_letter_docx_template_path": str(source), "cover_letter_no_dashes": "true"}
+        profile = {"name": "Terry Mak", "email": "terry.hcmak@gmail.com", "cover_letter_docx_template_path": str(source), "cover_letter_no_dashes": "true"}
         job = {"company": "Lakeview Loan Servicing", "title": "Backend Engineer", "location": "Toronto, Ontario", "job_description": "Build Python and Flask APIs with PostgreSQL and automated testing."}
         result = app_module.build_format_preserving_cover_letter(
             job,
@@ -2620,27 +2620,27 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(result["status"], "generated", result)
         generated = Document(output_path)
         generated_text = "\n".join(paragraph.text for paragraph in app_module.iter_document_paragraphs(generated))
-        self.assertEqual(generated_text.count("new@example.com"), 1)
-        self.assertNotIn("old@example.com", generated_text)
+        self.assertEqual(generated_text.count("terry.hcmak@gmail.com"), 1)
+        self.assertNotIn("ter23rymhc@gmail.com", generated_text)
         self.assertIn("50 to 250 SKUs", generated_text)
         self.assertNotIn("50–250", generated_text)
         self.assertEqual(
             [rel.target_ref for rel in generated.paragraphs[1].part.rels.values() if rel.reltype.endswith("/hyperlink")],
-            ["mailto:new@example.com"],
+            ["mailto:terry.hcmak@gmail.com"],
         )
 
     def test_resume_identity_uses_the_same_selected_email_as_cover_letter(self):
         document = Document()
         document.add_paragraph("Old Applicant")
         contact = document.add_paragraph()
-        self.add_hyperlink(contact, "mailto:old@example.com", "old@example.com")
-        self.assertTrue(app_module.replace_resume_identity(document, "Alex Rivera", "alex@example.com"))
-        self.assertEqual(document.paragraphs[0].text, "Alex Rivera")
-        self.assertEqual(document.paragraphs[1].text, "alex@example.com")
-        self.assertNotIn("old@example.com", document.paragraphs[1].text)
+        self.add_hyperlink(contact, "mailto:ter23rymhc@gmail.com", "ter23rymhc@gmail.com")
+        self.assertTrue(app_module.replace_resume_identity(document, "Terry Mak", "terry.hcmak@gmail.com"))
+        self.assertEqual(document.paragraphs[0].text, "Terry Mak")
+        self.assertEqual(document.paragraphs[1].text, "terry.hcmak@gmail.com")
+        self.assertNotIn("ter23rymhc@gmail.com", document.paragraphs[1].text)
         self.assertEqual(
             [rel.target_ref for rel in contact.part.rels.values() if rel.reltype.endswith("/hyperlink")],
-            ["mailto:alex@example.com"],
+            ["mailto:terry.hcmak@gmail.com"],
         )
 
     def test_no_dash_phrase_cleanup_does_not_duplicate_experience(self):
