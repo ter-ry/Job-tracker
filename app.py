@@ -25,6 +25,7 @@ import platform
 import warnings
 
 from docx import Document
+from docx.oxml.ns import qn
 from flask import Flask, Response, g, has_app_context, jsonify, render_template, request, send_file
 
 from grounding import (
@@ -2824,9 +2825,17 @@ def build_format_preserving_resume(
     candidate_path = resume_path.with_name(f"{resume_path.stem}.layout-check.docx")
     shutil.copyfile(template_path, candidate_path)
     document = Document(candidate_path)
-    replace_resume_identity(document, text(profile.get("name")))
+    identity_changed = replace_resume_identity(document, text(profile.get("name")))
     plan = build_resume_change_plan(document, job, profile, output)
     change_log = apply_resume_change_plan(document, plan)
+    if identity_changed:
+        change_log.setdefault("applied", []).insert(0, {
+            "kind": "identity",
+            "original": "",
+            "replacement": normalize_space(text(profile.get("name"))),
+            "reason": "Updated the selected applicant identity.",
+            "applied": True,
+        })
     document.save(candidate_path)
     layout_validation = compare_docx_layout(template_path, candidate_path)
     change_log["layout_validation"] = layout_validation
@@ -2853,6 +2862,16 @@ def build_format_preserving_resume(
     candidate_path.unlink(missing_ok=True)
     reopened_resume = Document(resume_path)
     _ = "\n".join(paragraph.text for paragraph in reopened_resume.paragraphs)
+    meaningful_changes = [
+        item for item in change_log.get("applied", [])
+        if item.get("kind") != "identity" and item.get("applied", True)
+    ]
+    change_log["meaningful_customization"] = bool(meaningful_changes)
+    change_log["tailoring_message"] = (
+        "The original résumé was retained because no safe, layout-preserving customization was available."
+        if not meaningful_changes
+        else "Meaningful, evidence-grounded résumé customization was applied."
+    )
     return {
         "status": "generated",
         "error": "",
@@ -2887,9 +2906,47 @@ def remove_dashes_from_document(document: Document) -> bool:
         for run in paragraph.runs:
             updated = re.sub(r"(?<=\d)[-–—](?=\d)", " to ", run.text)
             updated = re.sub(r"[-–—]", " ", updated)
+            updated = re.sub(r"\bhands\s+on\b", "practical experience", updated, flags=re.I)
             if updated != run.text:
                 run.text = re.sub(r"[ \t]+", " ", updated)
                 changed = True
+    return changed
+
+
+EMAIL_PATTERN = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
+
+
+def replace_cover_letter_email(paragraph: Any, replacement: str) -> bool:
+    """Replace a contact email atomically, including hyperlink text and target."""
+    replacement = normalize_space(replacement)
+    if not replacement:
+        return False
+    changed = False
+    hyperlinks = paragraph._p.xpath(".//w:hyperlink")
+    for hyperlink in hyperlinks:
+        visible = "".join(node.text or "" for node in hyperlink.xpath(".//w:t"))
+        relationship_id = hyperlink.get(qn("r:id"))
+        relationship = paragraph.part.rels.get(relationship_id) if relationship_id else None
+        target = str(getattr(relationship, "target_ref", "") or "") if relationship else ""
+        if not EMAIL_PATTERN.search(visible) and not target.lower().startswith("mailto:"):
+            continue
+        already_current = visible == replacement and target.lower() == f"mailto:{replacement}".lower()
+        if already_current:
+            continue
+        text_nodes = hyperlink.xpath(".//w:t")
+        if text_nodes:
+            text_nodes[0].text = replacement
+            for node in text_nodes[1:]:
+                node.text = ""
+        if relationship is not None:
+            relationship._target = f"mailto:{replacement}"
+        changed = True
+
+    value = paragraph.text or ""
+    if EMAIL_PATTERN.search(value):
+        updated = EMAIL_PATTERN.sub(replacement, value)
+        if updated != value and replace_paragraph_text(paragraph, value, updated):
+            changed = True
     return changed
 
 
@@ -3343,7 +3400,7 @@ def build_cover_letter_section_map(
         opening = f"I am pleased to apply for the {title} role at {company}. My experience with {short_join(supported_terms)} includes building and supporting software tools and data workflows relevant to this role."
     else:
         opening = f"I am pleased to apply for the {title} role at {company}. My background includes practical experience relevant to the responsibilities described in this posting."
-    motivation = build_job_motivation(job)
+    motivation = build_job_motivation(job, candidate_evidence)
     return {
         "date": format_cover_letter_date(date.today()),
         "company": company,
@@ -3365,7 +3422,7 @@ def build_cover_letter_section_map(
     }
 
 
-def build_job_motivation(job: dict[str, Any]) -> str:
+def build_job_motivation(job: dict[str, Any], candidate_evidence: dict[str, Any] | None = None) -> str:
     """Use only company or role context explicitly present in the current posting."""
     company = text(job.get("company")) or "the company"
     description = text(job.get("job_description"))
@@ -3384,6 +3441,14 @@ def build_job_motivation(job: dict[str, Any]) -> str:
             return (
                 f"I am particularly interested in {company} because the posting states that it {detail}. "
                 "I would welcome the opportunity to contribute to that work in a collaborative engineering team."
+            )
+    if candidate_evidence:
+        supported = matching_evidence_terms(job, candidate_evidence, limit=4)
+        if supported:
+            terms = short_join(supported)
+            return (
+                f"I am particularly interested in the opportunity at {company} because the posting emphasizes {terms}. "
+                f"That focus connects directly with my documented experience using {terms}, and I would welcome the opportunity to contribute to the team."
             )
     return (
         "I am particularly interested in the opportunity to contribute to the responsibilities described in this posting. "
@@ -3474,7 +3539,16 @@ def refresh_cover_letter_identity(
         replacement = ""
         change = ""
         if "@" in value and section_map.get("applicant_email"):
-            replacement, change = section_map["applicant_email"], "applicant email"
+            if replace_cover_letter_email(paragraph, section_map["applicant_email"]):
+                applied.append({
+                    "kind": "identity",
+                    "original": value,
+                    "replacement": section_map["applicant_email"],
+                    "changes": ["applicant email", "hyperlink display text", "mailto target"],
+                    "reason": "Replaced the complete selected applicant email hyperlink atomically.",
+                    "validation_status": "passed",
+                })
+            continue
         elif re.search(r"\d[\d ()+.-]{6,}\d", value) and section_map.get("applicant_phone"):
             replacement, change = section_map["applicant_phone"], "applicant phone"
         if replacement and normalize_space(value) != normalize_space(replacement) and replace_paragraph_text(paragraph, paragraph.text, replacement):
@@ -3484,6 +3558,21 @@ def refresh_cover_letter_identity(
                 "replacement": replacement,
                 "changes": [change],
                 "reason": "Refreshed the selected distinct applicant identity.",
+                "validation_status": "passed",
+            })
+    # Contact blocks can live in headers or tables. Handle those nodes too so
+    # an old linked address cannot survive outside the main body paragraphs.
+    for paragraph in iter_document_paragraphs(document):
+        value = normalize_space(paragraph.text)
+        if "@" not in value or not section_map.get("applicant_email"):
+            continue
+        if replace_cover_letter_email(paragraph, section_map["applicant_email"]):
+            applied.append({
+                "kind": "identity",
+                "original": value,
+                "replacement": section_map["applicant_email"],
+                "changes": ["applicant email", "hyperlink display text", "mailto target"],
+                "reason": "Replaced the complete selected applicant email hyperlink atomically.",
                 "validation_status": "passed",
             })
 
@@ -3535,7 +3624,16 @@ def render_cover_letter_template_by_structure(document: Document, section_map: d
     for index, paragraph in nonempty:
         value = normalize_space(paragraph.text)
         if "@" in value and section_map.get("applicant_email"):
-            replacements[index] = section_map["applicant_email"]
+            if replace_cover_letter_email(paragraph, section_map["applicant_email"]):
+                applied.append({
+                    "kind": "identity",
+                    "original": value,
+                    "replacement": section_map["applicant_email"],
+                    "changes": ["applicant email", "hyperlink display text", "mailto target"],
+                    "reason": "Replaced the complete selected applicant email hyperlink atomically.",
+                    "validation_status": "passed",
+                })
+            continue
         elif re.search(r"\d[\d ()+.-]{6,}\d", value) and section_map.get("applicant_phone"):
             replacements[index] = section_map["applicant_phone"]
 

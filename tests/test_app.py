@@ -2526,6 +2526,18 @@ class JobAssistantTest(unittest.TestCase):
         self.assertNotIn("role's focus on", gatekeeper_map["opening"].lower())
         self.assertNotIn("role's focus on", finance_map["opening"].lower())
 
+        lakeview = {
+            "company": "Lakeview Loan Servicing",
+            "title": "Backend Engineer",
+            "job_description": "Build Python and Flask APIs with PostgreSQL, authentication, permissions, migrations, validation, and automated testing.",
+            "required_skills": "Python, Flask, PostgreSQL, APIs, testing",
+        }
+        lakeview_map = app_module.build_cover_letter_section_map(profile, lakeview, [], grounding.build_candidate_evidence(profile))
+        self.assertIn("Python", lakeview_map["motivation"])
+        self.assertIn("SQL", lakeview_map["motivation"])
+        self.assertNotIn("Kafka", lakeview_map["motivation"])
+        self.assertNotIn("Kubernetes", lakeview_map["motivation"])
+
     def test_cover_letter_validation_uses_body_boundaries_for_contact_details(self):
         evidence = grounding.build_candidate_evidence(self.software_profile())
         header_safe = (
@@ -2554,6 +2566,67 @@ class JobAssistantTest(unittest.TestCase):
         body_validation = grounding.validate_cover_letter_output(body_leak, evidence, self.software_job())
         self.assertFalse(body_validation["ok"])
         self.assertTrue(any("Contact details detected in body paragraph" in item for item in body_validation["conflicting_phrases"]))
+
+    def test_cover_letter_email_hyperlink_is_replaced_atomically(self):
+        document = Document()
+        contact = document.add_paragraph()
+        contact.add_run("Email: ")
+        self.add_hyperlink(contact, "mailto:old@example.com", "old@example.com")
+        split_contact = document.add_paragraph()
+        split_contact.add_run("old")
+        split_contact.add_run("@example")
+        split_contact.add_run(".com")
+
+        self.assertTrue(app_module.replace_cover_letter_email(contact, "new@example.com"))
+        self.assertTrue(app_module.replace_cover_letter_email(split_contact, "new@example.com"))
+        self.assertEqual(contact.text, "Email: new@example.com")
+        self.assertEqual(split_contact.text, "new@example.com")
+        self.assertEqual(
+            [rel.target_ref for rel in contact.part.rels.values() if rel.reltype.endswith("/hyperlink")],
+            ["mailto:new@example.com"],
+        )
+        self.assertEqual(len(app_module.EMAIL_PATTERN.findall(contact.text)), 1)
+        self.assertEqual(len(app_module.EMAIL_PATTERN.findall(split_contact.text)), 1)
+
+    def test_format_preserving_cover_letter_updates_hyperlinked_identity_and_keeps_range_natural(self):
+        source = Path(self.tmpdir.name) / "hyperlinked_cover_letter.docx"
+        document = Document()
+        heading = document.add_paragraph("Terry Mak")
+        contact = document.add_paragraph()
+        self.add_hyperlink(contact, "mailto:old@example.com", "old@example.com")
+        document.add_paragraph("May 1, 2024")
+        document.add_paragraph("Old Company")
+        document.add_paragraph("Toronto, Ontario")
+        document.add_paragraph("Dear Old Company Hiring Team,")
+        document.add_paragraph("Re: Application for Software Engineer")
+        document.add_paragraph("I am pleased to apply for the Software Engineer role at Old Company.")
+        document.add_paragraph("I tracked 50–250 SKUs and built Python and Flask tools.")
+        document.add_paragraph("My experience would support this team.")
+        document.add_paragraph("Thank you for your consideration.")
+        document.add_paragraph("Sincerely,")
+        document.add_paragraph("Terry Mak")
+        document.save(source)
+
+        output_path = Path(self.tmpdir.name) / "generated_cover_letter.docx"
+        profile = {"name": "Terry Mak", "email": "new@example.com", "cover_letter_docx_template_path": str(source), "cover_letter_no_dashes": "true"}
+        job = {"company": "Lakeview Loan Servicing", "title": "Backend Engineer", "location": "Toronto, Ontario", "job_description": "Build Python and Flask APIs with PostgreSQL and automated testing."}
+        result = app_module.build_format_preserving_cover_letter(
+            job,
+            profile,
+            {"cover_letter": "", "candidate_evidence": grounding.build_candidate_evidence({"work_experience": "Built Python and Flask APIs with PostgreSQL and automated testing for internal operations workflows."})},
+            output_path,
+        )
+        self.assertEqual(result["status"], "generated", result)
+        generated = Document(output_path)
+        generated_text = "\n".join(paragraph.text for paragraph in app_module.iter_document_paragraphs(generated))
+        self.assertEqual(generated_text.count("new@example.com"), 1)
+        self.assertNotIn("old@example.com", generated_text)
+        self.assertIn("50 to 250 SKUs", generated_text)
+        self.assertNotIn("50–250", generated_text)
+        self.assertEqual(
+            [rel.target_ref for rel in generated.paragraphs[1].part.rels.values() if rel.reltype.endswith("/hyperlink")],
+            ["mailto:new@example.com"],
+        )
 
     def test_scotiabank_cover_letter_template_preserves_structure_and_replaces_stale_content(self):
         self.seed_profile_for_documents(with_template=True)
