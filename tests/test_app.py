@@ -487,7 +487,15 @@ class JobAssistantTest(unittest.TestCase):
         complete = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
         self.assertTrue(complete["keywords"]["available"])
         self.assertGreater(complete["keywords"]["total"], 1)
-        self.assertTrue(any(item["normalized"] == "kafka" for item in complete["keywords"]["missing"]))
+        self.assertTrue(any(item["normalized"] == "messaging and queue platforms" for item in complete["keywords"]["missing"]))
+        override = self.client.post(f"/api/tailoring/{job['id']}/requirement-overrides", json={"normalized_requirement": "messaging and queue platforms", "override": "not_a_requirement"})
+        self.assertEqual(override.status_code, 200)
+        adjusted = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()["keywords"]
+        self.assertEqual(adjusted["excluded_count"], 1)
+        self.assertEqual(adjusted["adjusted_total"], adjusted["total"] - 1)
+        self.assertTrue(any(item.get("excluded_from_adjusted_coverage") for item in adjusted["missing"]))
+        restored = self.client.delete(f"/api/tailoring/{job['id']}/requirement-overrides/messaging%20and%20queue%20platforms")
+        self.assertEqual(restored.status_code, 200)
 
     def test_tailoring_ai_structured_proposal_is_extracted_without_dictionary_text(self):
         self.client.post("/api/profile", json={"name": "Terry Mak", "email": "terry@example.com", "resume_text": "Built Python automation."})
@@ -537,7 +545,7 @@ class JobAssistantTest(unittest.TestCase):
         package = prepared.get_json()
         self.assertEqual(package["status"], "ready_for_review", package)
         self.assertEqual(Path(package["prepared_resume_path"]), tailored_path)
-        self.assertIn("rest apis", [item["keyword"] for item in package["keywords_score"].get("matched", [])], {"score": package["keywords_score"], "text": app_module.extract_docx_text(tailored_path.read_bytes()), "job": package["job"].get("required_skills")})
+        self.assertIn("rest apis", [item["normalized"] for item in package["keywords_score"].get("matched", [])], {"score": package["keywords_score"], "text": app_module.extract_docx_text(tailored_path.read_bytes()), "job": package["job"].get("required_skills")})
         self.assertIn("REST APIs", app_module.extract_docx_text(tailored_path.read_bytes()))
         tailored_path.unlink()
         unavailable = self.client.post(f"/api/preparation/{item['id']}/regenerate")
@@ -546,7 +554,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("approved tailored résumé", unavailable.get_json()["error"])
         second_job = self.client.post("/api/jobs", json={"company": "Second Co", "title": "Backend Developer", "required_skills": "REST APIs", "job_description": "REST APIs"}).get_json()
         second_workspace = self.client.get(f"/api/tailoring/{second_job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
-        reusable = next(item for group in ("matched", "related", "missing") for item in second_workspace["keywords"][group] if item["normalized"] == "rest apis")
+        reusable = next(item for group in ("matched", "related", "missing") for item in second_workspace["keywords"][group] if item["normalized"] == "api and service design")
         self.assertTrue(reusable["memory"]["source_matches"])
         reused = self.client.post(f"/api/tailoring/drafts/{second_workspace['draft']['id']}/apply-memory", json={"keyword": "REST APIs", "paragraph_index": reusable["memory"]["matching_paragraph_index"]})
         self.assertEqual(reused.status_code, 200, reused.get_json())
@@ -2328,19 +2336,34 @@ class JobAssistantTest(unittest.TestCase):
         report = grounding.build_tailoring_coverage_report(job, resume)
         inventory = {item["normalized"]: item for group in ("matched", "related", "missing") for item in report[group]}
         self.assertGreater(report["total"], 1)
-        self.assertIn("python", inventory)
-        self.assertIn("postgresql", inventory)
-        self.assertIn("advanced distributed systems", inventory)
-        self.assertIn("kafka", inventory)
-        self.assertIn("kubernetes", inventory)
-        self.assertIn("3 to 5+ years of production backend experience", inventory)
-        self.assertEqual(inventory["python"]["match_type"], "exact")
-        self.assertEqual(inventory["postgresql"]["match_type"], "exact")
-        self.assertEqual(inventory["kafka"]["match_type"], "missing")
-        self.assertEqual(inventory["kubernetes"]["match_type"], "missing")
-        self.assertEqual(inventory["advanced distributed systems"]["requirement_type"], "required")
+        self.assertIn("backend programming languages", inventory)
+        self.assertIn("distributed and event-driven systems", inventory)
+        self.assertIn("messaging and queue platforms", inventory)
+        self.assertIn("production backend experience", inventory)
+        self.assertEqual(inventory["backend programming languages"]["match_type"], "exact")
+        self.assertEqual(inventory["messaging and queue platforms"]["match_type"], "missing")
+        self.assertEqual(inventory["distributed and event-driven systems"]["match_type"], "missing")
+        self.assertEqual(inventory["distributed and event-driven systems"]["requirement_type"], "required")
         self.assertTrue(report["review_before_applying"])
         self.assertLess(report["score_percent"], 100)
+
+    def test_complete_lakeview_fixture_groups_alternatives_and_preserves_sections(self):
+        description = (Path(__file__).parent / "fixtures" / "lakeview_backend_engineer_job.txt").read_text(encoding="utf-8")
+        job = {"title": "Backend Engineer", "job_description": description}
+        report = grounding.build_tailoring_coverage_report(
+            job,
+            "Built Python Flask REST APIs with PostgreSQL, automated testing, AWS and data models.",
+        )
+        inventory = {item["normalized"]: item for group in ("matched", "related", "missing") for item in report[group]}
+        self.assertGreaterEqual(report["total"], 15)
+        self.assertIn("backend programming languages", inventory)
+        self.assertIn("messaging and queue platforms", inventory)
+        self.assertIn("transactional correctness", inventory)
+        self.assertIn("llm and ai orchestration", inventory)
+        self.assertEqual(inventory["messaging and queue platforms"]["requirement_type"], "preferred")
+        self.assertTrue(inventory["api and service design"]["source_evidence"])
+        self.assertNotIn("and the ability to build dependable", {item["keyword"] for item in inventory.values()})
+        self.assertEqual(inventory["backend programming languages"]["match_type"], "exact")
 
     def test_nodejs_alias_substitution_preserves_word_layout_and_reports_final_docx_coverage(self):
         master = Path(self.tmpdir.name) / "nodejs_alias_master.docx"

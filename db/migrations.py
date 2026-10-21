@@ -148,6 +148,24 @@ def _migration_007_keyword_memory_paragraph(db: sqlite3.Connection) -> None:
         db.execute("ALTER TABLE keyword_memory ADD COLUMN source_paragraph_index INTEGER NOT NULL DEFAULT -1")
 
 
+def _migration_008_tailoring_requirement_overrides(db: sqlite3.Connection) -> None:
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS tailoring_requirement_overrides (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id INTEGER NOT NULL,
+            normalized_requirement TEXT NOT NULL,
+            override TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(job_id, normalized_requirement),
+            FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS tailoring_requirement_overrides_job_idx ON tailoring_requirement_overrides(job_id);
+        """
+    )
+
+
 MIGRATIONS: tuple[tuple[int, str, Migration], ...] = (
     (1, "legacy baseline", _migration_001_baseline),
     (2, "candidate document profiles", _migration_002_candidate_documents),
@@ -156,6 +174,7 @@ MIGRATIONS: tuple[tuple[int, str, Migration], ...] = (
     (5, "tailoring package handoff", _migration_005_tailoring_package_handoff),
     (6, "keyword memory source résumé", _migration_006_keyword_memory_source),
     (7, "keyword memory paragraph identity", _migration_007_keyword_memory_paragraph),
+    (8, "tailoring requirement overrides", _migration_008_tailoring_requirement_overrides),
 )
 
 

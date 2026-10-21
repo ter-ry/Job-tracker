@@ -274,12 +274,13 @@ function renderTailoringStudio() {
     document.getElementById("tailoring-score-summary").innerHTML = `<p class="risk medium"><strong>Keyword coverage unavailable</strong></p><p>${escapeHtml(current.unavailable_reason || original.unavailable_reason || "The complete job description is not available for this posting.")}</p><p class="muted helper">This is not a 0% result. Edit the job and paste or refresh the original posting, then reopen Tailoring Studio.</p>`;
   } else {
   const delta = Number(current.score_percent || 0) - Number(original.score_percent || 0);
-  document.getElementById("tailoring-score-summary").innerHTML = `<p><strong>Original coverage:</strong> ${Number(original.score_percent || 0)}% (${Number(original.matched_count || 0)}/${Number(original.total || 0)})</p><p><strong>Current draft:</strong> ${Number(current.score_percent || 0)}% (${Number(current.matched_count || 0)}/${Number(current.total || 0)}) <span class="badge">${delta >= 0 ? "+" : ""}${delta} points</span></p><p class="muted helper">This is a transparent keyword heuristic, not an ATS score. Unapplied suggestions are excluded.</p>`;
+  document.getElementById("tailoring-score-summary").innerHTML = `<p><strong>Original coverage:</strong> ${Number(original.score_percent || 0)}% (${Number(original.matched_count || 0)}/${Number(original.total || 0)})</p><p><strong>User-adjusted draft:</strong> ${Number(current.score_percent || 0)}% (${Number(current.matched_count || 0)}/${Number(current.total || 0)}) <span class="badge">${delta >= 0 ? "+" : ""}${delta} points</span></p>${Number(current.excluded_count || 0) ? `<p class="muted helper">${Number(current.excluded_count)} requirement${Number(current.excluded_count) === 1 ? "" : "s"} excluded as not a requirement for this application.</p>` : ""}<p class="muted helper">This is transparent keyword coverage, not a qualification or ATS score. Unapplied suggestions are excluded.</p>`;
   }
   const records = [...(current.matched || []), ...(current.related || []), ...(current.missing || [])];
   document.getElementById("tailoring-keywords").innerHTML = records.map((item, index) => {
     const memory = item.memory || {};
-    const status = memory.status === "yes" ? "Previously confirmed" : memory.status === "no" ? "No experience, previously confirmed" : item.match_type === "missing" ? "Experience unknown" : item.match_type === "related_review" ? "Related evidence" : "Found in current résumé";
+    const importance = item.requirement_type === "required" ? "Required" : item.requirement_type === "preferred" ? "Preferred" : item.requirement_type === "responsibility" ? "Responsibility" : "Unclassified";
+    const status = item.user_override === "not_a_requirement" ? `Excluded for this job · ${importance}` : `${item.match_type === "missing" ? "Missing" : item.match_type === "partial" || item.match_type === "related_review" ? "Partial evidence" : "Matched"} · ${importance}`;
     return `<button class="tailoring-keyword ${item.match_type}" type="button" data-keyword-index="${index}"><strong>${escapeHtml(item.keyword)}</strong><span>${escapeHtml(status)}</span></button>`;
   }).join("") || (current.available === false ? `<p class="risk medium">Requirements cannot be reviewed until the complete job description is stored for this posting.</p>` : `<p class="muted">No significant requirements were extracted from this job description.</p>`);
   document.querySelectorAll("[data-keyword-index]").forEach((button) => button.addEventListener("click", () => {
@@ -320,9 +321,24 @@ function renderTailoringKeywordActions() {
   const bullet = state.tailoring.selectedParagraph;
   const suggestion = memory.status === "yes" && memory.approved_replacement ? `<div class="muted helper">Previously approved suggestion: ${escapeHtml(memory.approved_replacement)}</div>` : "";
   const matchNote = memory.status === "yes" && memory.approved_replacement && !memory.source_matches ? '<span class="muted helper">The original source bullet changed; select a matching bullet manually.</span>' : "";
-  target.innerHTML = `<button class="button ghost small" type="button" data-memory-status="yes">Yes, I have this experience</button><button class="button ghost small" type="button" data-memory-status="no">No experience</button><button class="button ghost small" type="button" data-memory-status="unknown">Skip</button>${memory.status === "yes" && memory.approved_replacement && bullet && memory.source_matches ? '<button class="button small" type="button" data-apply-memory>Apply previous edit</button>' : ""}${suggestion}${matchNote}`;
+  const excluded = keyword.user_override === "not_a_requirement";
+  target.innerHTML = `<button class="button ghost small" type="button" data-memory-status="yes">Yes, I have this experience</button><button class="button ghost small" type="button" data-memory-status="no">No experience</button><button class="button ghost small" type="button" data-requirement-override="${excluded ? "restore" : "not_a_requirement"}">${excluded ? "Restore requirement" : "Not a requirement"}</button><button class="button ghost small" type="button" data-memory-status="unknown">Skip for now</button>${memory.status === "yes" && memory.approved_replacement && bullet && memory.source_matches ? '<button class="button small" type="button" data-apply-memory>Apply previous edit</button>' : ""}${suggestion}${matchNote}`;
   target.querySelectorAll("[data-memory-status]").forEach((button) => button.addEventListener("click", () => saveTailoringKeywordMemory(button.dataset.memoryStatus)));
+  target.querySelector("[data-requirement-override]")?.addEventListener("click", () => saveTailoringRequirementOverride(target.querySelector("[data-requirement-override]").dataset.requirementOverride));
   target.querySelector("[data-apply-memory]")?.addEventListener("click", applyTailoringMemory);
+}
+
+async function saveTailoringRequirementOverride(action) {
+  const keyword = state.tailoring.selectedKeyword;
+  if (!keyword) return;
+  try {
+    if (action === "restore") {
+      await api.send(`/api/tailoring/${state.tailoring.jobId}/requirement-overrides/${encodeURIComponent(keyword.normalized)}`, "DELETE", {});
+    } else {
+      await api.send(`/api/tailoring/${state.tailoring.jobId}/requirement-overrides`, "POST", { normalized_requirement: keyword.normalized, override: "not_a_requirement" });
+    }
+    await openTailoringStudio(state.tailoring.jobId, state.tailoring.profileId, state.tailoring.resumeId);
+  } catch (error) { document.getElementById("tailoring-edit-status").textContent = error.message; }
 }
 
 async function saveTailoringKeywordMemory(status) {

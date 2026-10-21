@@ -38,10 +38,12 @@ from grounding import (
     contains_resume_section_heading,
     build_keywords_score_report,
     build_tailoring_coverage_report,
+    apply_tailoring_requirement_overrides,
     evidence_has_generation_source,
     is_corrupted_text,
     job_keywords,
     normalize_keyword,
+    normalize_tailoring_requirement,
     stable_hash as grounding_hash,
     supporting_snippets,
     validate_cover_letter_output,
@@ -104,7 +106,7 @@ DISCOVERY_DATE_WINDOWS = {
 # Keep the public diagnostics field stable for existing API clients.  The
 # database itself is now tracked independently by the migration runner.
 APP_SCHEMA_VERSION = 1
-CURRENT_DB_SCHEMA_VERSION = 7
+CURRENT_DB_SCHEMA_VERSION = 8
 DISCOVERY_DEBUG_SNAPSHOT_LIMIT = 25
 GEOCODING_FAILURE_CACHE_SECONDS = 15 * 60
 DISCOVERY_TASK_NAME = "Job Tracker Discovery"
@@ -632,9 +634,19 @@ def create_app() -> Flask:
                     item["source_matches"] = True
                     item["matching_paragraph_index"] = int(match["paragraph_index"])
         report = score_tailoring_text(job, selection["profile"], draft_text)
+        override_rows = query_db("SELECT normalized_requirement, override FROM tailoring_requirement_overrides WHERE job_id = ?", [job_id])
+        overrides = {text(item["normalized_requirement"]): text(item["override"]) for item in override_rows}
+        report = apply_tailoring_requirement_overrides(report, overrides)
         for group in ("matched", "related", "missing"):
             for item in report.get(group, []):
-                item["memory"] = memory.get(item["normalized"], {})
+                saved = memory.get(item["normalized"])
+                if saved is None:
+                    saved = next(
+                        (memory.get(normalize_keyword(alias)) for alias in item.get("alternative_terms", ())
+                         if memory.get(normalize_keyword(alias))),
+                        None,
+                    )
+                item["memory"] = saved or {}
         return jsonify({
             "job": job,
             "candidate_profile": selection["profile_row"],
@@ -645,6 +657,29 @@ def create_app() -> Flask:
             "original_keywords": score_tailoring_text(job, selection["profile"], source_text),
             "preview": {"text": draft_text, "layout": draft.get("layout", {}), "approximate": not bool(draft.get("layout", {}).get("available"))},
         })
+
+    @app.post("/api/tailoring/<int:job_id>/requirement-overrides")
+    def save_tailoring_requirement_override(job_id: int) -> Response:
+        payload = request.get_json(silent=True) or {}
+        normalized = normalize_tailoring_requirement(text(payload.get("normalized_requirement") or payload.get("keyword")))
+        override = text(payload.get("override"))
+        if not normalized or override not in {"yes", "no", "not_a_requirement", "unknown"}:
+            return jsonify({"error": "A requirement and a valid override are required."}), 400
+        if query_db("SELECT id FROM jobs WHERE id = ?", [job_id], one=True) is None:
+            return jsonify({"error": "Job not found"}), 404
+        get_db().execute(
+            "INSERT INTO tailoring_requirement_overrides(job_id, normalized_requirement, override) VALUES (?, ?, ?) ON CONFLICT(job_id, normalized_requirement) DO UPDATE SET override = excluded.override, updated_at = CURRENT_TIMESTAMP",
+            [job_id, normalized, override],
+        )
+        get_db().commit()
+        return jsonify({"job_id": job_id, "normalized_requirement": normalized, "override": override})
+
+    @app.delete("/api/tailoring/<int:job_id>/requirement-overrides/<path:normalized_requirement>")
+    def delete_tailoring_requirement_override(job_id: int, normalized_requirement: str) -> Response:
+        normalized = normalize_tailoring_requirement(normalized_requirement)
+        get_db().execute("DELETE FROM tailoring_requirement_overrides WHERE job_id = ? AND normalized_requirement = ?", [job_id, normalized])
+        get_db().commit()
+        return jsonify({"job_id": job_id, "normalized_requirement": normalized, "override": ""})
 
     @app.post("/api/tailoring/<int:job_id>/draft")
     def create_tailoring_draft(job_id: int) -> Response:
@@ -747,8 +782,25 @@ def create_app() -> Flask:
     def apply_tailoring_memory(draft_id: int) -> Response:
         payload = request.get_json(silent=True) or {}
         row = query_db("SELECT * FROM tailoring_drafts WHERE id = ?", [draft_id], one=True)
-        keyword = normalize_keyword(text(payload.get("keyword")))
+        requested_keyword = text(payload.get("keyword"))
+        keyword = normalize_keyword(requested_keyword)
         memory = query_db("SELECT * FROM keyword_memory WHERE candidate_profile_id = ? AND normalized_keyword = ?", [row["candidate_profile_id"] if row else 0, keyword], one=True)
+        if memory is None and row is not None:
+            job_row = query_db("SELECT * FROM jobs WHERE id = ?", [row["job_id"]], one=True)
+            requirement = next(
+                (item for item in extract_tailoring_requirements(job_to_dict(job_row))
+                 if item["normalized"] == keyword or any(normalize_keyword(alias) == keyword for alias in item.get("alternative_terms", ()))),
+                None,
+            )
+            if requirement:
+                for alias in requirement.get("alternative_terms", ()):
+                    memory = query_db(
+                        "SELECT * FROM keyword_memory WHERE candidate_profile_id = ? AND normalized_keyword = ?",
+                        [row["candidate_profile_id"], normalize_keyword(alias)], one=True,
+                    )
+                    if memory is not None:
+                        keyword = text(memory["normalized_keyword"])
+                        break
         if row is None or memory is None:
             return jsonify({"error": "No saved approved suggestion exists for this profile and keyword."}), 404
         if memory["status"] != "yes" or not text(memory["approved_replacement"]):

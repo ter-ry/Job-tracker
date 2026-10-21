@@ -123,6 +123,25 @@ TAILORING_REQUIREMENT_ALIASES = {
     "production backend experience": "production backend experience",
 }
 
+TAILORING_COMPETENCIES = [
+    ("production backend experience", "experience", ("production-grade backend", "production backend", "backend systems", "backend services", "backend applications")),
+    ("backend programming languages", "technical", ("python", "go", "c++", "rust", "java", "kotlin", "scala", "typescript", "c#")),
+    ("distributed and event-driven systems", "architecture", ("distributed systems", "distributed applications", "event-driven", "asynchronous architecture", "event streams")),
+    ("api and service design", "architecture", ("api design", "rest apis", "restful apis", "apis", "service boundaries", "service interfaces", "domain models")),
+    ("database architecture and migrations", "data", ("relational data stores", "non-relational data stores", "data modeling", "database architecture", "schema evolution", "migrations", "data access patterns")),
+    ("transactional correctness", "architecture", ("transactional systems", "idempotency", "consistency", "reconciliation", "auditability")),
+    ("llm and ai orchestration", "ai", ("llms", "llm", "ai-powered", "ai systems", "retrieval", "tool integrations", "workflow orchestration")),
+    ("cloud platforms", "cloud", ("aws", "gcp", "azure", "cloud platforms", "cloud-based")),
+    ("infrastructure as code and ci/cd", "operations", ("infrastructure-as-code", "infrastructure as code", "ci/cd", "continuous integration", "continuous delivery", "deployment automation")),
+    ("observability and production operations", "operations", ("observability", "logging", "tracing", "metrics", "alerting", "incident response", "production support", "production operations")),
+    ("security, identity, and permissions", "security", ("authentication", "authorization", "permissions", "identity", "access control", "audit logging", "data protection")),
+    ("testing and code quality", "quality", ("testing", "debugging", "code quality", "code review", "testable", "reliability")),
+    ("data structures, algorithms, and system design", "fundamentals", ("data structures", "algorithms", "system design", "software engineering fundamentals")),
+    ("messaging and queue platforms", "integration", ("kafka", "rabbitmq", "kinesis", "sqs", "sns", "pub/sub", "message queues", "queues", "streaming")),
+    ("regulated domain experience", "domain", ("fintech", "mortgage", "lending", "payments", "insurance", "banking", "regulated domains")),
+    ("cross-functional communication", "collaboration", ("cross-functional", "stakeholders", "stakeholder", "communication", "business stakeholders")),
+]
+
 RELATED_KEYWORD_EVIDENCE = {
     "data solutions": ("data", "workflow", "reporting", "analytics", "database", "models"),
     "design patterns": ("object oriented", "oop", "software design"),
@@ -360,55 +379,63 @@ def extract_tailoring_requirements(job: dict[str, Any]) -> list[dict[str, Any]]:
     evidence.  It recognizes posted phrases and requirement sections only;
     it does not infer that a candidate has any of them.
     """
+    description = str(job.get("job_description") or "")
     content = " ".join(str(job.get(field) or "") for field in ("title", "required_skills", "preferred_skills", "responsibilities", "job_description"))
-    found: dict[str, dict[str, Any]] = {}
+    lines = [normalize_space(line).strip(" -*•") for line in description.splitlines() if normalize_space(line)]
+    section = "unclassified"
+    sections: list[tuple[str, str, str]] = []
+    for line in lines:
+        heading = line.lower().strip(" :")
+        if re.match(r"^(responsibilities|responsibility|overview|about the role|the role)$", heading):
+            section = "responsibility"
+        elif re.match(r"^(qualifications?|required qualifications?|requirements?)$", heading):
+            section = "required"
+        elif re.match(r"^(preferred experience|preferred qualifications?|nice to have|bonus|assets?)$", heading):
+            section = "preferred"
+        elif not re.search(r"^(full job description|li-remote)$", heading):
+            sections.append((section, line, heading))
 
-    def add(phrase: str, source: str) -> None:
-        clean = normalize_space(phrase).strip(" -*•:;,.()")
-        if len(clean) < 3 or clean.lower() in COMMON_JOB_WORDS:
-            return
-        normalized = normalize_tailoring_requirement(clean)
-        if len(normalized) < 3 or normalized in {"experience", "requirements", "qualifications", "responsibilities"}:
-            return
-        record = found.setdefault(normalized, {"keyword": clean, "normalized": normalized, "category": "requirement", "requirement_type": _tailoring_requirement_type(job, clean), "source_fields": []})
-        if source not in record["source_fields"]:
-            record["source_fields"].append(source)
-        if record["requirement_type"] == "unclassified":
-            record["requirement_type"] = _tailoring_requirement_type(job, clean)
+    def occurrences(terms: tuple[str, ...]) -> list[tuple[str, str, str]]:
+        hits = []
+        for kind, line, _ in sections:
+            matched_terms = [term for term in terms if keyword_present(line, term)]
+            if matched_terms:
+                hits.append((kind, line, matched_terms[0]))
+        return hits
 
-    for field, kind in (("required_skills", "required_skills"), ("preferred_skills", "preferred_skills")):
-        raw = str(job.get(field) or "")
-        for piece in re.split(r"[,;\n]+", raw):
-            add(piece, kind)
-
-    for term in sorted(set(TAILORING_REQUIREMENT_TERMS), key=len, reverse=True):
-        if keyword_present(content, term):
-            add(term, "job_description")
-
-    years_patterns = re.findall(r"\b\d+\s*(?:to|-|–)\s*\d+\+?\s+years?\s+(?:of\s+)?(?:professional\s+|production\s+)?[A-Za-z][A-Za-z -]{2,45}?\b", content, re.I)
-    for phrase in years_patterns:
-        add(phrase, "job_description")
-
-    # Capture concise requirement clauses that contain an explicit experience
-    # or qualification signal, without treating the whole posting as one item.
-    for chunk in re.split(r"[\n•]+|(?<=[.!?])\s+", str(job.get("job_description") or "")):
-        clean = normalize_space(chunk).strip(" -*:")
-        if re.search(r"\b(?:years? of|experience with|experience in|proficiency in|knowledge of|ability to|familiarity with|responsible for)\b", clean, re.I):
-            for piece in re.split(r"[,;]+", clean):
-                if re.search(r"\b(?:years?|experience|proficiency|knowledge|ability|familiarity)\b", piece, re.I):
-                    add(piece, "job_description")
-
-    records = list(found.values())
-    # Prefer the more specific phrase when one normalized requirement contains
-    # another; aliases remain one record and cannot inflate the denominator.
-    redundant: set[str] = set()
-    for left in records:
-        for right in records:
-            if left is right:
+    records: list[dict[str, Any]] = []
+    for canonical, category, terms in TAILORING_COMPETENCIES:
+        hits = occurrences(terms)
+        field_hits = []
+        for field, kind in (("required_skills", "required"), ("preferred_skills", "preferred")):
+            value = str(job.get(field) or "")
+            if any(keyword_present(value, term) for term in terms):
+                field_hits.append(kind)
+        if not hits and not field_hits:
+            if not any(keyword_present(content, term) for term in terms):
                 continue
-            if len(left["normalized"]) < len(right["normalized"]) and keyword_present(right["normalized"], left["normalized"]):
-                redundant.add(left["normalized"])
-    return sorted((item for item in records if item["normalized"] not in redundant), key=lambda item: (item["requirement_type"] == "unclassified", item["normalized"]))
+        kinds = field_hits + [hit[0] for hit in hits]
+        requirement_type = "required" if "required" in kinds else "preferred" if "preferred" in kinds else "responsibility" if "responsibility" in kinds else "unclassified"
+        source_lines = list(dict.fromkeys(hit[1] for hit in hits))
+        matched_terms = list(dict.fromkeys(
+            term for term in terms
+            if any(keyword_present(line, term) for _, line, _ in hits)
+        ))
+        records.append({
+            "keyword": canonical,
+            "normalized": normalize_tailoring_requirement(canonical),
+            "category": category,
+            "requirement_type": requirement_type,
+            "source_fields": ["job_description"] if hits else ["required_skills" if "required" in field_hits else "preferred_skills"],
+            "source_evidence": source_lines[:4],
+            "alternative_terms": matched_terms,
+        })
+
+    years = re.search(r"\b\d+\s*(?:to|-|–)\s*\d+\+?\s+years?\s+of\s+experience\b[^.\n]*", content, re.I)
+    if years:
+        hits = occurrences((years.group(0),))
+        records.append({"keyword": normalize_space(years.group(0)), "normalized": normalize_tailoring_requirement(years.group(0)), "category": "experience", "requirement_type": "required" if any(hit[0] == "required" for hit in hits) else "unclassified", "source_fields": ["job_description"], "source_evidence": [hit[1] for hit in hits][:3], "alternative_terms": []})
+    return sorted(records, key=lambda item: (item["requirement_type"] == "unclassified", item["requirement_type"] == "responsibility", item["normalized"]))
 
 
 def match_tailoring_requirements(job: dict[str, Any], resume_text: str) -> dict[str, list[dict[str, Any]]]:
@@ -420,17 +447,25 @@ def match_tailoring_requirements(job: dict[str, Any], resume_text: str) -> dict[
     alias_pairs = [(source, target) for source, target in {**KEYWORD_ALIASES, **TAILORING_REQUIREMENT_ALIASES}.items()]
     for requirement in extract_tailoring_requirements(job):
         normalized = requirement["normalized"]
-        exact = keyword_present(full_text, requirement["keyword"])
+        alternatives = tuple(requirement.get("alternative_terms") or ())
+        exact_source = next((term for term in alternatives if keyword_present(full_text, term)), None)
+        exact = bool(exact_source)
         equivalent_source = next((source for source, target in alias_pairs if target == normalized and keyword_present(full_text, source)), None)
-        if not equivalent_source and normalized != requirement["keyword"] and keyword_present(full_text, normalized):
+        if not equivalent_source and not exact and normalized != requirement["keyword"] and keyword_present(full_text, normalized):
             equivalent_source = normalized
         source_phrase = equivalent_source or requirement["keyword"]
+        if exact_source:
+            source_phrase = exact_source
         unit = next((item for item in units if keyword_present(item["text"], source_phrase) or keyword_present(item["text"], normalized)), None)
+        if normalized == "api and service design" and exact and keyword_present(full_text, "rest apis"):
+            exact = False
+            equivalent_source = "REST APIs"
+            source_phrase = "REST APIs"
         record = {**requirement, "match_type": "exact" if exact else "equivalent" if equivalent_source else "missing", "found_as": source_phrase if exact or equivalent_source else "", "source_section": unit.get("section", "Résumé") if unit else "Résumé", "evidence": evidence_snippet(unit["text"], source_phrase) if unit and (exact or equivalent_source) else ""}
         if exact or equivalent_source:
             result["matched"].append(record)
             continue
-        words = [word for word in re.findall(r"[a-z0-9+#.]+", normalized) if len(word) > 2 and word not in COMMON_JOB_WORDS]
+        words = [word for word in re.findall(r"[a-z0-9+#.]+", " ".join(alternatives or (normalized,))) if len(word) > 2 and word not in COMMON_JOB_WORDS]
         partial_unit = next((item for item in units if sum(keyword_present(item["text"], word) for word in words) >= max(1, len(words) // 2)), None)
         if partial_unit:
             record["match_type"] = "partial"
@@ -472,6 +507,28 @@ def build_tailoring_coverage_report(job: dict[str, Any], resume_text: str) -> di
         return {"status": "assessed" if items else "not_assessed", "matched": len(hits), "total": len(items), "score_percent": round(len(hits) / len(items) * 100) if items else None}
     total = len(inventory)
     return {"available": True, "score_percent": round(len(matched) / total * 100) if total else 0, "matched_count": len(matched), "total": total, "matched": matched, "related": result["related"], "missing": result["missing"], "required": subset(required), "preferred": subset(preferred), "unclassified": sum(1 for item in inventory if item["requirement_type"] == "unclassified"), "unclassified_keywords": [item for item in inventory if item["requirement_type"] == "unclassified"], "review_threshold_percent": 70, "review_before_applying": bool(total and len(matched) / total * 100 < 70), "heuristic_note": "Tailoring coverage is a transparent keyword and requirement review heuristic, not a qualification score. Partial evidence is shown separately and is not counted as matched."}
+
+
+def apply_tailoring_requirement_overrides(report: dict[str, Any], overrides: dict[str, str]) -> dict[str, Any]:
+    """Exclude only job-scoped user-marked non-requirements from adjusted coverage."""
+    if not report.get("available"):
+        return report
+    excluded = {normalize_tailoring_requirement(key) for key, value in overrides.items() if value == "not_a_requirement"}
+    all_items = report.get("matched", []) + report.get("related", []) + report.get("missing", [])
+    for item in all_items:
+        item["user_override"] = overrides.get(item.get("normalized"), "")
+        item["excluded_from_adjusted_coverage"] = item.get("normalized") in excluded
+    eligible = [item for item in all_items if item.get("normalized") not in excluded]
+    matched = [item for item in report.get("matched", []) if item.get("normalized") not in excluded]
+    report["excluded_count"] = len(excluded)
+    report["adjusted_total"] = len(eligible)
+    report["adjusted_matched_count"] = len(matched)
+    report["adjusted_score_percent"] = round(len(matched) / len(eligible) * 100) if eligible else None
+    report["score_percent"] = report["adjusted_score_percent"]
+    report["matched_count"] = len(matched)
+    report["original_total"] = len(all_items)
+    report["original_matched_count"] = len(report.get("matched", []))
+    return report
 
 
 def keyword_present(content: str, phrase: str) -> bool:
