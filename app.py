@@ -7641,6 +7641,7 @@ def job_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:
     if row is None:
         return {}
     data = dict(row)
+    data["description_completeness"] = classify_job_description_completeness(data.get("job_description"))
     data["score_breakdown"] = parse_json_object(data.get("score_breakdown"))
     if "profile_updated_at" in data and data.get("profile_updated_at"):
         profile_row = query_db("SELECT updated_at FROM profile WHERE id = 1", one=True)
@@ -7662,6 +7663,16 @@ def job_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:
         )
         data["preparation_status"] = text(preparation["status"]) if preparation else ""
     return data
+
+
+def classify_job_description_completeness(value: Any) -> str:
+    """Label stored description availability without inventing provider content."""
+    description = normalize_space(text(value))
+    if not description:
+        return "missing"
+    if len(description) < 800:
+        return "partial"
+    return "complete"
 
 
 def build_qualification_fit(job: dict[str, Any]) -> dict[str, Any]:
