@@ -270,14 +270,18 @@ function renderTailoringStudio() {
   document.getElementById("tailoring-studio-subtitle").textContent = `${data.job.company || "Employer"} · ${data.job.title || "Role"} · ${data.resume.name || "Selected résumé"}`;
   const original = data.original_keywords || {};
   const current = data.keywords || {};
+  if (current.available === false || original.available === false) {
+    document.getElementById("tailoring-score-summary").innerHTML = `<p class="risk medium"><strong>Keyword coverage unavailable</strong></p><p>${escapeHtml(current.unavailable_reason || original.unavailable_reason || "The complete job description is not available for this posting.")}</p><p class="muted helper">This is not a 0% result. Edit the job and paste or refresh the original posting, then reopen Tailoring Studio.</p>`;
+  } else {
   const delta = Number(current.score_percent || 0) - Number(original.score_percent || 0);
   document.getElementById("tailoring-score-summary").innerHTML = `<p><strong>Original coverage:</strong> ${Number(original.score_percent || 0)}% (${Number(original.matched_count || 0)}/${Number(original.total || 0)})</p><p><strong>Current draft:</strong> ${Number(current.score_percent || 0)}% (${Number(current.matched_count || 0)}/${Number(current.total || 0)}) <span class="badge">${delta >= 0 ? "+" : ""}${delta} points</span></p><p class="muted helper">This is a transparent keyword heuristic, not an ATS score. Unapplied suggestions are excluded.</p>`;
+  }
   const records = [...(current.matched || []), ...(current.related || []), ...(current.missing || [])];
   document.getElementById("tailoring-keywords").innerHTML = records.map((item, index) => {
     const memory = item.memory || {};
     const status = memory.status === "yes" ? "Previously confirmed" : memory.status === "no" ? "No experience, previously confirmed" : item.match_type === "missing" ? "Experience unknown" : item.match_type === "related_review" ? "Related evidence" : "Found in current résumé";
     return `<button class="tailoring-keyword ${item.match_type}" type="button" data-keyword-index="${index}"><strong>${escapeHtml(item.keyword)}</strong><span>${escapeHtml(status)}</span></button>`;
-  }).join("") || `<p class="muted">No significant keywords were extracted from this job description.</p>`;
+  }).join("") || (current.available === false ? `<p class="risk medium">Requirements cannot be reviewed until the complete job description is stored for this posting.</p>` : `<p class="muted">No significant requirements were extracted from this job description.</p>`);
   document.querySelectorAll("[data-keyword-index]").forEach((button) => button.addEventListener("click", () => {
     const item = records[Number(button.dataset.keywordIndex)];
     state.tailoring.selectedKeyword = item;

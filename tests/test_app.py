@@ -463,6 +463,31 @@ class JobAssistantTest(unittest.TestCase):
         self.assertGreaterEqual(refreshed["keywords"]["matched_count"], body["keywords"]["matched_count"])
         self.assertNotIn("REST API", app_module.extract_docx_text(Path(upload.get_json()["path"]).read_bytes()))
 
+    def test_tailoring_workspace_reports_missing_description_then_uses_persisted_description(self):
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Lakeview QA"}).get_json()
+        document = Document(); document.add_paragraph("Alex Rivera"); document.add_paragraph("Built Python services.", style="List Bullet")
+        buffer = io.BytesIO(); document.save(buffer)
+        resume = self.client.post(
+            f"/api/candidate-profiles/{profile['id']}/resumes/upload",
+            data={"file": (io.BytesIO(buffer.getvalue()), "lakeview.docx"), "is_default": "true"},
+            content_type="multipart/form-data",
+        ).get_json()
+        job = self.client.post("/api/jobs", json={"company": "Lakeview Loan Servicing", "title": "Backend Engineer"}).get_json()
+        empty = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        self.assertFalse(empty["keywords"]["available"])
+        self.assertEqual(empty["keywords"]["total"], 0)
+        self.assertIn("complete job description", empty["keywords"]["unavailable_reason"])
+        updated = self.client.put(f"/api/jobs/{job['id']}", json={
+            "job_description": "Requirements:\n3 to 5+ years of production backend experience. Advanced distributed systems. Python and PostgreSQL. Preferred:\nKafka and Kubernetes.",
+            "required_skills": "3 to 5+ years of production backend experience, advanced distributed systems, Python, PostgreSQL",
+            "preferred_skills": "Kafka, Kubernetes",
+        })
+        self.assertEqual(updated.status_code, 200)
+        complete = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        self.assertTrue(complete["keywords"]["available"])
+        self.assertGreater(complete["keywords"]["total"], 1)
+        self.assertTrue(any(item["normalized"] == "kafka" for item in complete["keywords"]["missing"]))
+
     def test_tailoring_ai_structured_proposal_is_extracted_without_dictionary_text(self):
         self.client.post("/api/profile", json={"name": "Terry Mak", "email": "terry@example.com", "resume_text": "Built Python automation."})
         profile = self.client.post("/api/candidate-profiles", json={"name": "Software Engineering", "identity_mode": "shared"}).get_json()

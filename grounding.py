@@ -443,6 +443,24 @@ def match_tailoring_requirements(job: dict[str, Any], resume_text: str) -> dict[
 
 
 def build_tailoring_coverage_report(job: dict[str, Any], resume_text: str) -> dict[str, Any]:
+    source_text = " ".join(str(job.get(field) or "").strip() for field in ("job_description", "required_skills", "preferred_skills", "responsibilities"))
+    if not normalize_space(source_text):
+        return {
+            "available": False,
+            "unavailable_reason": "The complete job description is not stored for this posting. Edit or refresh the job with the original description before reviewing tailoring requirements.",
+            "score_percent": None,
+            "matched_count": 0,
+            "total": 0,
+            "matched": [],
+            "related": [],
+            "missing": [],
+            "required": {"status": "not_assessed", "matched": 0, "total": 0, "score_percent": None},
+            "preferred": {"status": "not_assessed", "matched": 0, "total": 0, "score_percent": None},
+            "unclassified": 0,
+            "unclassified_keywords": [],
+            "review_before_applying": False,
+            "heuristic_note": "Coverage is unavailable until the complete job description is stored. This is not a zero-percent qualification result.",
+        }
     result = match_tailoring_requirements(job, resume_text)
     inventory = extract_tailoring_requirements(job)
     matched = result["matched"]
@@ -453,7 +471,7 @@ def build_tailoring_coverage_report(job: dict[str, Any], resume_text: str) -> di
         hits = [item for item in matched if item["normalized"] in keys]
         return {"status": "assessed" if items else "not_assessed", "matched": len(hits), "total": len(items), "score_percent": round(len(hits) / len(items) * 100) if items else None}
     total = len(inventory)
-    return {"score_percent": round(len(matched) / total * 100) if total else 0, "matched_count": len(matched), "total": total, "matched": matched, "related": result["related"], "missing": result["missing"], "required": subset(required), "preferred": subset(preferred), "unclassified": sum(1 for item in inventory if item["requirement_type"] == "unclassified"), "unclassified_keywords": [item for item in inventory if item["requirement_type"] == "unclassified"], "review_threshold_percent": 70, "review_before_applying": bool(total and len(matched) / total * 100 < 70), "heuristic_note": "Tailoring coverage is a transparent keyword and requirement review heuristic, not a qualification score. Partial evidence is shown separately and is not counted as matched."}
+    return {"available": True, "score_percent": round(len(matched) / total * 100) if total else 0, "matched_count": len(matched), "total": total, "matched": matched, "related": result["related"], "missing": result["missing"], "required": subset(required), "preferred": subset(preferred), "unclassified": sum(1 for item in inventory if item["requirement_type"] == "unclassified"), "unclassified_keywords": [item for item in inventory if item["requirement_type"] == "unclassified"], "review_threshold_percent": 70, "review_before_applying": bool(total and len(matched) / total * 100 < 70), "heuristic_note": "Tailoring coverage is a transparent keyword and requirement review heuristic, not a qualification score. Partial evidence is shown separately and is not counted as matched."}
 
 
 def keyword_present(content: str, phrase: str) -> bool:
