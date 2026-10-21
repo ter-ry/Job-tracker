@@ -142,6 +142,12 @@ def _migration_006_keyword_memory_source(db: sqlite3.Connection) -> None:
         db.execute("ALTER TABLE keyword_memory ADD COLUMN resume_id INTEGER NOT NULL DEFAULT 0")
 
 
+def _migration_007_keyword_memory_paragraph(db: sqlite3.Connection) -> None:
+    existing = {row[1] for row in db.execute("PRAGMA table_info(keyword_memory)")}
+    if "source_paragraph_index" not in existing:
+        db.execute("ALTER TABLE keyword_memory ADD COLUMN source_paragraph_index INTEGER NOT NULL DEFAULT -1")
+
+
 MIGRATIONS: tuple[tuple[int, str, Migration], ...] = (
     (1, "legacy baseline", _migration_001_baseline),
     (2, "candidate document profiles", _migration_002_candidate_documents),
@@ -149,6 +155,7 @@ MIGRATIONS: tuple[tuple[int, str, Migration], ...] = (
     (4, "interactive tailoring studio", _migration_004_tailoring_studio),
     (5, "tailoring package handoff", _migration_005_tailoring_package_handoff),
     (6, "keyword memory source résumé", _migration_006_keyword_memory_source),
+    (7, "keyword memory paragraph identity", _migration_007_keyword_memory_paragraph),
 )
 
 

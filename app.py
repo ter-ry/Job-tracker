@@ -103,7 +103,7 @@ DISCOVERY_DATE_WINDOWS = {
 # Keep the public diagnostics field stable for existing API clients.  The
 # database itself is now tracked independently by the migration runner.
 APP_SCHEMA_VERSION = 1
-CURRENT_DB_SCHEMA_VERSION = 6
+CURRENT_DB_SCHEMA_VERSION = 7
 DISCOVERY_DEBUG_SNAPSHOT_LIMIT = 25
 GEOCODING_FAILURE_CACHE_SECONDS = 15 * 60
 DISCOVERY_TASK_NAME = "Job Tracker Discovery"
@@ -618,8 +618,18 @@ def create_app() -> Flask:
         draft_path = safe_local_path(text(draft.get("draft_path")))
         if draft_path and draft_path.is_file():
             draft_text = extract_docx_text(draft_path.read_bytes())
+        draft_docx = draft_path if draft_path and draft_path.is_file() else selection["resume_path"]
+        current_bullets = tailoring_paragraphs(draft_docx)
         memory_rows = query_db("SELECT * FROM keyword_memory WHERE candidate_profile_id = ? ORDER BY normalized_keyword", [int(selection["profile_row"]["id"])])
         memory = {item["normalized_keyword"]: dict(item) for item in memory_rows}
+        for item in memory.values():
+            item["source_matches"] = False
+            item["matching_paragraph_index"] = None
+            if item.get("status") == "yes" and int(item.get("resume_id") or 0) == int(selection["resume"]["id"]) and text(item.get("source_fingerprint")):
+                match = next((bullet for bullet in current_bullets if bullet.get("editable") and grounding_hash(normalize_space(bullet.get("text"))) == text(item["source_fingerprint"])), None)
+                if match:
+                    item["source_matches"] = True
+                    item["matching_paragraph_index"] = int(match["paragraph_index"])
         report = score_tailoring_text(job, selection["profile"], draft_text)
         for group in ("matched", "related", "missing"):
             for item in report.get(group, []):
@@ -629,7 +639,7 @@ def create_app() -> Flask:
             "candidate_profile": selection["profile_row"],
             "resume": selection["resume"],
             "draft": draft,
-            "bullets": tailoring_paragraphs(draft_path if draft_path and draft_path.is_file() else selection["resume_path"]),
+            "bullets": current_bullets,
             "keywords": report,
             "original_keywords": score_tailoring_text(job, selection["profile"], source_text),
             "preview": {"text": draft_text, "layout": draft.get("layout", {}), "approximate": not bool(draft.get("layout", {}).get("available"))},
@@ -684,7 +694,7 @@ def create_app() -> Flask:
                 current_text = normalize_space(paragraphs[paragraph_index].text)
             if current_text and normalize_space(original) != current_text:
                 return jsonify({"error": "The displayed bullet is stale. Refresh the studio and review the current wording before applying this edit."}), 409
-            change = {"paragraph_index": paragraph_index, "original_text": text(prior.get("original_text")) if prior else original, "proposed_text": proposed, "operation": operation}
+            change = {"paragraph_index": paragraph_index, "keyword": normalize_keyword(text(payload.get("keyword")) or text(prior.get("keyword") if prior else "")), "original_text": text(prior.get("original_text")) if prior else original, "proposed_text": proposed, "operation": operation}
             changes = [item for item in changes if int(item.get("paragraph_index", -1)) != paragraph_index]
             changes.append(change)
         try:
@@ -717,6 +727,16 @@ def create_app() -> Flask:
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(draft_path, target)
         now = datetime.now().isoformat(timespec="seconds")
+        for change in parse_json_array(row["changes_json"]):
+            normalized = normalize_keyword(text(change.get("keyword")))
+            if not normalized:
+                continue
+            get_db().execute(
+                """INSERT INTO keyword_memory(candidate_profile_id, normalized_keyword, keyword, status, project_employer, supporting_bullet, source_fingerprint, approved_replacement, resume_id, source_paragraph_index)
+                   VALUES (?, ?, ?, 'yes', '', ?, ?, ?, ?, ?)
+                   ON CONFLICT(candidate_profile_id, normalized_keyword) DO UPDATE SET keyword=excluded.keyword, status='yes', supporting_bullet=excluded.supporting_bullet, source_fingerprint=excluded.source_fingerprint, approved_replacement=excluded.approved_replacement, resume_id=excluded.resume_id, source_paragraph_index=excluded.source_paragraph_index, updated_at=CURRENT_TIMESTAMP""",
+                [row["candidate_profile_id"], normalized, text(change.get("keyword")), text(change.get("original_text")), grounding_hash(normalize_space(text(change.get("original_text")))), text(change.get("proposed_text")), row["resume_id"], int(change.get("paragraph_index") or -1)],
+            )
         get_db().execute("UPDATE tailoring_drafts SET status = 'approved', approved_at = ?, approved_tailoring_draft_id = ?, approved_tailored_resume_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [now, draft_id, str(target), draft_id])
         get_db().execute("UPDATE application_preparation_queue SET approved_tailoring_draft_id = ?, approved_tailored_resume_path = ?, prepared_resume_path = CASE WHEN status = 'ready_for_review' THEN ? ELSE prepared_resume_path END, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [draft_id, str(target), str(target), int(package["id"])])
         get_db().commit()
@@ -747,7 +767,7 @@ def create_app() -> Flask:
             return jsonify({"error": "The saved suggestion does not match this résumé bullet; choose a bullet manually."}), 409
         changes = parse_json_array(row["changes_json"])
         prior = next((item for item in changes if int(item.get("paragraph_index", -1)) == paragraph_index), None)
-        change = {"paragraph_index": paragraph_index, "original_text": text(prior.get("original_text")) if prior else current, "proposed_text": text(memory["approved_replacement"]), "operation": "edit"}
+        change = {"paragraph_index": paragraph_index, "keyword": keyword, "original_text": text(prior.get("original_text")) if prior else current, "proposed_text": text(memory["approved_replacement"]), "operation": "edit"}
         changes = [item for item in changes if int(item.get("paragraph_index", -1)) != paragraph_index]
         changes.append(change)
         try:
@@ -816,12 +836,13 @@ def create_app() -> Flask:
             "source_fingerprint": text(payload.get("source_fingerprint")) or text(existing["source_fingerprint"] if existing else ""),
             "approved_replacement": text(payload.get("approved_replacement")) or text(existing["approved_replacement"] if existing else ""),
             "resume_id": int(payload.get("resume_id") or (existing["resume_id"] if existing and "resume_id" in existing.keys() else 0)),
+            "source_paragraph_index": int(payload.get("source_paragraph_index") if payload.get("source_paragraph_index") is not None else (existing["source_paragraph_index"] if existing and "source_paragraph_index" in existing.keys() else -1)),
         }
         get_db().execute(
-            """INSERT INTO keyword_memory(candidate_profile_id, normalized_keyword, keyword, status, project_employer, supporting_bullet, source_fingerprint, approved_replacement, resume_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(candidate_profile_id, normalized_keyword) DO UPDATE SET keyword=excluded.keyword, status=excluded.status, project_employer=excluded.project_employer, supporting_bullet=excluded.supporting_bullet, source_fingerprint=excluded.source_fingerprint, approved_replacement=excluded.approved_replacement, resume_id=excluded.resume_id, updated_at=CURRENT_TIMESTAMP""",
-            [profile_id, normalized, values["keyword"], values["status"], values["project_employer"], values["supporting_bullet"], values["source_fingerprint"], values["approved_replacement"], values["resume_id"]],
+            """INSERT INTO keyword_memory(candidate_profile_id, normalized_keyword, keyword, status, project_employer, supporting_bullet, source_fingerprint, approved_replacement, resume_id, source_paragraph_index)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(candidate_profile_id, normalized_keyword) DO UPDATE SET keyword=excluded.keyword, status=excluded.status, project_employer=excluded.project_employer, supporting_bullet=excluded.supporting_bullet, source_fingerprint=excluded.source_fingerprint, approved_replacement=excluded.approved_replacement, resume_id=excluded.resume_id, source_paragraph_index=excluded.source_paragraph_index, updated_at=CURRENT_TIMESTAMP""",
+            [profile_id, normalized, values["keyword"], values["status"], values["project_employer"], values["supporting_bullet"], values["source_fingerprint"], values["approved_replacement"], values["resume_id"], values["source_paragraph_index"]],
         )
         get_db().commit()
         return jsonify(dict(query_db("SELECT * FROM keyword_memory WHERE candidate_profile_id = ? AND normalized_keyword = ?", [profile_id, normalized], one=True)))
@@ -3098,6 +3119,8 @@ def prepare_application_queue_item(item_id: int, *, owner: str = "manual", allow
             payload["cover_letter_template_id"] = row["cover_letter_template_id"]
         profile = resolve_generation_profile(payload)
         approved_resume = safe_local_path(text(row["approved_tailored_resume_path"])) if "approved_tailored_resume_path" in row.keys() else None
+        if text(row["approved_tailored_resume_path"]) and (approved_resume is None or not approved_resume.is_file()):
+            raise ValueError("The approved tailored résumé for this package is unavailable; restore it or explicitly clear the tailoring approval before regenerating.")
         has_approved_resume = bool(approved_resume and approved_resume.is_file())
         # An approved tailored résumé is a package artifact, not a new master
         # résumé. Regeneration may refresh the cover letter, but it must not
@@ -3108,7 +3131,8 @@ def prepare_application_queue_item(item_id: int, *, owner: str = "manual", allow
         resume_status = "generated" if has_approved_resume else (text(generation.get("resume")) or "failed")
         cover_status = text(generation.get("cover_letter")) or "failed"
         error = text(generation.get("error"))
-        keywords = build_keywords_score_report(job_to_dict(refreshed_job), profile)
+        score_text = extract_docx_text(approved_resume.read_bytes()) if has_approved_resume else ""
+        keywords = build_keywords_score_report(job_to_dict(refreshed_job), profile, final_resume_text=score_text or None)
         resume_path = str(approved_resume) if has_approved_resume else text(refreshed_job["resume_docx_path"])
         cover_path = text(refreshed_job["cover_letter_docx_path"])
         status = "ready_for_review" if resume_status == "generated" and cover_status == "generated" and safe_preparation_artifact_path(resume_path) and safe_preparation_artifact_path(resume_path).is_file() and safe_preparation_artifact_path(cover_path) and safe_preparation_artifact_path(cover_path).is_file() else "failed"

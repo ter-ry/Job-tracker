@@ -281,6 +281,9 @@ function renderTailoringStudio() {
   document.querySelectorAll("[data-keyword-index]").forEach((button) => button.addEventListener("click", () => {
     const item = records[Number(button.dataset.keywordIndex)];
     state.tailoring.selectedKeyword = item;
+    if (item.memory?.status === "yes" && item.memory.source_matches && item.memory.matching_paragraph_index !== null) {
+      selectTailoringParagraph(Number(item.memory.matching_paragraph_index));
+    }
     document.querySelectorAll(".tailoring-keyword").forEach((entry) => entry.classList.remove("selected"));
     button.classList.add("selected");
     document.getElementById("tailoring-edit-status").textContent = item.match_type === "missing" ? "Select an existing résumé bullet to make a grounded edit, or record your experience status in Profile." : `Reviewing ${item.keyword}. Choose the actual bullet you want to work on.`;
@@ -311,7 +314,9 @@ function renderTailoringKeywordActions() {
   if (!target || !keyword) return;
   const memory = keyword.memory || {};
   const bullet = state.tailoring.selectedParagraph;
-  target.innerHTML = `<button class="button ghost small" type="button" data-memory-status="yes">Yes, I have this experience</button><button class="button ghost small" type="button" data-memory-status="no">No experience</button><button class="button ghost small" type="button" data-memory-status="unknown">Skip</button>${memory.status === "yes" && memory.approved_replacement && bullet ? '<button class="button small" type="button" data-apply-memory>Apply previously approved suggestion</button>' : ""}${memory.status === "yes" && memory.approved_replacement ? '<span class="muted helper">Previously approved suggestion available.</span>' : ""}`;
+  const suggestion = memory.status === "yes" && memory.approved_replacement ? `<div class="muted helper">Previously approved suggestion: ${escapeHtml(memory.approved_replacement)}</div>` : "";
+  const matchNote = memory.status === "yes" && memory.approved_replacement && !memory.source_matches ? '<span class="muted helper">The original source bullet changed; select a matching bullet manually.</span>' : "";
+  target.innerHTML = `<button class="button ghost small" type="button" data-memory-status="yes">Yes, I have this experience</button><button class="button ghost small" type="button" data-memory-status="no">No experience</button><button class="button ghost small" type="button" data-memory-status="unknown">Skip</button>${memory.status === "yes" && memory.approved_replacement && bullet && memory.source_matches ? '<button class="button small" type="button" data-apply-memory>Apply previous edit</button>' : ""}${suggestion}${matchNote}`;
   target.querySelectorAll("[data-memory-status]").forEach((button) => button.addEventListener("click", () => saveTailoringKeywordMemory(button.dataset.memoryStatus)));
   target.querySelector("[data-apply-memory]")?.addEventListener("click", applyTailoringMemory);
 }
@@ -321,7 +326,7 @@ async function saveTailoringKeywordMemory(status) {
   if (!keyword) return;
   const bullet = state.tailoring.selectedParagraph;
   try {
-    await api.send(`/api/candidate-profiles/${state.tailoring.profileId}/keyword-memory`, "POST", { keyword: keyword.keyword, status, supporting_bullet: bullet?.text || "", source_fingerprint: bullet?.text ? await digestText(bullet.text) : "", approved_replacement: status === "yes" ? (document.getElementById("tailoring-proposed-text").value.trim() || bullet?.text || "") : "" });
+    await api.send(`/api/candidate-profiles/${state.tailoring.profileId}/keyword-memory`, "POST", { keyword: keyword.keyword, status, resume_id: state.tailoring.resumeId, source_paragraph_index: bullet?.paragraph_index, supporting_bullet: bullet?.text || "", source_fingerprint: bullet?.text ? await digestText(bullet.text) : "" });
     await openTailoringStudio(state.tailoring.jobId, state.tailoring.profileId, state.tailoring.resumeId);
     document.getElementById("tailoring-edit-status").textContent = status === "yes" ? "Experience confirmed for this profile. The suggestion is still subject to review." : status === "no" ? "No experience saved for this profile; it will not prompt an addition by default." : "Keyword skipped for now.";
   } catch (error) { document.getElementById("tailoring-edit-status").textContent = error.message; }
@@ -349,7 +354,7 @@ async function applyTailoringEdit() {
   if (!bullet) return toast("Select an existing résumé bullet first");
   const proposed = document.getElementById("tailoring-proposed-text").value.trim();
   if (!proposed) return toast("Enter proposed wording or choose Leave unchanged");
-  await submitTailoringChange({ paragraph_index: bullet.paragraph_index, original_text: bullet.text, proposed_text: proposed, operation: "edit" });
+  await submitTailoringChange({ paragraph_index: bullet.paragraph_index, keyword: state.tailoring.selectedKeyword?.keyword || "", original_text: bullet.text, proposed_text: proposed, operation: "edit" });
 }
 
 async function leaveTailoringUnchanged() {
