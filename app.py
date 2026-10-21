@@ -7548,12 +7548,14 @@ def update_resume_variant_review(variant_id: int, approved: Any = None, review_n
 
 def normalize_job_payload(payload: dict[str, Any]) -> dict[str, Any]:
     today = date.today().isoformat()
+    supplied_description = text(payload.get("job_description")) or text(payload.get("paste_description")) or text(payload.get("description"))
+    payload_for_extraction = {**payload, "job_description": supplied_description}
     extracted = extract_job_details(
-        text(payload.get("job_description")),
+        supplied_description,
         text(payload.get("source")),
-        existing=payload,
+        existing=payload_for_extraction,
     )
-    clean = {column: text(payload.get(column, extracted.get(column, ""))) for column in JOB_COLUMNS}
+    clean = {column: text(payload_for_extraction.get(column, extracted.get(column, ""))) for column in JOB_COLUMNS}
     clean["date_added"] = text(payload.get("date_added")) or today
     clean["status"] = clean["status"] if clean["status"] in STATUSES else "Saved"
     clean["fit_score"] = clamp_int(payload.get("fit_score"), 0, 100)

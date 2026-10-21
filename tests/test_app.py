@@ -478,11 +478,12 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(empty["keywords"]["total"], 0)
         self.assertIn("complete job description", empty["keywords"]["unavailable_reason"])
         updated = self.client.put(f"/api/jobs/{job['id']}", json={
-            "job_description": "Requirements:\n3 to 5+ years of production backend experience. Advanced distributed systems. Python and PostgreSQL. Preferred:\nKafka and Kubernetes.",
+            "paste_description": "Requirements:\n3 to 5+ years of production backend experience. Advanced distributed systems. Python and PostgreSQL. Preferred:\nKafka and Kubernetes.",
             "required_skills": "3 to 5+ years of production backend experience, advanced distributed systems, Python, PostgreSQL",
             "preferred_skills": "Kafka, Kubernetes",
         })
         self.assertEqual(updated.status_code, 200)
+        self.assertIn("production backend experience", updated.get_json()["job_description"])
         complete = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
         self.assertTrue(complete["keywords"]["available"])
         self.assertGreater(complete["keywords"]["total"], 1)

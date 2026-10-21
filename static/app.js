@@ -1141,6 +1141,8 @@ function linkFor(url) {
 }
 
 function getPayload() {
+  const pastedDescription = value("paste-description").trim();
+  const savedDescription = value("job-description").trim() || pastedDescription;
   return {
     id: value("job-id"),
     company: value("company"),
@@ -1161,7 +1163,8 @@ function getPayload() {
     preferred_skills: value("preferred-skills"),
     responsibilities: value("responsibilities"),
     notes: value("notes"),
-    job_description: value("job-description"),
+    job_description: savedDescription,
+    paste_description: pastedDescription,
   };
 }
 
@@ -1175,6 +1178,8 @@ function getProfilePayload() {
 
 async function saveJob(event) {
   event.preventDefault();
+  const errorTarget = document.getElementById("job-form-error");
+  if (errorTarget) { errorTarget.hidden = true; errorTarget.textContent = ""; }
   try {
     const id = value("job-id");
     const payload = getPayload();
@@ -1185,6 +1190,7 @@ async function saveJob(event) {
     toast(`${saved.company || "Job"} saved`);
     await loadAll();
   } catch (error) {
+    if (errorTarget) { errorTarget.hidden = false; errorTarget.textContent = `Could not save this job: ${error.message}`; }
     toast(error.message);
   }
 }
