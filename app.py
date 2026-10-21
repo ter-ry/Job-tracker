@@ -37,6 +37,7 @@ from grounding import (
     contains_contact_details,
     contains_resume_section_heading,
     build_keywords_score_report,
+    build_tailoring_coverage_report,
     evidence_has_generation_source,
     is_corrupted_text,
     job_keywords,
@@ -2922,7 +2923,7 @@ def tailoring_draft_path(draft_id: int) -> Path:
 
 
 def score_tailoring_text(job: dict[str, Any], profile: dict[str, Any], text_value: str) -> dict[str, Any]:
-    return build_keywords_score_report(job, profile, final_resume_text=text_value)
+    return build_tailoring_coverage_report(job, text_value)
 
 
 def rebuild_tailoring_draft(draft_id: int, changes: list[dict[str, Any]]) -> dict[str, Any]:

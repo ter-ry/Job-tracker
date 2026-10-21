@@ -2284,6 +2284,38 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(inventory["figma"]["requirement_type"], "preferred")
         self.assertEqual(inventory["python"]["requirement_type"], "required")
 
+    def test_tailoring_studio_builds_full_lakeview_requirement_inventory(self):
+        job = {
+            "title": "Backend Engineer",
+            "required_skills": "3 to 5+ years of production backend experience, advanced distributed systems, Kafka, Kubernetes",
+            "preferred_skills": "Python, PostgreSQL, Docker",
+            "job_description": (
+                "Requirements:\n"
+                "3 to 5+ years of production backend experience.\n"
+                "Advanced distributed systems expertise.\n"
+                "Build Python services and APIs with PostgreSQL.\n"
+                "Preferred:\nKafka, Kubernetes, Docker.\n"
+                "Collaborate with product teams and participate in code review."
+            ),
+        }
+        resume = "Built Python Flask APIs with PostgreSQL and automated testing. Collaborated with product teams and used Git."
+        report = grounding.build_tailoring_coverage_report(job, resume)
+        inventory = {item["normalized"]: item for group in ("matched", "related", "missing") for item in report[group]}
+        self.assertGreater(report["total"], 1)
+        self.assertIn("python", inventory)
+        self.assertIn("postgresql", inventory)
+        self.assertIn("advanced distributed systems", inventory)
+        self.assertIn("kafka", inventory)
+        self.assertIn("kubernetes", inventory)
+        self.assertIn("3 to 5+ years of production backend experience", inventory)
+        self.assertEqual(inventory["python"]["match_type"], "exact")
+        self.assertEqual(inventory["postgresql"]["match_type"], "exact")
+        self.assertEqual(inventory["kafka"]["match_type"], "missing")
+        self.assertEqual(inventory["kubernetes"]["match_type"], "missing")
+        self.assertEqual(inventory["advanced distributed systems"]["requirement_type"], "required")
+        self.assertTrue(report["review_before_applying"])
+        self.assertLess(report["score_percent"], 100)
+
     def test_nodejs_alias_substitution_preserves_word_layout_and_reports_final_docx_coverage(self):
         master = Path(self.tmpdir.name) / "nodejs_alias_master.docx"
         document = Document()
