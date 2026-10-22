@@ -849,7 +849,7 @@ def create_app() -> Flask:
         if not config.enabled:
             return jsonify({"error": "AI improvement is disabled. Enable the configured local Ollama assistant first."}), 503
         prompt = json.dumps({"task": "Improve only this résumé bullet", "job": {"title": job_row["title"], "description": job_row["job_description"]}, "keyword": text(payload.get("keyword")), "verified_candidate_evidence": text(selection["profile"].get("work_experience"))[:4000], "bullet": original, "rules": ["Return JSON with proposed_bullet string only", "Preserve every number and factual claim", "Do not add technologies or responsibilities"]})
-        response = request_json_completion(config, prompt)
+        response = request_json_completion(config, prompt, system="Return exactly one valid JSON object with a proposed_bullet string. Do not include reasoning, markdown, or commentary.")
         if not response.get("ok") or not text(response.get("data")):
             return jsonify({"error": response.get("error") or "The local AI assistant did not return a usable suggestion."}), 503
         raw_data = response.get("data")
