@@ -1218,3 +1218,10 @@ input, select, textarea { background: #111; border-color: #303030; color: #eee; 
   .pipeline-score { min-width: 72px; }
   .pipeline-detail-grid { grid-template-columns: 1fr; }
 }
+
+.tailoring-requirement-detail section { border-top: 1px solid var(--line, #2b2b2b); padding-top: 10px; margin-top: 10px; }
+.tailoring-requirement-detail section:first-child { border-top: 0; padding-top: 0; margin-top: 0; }
+.tailoring-requirement-detail h4 { margin: 0 0 6px; color: var(--text, #f4f4f4); }
+.tailoring-alternatives { display: grid; gap: 6px; list-style: none; margin: 0; padding: 0; }
+.tailoring-alternative { align-items: center; display: flex; gap: 12px; justify-content: space-between; }
+.tailoring-alternative select { min-width: 150px; }

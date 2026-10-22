@@ -106,7 +106,7 @@ DISCOVERY_DATE_WINDOWS = {
 # Keep the public diagnostics field stable for existing API clients.  The
 # database itself is now tracked independently by the migration runner.
 APP_SCHEMA_VERSION = 1
-CURRENT_DB_SCHEMA_VERSION = 8
+CURRENT_DB_SCHEMA_VERSION = 9
 DISCOVERY_DEBUG_SNAPSHOT_LIMIT = 25
 GEOCODING_FAILURE_CACHE_SECONDS = 15 * 60
 DISCOVERY_TASK_NAME = "Job Tracker Discovery"
@@ -639,6 +639,11 @@ def create_app() -> Flask:
         overrides = {text(item["normalized_requirement"]): text(item["override"]) for item in override_rows}
         report = apply_tailoring_requirement_overrides(report, overrides)
         report["coverage_improvement_count"] = int(report.get("original_matched_count", report.get("matched_count", 0))) - int(original_report.get("matched_count", 0))
+        skill_rows = query_db(
+            "SELECT * FROM keyword_memory WHERE candidate_profile_id = ? AND confirmation_source = 'skill_confirmation' ORDER BY normalized_keyword",
+            [int(selection["profile_row"]["id"])],
+        )
+        skill_memory = {row["normalized_keyword"]: dict(row) for row in skill_rows}
         for group in ("matched", "related", "missing"):
             for item in report.get(group, []):
                 saved = memory.get(item["normalized"])
@@ -649,6 +654,11 @@ def create_app() -> Flask:
                         None,
                     )
                 item["memory"] = saved or {}
+                item["skill_memory"] = {
+                    alias: skill_memory[normalize_keyword(alias)]
+                    for alias in item.get("alternative_terms", ())
+                    if normalize_keyword(alias) in skill_memory
+                }
         return jsonify({
             "job": job,
             "candidate_profile": selection["profile_row"],
@@ -905,6 +915,46 @@ def create_app() -> Flask:
     @app.delete("/api/candidate-profiles/<int:profile_id>/keyword-memory/<path:normalized_keyword>")
     def delete_keyword_memory(profile_id: int, normalized_keyword: str) -> Response:
         get_db().execute("DELETE FROM keyword_memory WHERE candidate_profile_id = ? AND normalized_keyword = ?", [profile_id, normalized_keyword])
+        get_db().commit()
+        return jsonify({"ok": True})
+
+    @app.get("/api/candidate-profiles/<int:profile_id>/skill-memory")
+    def list_skill_memory(profile_id: int) -> Response:
+        return jsonify([dict(row) for row in query_db(
+            "SELECT * FROM keyword_memory WHERE candidate_profile_id = ? AND confirmation_source = 'skill_confirmation' ORDER BY normalized_keyword",
+            [profile_id],
+        )])
+
+    @app.post("/api/candidate-profiles/<int:profile_id>/skill-memory")
+    def save_skill_memory(profile_id: int) -> Response:
+        payload = request.get_json(force=True) or {}
+        keyword = text(payload.get("keyword"))
+        normalized = normalize_keyword(keyword)
+        status = text(payload.get("status")) or "unknown"
+        if not normalized or status not in {"yes", "no", "unknown"}:
+            return jsonify({"error": "Keyword and status (yes, no or unknown) are required"}), 400
+        if query_db("SELECT id FROM candidate_profiles WHERE id = ?", [profile_id], one=True) is None:
+            return jsonify({"error": "Candidate profile was not found"}), 404
+        now = datetime.now().isoformat(timespec="seconds")
+        get_db().execute(
+            """INSERT INTO keyword_memory(candidate_profile_id, normalized_keyword, keyword, status, project_employer, supporting_bullet, source_fingerprint, approved_replacement, resume_id, source_paragraph_index, confirmation_source, confirmed_at, notes)
+               VALUES (?, ?, ?, ?, '', '', '', '', 0, -1, 'skill_confirmation', ?, ?)
+               ON CONFLICT(candidate_profile_id, normalized_keyword) DO UPDATE SET keyword=excluded.keyword, status=excluded.status, confirmation_source='skill_confirmation', confirmed_at=excluded.confirmed_at, notes=excluded.notes, updated_at=CURRENT_TIMESTAMP""",
+            [profile_id, normalized, keyword, status, now, text(payload.get("notes"))],
+        )
+        get_db().commit()
+        return jsonify(dict(query_db(
+            "SELECT * FROM keyword_memory WHERE candidate_profile_id = ? AND normalized_keyword = ?",
+            [profile_id, normalized], one=True,
+        )))
+
+    @app.delete("/api/candidate-profiles/<int:profile_id>/skill-memory/<path:normalized_skill>")
+    def delete_skill_memory(profile_id: int, normalized_skill: str) -> Response:
+        normalized = normalize_keyword(normalized_skill)
+        get_db().execute(
+            "DELETE FROM keyword_memory WHERE candidate_profile_id = ? AND normalized_keyword = ? AND confirmation_source = 'skill_confirmation'",
+            [profile_id, normalized],
+        )
         get_db().commit()
         return jsonify({"ok": True})
 

@@ -166,6 +166,18 @@ def _migration_008_tailoring_requirement_overrides(db: sqlite3.Connection) -> No
     )
 
 
+def _migration_009_skill_confirmation_metadata(db: sqlite3.Connection) -> None:
+    """Add metadata that distinguishes profile skill confirmations from bullet memory."""
+    columns = {
+        "confirmation_source": "TEXT NOT NULL DEFAULT ''",
+        "confirmed_at": "TEXT NOT NULL DEFAULT ''",
+        "notes": "TEXT NOT NULL DEFAULT ''",
+    }
+    existing = {row[1] for row in db.execute("PRAGMA table_info(keyword_memory)")}
+    for name, definition in columns.items():
+        if name not in existing:
+            db.execute(f"ALTER TABLE keyword_memory ADD COLUMN {name} {definition}")
+
 MIGRATIONS: tuple[tuple[int, str, Migration], ...] = (
     (1, "legacy baseline", _migration_001_baseline),
     (2, "candidate document profiles", _migration_002_candidate_documents),
@@ -175,6 +187,7 @@ MIGRATIONS: tuple[tuple[int, str, Migration], ...] = (
     (6, "keyword memory source résumé", _migration_006_keyword_memory_source),
     (7, "keyword memory paragraph identity", _migration_007_keyword_memory_paragraph),
     (8, "tailoring requirement overrides", _migration_008_tailoring_requirement_overrides),
+    (9, "skill confirmation metadata", _migration_009_skill_confirmation_metadata),
 )
 
 

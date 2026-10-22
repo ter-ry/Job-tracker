@@ -589,6 +589,29 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn('Candidate profile documents are separate from the legacy Profile documents', Path('static/app.js').read_text(encoding='utf-8'))
         self.assertIn('z-index: 60', Path('static/styles.css').read_text(encoding='utf-8'))
 
+    def test_skill_confirmation_memory_is_individual_profile_scoped_and_does_not_change_coverage(self):
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Backend"}).get_json()
+        document = Document(); document.add_paragraph("Built Python services with REST APIs.", style="List Bullet")
+        buffer = io.BytesIO(); document.save(buffer)
+        resume = self.client.post(f"/api/candidate-profiles/{profile['id']}/resumes/upload", data={"file": (io.BytesIO(buffer.getvalue()), "base.docx"), "is_default": "true"}, content_type="multipart/form-data").get_json()
+        job = self.client.post("/api/jobs", json={"company": "Example", "title": "Backend", "job_description": "Required\nPython or Java\nPreferred\nKafka or RabbitMQ\nResponsibilities\nBuild REST APIs"}).get_json()
+        before = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()["keywords"]
+        group = next(item for item in before["missing"] if item["normalized"] == "messaging and queue platforms")
+        self.assertEqual(group["skill_memory"], {})
+        saved = self.client.post(f"/api/candidate-profiles/{profile['id']}/skill-memory", json={"keyword": "Kafka", "status": "no", "notes": "Not used professionally"})
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(saved.get_json()["confirmation_source"], "skill_confirmation")
+        listed = self.client.get(f"/api/candidate-profiles/{profile['id']}/skill-memory").get_json()
+        self.assertEqual([(item["normalized_keyword"], item["status"]) for item in listed], [("kafka", "no")])
+        after = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()["keywords"]
+        group = next(item for item in after["missing"] if item["normalized"] == "messaging and queue platforms")
+        self.assertEqual(group["skill_memory"]["kafka"]["status"], "no")
+        self.assertEqual(after["matched_count"], before["matched_count"])
+        self.client.post(f"/api/candidate-profiles/{profile['id']}/skill-memory", json={"keyword": "RabbitMQ", "status": "yes"})
+        group = next(item for item in self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()["keywords"]["missing"] if item["normalized"] == "messaging and queue platforms")
+        self.assertEqual(group["skill_memory"]["rabbitmq"]["status"], "yes")
+        self.assertEqual(self.client.delete(f"/api/candidate-profiles/{profile['id']}/skill-memory/kafka").status_code, 200)
+        self.assertEqual(self.client.get(f"/api/candidate-profiles/{profile['id']}/skill-memory").get_json()[0]["normalized_keyword"], "rabbitmq")
     def test_jobspy_discovery_requires_keywords(self):
         response = self.client.post("/api/discovery/jobspy", json={"location": "Toronto"})
         self.assertEqual(response.status_code, 400)

@@ -417,6 +417,12 @@ def extract_tailoring_requirements(job: dict[str, Any]) -> list[dict[str, Any]]:
         kinds = field_hits + [hit[0] for hit in hits]
         requirement_type = "required" if "required" in kinds else "preferred" if "preferred" in kinds else "responsibility" if "responsibility" in kinds else "unclassified"
         source_lines = list(dict.fromkeys(hit[1] for hit in hits))
+        source_sections = list(dict.fromkeys({
+            "required": "Required qualifications",
+            "preferred": "Preferred qualifications",
+            "responsibility": "Responsibilities",
+            "unclassified": "Job description",
+        }.get(hit[0], "Job description") for hit in hits))
         matched_terms = list(dict.fromkeys(
             term for term in terms
             if any(keyword_present(line, term) for _, line, _ in hits)
@@ -434,7 +440,7 @@ def extract_tailoring_requirements(job: dict[str, Any]) -> list[dict[str, Any]]:
     years = re.search(r"\b\d+\s*(?:to|-|–)\s*\d+\+?\s+years?\s+of\s+experience\b[^.\n]*", content, re.I)
     if years:
         hits = occurrences((years.group(0),))
-        records.append({"keyword": normalize_space(years.group(0)), "normalized": normalize_tailoring_requirement(years.group(0)), "category": "experience", "requirement_type": "required" if any(hit[0] == "required" for hit in hits) else "unclassified", "source_fields": ["job_description"], "source_evidence": [hit[1] for hit in hits][:3], "alternative_terms": []})
+        records.append({"keyword": normalize_space(years.group(0)), "normalized": normalize_tailoring_requirement(years.group(0)), "category": "experience", "requirement_type": "required" if any(hit[0] == "required" for hit in hits) else "unclassified", "source_fields": ["job_description"], "source_evidence": [hit[1] for hit in hits][:3], "source_sections": ["Required qualifications" if hit[0] == "required" else "Job description" for hit in hits][:3], "alternative_terms": []})
     return sorted(records, key=lambda item: (item["requirement_type"] == "unclassified", item["requirement_type"] == "responsibility", item["normalized"]))
 
 

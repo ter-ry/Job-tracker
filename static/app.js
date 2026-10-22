@@ -282,12 +282,18 @@ function renderTailoringStudio() {
     const memory = item.memory || {};
     const importance = item.requirement_type === "required" ? "Required" : item.requirement_type === "preferred" ? "Preferred" : item.requirement_type === "responsibility" ? "Responsibility" : "Unclassified";
     const status = item.user_override === "not_a_requirement" ? `Excluded for this job · ${importance}` : `${item.match_type === "missing" ? "Missing" : item.match_type === "partial" || item.match_type === "related_review" ? "Partial evidence" : "Matched"} · ${importance}`;
-    const alternatives = (item.alternative_terms || []).join(", ");
+    const alternatives = item.alternative_terms || [];
     const source = (item.source_evidence || []).map((line) => `<li>${escapeHtml(line)}</li>`).join("");
-    const evidence = item.evidence ? `<p><strong>Résumé evidence:</strong> ${escapeHtml(item.evidence)}</p>` : `<p class="muted">No supporting résumé evidence.</p>`;
-    const explanation = item.match_type === "exact" ? "The résumé contains the posted wording." : item.match_type === "equivalent" ? "The résumé contains an approved equivalent wording." : item.match_type === "partial" ? "Related evidence exists, but it does not establish the full requirement." : "No supporting wording was found in the selected résumé.";
-    return `<details class="tailoring-requirement ${item.match_type}"><summary class="tailoring-keyword" data-keyword-index="${index}"><strong>${escapeHtml(item.keyword)}</strong><span>${escapeHtml(status)}</span></summary><div class="tailoring-requirement-detail"><p><strong>Job evidence:</strong></p><ul>${source || "<li>Source wording was not captured.</li>"}</ul>${alternatives ? `<p><strong>Alternatives:</strong> ${escapeHtml(alternatives)}</p>` : ""}${evidence}<p><strong>Why:</strong> ${escapeHtml(explanation)}</p></div></details>`;
-  }).join("") || (current.available === false ? `<p class="risk medium">Requirements cannot be reviewed until the complete job description is stored for this posting.</p>` : `<p class="muted">No significant requirements were extracted from this job description.</p>`);
+    const sourceSections = (item.source_sections || []).join(", ") || "Job description";
+    const evidence = item.evidence ? `<li><strong>${escapeHtml(item.source_section || "Résumé")}</strong>: ${escapeHtml(item.evidence)}</li>` : "<li class=\"muted\">No supporting résumé evidence.</li>";
+    const alternativeRows = alternatives.length ? alternatives.map((term) => {
+      const skill = (item.skill_memory || {})[term] || {};
+      const selected = skill.status || "unknown";
+      return `<li class=\"tailoring-alternative\"><span>${escapeHtml(term)}</span><select aria-label=\"Experience status for ${escapeAttribute(term)}\" data-skill-status=\"${escapeAttribute(term)}\"><option value=\"unknown\" ${selected === "unknown" ? "selected" : ""}>Unknown</option><option value=\"yes\" ${selected === "yes" ? "selected" : ""}>Have experience</option><option value=\"no\" ${selected === "no" ? "selected" : ""}>No experience</option></select></li>`;
+    }).join("") : "<li class=\"muted\">No alternative technology was listed.</li>";
+    const explanation = item.match_type === "exact" ? "The selected résumé contains the posted wording." : item.match_type === "equivalent" ? "The selected résumé contains an approved equivalent wording." : item.match_type === "partial" ? "Related evidence exists, but it does not establish the full requirement." : "No supporting wording was found in the selected résumé.";
+    return `<details class="tailoring-requirement ${item.match_type}"><summary class="tailoring-keyword" data-keyword-index="${index}"><strong>${escapeHtml(item.keyword)}</strong><span>${escapeHtml(status)}</span></summary><div class="tailoring-requirement-detail"><section><h4>Employer requirement</h4><p>${escapeHtml(importance)} · Source section: ${escapeHtml(sourceSections)}</p><ul>${source || "<li>Source wording was not captured.</li>"}</ul></section><section><h4>Acceptable alternatives</h4><ul class="tailoring-alternatives">${alternativeRows}</ul><p class="muted helper">These are individual experience confirmations. They do not increase coverage or add résumé claims.</p></section><section><h4>Résumé evidence</h4><ul>${evidence}</ul></section><section><h4>Matching assessment</h4><p>${escapeHtml(explanation)}</p></section></div></details>`;  }).join("") || (current.available === false ? `<p class="risk medium">Requirements cannot be reviewed until the complete job description is stored for this posting.</p>` : `<p class="muted">No significant requirements were extracted from this job description.</p>`);
+  document.querySelectorAll("[data-skill-status]").forEach((select) => select.addEventListener("change", () => saveTailoringSkillMemory(select.dataset.skillStatus, select.value)));
   document.querySelectorAll("[data-keyword-index]").forEach((button) => button.addEventListener("click", () => {
     const item = records[Number(button.dataset.keywordIndex)];
     state.tailoring.selectedKeyword = item;
@@ -327,7 +333,7 @@ function renderTailoringKeywordActions() {
   const suggestion = memory.status === "yes" && memory.approved_replacement ? `<div class="muted helper">Previously approved suggestion: ${escapeHtml(memory.approved_replacement)}</div>` : "";
   const matchNote = memory.status === "yes" && memory.approved_replacement && !memory.source_matches ? '<span class="muted helper">The original source bullet changed; select a matching bullet manually.</span>' : "";
   const excluded = keyword.user_override === "not_a_requirement";
-  const controls = keyword.match_type === "missing" || keyword.match_type === "partial" ? `<button class="button ghost small" type="button" data-memory-status="yes">Yes, I have this experience</button><button class="button ghost small" type="button" data-memory-status="no">No experience</button><button class="button ghost small" type="button" data-memory-status="unknown">Skip for now</button>` : `<span class="muted helper">Matched requirement: inspect the evidence above before editing.</span><button class="button ghost small" type="button" data-memory-status="unknown">Challenge this match</button>`;
+  const controls = (keyword.match_type === "missing" || keyword.match_type === "partial") && !(keyword.alternative_terms || []).length ? `<button class="button ghost small" type="button" data-memory-status="yes">Yes, I have this experience</button><button class="button ghost small" type="button" data-memory-status="no">No experience</button><button class="button ghost small" type="button" data-memory-status="unknown">Skip for now</button>` : keyword.match_type === "missing" || keyword.match_type === "partial" ? `<span class="muted helper">Set Have experience, No experience or Unknown beside each alternative above.</span>` : `<span class="muted helper">Matched requirement: inspect the evidence above before editing.</span><button class="button ghost small" type="button" data-memory-status="unknown">Challenge this match</button>`;
   target.innerHTML = `${controls}<button class="button ghost small" type="button" data-requirement-override="${excluded ? "restore" : "not_a_requirement"}">${excluded ? "Restore requirement" : "Not a requirement"}</button>${memory.status === "yes" && memory.approved_replacement && bullet && memory.source_matches ? '<button class="button small" type="button" data-apply-memory>Apply previous edit</button>' : ""}${suggestion}${matchNote}`;
   target.querySelectorAll("[data-memory-status]").forEach((button) => button.addEventListener("click", () => saveTailoringKeywordMemory(button.dataset.memoryStatus)));
   target.querySelector("[data-requirement-override]")?.addEventListener("click", () => saveTailoringRequirementOverride(target.querySelector("[data-requirement-override]").dataset.requirementOverride));
@@ -347,6 +353,12 @@ async function saveTailoringRequirementOverride(action) {
   } catch (error) { document.getElementById("tailoring-edit-status").textContent = error.message; }
 }
 
+async function saveTailoringSkillMemory(keyword, status) {
+  try {
+    await api.send(`/api/candidate-profiles/${state.tailoring.profileId}/skill-memory`, "POST", { keyword, status, notes: "Tailoring Studio confirmation" });
+    await openTailoringStudio(state.tailoring.jobId, state.tailoring.profileId, state.tailoring.resumeId);
+  } catch (error) { document.getElementById("tailoring-edit-status").textContent = error.message; }
+}
 async function saveTailoringKeywordMemory(status) {
   const keyword = state.tailoring.selectedKeyword;
   if (!keyword) return;
@@ -434,11 +446,27 @@ async function loadKeywordMemory() {
   const profileId = state.selectedCandidateProfileId;
   if (!target || !profileId) return;
   try {
-    const items = await api.get(`/api/candidate-profiles/${profileId}/keyword-memory`);
-    target.innerHTML = items.length ? items.map((item) => `<div class="memory-row"><strong>${escapeHtml(item.keyword || item.normalized_keyword)}</strong><select aria-label="Memory status for ${escapeAttribute(item.keyword || item.normalized_keyword)}" onchange="saveKeywordMemory('${escapeAttribute(item.normalized_keyword)}', '${escapeAttribute(item.keyword || item.normalized_keyword)}', this.value)"><option value="unknown" ${item.status === "unknown" ? "selected" : ""}>Unknown</option><option value="yes" ${item.status === "yes" ? "selected" : ""}>Confirmed experience</option><option value="no" ${item.status === "no" ? "selected" : ""}>No experience</option></select><button class="button ghost small" type="button" onclick="deleteKeywordMemory('${escapeAttribute(item.normalized_keyword)}')">Delete</button></div>`).join("") : "<p class=\"muted\">No saved keyword confirmations yet.</p>";
+    const [bulletItems, skillItems] = await Promise.all([
+      api.get(`/api/candidate-profiles/${profileId}/keyword-memory`),
+      api.get(`/api/candidate-profiles/${profileId}/skill-memory`),
+    ]);
+    const items = [...skillItems.map((item) => ({ ...item, memory_kind: "skill" })), ...bulletItems.filter((item) => item.confirmation_source !== "skill_confirmation").map((item) => ({ ...item, memory_kind: "bullet" }))];
+    target.innerHTML = items.length ? items.map((item) => `<div class="memory-row"><strong>${escapeHtml(item.keyword || item.normalized_keyword)}</strong><span class="muted">${item.memory_kind === "skill" ? "Skill confirmation" : "Approved résumé edit"}</span><select aria-label="Memory status for ${escapeAttribute(item.keyword || item.normalized_keyword)}" onchange="${item.memory_kind === "skill" ? `saveSkillMemory('${escapeAttribute(item.normalized_keyword)}', '${escapeAttribute(item.keyword || item.normalized_keyword)}', this.value)` : `saveKeywordMemory('${escapeAttribute(item.normalized_keyword)}', '${escapeAttribute(item.keyword || item.normalized_keyword)}', this.value)`}"><option value="unknown" ${item.status === "unknown" ? "selected" : ""}>Unknown</option><option value="yes" ${item.status === "yes" ? "selected" : ""}>Confirmed experience</option><option value="no" ${item.status === "no" ? "selected" : ""}>No experience</option></select><button class="button ghost small" type="button" onclick="${item.memory_kind === "skill" ? `deleteSkillMemory('${escapeAttribute(item.normalized_keyword)}')` : `deleteKeywordMemory('${escapeAttribute(item.normalized_keyword)}')`}">Clear</button></div>`).join("") : "<p class=\"muted\">No saved skill confirmations or approved edits yet.</p>";
   } catch (error) { target.textContent = error.message; }
 }
+async function saveSkillMemory(normalized, keyword, status) {
+  const profileId = state.selectedCandidateProfileId;
+  if (!profileId) return;
+  await api.send(`/api/candidate-profiles/${profileId}/skill-memory`, "POST", { keyword, status });
+  await loadKeywordMemory();
+}
 
+async function deleteSkillMemory(normalized) {
+  const profileId = state.selectedCandidateProfileId;
+  if (!profileId) return;
+  await api.send(`/api/candidate-profiles/${profileId}/skill-memory/${encodeURIComponent(normalized)}`, "DELETE", {});
+  await loadKeywordMemory();
+}
 async function saveKeywordMemory(normalized, keyword, status) {
   const profileId = state.selectedCandidateProfileId;
   if (!profileId) return;
