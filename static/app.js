@@ -294,11 +294,18 @@ function renderTailoringStudio() {
   if (state.tailoring.selectedKeyword) renderTailoringRequirementDetail();
   else if (records.length) selectTailoringRequirement(0);
   const bullets = data.bullets || [];
-  document.getElementById("tailoring-bullets").innerHTML = bullets.map((bullet) => `<button class="tailoring-bullet ${bullet.editable ? "editable" : ""}" type="button" ${bullet.editable ? "" : "disabled"} data-paragraph-index="${bullet.paragraph_index}"><span class="muted">${escapeHtml(bullet.section)}</span><span>${escapeHtml(bullet.text)}</span></button>`).join("") || `<p class="muted">No editable résumé bullets were found in this document.</p>`;
-  document.querySelectorAll("[data-paragraph-index]").forEach((button) => button.addEventListener("click", () => selectTailoringParagraph(Number(button.dataset.paragraphIndex))));
+  const bulletList = document.getElementById("tailoring-bullets");
+  if (bulletList) {
+    bulletList.innerHTML = bullets.map((bullet) => `<button class="tailoring-bullet ${bullet.editable ? "editable" : ""}" type="button" ${bullet.editable ? "" : "disabled"} data-paragraph-index="${bullet.paragraph_index}"><span class="muted">${escapeHtml(bullet.section)}</span><span>${escapeHtml(bullet.text)}</span></button>`).join("") || `<p class="muted">No editable résumé bullets were found in this document.</p>`;
+    bulletList.querySelectorAll("[data-paragraph-index]").forEach((button) => button.addEventListener("click", () => selectTailoringParagraph(Number(button.dataset.paragraphIndex))));
+  }
   document.getElementById("tailoring-preview-text").textContent = data.preview?.text || "";
   const layout = data.preview?.layout || {};
   document.getElementById("tailoring-layout-status").textContent = layout.available ? (layout.verified ? "Word layout check passed: paragraph lines and page count are unchanged." : "Word layout check found a change. Review the draft before approving it.") : "Preview is approximate until Word layout validation is available.";
+  const download = document.getElementById("tailoring-download-draft");
+  if (download) { download.href = `/api/tailoring/drafts/${state.tailoring.draftId}/download`; download.hidden = !data.draft?.draft_path; }
+  document.getElementById("tailoring-open-preview")?.addEventListener("click", () => document.getElementById("tailoring-document-preview")?.showModal());
+  renderTailoringEditor();
 }
 
 function selectTailoringRequirement(index) {
@@ -324,7 +331,7 @@ function renderTailoringRequirementDetail() {
   }).join("");
   const source = (item.source_evidence || []).map((line) => `<li>${escapeHtml(line)}</li>`).join("") || "<li>No source excerpt was captured.</li>";
   const evidence = item.evidence ? `<p><strong>${escapeHtml(item.source_section || "Résumé")}</strong>: ${escapeHtml(item.evidence)}</p>` : "<p class=\"muted\">No exact résumé evidence for this individual skill.</p>";
-  const suggestions = (item.suggested_bullets || []).map((bullet) => `<button class="tailoring-suggested-bullet" type="button" data-suggested-paragraph="${bullet.paragraph_index}"><span>${escapeHtml(bullet.section)}</span><strong>${escapeHtml(bullet.text)}</strong><small>Edit this bullet · overlap: ${escapeHtml((bullet.overlap || []).join(", "))}</small></button>`).join("");
+  const suggestions = (item.suggested_bullets || []).map((bullet) => `<button class="tailoring-suggested-bullet" type="button" data-suggested-paragraph="${bullet.paragraph_index}"><span>${escapeHtml(bullet.source_location || bullet.section || "Résumé")}</span><strong>${escapeHtml(bullet.text)}</strong><small>Edit this bullet · overlap: ${escapeHtml((bullet.overlap || []).join(", "))}</small></button>`).join("");
   target.innerHTML = `<section><h4>Employer requirement</h4><p><strong>${escapeHtml(item.keyword)}</strong> · ${escapeHtml(importance)}</p><p class="muted">Semantic competency: ${escapeHtml(item.semantic_group || item.parent_keyword || item.keyword)}</p></section><section><h4>Acceptable technologies or alternatives</h4><ul class="tailoring-alternatives">${alternatives || "<li class=\"muted\">No alternatives listed.</li>"}</ul></section><details><summary>Original job description</summary><p class="job-evidence">${source}</p><p class="muted">Source section: ${escapeHtml((item.source_sections || []).join(", ") || "Job description")}</p></details><section><h4>Résumé evidence</h4>${evidence}</section><section><h4>Matching assessment</h4><p><strong>${assessment}</strong> · ${escapeHtml(reason)}</p></section><section><h4>Suggested next action</h4>${suggestions || `<p class="muted">No safe adjacent résumé bullet was found. Confirm the skill in Profile only if you genuinely have the experience; do not add unsupported claims.</p>`}</section>`;
   target.querySelectorAll("[data-skill-status]").forEach((select) => select.addEventListener("change", () => saveTailoringSkillMemory(select.dataset.skillStatus, select.value)));
   target.querySelectorAll("[data-suggested-paragraph]").forEach((button) => button.addEventListener("click", () => { selectTailoringParagraph(Number(button.dataset.suggestedParagraph)); document.getElementById("tailoring-selected-original")?.scrollIntoView({ block: "nearest" }); }));
@@ -335,9 +342,44 @@ function selectTailoringParagraph(index) {
   state.tailoring.selectedParagraph = bullet;
   document.querySelectorAll(".tailoring-bullet").forEach((entry) => entry.classList.toggle("selected", Number(entry.dataset.paragraphIndex) === index));
   document.getElementById("tailoring-selected-original").textContent = bullet.text;
+  document.getElementById("tailoring-original-text").value = bullet.text;
   document.getElementById("tailoring-proposed-text").value = bullet.text;
   document.getElementById("tailoring-edit-status").textContent = "This is a copied draft. Apply only wording you approve.";
+  renderTailoringEditor();
   renderTailoringKeywordActions();
+}
+
+function tailoringDiffTokens(value) {
+  return String(value || "").match(/[A-Za-z0-9+#]+|[^A-Za-z0-9+#]+/g) || [];
+}
+
+function renderTailoringDiff(original, proposed) {
+  const target = document.getElementById("tailoring-diff");
+  if (!target) return;
+  const before = tailoringDiffTokens(original);
+  const after = tailoringDiffTokens(proposed);
+  const matrix = Array.from({ length: before.length + 1 }, () => Array(after.length + 1).fill(0));
+  for (let i = before.length - 1; i >= 0; i -= 1) for (let j = after.length - 1; j >= 0; j -= 1) matrix[i][j] = before[i] === after[j] ? matrix[i + 1][j + 1] + 1 : Math.max(matrix[i + 1][j], matrix[i][j + 1]);
+  let i = 0; let j = 0; let output = "";
+  const token = (value) => escapeHtml(value);
+  while (i < before.length && j < after.length) {
+    if (before[i] === after[j]) { output += token(before[i]); i += 1; j += 1; }
+    else if (matrix[i + 1][j] >= matrix[i][j + 1]) { output += `<span class="diff-remove">${token(before[i])}</span>`; i += 1; }
+    else { output += `<span class="diff-add">${token(after[j])}</span>`; j += 1; }
+  }
+  while (i < before.length) output += `<span class="diff-remove">${token(before[i++])}</span>`;
+  while (j < after.length) output += `<span class="diff-add">${token(after[j++])}</span>`;
+  target.innerHTML = output || `<span class="muted">No wording changes.</span>`;
+}
+
+function renderTailoringEditor() {
+  const original = document.getElementById("tailoring-original-text");
+  const proposed = document.getElementById("tailoring-proposed-text");
+  if (!original || !proposed) return;
+  const bullet = state.tailoring.selectedParagraph;
+  if (!bullet) { renderTailoringDiff("", ""); return; }
+  renderTailoringDiff(original.value || bullet.text, proposed.value || bullet.text);
+  proposed.oninput = () => renderTailoringDiff(original.value || bullet.text, proposed.value);
 }
 
 function renderTailoringKeywordActions() {
@@ -452,6 +494,7 @@ async function improveTailoringEdit() {
   try {
     const suggestion = await api.send(`/api/tailoring/drafts/${state.tailoring.draftId}/improve`, "POST", { original_text: bullet.text, keyword: state.tailoring.selectedKeyword?.keyword || "" });
     document.getElementById("tailoring-proposed-text").value = suggestion.proposed_text || bullet.text;
+    renderTailoringDiff(bullet.text, document.getElementById("tailoring-proposed-text").value);
     document.getElementById("tailoring-edit-status").textContent = suggestion.message || "AI suggestion loaded for review. It has not been applied.";
   } catch (error) { document.getElementById("tailoring-edit-status").textContent = error.message; }
   finally { button.disabled = false; button.textContent = "AI Improve"; }

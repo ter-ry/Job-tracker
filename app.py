@@ -679,7 +679,7 @@ def create_app() -> Flask:
                             bullet_words = set(re.findall(r"[a-z0-9+#.]+", text(bullet.get("text")).lower()))
                             overlap = [word for word in term_words if word in bullet_words]
                             if overlap:
-                                suggestions.append({"paragraph_index": bullet["paragraph_index"], "text": bullet["text"], "section": bullet.get("section", "Résumé"), "overlap": overlap})
+                                suggestions.append({"paragraph_index": bullet["paragraph_index"], "text": bullet["text"], "section": bullet.get("section", "Résumé"), "source_location": f"{bullet.get('section', 'Résumé')} · paragraph {bullet['paragraph_index'] + 1}", "overlap": overlap})
                         suggestions = suggestions[:3]
                     skill_inventory.append({
                         "keyword": term,
@@ -750,6 +750,16 @@ def create_app() -> Flask:
             get_db().commit()
             existing = query_db("SELECT * FROM tailoring_drafts WHERE id = ?", [cursor.lastrowid], one=True)
         return jsonify(tailoring_draft_to_dict(existing)), 201 if existing and int(existing["id"]) == int(cursor.lastrowid if 'cursor' in locals() else -1) else 200
+
+    @app.get("/api/tailoring/drafts/<int:draft_id>/download")
+    def download_tailoring_draft(draft_id: int) -> Response:
+        row = query_db("SELECT draft_path FROM tailoring_drafts WHERE id = ?", [draft_id], one=True)
+        if row is None:
+            return jsonify({"error": "Tailoring draft was not found"}), 404
+        path = safe_local_path(text(row["draft_path"]))
+        if path is None or not path.is_file():
+            return jsonify({"error": "The copied résumé DOCX is not available until an edit has been applied."}), 404
+        return send_file(path, as_attachment=True, download_name="tailored-resume-draft.docx", mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
     @app.post("/api/tailoring/drafts/<int:draft_id>/apply")
     def apply_tailoring_draft_change(draft_id: int) -> Response:

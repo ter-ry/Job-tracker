@@ -427,6 +427,9 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn('keyword-memory-list', html)
         self.assertIn('tailoring-requirement-search', html)
         self.assertIn('tailoring-requirement-detail', html)
+        self.assertIn('tailoring-editor', html)
+        self.assertIn('tailoring-diff', html)
+        self.assertIn('tailoring-open-preview', html)
         self.assertIn('tailoring-suggested-bullet', Path('static/app.js').read_text(encoding='utf-8'))
 
     def test_candidate_profile_creation_is_committed_and_returned_by_list_endpoint(self):
@@ -471,6 +474,9 @@ class JobAssistantTest(unittest.TestCase):
         result = self.client.post(f"/api/tailoring/drafts/{body['draft']['id']}/apply", json={"paragraph_index": editable["paragraph_index"], "original_text": editable["text"], "proposed_text": "Built Python and REST API automation for internal reporting.", "operation": "edit"})
         self.assertEqual(result.status_code, 200, result.get_json())
         self.assertIn("REST API", result.get_json()["text"])
+        draft_download = self.client.get(f"/api/tailoring/drafts/{body['draft']['id']}/download")
+        self.assertEqual(draft_download.status_code, 200)
+        self.assertEqual(draft_download.mimetype, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
         second = self.client.post(f"/api/tailoring/drafts/{body['draft']['id']}/apply", json={"paragraph_index": editable["paragraph_index"], "original_text": "Built Python and REST API automation for internal reporting.", "proposed_text": "Built Python REST API automation for internal reporting.", "operation": "edit"})
         self.assertEqual(second.status_code, 200, second.get_json())
         self.assertIn("Built Python REST API automation", second.get_json()["text"])
