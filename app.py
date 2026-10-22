@@ -659,6 +659,47 @@ def create_app() -> Flask:
                     for alias in item.get("alternative_terms", ())
                     if normalize_keyword(alias) in skill_memory
                 }
+        skill_inventory = []
+        stop_words = {"and", "or", "with", "for", "the", "of", "to", "in", "experience", "using", "such", "as"}
+        for group_name in ("matched", "related", "missing"):
+            for item in report.get(group_name, []):
+                alternatives = list(item.get("alternative_terms") or [item.get("keyword")])
+                found_as = normalize_keyword(item.get("found_as"))
+                for term in alternatives:
+                    term = text(term)
+                    term_normalized = normalize_keyword(term)
+                    term_match = item.get("match_type", "missing") if found_as and term_normalized == found_as else "missing"
+                    term_memory = (item.get("skill_memory") or {}).get(term, {})
+                    term_words = [word for word in re.findall(r"[a-z0-9+#.]+", term.lower()) if len(word) > 2 and word not in stop_words]
+                    suggestions = []
+                    if term_match in {"missing", "partial"}:
+                        for bullet in current_bullets:
+                            if not bullet.get("editable"):
+                                continue
+                            bullet_words = set(re.findall(r"[a-z0-9+#.]+", text(bullet.get("text")).lower()))
+                            overlap = [word for word in term_words if word in bullet_words]
+                            if overlap:
+                                suggestions.append({"paragraph_index": bullet["paragraph_index"], "text": bullet["text"], "section": bullet.get("section", "Résumé"), "overlap": overlap})
+                        suggestions = suggestions[:3]
+                    skill_inventory.append({
+                        "keyword": term,
+                        "normalized": term_normalized,
+                        "parent_keyword": item.get("keyword", term),
+                        "parent_normalized": item.get("normalized", term_normalized),
+                        "semantic_group": item.get("keyword", term),
+                        "alternative_terms": alternatives,
+                        "requirement_type": item.get("requirement_type", "unclassified"),
+                        "match_type": term_match,
+                        "parent_match_type": item.get("match_type", "missing"),
+                        "found_as": item.get("found_as", "") if term_match != "missing" else "",
+                        "source_evidence": item.get("source_evidence", []),
+                        "source_sections": item.get("source_sections", []),
+                        "evidence": item.get("evidence", "") if term_match != "missing" else "",
+                        "source_section": item.get("source_section", "Résumé") if term_match != "missing" else "",
+                        "skill_memory": term_memory,
+                        "suggested_bullets": suggestions,
+                    })
+        report["skill_inventory"] = skill_inventory
         return jsonify({
             "job": job,
             "candidate_profile": selection["profile_row"],

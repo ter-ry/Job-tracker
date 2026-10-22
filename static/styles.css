@@ -1225,3 +1225,19 @@ input, select, textarea { background: #111; border-color: #303030; color: #eee; 
 .tailoring-alternatives { display: grid; gap: 6px; list-style: none; margin: 0; padding: 0; }
 .tailoring-alternative { align-items: center; display: flex; gap: 12px; justify-content: space-between; }
 .tailoring-alternative select { min-width: 150px; }
+.tailoring-studio-grid { grid-template-columns: minmax(280px, 360px) minmax(0, 1fr); align-items: start; }
+.tailoring-controls { min-width: 0; }
+.tailoring-keywords { max-height: 520px; overflow-y: auto; overflow-x: hidden; }
+.tailoring-skill { align-items: center; background: #101010; border: 1px solid #2a2a2a; border-radius: 8px; color: #f4f4f4; display: flex; justify-content: space-between; gap: 10px; padding: 9px 10px; text-align: left; width: 100%; }
+.tailoring-skill:hover, .tailoring-skill:focus-visible, .tailoring-skill.selected { background: #1a1a1a; border-color: #f4f4f4; }
+.tailoring-skill span:first-child { min-width: 0; overflow-wrap: anywhere; }
+.tailoring-skill small { color: #999; display: block; font-size: .76rem; margin-top: 3px; }
+.tailoring-skill > span:last-child { color: #aaa; flex: 0 0 auto; font-size: .78rem; text-align: right; }
+.tailoring-search { display: block; margin: 10px 0; }
+.tailoring-search input { margin-top: 5px; width: 100%; }
+.tailoring-requirement-panel { min-height: 280px; }
+.tailoring-requirement-detail { max-height: none; overflow: visible; }
+.tailoring-suggested-bullet { background: #151515; border: 1px solid #333; border-radius: 7px; color: #eee; display: grid; gap: 3px; margin: 7px 0; padding: 9px; text-align: left; width: 100%; }
+.tailoring-suggested-bullet:hover, .tailoring-suggested-bullet:focus-visible { border-color: #f4f4f4; }
+.tailoring-suggested-bullet span, .tailoring-suggested-bullet small { color: #aaa; }
+@media (max-width: 900px) { .tailoring-studio-grid { grid-template-columns: 1fr; } .tailoring-keywords { max-height: 300px; } }

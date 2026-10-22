@@ -425,6 +425,9 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn('openTailoringStudio', Path('static/app.js').read_text(encoding='utf-8'))
         self.assertIn('tailoring-studio', html)
         self.assertIn('keyword-memory-list', html)
+        self.assertIn('tailoring-requirement-search', html)
+        self.assertIn('tailoring-requirement-detail', html)
+        self.assertIn('tailoring-suggested-bullet', Path('static/app.js').read_text(encoding='utf-8'))
 
     def test_candidate_profile_creation_is_committed_and_returned_by_list_endpoint(self):
         response = self.client.post(
@@ -598,6 +601,9 @@ class JobAssistantTest(unittest.TestCase):
         before = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()["keywords"]
         group = next(item for item in before["missing"] if item["normalized"] == "messaging and queue platforms")
         self.assertEqual(group["skill_memory"], {})
+        inventory_names = {item["keyword"] for item in before["skill_inventory"]}
+        self.assertTrue({"kafka", "rabbitmq"}.issubset({name.lower() for name in inventory_names}))
+        self.assertTrue(all(item["parent_keyword"] == "messaging and queue platforms" for item in before["skill_inventory"] if item["keyword"].lower() in {"kafka", "rabbitmq"}))
         saved = self.client.post(f"/api/candidate-profiles/{profile['id']}/skill-memory", json={"keyword": "Kafka", "status": "no", "notes": "Not used professionally"})
         self.assertEqual(saved.status_code, 200)
         self.assertEqual(saved.get_json()["confirmation_source"], "skill_confirmation")

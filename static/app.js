@@ -277,34 +277,22 @@ function renderTailoringStudio() {
   const activeTotal = Number(current.adjusted_total ?? current.total ?? 0);
   document.getElementById("tailoring-score-summary").innerHTML = `<p><strong>Original extracted coverage:</strong> ${Number(original.score_percent || 0)}% (${Number(original.matched_count || 0)}/${Number(original.total || 0)})</p><p><strong>Active coverage after exclusions:</strong> ${Number(current.score_percent || 0)}% (${Number(current.matched_count || 0)}/${activeTotal})</p><p><strong>Résumé coverage improvement from approved edits:</strong> ${delta > 0 ? "+" : ""}${delta} matched requirement${Math.abs(delta) === 1 ? "" : "s"}</p>${Number(current.excluded_count || 0) ? `<p class="muted helper">${Number(current.excluded_count)} requirement${Number(current.excluded_count) === 1 ? "" : "s"} excluded as not a requirement for this application.</p>` : ""}<p class="muted helper">This is transparent keyword coverage, not a qualification or ATS score. Experience confirmations do not increase coverage until evidence is approved into the résumé.</p>`;
   }
-  const records = [...(current.matched || []), ...(current.related || []), ...(current.missing || [])];
-  document.getElementById("tailoring-keywords").innerHTML = records.map((item, index) => {
-    const memory = item.memory || {};
-    const importance = item.requirement_type === "required" ? "Required" : item.requirement_type === "preferred" ? "Preferred" : item.requirement_type === "responsibility" ? "Responsibility" : "Unclassified";
-    const status = item.user_override === "not_a_requirement" ? `Excluded for this job · ${importance}` : `${item.match_type === "missing" ? "Missing" : item.match_type === "partial" || item.match_type === "related_review" ? "Partial evidence" : "Matched"} · ${importance}`;
-    const alternatives = item.alternative_terms || [];
-    const source = (item.source_evidence || []).map((line) => `<li>${escapeHtml(line)}</li>`).join("");
-    const sourceSections = (item.source_sections || []).join(", ") || "Job description";
-    const evidence = item.evidence ? `<li><strong>${escapeHtml(item.source_section || "Résumé")}</strong>: ${escapeHtml(item.evidence)}</li>` : "<li class=\"muted\">No supporting résumé evidence.</li>";
-    const alternativeRows = alternatives.length ? alternatives.map((term) => {
-      const skill = (item.skill_memory || {})[term] || {};
-      const selected = skill.status || "unknown";
-      return `<li class=\"tailoring-alternative\"><span>${escapeHtml(term)}</span><select aria-label=\"Experience status for ${escapeAttribute(term)}\" data-skill-status=\"${escapeAttribute(term)}\"><option value=\"unknown\" ${selected === "unknown" ? "selected" : ""}>Unknown</option><option value=\"yes\" ${selected === "yes" ? "selected" : ""}>Have experience</option><option value=\"no\" ${selected === "no" ? "selected" : ""}>No experience</option></select></li>`;
-    }).join("") : "<li class=\"muted\">No alternative technology was listed.</li>";
-    const explanation = item.match_type === "exact" ? "The selected résumé contains the posted wording." : item.match_type === "equivalent" ? "The selected résumé contains an approved equivalent wording." : item.match_type === "partial" ? "Related evidence exists, but it does not establish the full requirement." : "No supporting wording was found in the selected résumé.";
-    return `<details class="tailoring-requirement ${item.match_type}"><summary class="tailoring-keyword" data-keyword-index="${index}"><strong>${escapeHtml(item.keyword)}</strong><span>${escapeHtml(status)}</span></summary><div class="tailoring-requirement-detail"><section><h4>Employer requirement</h4><p>${escapeHtml(importance)} · Source section: ${escapeHtml(sourceSections)}</p><ul>${source || "<li>Source wording was not captured.</li>"}</ul></section><section><h4>Acceptable alternatives</h4><ul class="tailoring-alternatives">${alternativeRows}</ul><p class="muted helper">These are individual experience confirmations. They do not increase coverage or add résumé claims.</p></section><section><h4>Résumé evidence</h4><ul>${evidence}</ul></section><section><h4>Matching assessment</h4><p>${escapeHtml(explanation)}</p></section></div></details>`;  }).join("") || (current.available === false ? `<p class="risk medium">Requirements cannot be reviewed until the complete job description is stored for this posting.</p>` : `<p class="muted">No significant requirements were extracted from this job description.</p>`);
-  document.querySelectorAll("[data-skill-status]").forEach((select) => select.addEventListener("change", () => saveTailoringSkillMemory(select.dataset.skillStatus, select.value)));
-  document.querySelectorAll("[data-keyword-index]").forEach((button) => button.addEventListener("click", () => {
-    const item = records[Number(button.dataset.keywordIndex)];
-    state.tailoring.selectedKeyword = item;
-    if (item.memory?.status === "yes" && item.memory.source_matches && item.memory.matching_paragraph_index !== null) {
-      selectTailoringParagraph(Number(item.memory.matching_paragraph_index));
-    }
-    document.querySelectorAll(".tailoring-keyword").forEach((entry) => entry.classList.remove("selected"));
-    button.classList.add("selected");
-    document.getElementById("tailoring-edit-status").textContent = item.match_type === "missing" || item.match_type === "partial" ? "Select an existing résumé bullet to make a grounded edit, or record your experience status in Profile." : `Reviewing ${item.keyword}. Inspect the source evidence below; challenge the match if it is incorrect.`;
-    renderTailoringKeywordActions();
-  }));
+  const records = current.skill_inventory || [...(current.matched || []), ...(current.related || []), ...(current.missing || [])];
+  const renderSkillList = (filter = "") => {
+    const query = filter.trim().toLowerCase();
+    const visible = records.map((item, index) => ({ item, index })).filter(({ item }) => !query || [item.keyword, item.parent_keyword, item.requirement_type, item.match_type].join(" ").toLowerCase().includes(query));
+    document.getElementById("tailoring-keywords").innerHTML = visible.map(({ item, index }) => {
+      const importance = item.requirement_type === "required" ? "Required" : item.requirement_type === "preferred" ? "Preferred" : item.requirement_type === "responsibility" ? "Responsibility" : "Unclassified";
+      const status = item.user_override === "not_a_requirement" ? `Excluded · ${importance}` : `${item.match_type === "missing" ? "Missing" : item.match_type === "partial" ? "Partial" : "Matched"} · ${importance}`;
+      const memoryStatus = item.skill_memory?.status && item.skill_memory.status !== "unknown" ? ` · ${item.skill_memory.status === "yes" ? "Have experience" : "No experience"}` : "";
+      return `<button class="tailoring-skill ${state.tailoring.selectedKeyword === item ? "selected" : ""}" type="button" data-skill-index="${index}"><span><strong>${escapeHtml(item.keyword)}</strong><small>${escapeHtml(item.parent_keyword || "Requirement")}</small></span><span>${escapeHtml(status + memoryStatus)}</span></button>`;
+    }).join("") || `<p class="muted">No requirements match this search.</p>`;
+    document.querySelectorAll("[data-skill-index]").forEach((button) => button.addEventListener("click", () => selectTailoringRequirement(Number(button.dataset.skillIndex))));
+  };
+  renderSkillList(document.getElementById("tailoring-requirement-search")?.value || "");
+  document.getElementById("tailoring-requirement-search")?.addEventListener("input", (event) => renderSkillList(event.target.value));
+  if (state.tailoring.selectedKeyword) renderTailoringRequirementDetail();
+  else if (records.length) selectTailoringRequirement(0);
   const bullets = data.bullets || [];
   document.getElementById("tailoring-bullets").innerHTML = bullets.map((bullet) => `<button class="tailoring-bullet ${bullet.editable ? "editable" : ""}" type="button" ${bullet.editable ? "" : "disabled"} data-paragraph-index="${bullet.paragraph_index}"><span class="muted">${escapeHtml(bullet.section)}</span><span>${escapeHtml(bullet.text)}</span></button>`).join("") || `<p class="muted">No editable résumé bullets were found in this document.</p>`;
   document.querySelectorAll("[data-paragraph-index]").forEach((button) => button.addEventListener("click", () => selectTailoringParagraph(Number(button.dataset.paragraphIndex))));
@@ -313,6 +301,34 @@ function renderTailoringStudio() {
   document.getElementById("tailoring-layout-status").textContent = layout.available ? (layout.verified ? "Word layout check passed: paragraph lines and page count are unchanged." : "Word layout check found a change. Review the draft before approving it.") : "Preview is approximate until Word layout validation is available.";
 }
 
+function selectTailoringRequirement(index) {
+  const records = state.tailoring.data?.keywords?.skill_inventory || [];
+  const item = records[index];
+  if (!item) return;
+  state.tailoring.selectedKeyword = item;
+  renderTailoringRequirementDetail();
+  document.querySelectorAll("[data-skill-index]").forEach((entry) => entry.classList.toggle("selected", Number(entry.dataset.skillIndex) === index));
+  renderTailoringKeywordActions();
+}
+
+function renderTailoringRequirementDetail() {
+  const target = document.getElementById("tailoring-requirement-detail");
+  const item = state.tailoring.selectedKeyword;
+  if (!target || !item) return;
+  const importance = item.requirement_type === "required" ? "Required" : item.requirement_type === "preferred" ? "Preferred" : item.requirement_type === "responsibility" ? "Responsibility" : "Unclassified";
+  const assessment = item.match_type === "matched" || item.match_type === "exact" ? "Matched" : item.match_type === "partial" ? "Partially demonstrated" : "Missing or undemonstrated";
+  const reason = item.match_type === "exact" ? "The selected résumé contains the posted wording." : item.match_type === "equivalent" ? "The selected résumé contains equivalent wording." : item.match_type === "partial" ? "Related résumé evidence exists, but it does not establish the complete requirement." : "No supporting wording was found in the selected résumé.";
+  const alternatives = (item.alternative_terms || []).map((term) => {
+    const memory = (item.skill_memory && term === item.keyword) ? item.skill_memory : ((state.tailoring.data?.keywords?.matched || []).concat(state.tailoring.data?.keywords?.related || [], state.tailoring.data?.keywords?.missing || []).find((entry) => entry.keyword === item.parent_keyword)?.skill_memory || {})[term] || {};
+    return `<li class="tailoring-alternative"><span>${escapeHtml(term)}</span><select aria-label="Experience status for ${escapeAttribute(term)}" data-skill-status="${escapeAttribute(term)}"><option value="unknown" ${memory.status === "unknown" || !memory.status ? "selected" : ""}>Unknown</option><option value="yes" ${memory.status === "yes" ? "selected" : ""}>Have experience</option><option value="no" ${memory.status === "no" ? "selected" : ""}>No experience</option></select></li>`;
+  }).join("");
+  const source = (item.source_evidence || []).map((line) => `<li>${escapeHtml(line)}</li>`).join("") || "<li>No source excerpt was captured.</li>";
+  const evidence = item.evidence ? `<p><strong>${escapeHtml(item.source_section || "Résumé")}</strong>: ${escapeHtml(item.evidence)}</p>` : "<p class=\"muted\">No exact résumé evidence for this individual skill.</p>";
+  const suggestions = (item.suggested_bullets || []).map((bullet) => `<button class="tailoring-suggested-bullet" type="button" data-suggested-paragraph="${bullet.paragraph_index}"><span>${escapeHtml(bullet.section)}</span><strong>${escapeHtml(bullet.text)}</strong><small>Edit this bullet · overlap: ${escapeHtml((bullet.overlap || []).join(", "))}</small></button>`).join("");
+  target.innerHTML = `<section><h4>Employer requirement</h4><p><strong>${escapeHtml(item.keyword)}</strong> · ${escapeHtml(importance)}</p><p class="muted">Semantic competency: ${escapeHtml(item.semantic_group || item.parent_keyword || item.keyword)}</p></section><section><h4>Acceptable technologies or alternatives</h4><ul class="tailoring-alternatives">${alternatives || "<li class=\"muted\">No alternatives listed.</li>"}</ul></section><details><summary>Original job description</summary><p class="job-evidence">${source}</p><p class="muted">Source section: ${escapeHtml((item.source_sections || []).join(", ") || "Job description")}</p></details><section><h4>Résumé evidence</h4>${evidence}</section><section><h4>Matching assessment</h4><p><strong>${assessment}</strong> · ${escapeHtml(reason)}</p></section><section><h4>Suggested next action</h4>${suggestions || `<p class="muted">No safe adjacent résumé bullet was found. Confirm the skill in Profile only if you genuinely have the experience; do not add unsupported claims.</p>`}</section>`;
+  target.querySelectorAll("[data-skill-status]").forEach((select) => select.addEventListener("change", () => saveTailoringSkillMemory(select.dataset.skillStatus, select.value)));
+  target.querySelectorAll("[data-suggested-paragraph]").forEach((button) => button.addEventListener("click", () => { selectTailoringParagraph(Number(button.dataset.suggestedParagraph)); document.getElementById("tailoring-selected-original")?.scrollIntoView({ block: "nearest" }); }));
+}
 function selectTailoringParagraph(index) {
   const bullet = (state.tailoring.data?.bullets || []).find((item) => Number(item.paragraph_index) === index);
   if (!bullet) return;
