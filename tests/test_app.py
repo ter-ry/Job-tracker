@@ -319,6 +319,18 @@ class JobAssistantTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "Ollama returned an empty response.")
 
+    def test_ollama_json_completion_retries_bounded_malformed_output(self):
+        responses = iter([
+            FakeUrlopenResponse({"response": "Here is the answer: not JSON"}),
+            FakeUrlopenResponse({"response": "```json\n{\"proposed_bullet\": \"Built Python services.\"}\n```"}),
+        ])
+        config = ollama_client.OllamaConfig(True, "http://127.0.0.1:11434", "qwen3:4b", 1, 120, 24000)
+        with patch.object(ollama_client.urllib.request, "urlopen", side_effect=lambda request, timeout: next(responses)):
+            result = ollama_client.request_json_completion(config, "Return JSON.")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["attempts"], 2)
+        self.assertEqual(result["data"]["proposed_bullet"], "Built Python services.")
+
     def test_job_create_scores_and_dashboard(self):
         self.seed_profile_for_documents(with_template=True)
         response = self.client.post(

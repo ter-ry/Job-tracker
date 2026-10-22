@@ -633,10 +633,12 @@ def create_app() -> Flask:
                 if match:
                     item["source_matches"] = True
                     item["matching_paragraph_index"] = int(match["paragraph_index"])
+        original_report = score_tailoring_text(job, selection["profile"], source_text)
         report = score_tailoring_text(job, selection["profile"], draft_text)
         override_rows = query_db("SELECT normalized_requirement, override FROM tailoring_requirement_overrides WHERE job_id = ?", [job_id])
         overrides = {text(item["normalized_requirement"]): text(item["override"]) for item in override_rows}
         report = apply_tailoring_requirement_overrides(report, overrides)
+        report["coverage_improvement_count"] = int(report.get("original_matched_count", report.get("matched_count", 0))) - int(original_report.get("matched_count", 0))
         for group in ("matched", "related", "missing"):
             for item in report.get(group, []):
                 saved = memory.get(item["normalized"])
@@ -654,7 +656,7 @@ def create_app() -> Flask:
             "draft": draft,
             "bullets": current_bullets,
             "keywords": report,
-            "original_keywords": score_tailoring_text(job, selection["profile"], source_text),
+            "original_keywords": original_report,
             "preview": {"text": draft_text, "layout": draft.get("layout", {}), "approximate": not bool(draft.get("layout", {}).get("available"))},
         })
 
