@@ -301,7 +301,15 @@ function buildTailoringRequirementGroups(records) {
     group.source_sections = [...new Set(group.members.flatMap((item) => item.source_sections || []))];
     group.evidence = [...group.members].sort((a, b) => (b.evidence ? 1 : 0) - (a.evidence ? 1 : 0)).find((item) => item.evidence)?.evidence || "";
     group.source_section = group.members.find((item) => item.evidence)?.source_section || "Résumé";
-    group.suggested_bullets = [...group.suggestions.values()];
+const sectionRank = { experience: 0, projects: 1, education: 2, skills: 3 };
+    const evidenceScore = (bullet) => {
+      const text = String(bullet.text || "").toLowerCase();
+      const direct = (text.match(/\b(api|apis|rest|service|backend|flask|postgres|database|kafka|rabbitmq|cloud|event|observability|testing)\b/g) || []).length;
+      const overlap = (bullet.overlap || []).length;
+      const section = sectionRank[String(bullet.section || bullet.source_location || "").split(" ")[0].toLowerCase()] ?? 9;
+      return direct * 10 + overlap * 2 - section;
+    };
+    group.suggested_bullets = [...group.suggestions.values()].sort((a, b) => evidenceScore(b) - evidenceScore(a));
     group.relatedEvidence = group.evidence ? "" : group.suggested_bullets[0]?.text || "";
     group.memory = group.members.find((item) => item.skill_memory?.status && item.skill_memory.status !== "unknown")?.skill_memory || representative?.skill_memory || {};
     return group;

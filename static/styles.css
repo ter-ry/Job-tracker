@@ -908,25 +908,7 @@ th {
   outline-offset: 3px;
   background: #181818;
 }
-.tailoring-studio-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
-.tailoring-controls, .tailoring-preview { min-width: 0; }
-.tailoring-keywords, .tailoring-bullets { display: grid; gap: 8px; max-height: 360px; overflow: auto; }
-.tailoring-requirement { min-width: 0; border: 1px solid #2a2a2a; background: #101010; color: #f4f4f4; border-radius: 8px; overflow: hidden; }
-.tailoring-requirement-detail { padding: 10px 12px; border-top: 1px solid #2a2a2a; color: #d7d7d7; overflow-wrap: anywhere; }
-.tailoring-requirement-detail ul { margin: 6px 0; padding-left: 20px; }
-.tailoring-requirement-detail p { margin: 6px 0; }
-.tailoring-keyword, .tailoring-bullet { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; width: 100%; text-align: left; border: 1px solid #2a2a2a; background: #101010; color: #f4f4f4; border-radius: 8px; padding: 9px 10px; }
-.tailoring-requirement > .tailoring-keyword { border: 0; border-radius: 0; cursor: pointer; }
-.tailoring-keyword span, .tailoring-bullet span:first-child { color: #a6a6a6; font-size: .85rem; }
-.tailoring-keyword.selected, .tailoring-bullet.selected { border-color: #f4f4f4; background: #1a1a1a; }
-.tailoring-keyword.missing { border-left: 3px solid #a6a6a6; }
-.tailoring-keyword.related_review { border-left: 3px solid #c8c8c8; }
-.tailoring-bullet.editable { cursor: pointer; }
-.tailoring-bullet:disabled { opacity: .55; cursor: not-allowed; }
-.tailoring-preview pre, #tailoring-preview-text { width: 100%; max-width: 100%; box-sizing: border-box; overflow-x: auto; overflow-wrap: anywhere; word-break: break-word; white-space: pre-wrap; }
-.memory-row { display: flex; gap: 12px; align-items: center; border-bottom: 1px solid #252525; padding: 8px 0; }
-.memory-row span { color: #a6a6a6; margin-right: auto; }
-@media (max-width: 900px) { .tailoring-studio-grid { grid-template-columns: 1fr; } }
+
 .spinner {
   display: inline-block;
   width: 0.8rem;
@@ -1219,64 +1201,61 @@ input, select, textarea { background: #111; border-color: #303030; color: #eee; 
   .pipeline-detail-grid { grid-template-columns: 1fr; }
 }
 
-.tailoring-requirement-detail section { border-top: 1px solid var(--line, #2b2b2b); padding-top: 10px; margin-top: 10px; }
-.tailoring-requirement-detail section:first-child { border-top: 0; padding-top: 0; margin-top: 0; }
-.tailoring-requirement-detail h4 { margin: 0 0 6px; color: var(--text, #f4f4f4); }
-.tailoring-alternatives { display: grid; gap: 6px; list-style: none; margin: 0; padding: 0; }
-.tailoring-alternative { align-items: center; display: flex; gap: 12px; justify-content: space-between; }
-.tailoring-alternative select { min-width: 150px; }
-.tailoring-studio-grid { grid-template-columns: minmax(280px, 360px) minmax(0, 1fr); align-items: start; }
-.tailoring-controls { min-width: 0; }
-.tailoring-keywords { max-height: 520px; overflow-y: auto; overflow-x: hidden; }
-.tailoring-skill { align-items: center; background: #101010; border: 1px solid #2a2a2a; border-radius: 8px; color: #f4f4f4; display: flex; justify-content: space-between; gap: 10px; padding: 9px 10px; text-align: left; width: 100%; }
-.tailoring-skill:hover, .tailoring-skill:focus-visible, .tailoring-skill.selected { background: #1a1a1a; border-color: #f4f4f4; }
-.tailoring-skill span:first-child { min-width: 0; overflow-wrap: anywhere; }
-.tailoring-skill small { color: #999; display: block; font-size: .76rem; margin-top: 3px; }
-.tailoring-skill > span:last-child { color: #aaa; flex: 0 0 auto; font-size: .78rem; text-align: right; }
-.tailoring-search { display: block; margin: 10px 0; }
-.tailoring-search input { margin-top: 5px; width: 100%; }
-.tailoring-requirement-panel { min-height: 280px; }
-.tailoring-requirement-detail { max-height: none; overflow: visible; }
-.tailoring-suggested-bullet { background: #151515; border: 1px solid #333; border-radius: 7px; color: #eee; display: grid; gap: 3px; margin: 7px 0; padding: 9px; text-align: left; width: 100%; }
-.tailoring-suggested-bullet:hover, .tailoring-suggested-bullet:focus-visible { border-color: #f4f4f4; }
-.tailoring-suggested-bullet span, .tailoring-suggested-bullet small { color: #aaa; }
-@media (max-width: 900px) { .tailoring-studio-grid { grid-template-columns: 1fr; } .tailoring-keywords { max-height: 300px; } }
-
-/* Tailoring Studio: compact master/detail/editor layout. */
-.tailoring-studio-grid { display: grid; grid-template-columns: minmax(250px, 300px) minmax(420px, 1fr) minmax(330px, 410px); gap: 14px; align-items: start; }
+/* Tailoring Studio: one consolidated master/detail/editor system. */
+.tailoring-scorebar { margin: 0 0 14px; padding: 12px 16px; background: #111; border: 1px solid #2c2c2c; border-radius: 10px; }
+.tailoring-scorebar #tailoring-score-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; align-items: center; }
+.tailoring-score-metric { display: grid; gap: 3px; min-width: 0; }
+.tailoring-score-metric strong { color: #c9c9c9; font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; }
+.tailoring-score-metric b { color: #f4f4f4; font-size: 1.35rem; line-height: 1; }
+.tailoring-score-metric span { color: #929292; font-size: .8rem; }
+.tailoring-studio-grid { display: grid; grid-template-columns: minmax(270px, 300px) minmax(0, 1fr) minmax(350px, 410px); gap: 16px; align-items: start; }
 .tailoring-controls, .tailoring-center, .tailoring-editor { min-width: 0; }
-.tailoring-controls .nested-panel, .tailoring-center .nested-panel, .tailoring-editor .nested-panel { min-width: 0; }
-.tailoring-keywords { max-height: 620px; overflow-y: auto; overflow-x: hidden; }
-.tailoring-editor { position: sticky; top: 14px; }
-.tailoring-editor textarea { width: 100%; max-width: 100%; box-sizing: border-box; resize: vertical; }
-.tailoring-editor .tailoring-diff { min-height: 72px; max-height: 170px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
-.tailoring-diff .diff-remove { background: #54272d; color: #ffd9dc; text-decoration: line-through; }
-.tailoring-diff .diff-add { background: #174633; color: #c8ffe0; }
-#tailoring-document-preview { width: min(900px, 92vw); max-height: 85vh; background: var(--panel, #111); color: var(--text, #f4f4f4); border: 1px solid var(--line, #333); border-radius: 10px; padding: 18px; }
-#tailoring-document-preview::backdrop { background: rgb(0 0 0 / 72%); }
-#tailoring-document-preview pre { max-height: 65vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
-@media (max-width: 1100px) { .tailoring-studio-grid { grid-template-columns: minmax(230px, 280px) minmax(0, 1fr); } .tailoring-editor { grid-column: 1 / -1; position: static; } }
-@media (max-width: 700px) { .tailoring-studio-grid { display: block; } .tailoring-controls, .tailoring-center, .tailoring-editor { margin-bottom: 12px; } .tailoring-keywords { max-height: 300px; } }
-
-/* Tailoring Studio acceptance layout: compact coverage bar and grouped requirements. */
-.tailoring-scorebar { margin: 0 0 14px; padding: 10px 14px; }
-.tailoring-scorebar #tailoring-score-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; align-items: center; }
-.tailoring-score-metric { display: grid; gap: 2px; min-width: 0; }
-.tailoring-score-metric b { font-size: 1.35rem; color: var(--text, #f4f4f4); }
-.tailoring-score-metric span { color: var(--muted, #a9a9a9); font-size: .82rem; }
-.tailoring-filter-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 10px; }
-.tailoring-filter-row .active { border-color: var(--text, #f4f4f4); color: var(--text, #fff); }
-.tailoring-competency { grid-template-columns: 10px minmax(0, 1fr) auto; align-items: center; gap: 8px; }
-.tailoring-competency strong, .tailoring-competency small { overflow-wrap: anywhere; }
-.tailoring-competency small { display: block; color: var(--muted, #aaa); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.tailoring-skill-status { color: var(--muted, #b8b8b8); font-size: .78rem; white-space: nowrap; }
-.tailoring-status-dot { width: 8px; height: 8px; border-radius: 50%; background: #b13b43; }
+.tailoring-controls .nested-panel, .tailoring-center .nested-panel, .tailoring-editor .nested-panel { min-width: 0; background: #0f0f0f; border: 1px solid #292929; border-radius: 10px; }
+.tailoring-controls .nested-panel { padding: 12px; }
+.tailoring-center .nested-panel, .tailoring-editor .nested-panel { padding: 14px; }
+.tailoring-controls h3, .tailoring-center h3, .tailoring-editor h3 { margin: 0 0 10px; color: #f0f0f0; }
+.tailoring-search { display: block; margin: 0 0 9px; color: #c5c5c5; font-size: .86rem; }
+.tailoring-search input { width: 100%; margin-top: 5px; box-sizing: border-box; }
+.tailoring-filter-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 10px; }
+.tailoring-filter-row .active { border-color: #f4f4f4; color: #fff; background: #242424; }
+.tailoring-keywords { display: grid; gap: 7px; max-height: 620px; overflow-y: auto; overflow-x: hidden; padding-right: 3px; }
+.tailoring-skill { display: grid; grid-template-columns: 9px minmax(0, 1fr) minmax(76px, 100px); align-items: center; gap: 8px; width: 100%; min-width: 0; padding: 9px 10px; text-align: left; color: #f2f2f2; background: #151515; border: 1px solid #2c2c2c; border-radius: 8px; }
+.tailoring-skill:hover, .tailoring-skill:focus-visible, .tailoring-skill.selected { background: #1c1c1c; border-color: #d8d8d8; }
+.tailoring-competency > span:nth-child(2) { min-width: 0; text-align: left; }
+.tailoring-competency strong { display: block; min-width: 0; color: #f1f1f1; font-size: .86rem; line-height: 1.2; overflow-wrap: anywhere; }
+.tailoring-competency small { display: block; min-width: 0; margin-top: 3px; color: #898989; font-size: .72rem; line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tailoring-skill-status { justify-self: stretch; padding: 3px 5px; color: #d4d4d4; border: 1px solid #444; border-radius: 999px; font-size: .68rem; line-height: 1.15; text-align: center; white-space: normal; }
+.tailoring-competency.matched .tailoring-skill-status { color: #a8efbf; border-color: #32754a; background: #15311f; }
+.tailoring-competency.partial .tailoring-skill-status { color: #f0d18b; border-color: #80632d; background: #302613; }
+.tailoring-competency.missing .tailoring-skill-status { color: #f0a4aa; border-color: #763b42; background: #321a1d; }
+.tailoring-status-dot { width: 8px; height: 8px; border-radius: 50%; background: #cf5a63; }
 .tailoring-competency.matched .tailoring-status-dot { background: #51c878; }
 .tailoring-competency.partial .tailoring-status-dot { background: #d6a84f; }
 .tailoring-competency.missing .tailoring-status-dot { background: #cf5a63; }
-.tailoring-competency.selected { border-color: var(--text, #f4f4f4); }
+.tailoring-requirement-panel { min-height: 360px; }
+.tailoring-requirement-detail { color: #cfcfcf; overflow-wrap: anywhere; }
+.tailoring-requirement-detail section { border-top: 1px solid #292929; margin-top: 13px; padding-top: 13px; }
+.tailoring-requirement-detail section:first-child { border-top: 0; margin-top: 0; padding-top: 0; }
+.tailoring-requirement-detail h4 { margin: 0 0 6px; color: #f0f0f0; font-size: .88rem; }
+.tailoring-requirement-detail p { margin: 6px 0; }
+.tailoring-requirement-detail details { margin-top: 13px; border-top: 1px solid #292929; padding-top: 11px; }
+.tailoring-requirement-detail summary { cursor: pointer; color: #d9d9d9; }
 .tailoring-alternatives { display: flex; flex-wrap: wrap; gap: 6px; list-style: none; margin: 8px 0; padding: 0; }
-.tailoring-alternative { display: flex; flex: 0 1 auto; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; padding: 6px 8px; border: 1px solid var(--line, #333); border-radius: 6px; background: rgb(255 255 255 / 3%); }
+.tailoring-alternative { display: flex; flex: 0 1 auto; align-items: center; gap: 8px; min-width: 0; padding: 6px 8px; color: #e1e1e1; background: #161616; border: 1px solid #303030; border-radius: 6px; }
 .tailoring-alternative span { overflow-wrap: normal; white-space: nowrap; }
-.tailoring-equivalent-label { color: var(--muted, #aaa); white-space: nowrap; }
-@media (max-width: 900px) { .tailoring-scorebar #tailoring-score-summary { grid-template-columns: 1fr; } }
+.tailoring-alternative select { min-width: 125px; }
+.tailoring-equivalent-label { color: #969696; font-size: .74rem; white-space: nowrap; }
+.tailoring-suggested-bullet { display: grid; gap: 5px; width: 100%; margin: 7px 0; padding: 10px 11px; text-align: left; color: #ececec; background: #171717; border: 1px solid #343434; border-radius: 8px; }
+.tailoring-suggested-bullet:hover, .tailoring-suggested-bullet:focus-visible { background: #202020; border-color: #cfcfcf; }
+.tailoring-suggested-bullet span, .tailoring-suggested-bullet small { color: #999; font-size: .76rem; }
+.tailoring-suggested-bullet strong { color: #ededed; font-size: .84rem; line-height: 1.35; font-weight: 500; }
+.tailoring-editor { position: sticky; top: 14px; }
+.tailoring-editor textarea { width: 100%; max-width: 100%; box-sizing: border-box; resize: vertical; background: #151515; border-color: #333; color: #ededed; }
+.tailoring-editor .tailoring-diff { min-height: 72px; max-height: 170px; overflow: auto; padding: 10px; white-space: pre-wrap; overflow-wrap: anywhere; background: #151515; border: 1px solid #303030; border-radius: 7px; }
+.tailoring-diff .diff-remove { background: #54272d; color: #ffd9dc; text-decoration: line-through; }
+.tailoring-diff .diff-add { background: #174633; color: #c8ffe0; }
+#tailoring-document-preview { width: min(900px, 92vw); max-height: 85vh; padding: 18px; color: #f4f4f4; background: #111; border: 1px solid #333; border-radius: 10px; }
+#tailoring-document-preview::backdrop { background: rgb(0 0 0 / 72%); }
+#tailoring-document-preview pre { max-height: 65vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+@media (max-width: 1100px) { .tailoring-studio-grid { grid-template-columns: minmax(235px, 280px) minmax(0, 1fr); } .tailoring-editor { grid-column: 1 / -1; position: static; } }
+@media (max-width: 700px) { .tailoring-studio-grid { display: block; } .tailoring-controls, .tailoring-center, .tailoring-editor { margin-bottom: 12px; } .tailoring-keywords { max-height: 300px; } .tailoring-scorebar #tailoring-score-summary { grid-template-columns: 1fr; } }
