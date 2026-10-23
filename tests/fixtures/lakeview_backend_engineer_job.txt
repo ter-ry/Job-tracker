@@ -1,0 +1,78 @@
+Full job description
+Overview:
+The Backend Engineer on the AI Platform team plays a critical role in building and evolving the backend systems that power internal products, customer-facing capabilities, AI-enabled workflows, and operational decision-making across the organization. This role is responsible for designing, building, testing, and operating reliable, scalable, and flexible services that support a wide range of internal and external use cases.
+
+This role contributes to the development and evolution of core backend and distributed systems capabilities, including service-oriented architectures, APIs, workflow orchestration, event-driven integrations, identity and permissions, operational tooling, and system interfaces that enable product, data, and AI teams to move quickly. Success requires strong technical depth, sound systems thinking, and the ability to build dependable solutions in a cloud-based, regulated, high-stakes environment.
+
+The Backend Engineer is expected to operate effectively in a modern engineering environment, using automation, observability, CI/CD, testing, and infrastructure-as-code practices to deploy, manage, and improve production services. In parallel, this individual will help enable downstream product capabilities, operational workflows, reporting, and AI systems by ensuring that backend services are trustworthy, maintainable, and performant.
+
+This is a fully remote position that offers a competitive salary range of $140,000 to $240,000 USD, plus an annual bonus. You'll also receive our excellent benefits package, which includes medical coverage starting on day one and a company-matched 401(k). Compensation may vary based on experience, location, and other job-related factors.
+Responsibilities:
+Scale High-Performance Distributed Systems
+
+Design, build, and maintain production backend services for a wide variety of internal and external use cases, including product workflows, operational tools, integrations, APIs, and AI-enabled applications
+Develop well-structured APIs, domain models, service interfaces, and business logic that are easy to understand, test, operate, and extend
+Build scalable backend workflows that support complex business processes across loans, documents, accounts, users, permissions, vendors, and operational decision making
+Ensure backend services are reliable, testable, observable, and resilient as business needs, data volumes, and product surfaces evolve
+Systems Architecture & Integration
+
+Contribute to service architectures that support transactional, operational, analytical, and AI-driven workloads across production environments
+Integrate with internal systems, third-party platforms, vendor APIs, databases, files, message queues, event streams, and cloud services
+Design patterns for service boundaries, idempotency, consistency, retries, failure handling, schema evolution, versioning, and backward compatibility
+Help define practical architecture standards that balance speed, simplicity, reliability, security, and long-term maintainability
+Cloud Deployment & Operations
+
+Deploy, operate, and improve backend services on major cloud platforms such as AWS, GCP, or Azure
+Use infrastructure-as-code, CI/CD, automated testing, and deployment automation to improve release speed, consistency, and reliability
+Monitor production services using logging, tracing, metrics, alerting, and observability tools to proactively identify and resolve issues
+Support secure, resilient, and cost-conscious operation of cloud-based backend infrastructure and application services
+Reliability, Security & Compliance
+
+Build systems with strong operational discipline, including attention to latency, availability, scalability, correctness, incident response, and production support
+Implement authentication, authorization, permissions, audit logging, data protection, and secure service-to-service communication patterns
+Establish and maintain standards for API documentation, service ownership, runbooks, operational metrics, change management, and production readiness
+Contribute to practices that support security, privacy, auditability, compliance, and risk management in a regulated environment
+Cross-Functional Collaboration
+
+Partner closely with Product, Engineering, Data, AI, Design, Operations, and business stakeholders to understand workflows, user needs, constraints, and delivery priorities
+Translate business and operational requirements into clean, scalable, maintainable, and secure backend solutions
+Support downstream consumers of backend capabilities, including product teams, analysts, researchers, AI systems, operational users, and external integrations
+Communicate clearly with both technical and non-technical stakeholders about system behavior, tradeoffs, risks, dependencies, and delivery timelines
+Iteration & Continuous Improvement
+
+Continuously improve service performance, reliability, scalability, security, and developer productivity
+Identify opportunities to simplify architecture, reduce operational toil, improve shared platform leverage, and make systems easier to reason about
+Operate with a strong bias toward action and iterative delivery, moving quickly from problem definition to implementation, validation, and improvement
+Help raise the bar on engineering quality through thoughtful design, code review, testing, documentation, mentorship, and operational discipline
+Qualifications:
+3-5+ years of experience building and operating production-grade backend systems, APIs, services, or distributed applications
+Strong software engineering fundamentals, including data structures, algorithms, system design, debugging, testing, and code quality
+Experience designing, building, maintaining, and debugging services that run in production and support real users or business-critical workflows
+Experience with modern backend programming languages such as Python, Go, C++, Rust, Java, Kotlin, Scala, TypeScript, or C#
+Experience with API design, service boundaries, event-driven or asynchronous architectures, relational data stores, and non-relational data stores
+Experience building transactional systems where correctness, idempotency, consistency, reconciliation, and auditability matter
+Experience deploying and operating backend services on major cloud platforms such as AWS, GCP, or Azure
+Strong SQL skills and comfort with application data modeling, schema evolution, migrations, query performance, and data access patterns
+Experience building AI-powered capabilities on top of LLMs, including orchestration, retrieval, evaluation, tool integrations, and workflow automation
+Comfort working with CI/CD, infrastructure-as-code, observability, incident response, and production operations for backend systems
+Strong judgment in ambiguous environments where requirements evolve and systems must balance speed, reliability, security, and flexibility
+Clear communication skills with both technical and non-technical teammates
+
+Preferred Experience
+
+Experience in fintech, mortgage, lending, payments, insurance, banking, capital markets, or other regulated domains
+Experience with queues, streaming, and event-driven platforms such as Kafka, Kinesis, SQS/SNS, Pub/Sub, RabbitMQ, or similar systems
+Experience building secure identity, access control, permissions, audit trail, policy, or compliance-oriented backend capabilities
+Experience building high-volume, low-latency, multi-tenant, B2B, enterprise, or internal platform systems
+Experience building AI products, developer platforms, workflow automation systems, or LLM-powered enterprise applications
+Experience improving system reliability, cost efficiency, developer productivity, and operational scalability as a platform grows
+
+A note to candidates
+
+You do not need prior fintech or finance experience to succeed in this role. If you are a strong backend engineer with solid technical judgment, a product mindset, and excitement for solving complex systems problems, we would love to hear from you.
+
+If your background does not line up perfectly with every bullet, but this role feels like the kind of work you want to do, please apply.
+
+Bayview is an Equal Employment Opportunity employer. All aspects of consideration for employment and employment with the Company are governed on the basis of merit, competence and qualifications without regard to race, color, religion, sex, national origin, age, disability, veteran status, sexual orientation, or any other category protected by federal, state, or local law.
+
+#LI-Remote
