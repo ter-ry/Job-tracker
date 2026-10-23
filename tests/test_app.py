@@ -431,6 +431,9 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn('tailoring-diff', html)
         self.assertIn('tailoring-open-preview', html)
         self.assertIn('tailoring-suggested-bullet', Path('static/app.js').read_text(encoding='utf-8'))
+        self.assertIn('tailoring-requirement-filters', html)
+        self.assertIn('buildTailoringRequirementGroups', Path('static/app.js').read_text(encoding='utf-8'))
+        self.assertIn('Related résumé evidence for review', Path('static/app.js').read_text(encoding='utf-8'))
 
     def test_candidate_profile_creation_is_committed_and_returned_by_list_endpoint(self):
         response = self.client.post(

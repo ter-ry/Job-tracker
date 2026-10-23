@@ -1257,3 +1257,26 @@ input, select, textarea { background: #111; border-color: #303030; color: #eee; 
 #tailoring-document-preview pre { max-height: 65vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
 @media (max-width: 1100px) { .tailoring-studio-grid { grid-template-columns: minmax(230px, 280px) minmax(0, 1fr); } .tailoring-editor { grid-column: 1 / -1; position: static; } }
 @media (max-width: 700px) { .tailoring-studio-grid { display: block; } .tailoring-controls, .tailoring-center, .tailoring-editor { margin-bottom: 12px; } .tailoring-keywords { max-height: 300px; } }
+
+/* Tailoring Studio acceptance layout: compact coverage bar and grouped requirements. */
+.tailoring-scorebar { margin: 0 0 14px; padding: 10px 14px; }
+.tailoring-scorebar #tailoring-score-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; align-items: center; }
+.tailoring-score-metric { display: grid; gap: 2px; min-width: 0; }
+.tailoring-score-metric b { font-size: 1.35rem; color: var(--text, #f4f4f4); }
+.tailoring-score-metric span { color: var(--muted, #a9a9a9); font-size: .82rem; }
+.tailoring-filter-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 10px; }
+.tailoring-filter-row .active { border-color: var(--text, #f4f4f4); color: var(--text, #fff); }
+.tailoring-competency { grid-template-columns: 10px minmax(0, 1fr) auto; align-items: center; gap: 8px; }
+.tailoring-competency strong, .tailoring-competency small { overflow-wrap: anywhere; }
+.tailoring-competency small { display: block; color: var(--muted, #aaa); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tailoring-skill-status { color: var(--muted, #b8b8b8); font-size: .78rem; white-space: nowrap; }
+.tailoring-status-dot { width: 8px; height: 8px; border-radius: 50%; background: #b13b43; }
+.tailoring-competency.matched .tailoring-status-dot { background: #51c878; }
+.tailoring-competency.partial .tailoring-status-dot { background: #d6a84f; }
+.tailoring-competency.missing .tailoring-status-dot { background: #cf5a63; }
+.tailoring-competency.selected { border-color: var(--text, #f4f4f4); }
+.tailoring-alternatives { display: flex; flex-wrap: wrap; gap: 6px; list-style: none; margin: 8px 0; padding: 0; }
+.tailoring-alternative { display: flex; flex: 0 1 auto; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; padding: 6px 8px; border: 1px solid var(--line, #333); border-radius: 6px; background: rgb(255 255 255 / 3%); }
+.tailoring-alternative span { overflow-wrap: normal; white-space: nowrap; }
+.tailoring-equivalent-label { color: var(--muted, #aaa); white-space: nowrap; }
+@media (max-width: 900px) { .tailoring-scorebar #tailoring-score-summary { grid-template-columns: 1fr; } }

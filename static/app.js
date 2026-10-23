@@ -264,35 +264,88 @@ function closeTailoringStudio() {
   state.tailoring = { draftId: null, jobId: null, profileId: null, resumeId: null, data: null, selectedParagraph: null, selectedKeyword: null };
 }
 
+function tailoringTitle(value) {
+  return String(value || "Requirement").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function buildTailoringRequirementGroups(records) {
+  const groups = new Map();
+  records.forEach((item, index) => {
+    const key = item.parent_normalized || item.parent_keyword || item.normalized || item.keyword || `requirement-${index}`;
+    if (!groups.has(key)) groups.set(key, { key, members: [], indices: [], terms: new Set(), suggestions: new Map() });
+    const group = groups.get(key);
+    group.members.push(item); group.indices.push(index);
+    [item.keyword, ...(item.alternative_terms || [])].filter(Boolean).forEach((term) => group.terms.add(term));
+    (item.suggested_bullets || []).forEach((bullet) => group.suggestions.set(bullet.paragraph_index, bullet));
+  });
+  const importanceRank = { required: 4, preferred: 3, responsibility: 2, unclassified: 1 };
+  return [...groups.values()].map((group) => {
+    const representative = [...group.members].sort((a, b) => {
+      const statusRank = { matched: 4, exact: 4, equivalent: 4, partial: 3, related: 3, missing: 1 };
+      return (statusRank[b.match_type] || 0) - (statusRank[a.match_type] || 0) || (importanceRank[b.requirement_type] || 0) - (importanceRank[a.requirement_type] || 0);
+    })[0];
+    const matched = group.members.some((item) => ["matched", "exact", "equivalent"].includes(item.match_type));
+    const partial = !matched && (group.members.some((item) => ["partial", "related"].includes(item.match_type)) || group.suggestions.size > 0);
+    group.primary = representative;
+    group.primaryKeyword = representative?.keyword || [...group.terms][0] || "Requirement";
+    group.keyword = group.primaryKeyword;
+    group.normalized = representative?.parent_normalized || representative?.normalized || group.key;
+    group.parent_keyword = representative?.parent_keyword || representative?.semantic_group || group.primaryKeyword;
+    group.match_type = matched ? "matched" : partial ? "partial" : "missing";
+    group.statusLabel = matched ? "Matched" : partial ? "Partial" : "Missing";
+    group.requirement_type = group.members.reduce((best, item) => (importanceRank[item.requirement_type] || 0) > (importanceRank[best] || 0) ? item.requirement_type : best, "unclassified");
+    group.user_override = group.members.find((item) => item.user_override === "not_a_requirement")?.user_override || "";
+    group.alternative_terms = [...group.terms];
+    group.independentTerms = group.alternative_terms.filter((term) => /messaging|queue|kafka|rabbitmq|kinesis|sqs|pub.?sub|cloud|aws|gcp|azure/i.test(`${group.parent_keyword} ${term}`));
+    group.source_evidence = [...new Set(group.members.flatMap((item) => item.source_evidence || []))];
+    group.source_sections = [...new Set(group.members.flatMap((item) => item.source_sections || []))];
+    group.evidence = [...group.members].sort((a, b) => (b.evidence ? 1 : 0) - (a.evidence ? 1 : 0)).find((item) => item.evidence)?.evidence || "";
+    group.source_section = group.members.find((item) => item.evidence)?.source_section || "Résumé";
+    group.suggested_bullets = [...group.suggestions.values()];
+    group.relatedEvidence = group.evidence ? "" : group.suggested_bullets[0]?.text || "";
+    group.memory = group.members.find((item) => item.skill_memory?.status && item.skill_memory.status !== "unknown")?.skill_memory || representative?.skill_memory || {};
+    return group;
+  });
+}
+
 function renderTailoringStudio() {
   const data = state.tailoring.data;
   if (!data) return;
   document.getElementById("tailoring-studio-subtitle").textContent = `${data.job.company || "Employer"} · ${data.job.title || "Role"} · ${data.resume.name || "Selected résumé"}`;
   const original = data.original_keywords || {};
   const current = data.keywords || {};
+  const summary = document.getElementById("tailoring-score-summary");
   if (current.available === false || original.available === false) {
-    document.getElementById("tailoring-score-summary").innerHTML = `<p class="risk medium"><strong>Keyword coverage unavailable</strong></p><p>${escapeHtml(current.unavailable_reason || original.unavailable_reason || "The complete job description is not available for this posting.")}</p><p class="muted helper">This is not a 0% result. Edit the job and paste or refresh the original posting, then reopen Tailoring Studio.</p>`;
+    summary.innerHTML = `<p class="risk medium"><strong>Keyword coverage unavailable</strong></p><p>${escapeHtml(current.unavailable_reason || original.unavailable_reason || "The complete job description is not available for this posting.")}</p><p class="muted helper">This is not a 0% result. Edit the job and paste or refresh the original posting, then reopen Tailoring Studio.</p>`;
   } else {
-  const delta = Number(current.coverage_improvement_count || 0);
-  const activeTotal = Number(current.adjusted_total ?? current.total ?? 0);
-  document.getElementById("tailoring-score-summary").innerHTML = `<p><strong>Original extracted coverage:</strong> ${Number(original.score_percent || 0)}% (${Number(original.matched_count || 0)}/${Number(original.total || 0)})</p><p><strong>Active coverage after exclusions:</strong> ${Number(current.score_percent || 0)}% (${Number(current.matched_count || 0)}/${activeTotal})</p><p><strong>Résumé coverage improvement from approved edits:</strong> ${delta > 0 ? "+" : ""}${delta} matched requirement${Math.abs(delta) === 1 ? "" : "s"}</p>${Number(current.excluded_count || 0) ? `<p class="muted helper">${Number(current.excluded_count)} requirement${Number(current.excluded_count) === 1 ? "" : "s"} excluded as not a requirement for this application.</p>` : ""}<p class="muted helper">This is transparent keyword coverage, not a qualification or ATS score. Experience confirmations do not increase coverage until evidence is approved into the résumé.</p>`;
+    const delta = Number(current.coverage_improvement_count || 0);
+    const activeTotal = Number(current.adjusted_total ?? current.total ?? 0);
+    summary.innerHTML = `<div class="tailoring-score-metric"><strong>Original extracted coverage</strong><b>${Number(original.score_percent || 0)}%</b><span>${Number(original.matched_count || 0)}/${Number(original.total || 0)} grouped competencies</span></div><div class="tailoring-score-metric"><strong>Active coverage</strong><b>${Number(current.score_percent || 0)}%</b><span>${Number(current.matched_count || 0)}/${activeTotal} after exclusions</span></div><div class="tailoring-score-metric"><strong>Approved résumé improvement</strong><b>${delta > 0 ? "+" : ""}${delta}</b><span>matched competencies</span></div>${Number(current.excluded_count || 0) ? `<p class="muted helper">${Number(current.excluded_count)} competency${Number(current.excluded_count) === 1 ? "" : "ies"} excluded as not a requirement for this application.</p>` : ""}<p class="muted helper">Keyword coverage is transparent document evidence, not a qualification or ATS score. Experience confirmations do not increase coverage until approved evidence is in the résumé.</p>`;
   }
   const records = current.skill_inventory || [...(current.matched || []), ...(current.related || []), ...(current.missing || [])];
+  const groups = buildTailoringRequirementGroups(records);
+  state.tailoring.requirementGroups = groups;
   const renderSkillList = (filter = "") => {
-    const query = filter.trim().toLowerCase();
-    const visible = records.map((item, index) => ({ item, index })).filter(({ item }) => !query || [item.keyword, item.parent_keyword, item.requirement_type, item.match_type].join(" ").toLowerCase().includes(query));
-    document.getElementById("tailoring-keywords").innerHTML = visible.map(({ item, index }) => {
-      const importance = item.requirement_type === "required" ? "Required" : item.requirement_type === "preferred" ? "Preferred" : item.requirement_type === "responsibility" ? "Responsibility" : "Unclassified";
-      const status = item.user_override === "not_a_requirement" ? `Excluded · ${importance}` : `${item.match_type === "missing" ? "Missing" : item.match_type === "partial" ? "Partial" : "Matched"} · ${importance}`;
-      const memoryStatus = item.skill_memory?.status && item.skill_memory.status !== "unknown" ? ` · ${item.skill_memory.status === "yes" ? "Have experience" : "No experience"}` : "";
-      return `<button class="tailoring-skill ${state.tailoring.selectedKeyword === item ? "selected" : ""}" type="button" data-skill-index="${index}"><span><strong>${escapeHtml(item.keyword)}</strong><small>${escapeHtml(item.parent_keyword || "Requirement")}</small></span><span>${escapeHtml(status + memoryStatus)}</span></button>`;
-    }).join("") || `<p class="muted">No requirements match this search.</p>`;
-    document.querySelectorAll("[data-skill-index]").forEach((button) => button.addEventListener("click", () => selectTailoringRequirement(Number(button.dataset.skillIndex))));
+    const query = document.getElementById("tailoring-requirement-search")?.value.trim().toLowerCase() || "";
+    const visible = groups.filter((group) => {
+      const text = [group.parent_keyword, group.primaryKeyword, group.requirement_type, ...group.alternative_terms].join(" ").toLowerCase();
+      const filterMatch = filter === "matched" ? group.match_type === "matched" : filter === "review" ? group.match_type !== "matched" && group.user_override !== "not_a_requirement" : true;
+      return filterMatch && (!query || text.includes(query));
+    });
+    document.getElementById("tailoring-keywords").innerHTML = visible.map((group) => {
+      const importance = group.requirement_type === "required" ? "Required" : group.requirement_type === "preferred" ? "Preferred" : group.requirement_type === "responsibility" ? "Responsibility" : "Unclassified";
+      const excluded = group.user_override === "not_a_requirement";
+      const statusClass = group.match_type === "matched" ? "matched" : group.match_type === "partial" ? "partial" : "missing";
+      const selected = state.tailoring.selectedKeyword === group ? " selected" : "";
+      return `<button class="tailoring-skill tailoring-competency ${statusClass}${selected}" type="button" data-group-key="${escapeAttribute(group.key)}"><span class="tailoring-status-dot" aria-hidden="true"></span><span><strong>${escapeHtml(tailoringTitle(group.parent_keyword || group.primaryKeyword))}</strong><small>${escapeHtml(group.alternative_terms.slice(0, 5).join(" · ") || group.primaryKeyword)}</small></span><span class="tailoring-skill-status">${excluded ? "Excluded" : group.statusLabel} · ${importance}</span></button>`;
+    }).join("") || `<p class="muted">No grouped requirements match this view.</p>`;
+    document.querySelectorAll("[data-group-key]").forEach((button) => button.addEventListener("click", () => selectTailoringRequirement(button.dataset.groupKey)));
   };
-  renderSkillList(document.getElementById("tailoring-requirement-search")?.value || "");
-  document.getElementById("tailoring-requirement-search")?.addEventListener("input", (event) => renderSkillList(event.target.value));
-  if (state.tailoring.selectedKeyword) renderTailoringRequirementDetail();
-  else if (records.length) selectTailoringRequirement(0);
+  renderSkillList("all");
+  document.getElementById("tailoring-requirement-search")?.addEventListener("input", () => renderSkillList(document.querySelector("[data-tailoring-filter].active")?.dataset.tailoringFilter || "all"));
+  document.querySelectorAll("[data-tailoring-filter]").forEach((button) => button.addEventListener("click", () => { document.querySelectorAll("[data-tailoring-filter]").forEach((item) => item.classList.toggle("active", item === button)); renderSkillList(button.dataset.tailoringFilter); }));
+  if (state.tailoring.selectedKeyword && groups.some((group) => group.key === state.tailoring.selectedKeyword.key)) renderTailoringRequirementDetail();
+  else if (groups.length) selectTailoringRequirement(groups[0].key);
   const bullets = data.bullets || [];
   const bulletList = document.getElementById("tailoring-bullets");
   if (bulletList) {
@@ -308,31 +361,32 @@ function renderTailoringStudio() {
   renderTailoringEditor();
 }
 
-function selectTailoringRequirement(index) {
-  const records = state.tailoring.data?.keywords?.skill_inventory || [];
-  const item = records[index];
-  if (!item) return;
-  state.tailoring.selectedKeyword = item;
+function selectTailoringRequirement(key) {
+  const group = (state.tailoring.requirementGroups || buildTailoringRequirementGroups(state.tailoring.data?.keywords?.skill_inventory || [])).find((item) => item.key === key);
+  if (!group) return;
+  state.tailoring.selectedKeyword = group;
   renderTailoringRequirementDetail();
-  document.querySelectorAll("[data-skill-index]").forEach((entry) => entry.classList.toggle("selected", Number(entry.dataset.skillIndex) === index));
+  document.querySelectorAll("[data-group-key]").forEach((entry) => entry.classList.toggle("selected", entry.dataset.groupKey === key));
   renderTailoringKeywordActions();
 }
 
 function renderTailoringRequirementDetail() {
   const target = document.getElementById("tailoring-requirement-detail");
-  const item = state.tailoring.selectedKeyword;
-  if (!target || !item) return;
-  const importance = item.requirement_type === "required" ? "Required" : item.requirement_type === "preferred" ? "Preferred" : item.requirement_type === "responsibility" ? "Responsibility" : "Unclassified";
-  const assessment = item.match_type === "matched" || item.match_type === "exact" ? "Matched" : item.match_type === "partial" ? "Partially demonstrated" : "Missing or undemonstrated";
-  const reason = item.match_type === "exact" ? "The selected résumé contains the posted wording." : item.match_type === "equivalent" ? "The selected résumé contains equivalent wording." : item.match_type === "partial" ? "Related résumé evidence exists, but it does not establish the complete requirement." : "No supporting wording was found in the selected résumé.";
-  const alternatives = (item.alternative_terms || []).map((term) => {
-    const memory = (item.skill_memory && term === item.keyword) ? item.skill_memory : ((state.tailoring.data?.keywords?.matched || []).concat(state.tailoring.data?.keywords?.related || [], state.tailoring.data?.keywords?.missing || []).find((entry) => entry.keyword === item.parent_keyword)?.skill_memory || {})[term] || {};
-    return `<li class="tailoring-alternative"><span>${escapeHtml(term)}</span><select aria-label="Experience status for ${escapeAttribute(term)}" data-skill-status="${escapeAttribute(term)}"><option value="unknown" ${memory.status === "unknown" || !memory.status ? "selected" : ""}>Unknown</option><option value="yes" ${memory.status === "yes" ? "selected" : ""}>Have experience</option><option value="no" ${memory.status === "no" ? "selected" : ""}>No experience</option></select></li>`;
+  const group = state.tailoring.selectedKeyword;
+  if (!target || !group) return;
+  const importance = group.requirement_type === "required" ? "Required" : group.requirement_type === "preferred" ? "Preferred" : group.requirement_type === "responsibility" ? "Responsibility derived" : "Unclassified";
+  const assessment = group.match_type === "matched" ? "Matched" : group.match_type === "partial" ? "Partially demonstrated" : "Missing or undemonstrated";
+  const reason = group.match_type === "matched" ? "The selected résumé contains grounded evidence for this competency." : group.match_type === "partial" ? "Related résumé evidence exists, but it does not establish the complete requirement." : "No supporting wording was found in the selected résumé.";
+  const alternatives = group.alternative_terms.map((term) => {
+    const member = group.members.find((item) => item.keyword === term || (item.alternative_terms || []).includes(term));
+    const memory = member?.skill_memory || {};
+    const control = group.independentTerms.includes(term) ? `<select aria-label="Experience status for ${escapeAttribute(term)}" data-skill-status="${escapeAttribute(term)}"><option value="unknown" ${memory.status === "unknown" || !memory.status ? "selected" : ""}>Unknown</option><option value="yes" ${memory.status === "yes" ? "selected" : ""}>Have experience</option><option value="no" ${memory.status === "no" ? "selected" : ""}>No experience</option></select>` : `<small class="tailoring-equivalent-label">Equivalent wording</small>`;
+    return `<li class="tailoring-alternative"><span>${escapeHtml(term)}</span>${control}</li>`;
   }).join("");
-  const source = (item.source_evidence || []).map((line) => `<li>${escapeHtml(line)}</li>`).join("") || "<li>No source excerpt was captured.</li>";
-  const evidence = item.evidence ? `<p><strong>${escapeHtml(item.source_section || "Résumé")}</strong>: ${escapeHtml(item.evidence)}</p>` : "<p class=\"muted\">No exact résumé evidence for this individual skill.</p>";
-  const suggestions = (item.suggested_bullets || []).map((bullet) => `<button class="tailoring-suggested-bullet" type="button" data-suggested-paragraph="${bullet.paragraph_index}"><span>${escapeHtml(bullet.source_location || bullet.section || "Résumé")}</span><strong>${escapeHtml(bullet.text)}</strong><small>Edit this bullet · overlap: ${escapeHtml((bullet.overlap || []).join(", "))}</small></button>`).join("");
-  target.innerHTML = `<section><h4>Employer requirement</h4><p><strong>${escapeHtml(item.keyword)}</strong> · ${escapeHtml(importance)}</p><p class="muted">Semantic competency: ${escapeHtml(item.semantic_group || item.parent_keyword || item.keyword)}</p></section><section><h4>Acceptable technologies or alternatives</h4><ul class="tailoring-alternatives">${alternatives || "<li class=\"muted\">No alternatives listed.</li>"}</ul></section><details><summary>Original job description</summary><p class="job-evidence">${source}</p><p class="muted">Source section: ${escapeHtml((item.source_sections || []).join(", ") || "Job description")}</p></details><section><h4>Résumé evidence</h4>${evidence}</section><section><h4>Matching assessment</h4><p><strong>${assessment}</strong> · ${escapeHtml(reason)}</p></section><section><h4>Suggested next action</h4>${suggestions || `<p class="muted">No safe adjacent résumé bullet was found. Confirm the skill in Profile only if you genuinely have the experience; do not add unsupported claims.</p>`}</section>`;
+  const source = group.source_evidence.map((line) => `<li>${escapeHtml(line)}</li>`).join("") || "<li>No source excerpt was captured.</li>";
+  const evidence = group.evidence ? `<p><strong>${escapeHtml(group.source_section || "Résumé")}</strong>: ${escapeHtml(group.evidence)}</p>` : group.relatedEvidence ? `<p><strong>Related résumé evidence for review</strong>: ${escapeHtml(group.relatedEvidence)}</p>` : "<p class=\"muted\">No exact résumé evidence for this competency.</p>";
+  const suggestions = group.suggested_bullets.map((bullet) => `<button class="tailoring-suggested-bullet" type="button" data-suggested-paragraph="${bullet.paragraph_index}"><span>${escapeHtml(bullet.source_location || bullet.section || "Résumé")}</span><strong>${escapeHtml(bullet.text)}</strong><small>Edit this bullet · overlap: ${escapeHtml((bullet.overlap || []).join(", "))}</small></button>`).join("");
+  target.innerHTML = `<section><h4>Employer requirement</h4><p><strong>${escapeHtml(tailoringTitle(group.parent_keyword || group.primaryKeyword))}</strong> · ${escapeHtml(importance)}</p><p class="muted">${escapeHtml(group.alternative_terms.join(" · "))}</p></section><section><h4>Acceptable alternatives</h4><ul class="tailoring-alternatives">${alternatives || "<li class=\"muted\">No alternatives listed.</li>"}</ul></section><details><summary>Original job description</summary><p class="job-evidence">${source}</p><p class="muted">Source section: ${escapeHtml(group.source_sections.join(", ") || "Job description")}</p></details><section><h4>Résumé evidence</h4>${evidence}</section><section><h4>Matching assessment</h4><p><strong>${assessment}</strong> · ${escapeHtml(reason)}</p></section><section><h4>Suggested next action</h4>${suggestions || `<p class="muted">No safe adjacent résumé bullet was found. Confirm the experience only if it is genuine; do not add unsupported claims.</p>`}</section>`;
   target.querySelectorAll("[data-skill-status]").forEach((select) => select.addEventListener("change", () => saveTailoringSkillMemory(select.dataset.skillStatus, select.value)));
   target.querySelectorAll("[data-suggested-paragraph]").forEach((button) => button.addEventListener("click", () => { selectTailoringParagraph(Number(button.dataset.suggestedParagraph)); document.getElementById("tailoring-selected-original")?.scrollIntoView({ block: "nearest" }); }));
 }
@@ -391,7 +445,7 @@ function renderTailoringKeywordActions() {
   const suggestion = memory.status === "yes" && memory.approved_replacement ? `<div class="muted helper">Previously approved suggestion: ${escapeHtml(memory.approved_replacement)}</div>` : "";
   const matchNote = memory.status === "yes" && memory.approved_replacement && !memory.source_matches ? '<span class="muted helper">The original source bullet changed; select a matching bullet manually.</span>' : "";
   const excluded = keyword.user_override === "not_a_requirement";
-  const controls = (keyword.match_type === "missing" || keyword.match_type === "partial") && !(keyword.alternative_terms || []).length ? `<button class="button ghost small" type="button" data-memory-status="yes">Yes, I have this experience</button><button class="button ghost small" type="button" data-memory-status="no">No experience</button><button class="button ghost small" type="button" data-memory-status="unknown">Skip for now</button>` : keyword.match_type === "missing" || keyword.match_type === "partial" ? `<span class="muted helper">Set Have experience, No experience or Unknown beside each alternative above.</span>` : `<span class="muted helper">Matched requirement: inspect the evidence above before editing.</span><button class="button ghost small" type="button" data-memory-status="unknown">Challenge this match</button>`;
+  const controls = (keyword.match_type === "missing" || keyword.match_type === "partial") && !(keyword.independentTerms || []).length ? `<button class="button ghost small" type="button" data-memory-status="yes">Yes, I have this experience</button><button class="button ghost small" type="button" data-memory-status="no">No experience</button><button class="button ghost small" type="button" data-memory-status="unknown">Skip for now</button>` : keyword.match_type === "missing" || keyword.match_type === "partial" ? `<span class="muted helper">Set Have experience, No experience or Unknown beside each alternative above.</span>` : `<span class="muted helper">Matched requirement: inspect the evidence above before editing.</span><button class="button ghost small" type="button" data-memory-status="unknown">Challenge this match</button>`;
   target.innerHTML = `${controls}<button class="button ghost small" type="button" data-requirement-override="${excluded ? "restore" : "not_a_requirement"}">${excluded ? "Restore requirement" : "Not a requirement"}</button>${memory.status === "yes" && memory.approved_replacement && bullet && memory.source_matches ? '<button class="button small" type="button" data-apply-memory>Apply previous edit</button>' : ""}${suggestion}${matchNote}`;
   target.querySelectorAll("[data-memory-status]").forEach((button) => button.addEventListener("click", () => saveTailoringKeywordMemory(button.dataset.memoryStatus)));
   target.querySelector("[data-requirement-override]")?.addEventListener("click", () => saveTailoringRequirementOverride(target.querySelector("[data-requirement-override]").dataset.requirementOverride));
