@@ -241,18 +241,34 @@ async function loadPreparationQueue() {
   } catch (error) { target.textContent = error.message; }
 }
 
-async function openTailoringStudio(jobId, profileId, resumeId) {
+function tailoringSelectionSnapshot() {
+  return {
+    selectedKeywordKey: state.tailoring.selectedKeyword?.key || "",
+    selectedParagraphIndex: state.tailoring.selectedParagraph?.paragraph_index ?? null,
+  };
+}
+
+async function openTailoringStudio(jobId, profileId, resumeId, options = {}) {
   const studio = document.getElementById("tailoring-studio");
   const error = document.getElementById("tailoring-studio-error");
   if (!studio) return;
+  const previous = options.preserveSelection ? tailoringSelectionSnapshot() : {};
   studio.hidden = false;
   if (error) { error.hidden = true; error.textContent = ""; }
   document.getElementById("tailoring-studio-subtitle").textContent = "Loading the selected résumé and job requirements…";
-  studio.scrollIntoView({ behavior: "smooth", block: "start" });
+  if (!options.preserveSelection) studio.scrollIntoView({ behavior: "smooth", block: "start" });
   try {
     const data = await api.get(`/api/tailoring/${jobId}/workspace?candidate_profile_id=${encodeURIComponent(profileId)}&resume_id=${encodeURIComponent(resumeId)}`);
-    state.tailoring = { draftId: data.draft.id, jobId, profileId, resumeId, data, selectedParagraph: null, selectedKeyword: null };
+    const persistedOperationState = data.draft?.status === "approved" ? "approved" : (options.operationState || "idle");
+    state.tailoring = { draftId: data.draft.id, jobId, profileId, resumeId, data, selectedParagraph: null, selectedKeyword: null, operationState: persistedOperationState, statusMessage: options.statusMessage || "" };
     renderTailoringStudio();
+    if (previous.selectedKeywordKey) selectTailoringRequirement(previous.selectedKeywordKey);
+    if (previous.selectedParagraphIndex !== null && previous.selectedParagraphIndex !== undefined) selectTailoringParagraph(previous.selectedParagraphIndex, { preserveStatus: true });
+    if (options.statusMessage) {
+      state.tailoring.statusMessage = options.statusMessage;
+      document.getElementById("tailoring-edit-status").textContent = options.statusMessage;
+    }
+    renderTailoringEditor();
   } catch (requestError) {
     if (error) { error.hidden = false; error.textContent = requestError.message; }
   }
@@ -261,7 +277,7 @@ async function openTailoringStudio(jobId, profileId, resumeId) {
 function closeTailoringStudio() {
   const studio = document.getElementById("tailoring-studio");
   if (studio) studio.hidden = true;
-  state.tailoring = { draftId: null, jobId: null, profileId: null, resumeId: null, data: null, selectedParagraph: null, selectedKeyword: null };
+  state.tailoring = { draftId: null, jobId: null, profileId: null, resumeId: null, data: null, selectedParagraph: null, selectedKeyword: null, operationState: "idle", statusMessage: "" };
 }
 
 function tailoringTitle(value) {
@@ -426,15 +442,16 @@ function renderTailoringRequirementDetail() {
   target.querySelectorAll("[data-skill-status]").forEach((select) => select.addEventListener("change", () => saveTailoringSkillMemory(select.dataset.skillStatus, select.value)));
   target.querySelectorAll("[data-suggested-paragraph]").forEach((button) => button.addEventListener("click", () => { selectTailoringParagraph(Number(button.dataset.suggestedParagraph)); document.getElementById("tailoring-selected-original")?.scrollIntoView({ block: "nearest" }); }));
 }
-function selectTailoringParagraph(index) {
+function selectTailoringParagraph(index, options = {}) {
   const bullet = (state.tailoring.data?.bullets || []).find((item) => Number(item.paragraph_index) === index);
   if (!bullet) return;
-  state.tailoring.selectedParagraph = bullet;
+  const savedChange = (state.tailoring.data?.draft?.changes || []).find((item) => Number(item.paragraph_index) === index);
+  state.tailoring.selectedParagraph = { ...bullet, source_text: savedChange?.original_text || bullet.text, applied_change: savedChange || null };
   document.querySelectorAll(".tailoring-bullet").forEach((entry) => entry.classList.toggle("selected", Number(entry.dataset.paragraphIndex) === index));
-  document.getElementById("tailoring-selected-original").textContent = bullet.text;
-  document.getElementById("tailoring-original-text").value = bullet.text;
+  document.getElementById("tailoring-selected-original").textContent = savedChange ? `Original source: ${savedChange.original_text}` : bullet.text;
+  document.getElementById("tailoring-original-text").value = savedChange?.original_text || bullet.text;
   document.getElementById("tailoring-proposed-text").value = bullet.text;
-  document.getElementById("tailoring-edit-status").textContent = "This is a copied draft. Apply only wording you approve.";
+  if (!options.preserveStatus) document.getElementById("tailoring-edit-status").textContent = savedChange ? "Applied to draft. Not yet approved." : "This is a copied draft. Apply only wording you approve.";
   renderTailoringEditor();
   renderTailoringKeywordActions();
 }
@@ -467,9 +484,28 @@ function renderTailoringEditor() {
   const proposed = document.getElementById("tailoring-proposed-text");
   if (!original || !proposed) return;
   const bullet = state.tailoring.selectedParagraph;
+  const busy = ["applying", "undoing"].includes(state.tailoring.operationState);
+  const hasAppliedChange = Boolean(bullet?.applied_change);
+  const hasMeaningfulChange = Boolean(bullet) && normalizeClientText(bullet.text) !== normalizeClientText(proposed.value);
+  document.getElementById("tailoring-apply")?.toggleAttribute("disabled", !bullet || !hasMeaningfulChange || busy || state.tailoring.operationState === "approved");
+  document.getElementById("tailoring-leave-unchanged")?.toggleAttribute("disabled", !bullet || !hasAppliedChange || busy || state.tailoring.operationState === "approved");
+  document.getElementById("tailoring-ai-improve")?.toggleAttribute("disabled", !bullet || busy || state.tailoring.operationState === "approved");
   if (!bullet) { renderTailoringDiff("", ""); return; }
   renderTailoringDiff(original.value || bullet.text, proposed.value || bullet.text);
-  proposed.oninput = () => renderTailoringDiff(original.value || bullet.text, proposed.value);
+  proposed.oninput = () => {
+    state.tailoring.operationState = hasAppliedChange ? "applied" : "modified";
+    state.tailoring.statusMessage = "Modified wording is not applied to the draft yet.";
+    renderTailoringDiff(original.value || bullet.text, proposed.value);
+    const status = document.getElementById("tailoring-edit-status");
+    if (status) status.textContent = state.tailoring.statusMessage;
+    renderTailoringEditor();
+  };
+  const status = document.getElementById("tailoring-edit-status");
+  if (status && state.tailoring.statusMessage) status.textContent = state.tailoring.statusMessage;
+}
+
+function normalizeClientText(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
 }
 
 function renderTailoringKeywordActions() {
@@ -538,23 +574,47 @@ async function applyTailoringMemory() {
 async function applyTailoringEdit() {
   const bullet = state.tailoring.selectedParagraph;
   if (!bullet) return toast("Select an existing résumé bullet first");
+  if (["applying", "undoing", "approved"].includes(state.tailoring.operationState)) return;
   const proposed = document.getElementById("tailoring-proposed-text").value.trim();
   if (!proposed) return toast("Enter proposed wording or choose Leave unchanged");
+  if (normalizeClientText(proposed) === normalizeClientText(bullet.text)) {
+    document.getElementById("tailoring-edit-status").textContent = "The existing bullet is already suitable; no draft change was made.";
+    return;
+  }
   await submitTailoringChange({ paragraph_index: bullet.paragraph_index, keyword: state.tailoring.selectedKeyword?.keyword || "", original_text: bullet.text, proposed_text: proposed, operation: "edit" });
 }
 
 async function leaveTailoringUnchanged() {
   const bullet = state.tailoring.selectedParagraph;
   if (!bullet) return toast("Select an existing résumé bullet first");
+  if (!bullet.applied_change) {
+    document.getElementById("tailoring-edit-status").textContent = "No applied draft edit exists for this bullet.";
+    return;
+  }
+  if (["applying", "undoing", "approved"].includes(state.tailoring.operationState)) return;
   await submitTailoringChange({ paragraph_index: bullet.paragraph_index, operation: "leave_unchanged" });
 }
 
 async function submitTailoringChange(payload) {
+  const undoing = payload.operation === "leave_unchanged";
+  state.tailoring.operationState = undoing ? "undoing" : "applying";
+  state.tailoring.statusMessage = undoing ? "Undoing draft edit…" : "Applying edit to the draft…";
+  const status = document.getElementById("tailoring-edit-status");
+  if (status) status.textContent = state.tailoring.statusMessage;
+  renderTailoringEditor();
   try {
     const result = await api.send(`/api/tailoring/drafts/${state.tailoring.draftId}/apply`, "POST", payload);
-    document.getElementById("tailoring-edit-status").textContent = result.layout?.verified ? "Applied to the copied draft. Word layout validation passed." : `Applied to the copied draft. ${result.layout?.reason || "Layout validation is approximate."}`;
-    await openTailoringStudio(state.tailoring.jobId, state.tailoring.profileId, state.tailoring.resumeId);
-  } catch (error) { document.getElementById("tailoring-edit-status").textContent = error.message; }
+    if (!undoing && !(result.applied || []).some((item) => item.applied)) {
+      throw new Error((result.skipped || []).map((item) => item.reason).filter(Boolean).join("; ") || "The edit was not applied to the draft.");
+    }
+    const message = undoing ? "Edit undone. Original wording restored." : "Applied to draft. Not yet approved.";
+    await openTailoringStudio(state.tailoring.jobId, state.tailoring.profileId, state.tailoring.resumeId, { preserveSelection: true, operationState: undoing ? "idle" : "applied", statusMessage: message });
+  } catch (error) {
+    state.tailoring.operationState = "error";
+    state.tailoring.statusMessage = error.message;
+    document.getElementById("tailoring-edit-status").textContent = error.message;
+    renderTailoringEditor();
+  }
 }
 
 async function approveTailoringDraft() {
@@ -570,7 +630,7 @@ async function approveTailoringDraft() {
     const result = await api.send(`/api/tailoring/drafts/${state.tailoring.draftId}/approve`, "POST", { preparation_id: packageItem.id });
     document.getElementById("tailoring-edit-status").textContent = result.preparation?.status === "ready_for_review" ? "Approved tailored résumé is now the package download." : "Tailored résumé approved for this package. Prepare the package to generate its cover letter.";
     await loadPreparationQueue();
-    await openTailoringStudio(state.tailoring.jobId, state.tailoring.profileId, state.tailoring.resumeId);
+    await openTailoringStudio(state.tailoring.jobId, state.tailoring.profileId, state.tailoring.resumeId, { preserveSelection: true, operationState: "approved", statusMessage: "Approved for the application package." });
   } catch (error) { document.getElementById("tailoring-edit-status").textContent = error.message; }
   finally { button.disabled = false; }
 }
@@ -585,7 +645,10 @@ async function improveTailoringEdit() {
     const suggestion = await api.send(`/api/tailoring/drafts/${state.tailoring.draftId}/improve`, "POST", { original_text: bullet.text, keyword: state.tailoring.selectedKeyword?.keyword || "" });
     document.getElementById("tailoring-proposed-text").value = suggestion.proposed_text || bullet.text;
     renderTailoringDiff(bullet.text, document.getElementById("tailoring-proposed-text").value);
-    document.getElementById("tailoring-edit-status").textContent = suggestion.message || "AI suggestion loaded for review. It has not been applied.";
+    state.tailoring.operationState = suggestion.meaningful_improvement === false ? "suitable" : "modified";
+    document.getElementById("tailoring-edit-status").textContent = suggestion.meaningful_improvement === false
+      ? `${suggestion.message || "The existing bullet is already suitable."} No wording change was made; review other evidence for remaining gaps.`
+      : (suggestion.message || "AI suggestion loaded for review. It has not been applied.");
   } catch (error) {
     document.getElementById("tailoring-proposed-text").value = bullet.text;
     renderTailoringDiff(bullet.text, bullet.text);

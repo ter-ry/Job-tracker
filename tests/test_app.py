@@ -487,6 +487,44 @@ class JobAssistantTest(unittest.TestCase):
         self.assertGreaterEqual(refreshed["keywords"]["matched_count"], body["keywords"]["matched_count"])
         self.assertNotIn("REST API", app_module.extract_docx_text(Path(upload.get_json()["path"]).read_bytes()))
 
+    def test_tailoring_apply_and_undo_rebuild_only_selected_draft_edit(self):
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Tailoring Undo QA"}).get_json()
+        document = Document()
+        document.add_paragraph("Taylor Example")
+        document.add_paragraph("Experience")
+        first = document.add_paragraph("Built Python services for internal reporting.", style="List Bullet")
+        second = document.add_paragraph("Created SQL validation workflows for operations.", style="List Bullet")
+        buffer = io.BytesIO(); document.save(buffer)
+        resume = self.client.post(
+            f"/api/candidate-profiles/{profile['id']}/resumes/upload",
+            data={"file": (io.BytesIO(buffer.getvalue()), "undo-qa.docx"), "is_default": "true"},
+            content_type="multipart/form-data",
+        ).get_json()
+        job = self.client.post("/api/jobs", json={"company": "Undo QA", "title": "Backend Engineer", "job_description": "Python, SQL and REST APIs required."}).get_json()
+        workspace = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        bullets = [item for item in workspace["bullets"] if item["editable"]]
+        self.assertGreaterEqual(len(bullets), 2)
+        draft_id = workspace["draft"]["id"]
+        for bullet, replacement in zip(bullets[:2], ["Built Python REST services for internal reporting.", "Created SQL validation and audit workflows for operations."]):
+            applied = self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={
+                "paragraph_index": bullet["paragraph_index"], "original_text": bullet["text"],
+                "proposed_text": replacement, "operation": "edit",
+            })
+            self.assertEqual(applied.status_code, 200, applied.get_json())
+        before_undo = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        self.assertEqual(len(before_undo["draft"]["changes"]), 2)
+        undone = self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={
+            "paragraph_index": bullets[0]["paragraph_index"], "operation": "leave_unchanged",
+        })
+        self.assertEqual(undone.status_code, 200, undone.get_json())
+        after_undo = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        self.assertEqual([change["paragraph_index"] for change in after_undo["draft"]["changes"]], [bullets[1]["paragraph_index"]])
+        self.assertIn("Built Python services for internal reporting.", after_undo["preview"]["text"])
+        self.assertIn("Created SQL validation and audit workflows for operations.", after_undo["preview"]["text"])
+        self.assertIn("Applied to draft", Path("static/app.js").read_text(encoding="utf-8"))
+        self.assertIn("Edit undone. Original wording restored.", Path("static/app.js").read_text(encoding="utf-8"))
+        self.assertIn('toggleAttribute("disabled"', Path("static/app.js").read_text(encoding="utf-8"))
+
     def test_tailoring_workspace_reports_missing_description_then_uses_persisted_description(self):
         profile = self.client.post("/api/candidate-profiles", json={"name": "Lakeview QA"}).get_json()
         document = Document(); document.add_paragraph("Alex Rivera"); document.add_paragraph("Built Python services.", style="List Bullet")
