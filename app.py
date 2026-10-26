@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from collections import Counter
 import html
 import importlib.metadata
 import io
@@ -922,10 +923,23 @@ def create_app() -> Flask:
             return jsonify({"error": "The local AI assistant returned JSON without a proposed_bullet string."}), 422
         if proposed.startswith("```"):
             proposed = proposed.strip("`").replace("text\n", "", 1).strip()
-        if re.findall(r"\d+(?:\.\d+)?%?", original) != re.findall(r"\d+(?:\.\d+)?%?", proposed):
-            return jsonify({"error": "The AI suggestion changed quantified facts and was rejected."}), 422
-        if contains_contact_details(proposed) or len(proposed) > max(240, len(original) * 2):
-            return jsonify({"error": "The AI suggestion failed the résumé safety checks and was rejected."}), 422
+        validation_error = validate_tailoring_bullet_suggestion(original, proposed)
+        if validation_error:
+            retry_prompt = f"{prompt}\n\nRetry this exact original bullet without changing any quantified fact. Preserve every number, percentage, version, range, plus sign, unit, and qualifier exactly. Return only a professional wording improvement as JSON; if no safe improvement is possible, return the original bullet unchanged. Original bullet: {original}"
+            retry_response = request_json_completion(
+                config,
+                retry_prompt,
+                system="Return exactly one valid JSON object with a proposed_bullet string. Preserve all factual and quantified content exactly. Do not include reasoning, markdown, or commentary.",
+            )
+            retry_data = retry_response.get("data") if retry_response.get("ok") else None
+            if isinstance(retry_data, dict):
+                retry_proposed = text(retry_data.get("proposed_bullet") or retry_data.get("proposed_text"))
+            else:
+                retry_proposed = text(retry_data)
+            retry_error = validate_tailoring_bullet_suggestion(original, retry_proposed) if retry_proposed else "The retry returned no usable suggestion."
+            if not retry_error:
+                return jsonify({"original_text": original, "proposed_text": retry_proposed, "applied": False, "retry_attempted": True, "message": "AI suggestion is ready for review and has not been applied."})
+            return jsonify({"error": f"AI suggestion rejected after one safety retry: {retry_error}", "original_text": original, "proposed_text": original, "applied": False, "retry_attempted": True}), 422
         return jsonify({"original_text": original, "proposed_text": proposed, "applied": False, "message": "AI suggestion is ready for review and has not been applied."})
 
     @app.get("/api/candidate-profiles/<int:profile_id>/keyword-memory")
@@ -8968,6 +8982,24 @@ def build_answers(profile: dict[str, str], job: dict[str, Any], focus: list[str]
         {"question": COMMON_QUESTIONS[6], "answer": "I would be glad to provide any additional details that help confirm fit for the role."},
     ]
 
+
+def extract_quantified_tokens(value: str) -> Counter[str]:
+    """Extract factual numeric tokens without treating ordinary word digits as claims."""
+    normalized = text(value).replace("−", "-").replace("–", "-").replace("—", "-")
+    tokens = re.findall(r"(?<![A-Za-z0-9])\d+(?:[.,]\d+)?(?:\s*[%+])?(?![A-Za-z0-9])", normalized)
+    return Counter(re.sub(r"\s+", "", token).lower() for token in tokens)
+
+
+def validate_tailoring_bullet_suggestion(original: str, proposed: str) -> str:
+    if not proposed:
+        return "The AI assistant returned no proposed bullet."
+    if extract_quantified_tokens(original) != extract_quantified_tokens(proposed):
+        return "The suggestion changed quantified facts, versions, ranges, or percentages."
+    if contains_contact_details(proposed):
+        return "The suggestion included contact details that do not belong in a résumé bullet."
+    if len(proposed) > max(240, len(original) * 2):
+        return "The suggestion was too long for a focused résumé bullet."
+    return ""
 
 def build_ollama_prompt(kind: str, job: dict[str, Any], evidence: dict[str, Any], payload: dict[str, Any]) -> str:
     return json.dumps(

@@ -558,7 +558,11 @@ async function improveTailoringEdit() {
     document.getElementById("tailoring-proposed-text").value = suggestion.proposed_text || bullet.text;
     renderTailoringDiff(bullet.text, document.getElementById("tailoring-proposed-text").value);
     document.getElementById("tailoring-edit-status").textContent = suggestion.message || "AI suggestion loaded for review. It has not been applied.";
-  } catch (error) { document.getElementById("tailoring-edit-status").textContent = error.message; }
+  } catch (error) {
+    document.getElementById("tailoring-proposed-text").value = bullet.text;
+    renderTailoringDiff(bullet.text, bullet.text);
+    document.getElementById("tailoring-edit-status").textContent = `${error.message} Original wording was preserved.`;
+  }
   finally { button.disabled = false; button.textContent = "AI Improve"; }
 }
 

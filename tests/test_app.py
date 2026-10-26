@@ -537,6 +537,71 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(response.get_json()["proposed_text"], "Built Python automation for reporting workflows.")
         self.assertNotIn("proposed_bullet", response.get_json()["proposed_text"])
 
+    def test_tailoring_ai_improve_numeric_safety_retry_and_successful_diff(self):
+        self.client.post("/api/profile", json={"name": "Terry Mak", "email": "terry@example.com", "resume_text": "Built Flowtally services."})
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Software Engineering", "identity_mode": "shared"}).get_json()
+        document = Document()
+        document.add_paragraph("Built Flowtally services.", style="List Bullet")
+        buffer = io.BytesIO(); document.save(buffer)
+        resume = self.client.post(
+            f"/api/candidate-profiles/{profile['id']}/resumes/upload",
+            data={"file": (io.BytesIO(buffer.getvalue()), "base.docx"), "is_default": "true"},
+            content_type="multipart/form-data",
+        ).get_json()
+        job = self.client.post("/api/jobs", json={"company": "Example", "title": "Developer", "job_description": "Python and REST APIs"}).get_json()
+        workspace = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        config = app_module.OllamaConfig(True, "http://ollama", "qwen3:4b", 10, 100, 1000)
+
+        def improve(original, response_values):
+            with patch.object(app_module, "request_json_completion", side_effect=response_values) as request_mock:
+                with patch.object(app_module.OllamaConfig, "from_mapping", return_value=config):
+                    response = self.client.post(f"/api/tailoring/drafts/{workspace['draft']['id']}/improve", json={"original_text": original, "keyword": "REST APIs"})
+            return response, request_mock
+
+        response, request_mock = improve(
+            "Architected REST APIs for the Flowtally platform.",
+            [{"ok": True, "data": {"proposed_bullet": "Designed REST APIs for the Flowtally platform."}}],
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["proposed_text"], "Designed REST APIs for the Flowtally platform.")
+        self.assertEqual(request_mock.call_count, 1)
+
+        response, _ = improve(
+            "Built React 18 services with 75% test coverage.",
+            [{"ok": True, "data": {"proposed_bullet": "Developed React 18 services with 75% test coverage."}}],
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+
+        response, _ = improve(
+            "Built 25+ tests and reduced errors by 75% across 3 services.",
+            [{"ok": True, "data": {"proposed_bullet": "Added 25+ tests and reduced errors by 75% across 3 services."}}],
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+
+        response, request_mock = improve(
+            "Built 25+ tests and reduced errors by 75% across 3 services.",
+            [
+                {"ok": True, "data": {"proposed_bullet": "Built 20+ tests and reduced errors by 75% across 3 services."}},
+                {"ok": True, "data": {"proposed_bullet": "Added 25+ tests and reduced errors by 75% across 3 services."}},
+            ],
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertTrue(response.get_json()["retry_attempted"])
+        self.assertEqual(request_mock.call_count, 2)
+
+        response, request_mock = improve(
+            "Built 25+ tests and reduced errors by 75% across 3 services.",
+            [
+                {"ok": True, "data": {"proposed_bullet": "Built 20+ tests and reduced errors by 75% across 3 services."}},
+                {"ok": True, "data": {"proposed_bullet": "Added 25+ tests and reduced errors by 60% across 3 services."}},
+            ],
+        )
+        self.assertEqual(response.status_code, 422, response.get_json())
+        self.assertTrue(response.get_json()["retry_attempted"])
+        self.assertEqual(response.get_json()["original_text"], "Built 25+ tests and reduced errors by 75% across 3 services.")
+        self.assertEqual(response.get_json()["proposed_text"], response.get_json()["original_text"])
+        self.assertIn("rejected after one safety retry", response.get_json()["error"])
+        self.assertEqual(request_mock.call_count, 2)
     def test_approved_tailoring_becomes_package_resume_and_survives_cover_regeneration(self):
         profile = self.client.post("/api/candidate-profiles", json={"name": "Backend", "identity_mode": "distinct", "applicant_name": "Alex Rivera"}).get_json()
         resume_doc = Document(); resume_doc.add_paragraph("Alex Rivera"); resume_doc.add_paragraph("Experience"); resume_doc.add_paragraph("Built Python automation for reports.", style="List Bullet")
