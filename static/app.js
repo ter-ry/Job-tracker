@@ -365,8 +365,36 @@ function renderTailoringStudio() {
   document.getElementById("tailoring-layout-status").textContent = layout.available ? (layout.verified ? "Word layout check passed: paragraph lines and page count are unchanged." : "Word layout check found a change. Review the draft before approving it.") : "Preview is approximate until Word layout validation is available.";
   const download = document.getElementById("tailoring-download-draft");
   if (download) { download.href = `/api/tailoring/drafts/${state.tailoring.draftId}/download`; download.hidden = !data.draft?.draft_path; }
-  document.getElementById("tailoring-open-preview")?.addEventListener("click", () => document.getElementById("tailoring-document-preview")?.showModal());
+  document.getElementById("tailoring-open-preview")?.addEventListener("click", openTailoringDocumentPreview);
   renderTailoringEditor();
+}
+
+async function openTailoringDocumentPreview() {
+  const dialog = document.getElementById("tailoring-document-preview");
+  const mode = document.getElementById("tailoring-preview-mode");
+  const frame = document.getElementById("tailoring-preview-pdf");
+  const textPreview = document.getElementById("tailoring-preview-text");
+  if (!dialog) return;
+  mode.textContent = "Loading the current draft DOCX preview…";
+  frame.hidden = true;
+  textPreview.hidden = true;
+  dialog.showModal();
+  try {
+    const preview = await api.get(`/api/tailoring/drafts/${state.tailoring.draftId}/preview`);
+    if (preview.pdf_available) {
+      frame.src = `${preview.pdf_url}?v=${Date.now()}`;
+      frame.hidden = false;
+      mode.textContent = "Rendered from the current draft DOCX through Microsoft Word PDF export.";
+    } else {
+      textPreview.textContent = preview.text || "No extracted preview is available.";
+      textPreview.hidden = false;
+      mode.textContent = `Accurate Word rendering is unavailable: ${preview.pdf_reason || "download the DOCX for authoritative formatting."}`;
+    }
+  } catch (error) {
+    textPreview.textContent = "The draft preview could not be loaded.";
+    textPreview.hidden = false;
+    mode.textContent = error.message;
+  }
 }
 
 function selectTailoringRequirement(key) {

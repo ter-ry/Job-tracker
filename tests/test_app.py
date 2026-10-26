@@ -551,6 +551,11 @@ class JobAssistantTest(unittest.TestCase):
         job = self.client.post("/api/jobs", json={"company": "Example", "title": "Developer", "job_description": "Python and REST APIs"}).get_json()
         workspace = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
         config = app_module.OllamaConfig(True, "http://ollama", "qwen3:4b", 10, 100, 1000)
+        with patch.object(app_module, "export_docx_to_pdf", return_value={"available": False, "reason": "Microsoft Word unavailable"}):
+            preview_response = self.client.get(f"/api/tailoring/drafts/{workspace['draft']['id']}/preview")
+        self.assertEqual(preview_response.status_code, 200, preview_response.get_json())
+        self.assertFalse(preview_response.get_json()["pdf_available"])
+        self.assertIn("Microsoft Word unavailable", preview_response.get_json()["pdf_reason"])
 
         def improve(original, response_values):
             with patch.object(app_module, "request_json_completion", side_effect=response_values) as request_mock:
@@ -602,6 +607,16 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(response.get_json()["proposed_text"], response.get_json()["original_text"])
         self.assertIn("rejected after one safety retry", response.get_json()["error"])
         self.assertEqual(request_mock.call_count, 2)
+
+    def test_tailoring_ai_rejects_cross_project_claims_omissions_and_long_rewrites(self):
+        original = "Architected a React and TypeScript frontend with a Flask and PostgreSQL backend, implementing REST APIs, Google OAuth, role-based access, tenant isolation, audit trails, and database migrations."
+        cross_project = "Designed and implemented REST APIs for product pricing and inventory systems, using Flask and PostgreSQL to support Google Docs, Amazon, and idempotent operations."
+        omission = "Designed Flask and PostgreSQL APIs for product pricing."
+        long_rewrite = original + " This additional wording is unnecessarily long and should remain review only."
+        self.assertIn("unsupported résumé claims", app_module.validate_tailoring_bullet_suggestion(original, cross_project))
+        self.assertIn("omitted supported résumé facts", app_module.validate_tailoring_bullet_suggestion(original, omission))
+        self.assertIn("target length budget", app_module.validate_tailoring_bullet_suggestion(original, long_rewrite))
+
     def test_approved_tailoring_becomes_package_resume_and_survives_cover_regeneration(self):
         profile = self.client.post("/api/candidate-profiles", json={"name": "Backend", "identity_mode": "distinct", "applicant_name": "Alex Rivera"}).get_json()
         resume_doc = Document(); resume_doc.add_paragraph("Alex Rivera"); resume_doc.add_paragraph("Experience"); resume_doc.add_paragraph("Built Python automation for reports.", style="List Bullet")

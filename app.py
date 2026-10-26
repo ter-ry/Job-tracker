@@ -68,7 +68,7 @@ from werkzeug.utils import secure_filename
 from db.migrations import run_migrations
 from profile_store import CandidateProfileStore
 from services.document_generation import DocumentGenerationService
-from resume_layout import compare_docx_layout
+from resume_layout import compare_docx_layout, export_docx_to_pdf
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -910,7 +910,9 @@ def create_app() -> Flask:
         config = OllamaConfig.from_mapping(load_profile())
         if not config.enabled:
             return jsonify({"error": "AI improvement is disabled. Enable the configured local Ollama assistant first."}), 503
-        prompt = json.dumps({"task": "Improve only this résumé bullet", "job": {"title": job_row["title"], "description": job_row["job_description"]}, "keyword": text(payload.get("keyword")), "verified_candidate_evidence": text(selection["profile"].get("work_experience"))[:4000], "bullet": original, "rules": ["Return JSON with proposed_bullet string only", "Preserve every number and factual claim", "Do not add technologies or responsibilities"]})
+        target_length = max(120, round(len(original) * 1.2))
+        source_context = next((item for item in tailoring_paragraphs(selection["resume_path"]) if normalize_space(item.get("text")) == normalize_space(original)), None)
+        prompt = json.dumps({"task": "Improve only this résumé bullet", "job": {"title": job_row["title"], "description": job_row["job_description"]}, "keyword": text(payload.get("keyword")), "source_location": source_context.get("section") if source_context else "Selected résumé bullet", "verified_candidate_evidence": original, "bullet": original, "target_length_characters": target_length, "rules": ["Return JSON with proposed_bullet string only", "Preserve every number, percentage, version, range, plus sign, unit, qualifier, technology, security fact, employer, project and responsibility from the selected bullet", "Do not combine facts from other résumé bullets, projects or employers", "Do not add technologies, integrations, responsibilities or achievements", "Prefer the same length or shorter than the original", "If no safe improvement is possible, return the original bullet unchanged"]})
         response = request_json_completion(config, prompt, system="Return exactly one valid JSON object with a proposed_bullet string. Do not include reasoning, markdown, or commentary.")
         if not response.get("ok") or not text(response.get("data")):
             return jsonify({"error": response.get("error") or "The local AI assistant did not return a usable suggestion."}), 503
@@ -941,6 +943,37 @@ def create_app() -> Flask:
                 return jsonify({"original_text": original, "proposed_text": retry_proposed, "applied": False, "retry_attempted": True, "message": "AI suggestion is ready for review and has not been applied."})
             return jsonify({"error": f"AI suggestion rejected after one safety retry: {retry_error}", "original_text": original, "proposed_text": original, "applied": False, "retry_attempted": True}), 422
         return jsonify({"original_text": original, "proposed_text": proposed, "applied": False, "message": "AI suggestion is ready for review and has not been applied."})
+
+    @app.get("/api/tailoring/drafts/<int:draft_id>/preview")
+    def preview_tailoring_draft(draft_id: int) -> Response:
+        row = query_db("SELECT * FROM tailoring_drafts WHERE id = ?", [draft_id], one=True)
+        if row is None:
+            return jsonify({"error": "Tailoring draft was not found"}), 404
+        draft_path = safe_local_path(text(row["draft_path"])) or safe_local_path(text(row["source_path"])) or tailoring_draft_path(draft_id)
+        if draft_path is None or not draft_path.is_file():
+            return jsonify({"error": "The current résumé draft DOCX is unavailable."}), 409
+        preview_pdf = DATA_DIR / "tailoring_drafts" / str(draft_id) / "preview.pdf"
+        preview_pdf.parent.mkdir(parents=True, exist_ok=True)
+        pdf = export_docx_to_pdf(draft_path, preview_pdf) if not preview_pdf.is_file() or preview_pdf.stat().st_mtime < draft_path.stat().st_mtime else {"available": True, "path": str(preview_pdf), "cached": True}
+        return jsonify({
+            "draft_id": draft_id,
+            "text": extract_docx_text(draft_path.read_bytes()),
+            "layout": parse_json_object(row["layout_json"]),
+            "pdf_available": bool(pdf.get("available")),
+            "pdf_url": f"/api/tailoring/drafts/{draft_id}/preview.pdf" if pdf.get("available") else "",
+            "pdf_reason": text(pdf.get("reason")),
+        })
+
+    @app.get("/api/tailoring/drafts/<int:draft_id>/preview.pdf")
+    def download_tailoring_preview_pdf(draft_id: int) -> Response:
+        row = query_db("SELECT * FROM tailoring_drafts WHERE id = ?", [draft_id], one=True)
+        if row is None:
+            return jsonify({"error": "Tailoring draft was not found"}), 404
+        draft_path = safe_local_path(text(row["draft_path"])) or safe_local_path(text(row["source_path"])) or tailoring_draft_path(draft_id)
+        preview_pdf = DATA_DIR / "tailoring_drafts" / str(draft_id) / "preview.pdf" if draft_path else None
+        if preview_pdf is None or not preview_pdf.is_file():
+            return jsonify({"error": "An accurate PDF preview is unavailable. Download the current DOCX instead."}), 404
+        return send_file(preview_pdf, mimetype="application/pdf", as_attachment=False, download_name=f"tailoring-draft-{draft_id}.pdf")
 
     @app.get("/api/candidate-profiles/<int:profile_id>/keyword-memory")
     def list_keyword_memory(profile_id: int) -> Response:
@@ -8990,15 +9023,45 @@ def extract_quantified_tokens(value: str) -> Counter[str]:
     return Counter(re.sub(r"\s+", "", token).lower() for token in tokens)
 
 
+AI_CLAIM_TERMS = tuple(dict.fromkeys([
+    *TECHNICAL_TERMS,
+    "oauth", "google docs", "amazon", "idempotent", "idempotency", "real-time synchronization",
+    "external platforms", "product pricing", "inventory systems", "relational data models",
+    "role-based access", "tenant isolation", "audit trails", "database migrations",
+]))
+
+
+def _claim_term_present(value: str, term: str) -> bool:
+    normalized_value = normalize_keyword(value)
+    normalized_term = normalize_keyword(term)
+    return bool(normalized_term and re.search(rf"(?<![a-z0-9]){re.escape(normalized_term)}(?![a-z0-9])", normalized_value))
+
+
+def _resume_claim_terms(value: str) -> set[str]:
+    return {term for term in AI_CLAIM_TERMS if _claim_term_present(value, term)}
+
+
 def validate_tailoring_bullet_suggestion(original: str, proposed: str) -> str:
     if not proposed:
         return "The AI assistant returned no proposed bullet."
     if extract_quantified_tokens(original) != extract_quantified_tokens(proposed):
         return "The suggestion changed quantified facts, versions, ranges, or percentages."
+    original_terms = _resume_claim_terms(original)
+    proposed_terms = _resume_claim_terms(proposed)
+    omitted = sorted(term for term in original_terms if not _claim_term_present(proposed, term))
+    introduced = sorted(term for term in proposed_terms if term not in original_terms)
+    fact_errors = []
+    if omitted:
+        fact_errors.append(f"The suggestion omitted supported résumé facts: {', '.join(omitted[:4])}.")
+    if introduced:
+        fact_errors.append(f"The suggestion introduced unsupported résumé claims: {', '.join(introduced[:4])}.")
+    if fact_errors:
+        return " ".join(fact_errors)
     if contains_contact_details(proposed):
         return "The suggestion included contact details that do not belong in a résumé bullet."
-    if len(proposed) > max(240, len(original) * 2):
-        return "The suggestion was too long for a focused résumé bullet."
+    target_length = max(120, round(len(original) * 1.2))
+    if len(proposed) > target_length:
+        return f"The suggestion exceeded the target length budget of {target_length} characters."
     return ""
 
 def build_ollama_prompt(kind: str, job: dict[str, Any], evidence: dict[str, Any], payload: dict[str, Any]) -> str:
