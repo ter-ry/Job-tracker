@@ -617,6 +617,38 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("omitted supported résumé facts", app_module.validate_tailoring_bullet_suggestion(original, omission))
         self.assertIn("target length budget", app_module.validate_tailoring_bullet_suggestion(original, long_rewrite))
 
+    def test_tailoring_ai_improve_flowtally_api_bullet_rejects_trivial_article_deletion(self):
+        self.client.post("/api/profile", json={"name": "Terry Mak", "email": "terry@example.com", "resume_text": "Flowtally"})
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Software Engineering", "identity_mode": "shared"}).get_json()
+        document = Document()
+        original = "Architected a React and TypeScript frontend with a Flask and PostgreSQL backend, implementing REST APIs, Google OAuth, role-based access, tenant isolation, audit trails, and database migrations."
+        document.add_paragraph(original, style="List Bullet")
+        buffer = io.BytesIO(); document.save(buffer)
+        resume = self.client.post(
+            f"/api/candidate-profiles/{profile['id']}/resumes/upload",
+            data={"file": (io.BytesIO(buffer.getvalue()), "flowtally.docx"), "is_default": "true"},
+            content_type="multipart/form-data",
+        ).get_json()
+        job = self.client.post("/api/jobs", json={"company": "Lakeview", "title": "Backend Engineer", "job_description": "Design APIs and services"}).get_json()
+        workspace = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        config = app_module.OllamaConfig(True, "http://ollama", "qwen3:4b", 10, 100, 1000)
+        trivial = "Architected React and TypeScript frontend with Flask and PostgreSQL backend, implementing REST APIs, Google OAuth, role-based access, tenant isolation, audit trails, and database migrations."
+        meaningful = "Architected and implemented REST APIs with a React and TypeScript frontend and a Flask and PostgreSQL backend, preserving Google OAuth, role-based access, tenant isolation, audit trails, and database migrations."
+        with patch.object(app_module, "request_json_completion", side_effect=[{"ok": True, "data": {"proposed_bullet": trivial}}, {"ok": True, "data": {"proposed_bullet": original}}]):
+            with patch.object(app_module.OllamaConfig, "from_mapping", return_value=config):
+                rejected_trivial = self.client.post(f"/api/tailoring/drafts/{workspace['draft']['id']}/improve", json={"original_text": original, "keyword": "API and service design"})
+        self.assertEqual(rejected_trivial.status_code, 200, rejected_trivial.get_json())
+        self.assertEqual(rejected_trivial.get_json()["message"], "The existing bullet is already suitable.")
+        self.assertFalse(rejected_trivial.get_json()["meaningful_improvement"])
+        self.assertEqual(rejected_trivial.get_json()["proposed_text"], original)
+
+        with patch.object(app_module, "request_json_completion", side_effect=[{"ok": True, "data": {"proposed_bullet": trivial}}, {"ok": True, "data": {"proposed_bullet": meaningful}}]):
+            with patch.object(app_module.OllamaConfig, "from_mapping", return_value=config):
+                improved = self.client.post(f"/api/tailoring/drafts/{workspace['draft']['id']}/improve", json={"original_text": original, "keyword": "API and service design"})
+        self.assertEqual(improved.status_code, 200, improved.get_json())
+        self.assertTrue(improved.get_json()["meaningful_improvement"])
+        self.assertEqual(improved.get_json()["proposed_text"], meaningful)
+
     def test_approved_tailoring_becomes_package_resume_and_survives_cover_regeneration(self):
         profile = self.client.post("/api/candidate-profiles", json={"name": "Backend", "identity_mode": "distinct", "applicant_name": "Alex Rivera"}).get_json()
         resume_doc = Document(); resume_doc.add_paragraph("Alex Rivera"); resume_doc.add_paragraph("Experience"); resume_doc.add_paragraph("Built Python automation for reports.", style="List Bullet")

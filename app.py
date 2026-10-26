@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 from collections import Counter
+import difflib
 import html
 import importlib.metadata
 import io
@@ -912,7 +913,8 @@ def create_app() -> Flask:
             return jsonify({"error": "AI improvement is disabled. Enable the configured local Ollama assistant first."}), 503
         target_length = max(120, round(len(original) * 1.2))
         source_context = next((item for item in tailoring_paragraphs(selection["resume_path"]) if normalize_space(item.get("text")) == normalize_space(original)), None)
-        prompt = json.dumps({"task": "Improve only this résumé bullet", "job": {"title": job_row["title"], "description": job_row["job_description"]}, "keyword": text(payload.get("keyword")), "source_location": source_context.get("section") if source_context else "Selected résumé bullet", "verified_candidate_evidence": original, "bullet": original, "target_length_characters": target_length, "rules": ["Return JSON with proposed_bullet string only", "Preserve every number, percentage, version, range, plus sign, unit, qualifier, technology, security fact, employer, project and responsibility from the selected bullet", "Do not combine facts from other résumé bullets, projects or employers", "Do not add technologies, integrations, responsibilities or achievements", "Prefer the same length or shorter than the original", "If no safe improvement is possible, return the original bullet unchanged"]})
+        keyword = text(payload.get("keyword"))
+        prompt = json.dumps({"task": "Improve only this résumé bullet", "job": {"title": job_row["title"], "description": job_row["job_description"]}, "keyword": keyword, "source_location": source_context.get("section") if source_context else "Selected résumé bullet", "verified_candidate_evidence": original, "bullet": original, "target_length_characters": target_length, "rules": ["Return JSON with proposed_bullet string only", "Preserve every number, percentage, version, range, plus sign, unit, qualifier, technology, security fact, employer, project and responsibility from the selected bullet", "Do not combine facts from other résumé bullets, projects or employers", "Do not add technologies, integrations, responsibilities or achievements", "Preserve necessary articles and grammatical sentence structure", "Reorganize existing supported facts to foreground the selected job requirement when useful", "Prefer the same length or shorter than the original", "If no meaningful safe improvement is possible, return the original bullet unchanged"]})
         response = request_json_completion(config, prompt, system="Return exactly one valid JSON object with a proposed_bullet string. Do not include reasoning, markdown, or commentary.")
         if not response.get("ok") or not text(response.get("data")):
             return jsonify({"error": response.get("error") or "The local AI assistant did not return a usable suggestion."}), 503
@@ -927,7 +929,7 @@ def create_app() -> Flask:
             proposed = proposed.strip("`").replace("text\n", "", 1).strip()
         validation_error = validate_tailoring_bullet_suggestion(original, proposed)
         if validation_error:
-            retry_prompt = f"{prompt}\n\nRetry this exact original bullet without changing any quantified fact. Preserve every number, percentage, version, range, plus sign, unit, and qualifier exactly. Return only a professional wording improvement as JSON; if no safe improvement is possible, return the original bullet unchanged. Original bullet: {original}"
+            retry_prompt = f"{prompt}\n\nThe first proposal failed this quality or safety check: {validation_error} Retry once. Preserve necessary articles and grammar, keep all selected-bullet facts, and foreground the requirement only by reorganizing existing supported wording. If no meaningful safe improvement is possible, return the original bullet unchanged. Original bullet: {original}"
             retry_response = request_json_completion(
                 config,
                 retry_prompt,
@@ -939,10 +941,12 @@ def create_app() -> Flask:
             else:
                 retry_proposed = text(retry_data)
             retry_error = validate_tailoring_bullet_suggestion(original, retry_proposed) if retry_proposed else "The retry returned no usable suggestion."
+            if retry_error in {TAILORING_ALREADY_SUITABLE, TAILORING_GRAMMAR_WARNING}:
+                return jsonify({"original_text": original, "proposed_text": original, "applied": False, "meaningful_improvement": False, "retry_attempted": True, "message": TAILORING_ALREADY_SUITABLE})
             if not retry_error:
-                return jsonify({"original_text": original, "proposed_text": retry_proposed, "applied": False, "retry_attempted": True, "message": "AI suggestion is ready for review and has not been applied."})
+                return jsonify({"original_text": original, "proposed_text": retry_proposed, "applied": False, "meaningful_improvement": True, "retry_attempted": True, "message": "AI suggestion is ready for review and has not been applied."})
             return jsonify({"error": f"AI suggestion rejected after one safety retry: {retry_error}", "original_text": original, "proposed_text": original, "applied": False, "retry_attempted": True}), 422
-        return jsonify({"original_text": original, "proposed_text": proposed, "applied": False, "message": "AI suggestion is ready for review and has not been applied."})
+        return jsonify({"original_text": original, "proposed_text": proposed, "applied": False, "meaningful_improvement": True, "message": "AI suggestion is ready for review and has not been applied."})
 
     @app.get("/api/tailoring/drafts/<int:draft_id>/preview")
     def preview_tailoring_draft(draft_id: int) -> Response:
@@ -9029,6 +9033,8 @@ AI_CLAIM_TERMS = tuple(dict.fromkeys([
     "external platforms", "product pricing", "inventory systems", "relational data models",
     "role-based access", "tenant isolation", "audit trails", "database migrations",
 ]))
+TAILORING_ALREADY_SUITABLE = "The existing bullet is already suitable."
+TAILORING_GRAMMAR_WARNING = "The suggestion degraded grammar or readability."
 
 
 def _claim_term_present(value: str, term: str) -> bool:
@@ -9039,6 +9045,27 @@ def _claim_term_present(value: str, term: str) -> bool:
 
 def _resume_claim_terms(value: str) -> set[str]:
     return {term for term in AI_CLAIM_TERMS if _claim_term_present(value, term)}
+
+
+def _has_article_drop(original: str, proposed: str) -> bool:
+    original_lower = normalize_space(original).lower()
+    proposed_lower = normalize_space(proposed).lower()
+    for match in re.finditer(r"\b(a|an|the)\s+([a-z][a-z0-9+#.-]+)", original_lower):
+        article, noun = match.groups()
+        if re.search(rf"\b{re.escape(noun)}\b", proposed_lower) and not re.search(rf"\b{re.escape(article)}\s+{re.escape(noun)}\b", proposed_lower):
+            return True
+    return False
+
+
+def _has_meaningful_word_change(original: str, proposed: str) -> bool:
+    original_words = re.findall(r"[a-z0-9+#.-]+", normalize_space(original).lower())
+    proposed_words = re.findall(r"[a-z0-9+#.-]+", normalize_space(proposed).lower())
+    stop_words = {"a", "an", "the", "and", "or", "of", "to", "in", "for", "with", "on", "by", "as"}
+    matcher = difflib.SequenceMatcher(a=original_words, b=proposed_words)
+    for tag, left_start, left_end, right_start, right_end in matcher.get_opcodes():
+        if tag != "equal" and any(word not in stop_words for word in original_words[left_start:left_end] + proposed_words[right_start:right_end]):
+            return True
+    return False
 
 
 def validate_tailoring_bullet_suggestion(original: str, proposed: str) -> str:
@@ -9059,6 +9086,10 @@ def validate_tailoring_bullet_suggestion(original: str, proposed: str) -> str:
         return " ".join(fact_errors)
     if contains_contact_details(proposed):
         return "The suggestion included contact details that do not belong in a résumé bullet."
+    if normalize_space(original).lower() == normalize_space(proposed).lower() or not _has_meaningful_word_change(original, proposed):
+        return TAILORING_ALREADY_SUITABLE
+    if _has_article_drop(original, proposed):
+        return TAILORING_GRAMMAR_WARNING
     target_length = max(120, round(len(original) * 1.2))
     if len(proposed) > target_length:
         return f"The suggestion exceeded the target length budget of {target_length} characters."
