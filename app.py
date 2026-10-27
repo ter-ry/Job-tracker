@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 from collections import Counter
 import difflib
+import hashlib
 import html
 import importlib.metadata
 import io
@@ -14,6 +15,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from urllib.parse import urlencode
@@ -597,7 +599,10 @@ def create_app() -> Flask:
 
     @app.get("/api/tailoring/<int:job_id>/workspace")
     def tailoring_workspace(job_id: int) -> Response:
+        workspace_started = time.perf_counter()
+        db_started = time.perf_counter()
         row = query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)
+        initial_db_ms = round((time.perf_counter() - db_started) * 1000, 2)
         if row is None:
             return jsonify({"error": "Job not found"}), 404
         payload = {key: request.args.get(key) for key in ("candidate_profile_id", "resume_id")}
@@ -702,7 +707,7 @@ def create_app() -> Flask:
                         "suggested_bullets": suggestions,
                     })
         report["skill_inventory"] = skill_inventory
-        return jsonify({
+        response = {
             "job": job,
             "candidate_profile": selection["profile_row"],
             "resume": selection["resume"],
@@ -711,7 +716,12 @@ def create_app() -> Flask:
             "keywords": report,
             "original_keywords": original_report,
             "preview": {"text": draft_text, "layout": draft.get("layout", {}), "approximate": not bool(draft.get("layout", {}).get("available"))},
-        })
+        }
+        response["timings_ms"] = {
+            "sqlite_initial_read": initial_db_ms,
+            "workspace_total": round((time.perf_counter() - workspace_started) * 1000, 2),
+        }
+        return jsonify(response)
 
     @app.post("/api/tailoring/<int:job_id>/requirement-overrides")
     def save_tailoring_requirement_override(job_id: int) -> Response:
@@ -785,21 +795,11 @@ def create_app() -> Flask:
             if operation not in {"edit", "replace"}:
                 return jsonify({"error": "This first studio release supports edit, replace or leave unchanged"}), 400
             prior = next((item for item in changes if int(item.get("paragraph_index", -1)) == paragraph_index), None)
-            current_path = safe_local_path(text(row["draft_path"])) if row["draft_path"] else None
-            current_source = current_path if current_path and current_path.is_file() else safe_local_path(text(row["source_path"]))
-            current_text = ""
-            if current_source and current_source.is_file():
-                paragraphs = list(Document(current_source).paragraphs)
-                if paragraph_index < 0 or paragraph_index >= len(paragraphs):
-                    return jsonify({"error": "That résumé paragraph no longer exists; refresh the studio before editing it."}), 409
-                current_text = normalize_space(paragraphs[paragraph_index].text)
-            if current_text and normalize_space(original) != current_text:
-                return jsonify({"error": "The displayed bullet is stale. Refresh the studio and review the current wording before applying this edit."}), 409
             change = {"paragraph_index": paragraph_index, "keyword": normalize_keyword(text(payload.get("keyword")) or text(prior.get("keyword") if prior else "")), "original_text": text(prior.get("original_text")) if prior else original, "proposed_text": proposed, "operation": operation}
             changes = [item for item in changes if int(item.get("paragraph_index", -1)) != paragraph_index]
             changes.append(change)
         try:
-            result = rebuild_tailoring_draft(draft_id, changes)
+            result = rebuild_tailoring_draft(draft_id, changes, draft_row=row)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 409
         return jsonify({"draft_id": draft_id, "changes": changes, **result})
@@ -824,6 +824,9 @@ def create_app() -> Flask:
             return jsonify({"error": "This tailoring draft does not belong to the selected application package."}), 409
         if package["status"] == "approved":
             return jsonify({"error": "Approved application packages cannot be changed."}), 409
+        layout = validate_tailoring_draft_layout(draft_id)
+        if not layout.get("available") or not layout.get("verified"):
+            return jsonify({"error": layout.get("reason") or "Word layout validation did not pass; the résumé draft cannot be approved yet.", "layout": layout}), 409
         target = DATA_DIR / "application_preparations" / str(package["id"]) / f"tailored_resume_draft_{draft_id}.docx"
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(draft_path, target)
@@ -889,7 +892,7 @@ def create_app() -> Flask:
         changes = [item for item in changes if int(item.get("paragraph_index", -1)) != paragraph_index]
         changes.append(change)
         try:
-            result = rebuild_tailoring_draft(draft_id, changes)
+            result = rebuild_tailoring_draft(draft_id, changes, draft_row=row)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 409
         return jsonify({"draft_id": draft_id, "changes": changes, "memory_applied": True, **result})
@@ -950,6 +953,7 @@ def create_app() -> Flask:
 
     @app.get("/api/tailoring/drafts/<int:draft_id>/preview")
     def preview_tailoring_draft(draft_id: int) -> Response:
+        preview_started = time.perf_counter()
         row = query_db("SELECT * FROM tailoring_drafts WHERE id = ?", [draft_id], one=True)
         if row is None:
             return jsonify({"error": "Tailoring draft was not found"}), 404
@@ -957,15 +961,49 @@ def create_app() -> Flask:
         if draft_path is None or not draft_path.is_file():
             return jsonify({"error": "The current résumé draft DOCX is unavailable."}), 409
         preview_pdf = DATA_DIR / "tailoring_drafts" / str(draft_id) / "preview.pdf"
+        preview_meta = preview_pdf.with_suffix(".meta.json")
         preview_pdf.parent.mkdir(parents=True, exist_ok=True)
-        pdf = export_docx_to_pdf(draft_path, preview_pdf) if not preview_pdf.is_file() or preview_pdf.stat().st_mtime < draft_path.stat().st_mtime else {"available": True, "path": str(preview_pdf), "cached": True}
+        draft_version = tailoring_draft_version(draft_path)
+        layout = validate_tailoring_draft_layout(draft_id, expected_version=draft_version)
+        pdf = {"available": False, "reason": layout.get("reason") or "Word layout validation is unavailable."}
+        pdf_cached = False
+        if layout.get("available") and layout.get("verified"):
+            cached_version = ""
+            if preview_meta.is_file():
+                try:
+                    cached_version = text(json.loads(preview_meta.read_text(encoding="utf-8")).get("draft_version"))
+                except (OSError, ValueError, TypeError):
+                    cached_version = ""
+            if preview_pdf.is_file() and cached_version == draft_version:
+                pdf = {"available": True, "path": str(preview_pdf), "cached": True}
+                pdf_cached = True
+            else:
+                export_started = time.perf_counter()
+                pdf = export_docx_to_pdf(draft_path, preview_pdf)
+                pdf.setdefault("timings_ms", {})["pdf_generation"] = round((time.perf_counter() - export_started) * 1000, 2)
+                if pdf.get("available") and tailoring_draft_version(draft_path) == draft_version:
+                    try:
+                        preview_meta.write_text(json.dumps({"draft_version": draft_version}), encoding="utf-8")
+                    except OSError:
+                        pass
+                elif pdf.get("available"):
+                    pdf = {"available": False, "reason": "The résumé draft changed while the PDF preview was generated. Refresh and try again."}
+        text_started = time.perf_counter()
+        preview_text = extract_docx_text(draft_path.read_bytes())
+        text_ms = round((time.perf_counter() - text_started) * 1000, 2)
+        timings = dict(layout.get("timings_ms") or {})
+        timings["pdf_generation"] = float((pdf.get("timings_ms") or {}).get("pdf_generation", 0.0))
+        timings["preview_text_extraction"] = text_ms
+        timings["preview_total"] = round((time.perf_counter() - preview_started) * 1000, 2)
         return jsonify({
             "draft_id": draft_id,
-            "text": extract_docx_text(draft_path.read_bytes()),
-            "layout": parse_json_object(row["layout_json"]),
+            "text": preview_text,
+            "layout": layout,
             "pdf_available": bool(pdf.get("available")),
             "pdf_url": f"/api/tailoring/drafts/{draft_id}/preview.pdf" if pdf.get("available") else "",
             "pdf_reason": text(pdf.get("reason")),
+            "cached": pdf_cached,
+            "timings_ms": timings,
         })
 
     @app.get("/api/tailoring/drafts/<int:draft_id>/preview.pdf")
@@ -975,7 +1013,15 @@ def create_app() -> Flask:
             return jsonify({"error": "Tailoring draft was not found"}), 404
         draft_path = safe_local_path(text(row["draft_path"])) or safe_local_path(text(row["source_path"])) or tailoring_draft_path(draft_id)
         preview_pdf = DATA_DIR / "tailoring_drafts" / str(draft_id) / "preview.pdf" if draft_path else None
-        if preview_pdf is None or not preview_pdf.is_file():
+        preview_meta = preview_pdf.with_suffix(".meta.json") if preview_pdf else None
+        draft_version = tailoring_draft_version(draft_path) if draft_path and draft_path.is_file() else ""
+        cached_version = ""
+        if preview_meta and preview_meta.is_file():
+            try:
+                cached_version = text(json.loads(preview_meta.read_text(encoding="utf-8")).get("draft_version"))
+            except (OSError, ValueError, TypeError):
+                cached_version = ""
+        if preview_pdf is None or not preview_pdf.is_file() or not draft_version or cached_version != draft_version:
             return jsonify({"error": "An accurate PDF preview is unavailable. Download the current DOCX instead."}), 404
         return send_file(preview_pdf, mimetype="application/pdf", as_attachment=False, download_name=f"tailoring-draft-{draft_id}.pdf")
 
@@ -3132,8 +3178,50 @@ def score_tailoring_text(job: dict[str, Any], profile: dict[str, Any], text_valu
     return build_tailoring_coverage_report(job, text_value)
 
 
-def rebuild_tailoring_draft(draft_id: int, changes: list[dict[str, Any]]) -> dict[str, Any]:
+def tailoring_draft_version(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def pending_tailoring_layout(version: str, reason: str = "Word layout validation is deferred until preview or approval.") -> dict[str, Any]:
+    return {"available": False, "verified": False, "pending": True, "draft_version": version, "reason": reason}
+
+
+def validate_tailoring_draft_layout(draft_id: int, expected_version: str | None = None) -> dict[str, Any]:
+    started = time.perf_counter()
     row = query_db("SELECT * FROM tailoring_drafts WHERE id = ?", [draft_id], one=True)
+    if row is None:
+        return {"available": False, "verified": False, "reason": "Tailoring draft was not found."}
+    source = safe_local_path(text(row["source_path"]))
+    draft = safe_local_path(text(row["draft_path"])) or source
+    if source is None or not source.is_file() or draft is None or not draft.is_file():
+        return {"available": False, "verified": False, "reason": "The source or current résumé draft DOCX is unavailable."}
+    version = tailoring_draft_version(draft)
+    if expected_version and version != expected_version:
+        return {"available": False, "verified": False, "stale": True, "draft_version": version, "reason": "The résumé draft changed before layout validation completed. Refresh and try again."}
+    current_layout = parse_json_object(row["layout_json"])
+    if current_layout.get("draft_version") == version and current_layout.get("available") and current_layout.get("verified"):
+        current_layout["cached"] = True
+        current_layout.setdefault("timings_ms", {})["word_layout_validation"] = 0.0
+        return current_layout
+    layout = compare_docx_layout(source, draft)
+    after_version = tailoring_draft_version(draft)
+    if after_version != version:
+        return {"available": False, "verified": False, "stale": True, "draft_version": after_version, "reason": "The résumé draft changed during layout validation. Refresh and try again."}
+    layout["draft_version"] = version
+    layout.setdefault("timings_ms", {})["word_layout_validation"] = round((time.perf_counter() - started) * 1000, 2)
+    db = get_db()
+    db.execute("UPDATE tailoring_drafts SET layout_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND draft_path = ?", [dumps_json(layout), draft_id, str(draft)])
+    db.commit()
+    return layout
+
+
+def rebuild_tailoring_draft(draft_id: int, changes: list[dict[str, Any]], *, draft_row: sqlite3.Row | None = None) -> dict[str, Any]:
+    started = time.perf_counter()
+    row = draft_row or query_db("SELECT * FROM tailoring_drafts WHERE id = ?", [draft_id], one=True)
     if row is None:
         raise ValueError("Tailoring draft was not found")
     source = safe_local_path(text(row["source_path"]))
@@ -3141,6 +3229,7 @@ def rebuild_tailoring_draft(draft_id: int, changes: list[dict[str, Any]]) -> dic
         raise ValueError("The source résumé DOCX is no longer available")
     output = tailoring_draft_path(draft_id)
     output.parent.mkdir(parents=True, exist_ok=True)
+    copy_started = time.perf_counter()
     shutil.copyfile(source, output)
     document = Document(output)
     applied: list[dict[str, Any]] = []
@@ -3166,12 +3255,26 @@ def rebuild_tailoring_draft(draft_id: int, changes: list[dict[str, Any]]) -> dic
         replace_paragraph_exact(paragraph, original, proposed)
         applied.append({**change, "applied": True})
     document.save(output)
-    layout = compare_docx_layout(source, output)
+    docx_rebuild_ms = round((time.perf_counter() - copy_started) * 1000, 2)
+    version = tailoring_draft_version(output)
+    layout = pending_tailoring_layout(version)
+    extraction_started = time.perf_counter()
     text_value = extract_docx_text(output.read_bytes())
+    extraction_ms = round((time.perf_counter() - extraction_started) * 1000, 2)
+    db_started = time.perf_counter()
     db = get_db()
     db.execute("UPDATE tailoring_drafts SET draft_path = ?, changes_json = ?, layout_json = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [str(output), dumps_json(changes), dumps_json(layout), "draft", draft_id])
     db.commit()
-    return {"applied": applied, "skipped": skipped, "layout": layout, "draft_path": str(output), "text": text_value}
+    sqlite_write_ms = round((time.perf_counter() - db_started) * 1000, 2)
+    timings = {
+        "docx_rebuild": docx_rebuild_ms,
+        "text_extraction": extraction_ms,
+        "sqlite_write_commit": sqlite_write_ms,
+        "rebuild_total": round((time.perf_counter() - started) * 1000, 2),
+        "word_layout_validation": 0.0,
+        "pdf_generation": 0.0,
+    }
+    return {"applied": applied, "skipped": skipped, "layout": layout, "draft_path": str(output), "draft_version": version, "text": text_value, "timings_ms": timings}
 
 
 def preparation_queue_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:

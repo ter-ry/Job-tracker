@@ -525,6 +525,62 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("Edit undone. Original wording restored.", Path("static/app.js").read_text(encoding="utf-8"))
         self.assertIn('toggleAttribute("disabled"', Path("static/app.js").read_text(encoding="utf-8"))
 
+    def test_tailoring_apply_defers_word_validation_and_preview_cache_tracks_draft_version(self):
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Tailoring Performance QA"}).get_json()
+        document = Document(); document.add_paragraph("Taylor Example"); document.add_paragraph("Experience")
+        document.add_paragraph("Built Python services for internal reporting.", style="List Bullet")
+        document.add_paragraph("Created SQL validation workflows for operations.", style="List Bullet")
+        buffer = io.BytesIO(); document.save(buffer)
+        resume = self.client.post(
+            f"/api/candidate-profiles/{profile['id']}/resumes/upload",
+            data={"file": (io.BytesIO(buffer.getvalue()), "performance-qa.docx"), "is_default": "true"},
+            content_type="multipart/form-data",
+        ).get_json()
+        job = self.client.post("/api/jobs", json={"company": "Performance QA", "title": "Backend Engineer", "job_description": "Python and SQL required."}).get_json()
+        workspace = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        bullet = next(item for item in workspace["bullets"] if item["editable"])
+        draft_id = workspace["draft"]["id"]
+        with patch.object(app_module, "compare_docx_layout") as layout_mock:
+            applied = self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={
+                "paragraph_index": bullet["paragraph_index"], "original_text": bullet["text"],
+                "proposed_text": "Built Python REST services for internal reporting.", "operation": "edit",
+            })
+        self.assertEqual(applied.status_code, 200, applied.get_json())
+        self.assertFalse(layout_mock.called)
+        self.assertTrue(applied.get_json()["layout"]["pending"])
+        self.assertIn("word_layout_validation", applied.get_json()["timings_ms"])
+
+        layout = {"available": True, "verified": True, "original_pages": 1, "candidate_pages": 1, "line_mismatches": []}
+        def fake_export(_source, output):
+            Path(output).write_bytes(b"%PDF-1.7 performance QA")
+            return {"available": True, "path": str(output)}
+
+        with patch.object(app_module, "compare_docx_layout", return_value=layout) as compare_mock:
+            with patch.object(app_module, "export_docx_to_pdf", side_effect=fake_export) as export_mock:
+                first_preview = self.client.get(f"/api/tailoring/drafts/{draft_id}/preview").get_json()
+                second_preview = self.client.get(f"/api/tailoring/drafts/{draft_id}/preview").get_json()
+        self.assertTrue(first_preview["pdf_available"])
+        self.assertFalse(first_preview["cached"])
+        self.assertTrue(second_preview["cached"])
+        self.assertEqual(compare_mock.call_count, 1)
+        self.assertEqual(export_mock.call_count, 1)
+        self.assertGreaterEqual(first_preview["timings_ms"]["preview_total"], 0)
+
+        with patch.object(app_module, "compare_docx_layout", return_value=layout) as compare_after_change:
+            changed = self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={
+                "paragraph_index": bullet["paragraph_index"], "original_text": "Built Python REST services for internal reporting.",
+                "proposed_text": "Built Python and SQL REST services for internal reporting.", "operation": "edit",
+            })
+        self.assertEqual(changed.status_code, 200, changed.get_json())
+        self.assertFalse(compare_after_change.called)
+        with patch.object(app_module, "compare_docx_layout", return_value=layout) as compare_after_version:
+            with patch.object(app_module, "export_docx_to_pdf", side_effect=fake_export) as export_after_version:
+                refreshed_preview = self.client.get(f"/api/tailoring/drafts/{draft_id}/preview").get_json()
+        self.assertTrue(refreshed_preview["pdf_available"])
+        self.assertFalse(refreshed_preview["cached"])
+        self.assertEqual(compare_after_version.call_count, 1)
+        self.assertEqual(export_after_version.call_count, 1)
+
     def test_tailoring_workspace_reports_missing_description_then_uses_persisted_description(self):
         profile = self.client.post("/api/candidate-profiles", json={"name": "Lakeview QA"}).get_json()
         document = Document(); document.add_paragraph("Alex Rivera"); document.add_paragraph("Built Python services.", style="List Bullet")
@@ -589,8 +645,9 @@ class JobAssistantTest(unittest.TestCase):
         job = self.client.post("/api/jobs", json={"company": "Example", "title": "Developer", "job_description": "Python and REST APIs"}).get_json()
         workspace = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
         config = app_module.OllamaConfig(True, "http://ollama", "qwen3:4b", 10, 100, 1000)
-        with patch.object(app_module, "export_docx_to_pdf", return_value={"available": False, "reason": "Microsoft Word unavailable"}):
-            preview_response = self.client.get(f"/api/tailoring/drafts/{workspace['draft']['id']}/preview")
+        with patch.object(app_module, "compare_docx_layout", return_value={"available": False, "verified": False, "reason": "Microsoft Word unavailable"}):
+            with patch.object(app_module, "export_docx_to_pdf", return_value={"available": False, "reason": "Microsoft Word unavailable"}):
+                preview_response = self.client.get(f"/api/tailoring/drafts/{workspace['draft']['id']}/preview")
         self.assertEqual(preview_response.status_code, 200, preview_response.get_json())
         self.assertFalse(preview_response.get_json()["pdf_available"])
         self.assertIn("Microsoft Word unavailable", preview_response.get_json()["pdf_reason"])
@@ -702,7 +759,8 @@ class JobAssistantTest(unittest.TestCase):
         applied = self.client.post(f"/api/tailoring/drafts/{workspace['draft']['id']}/apply", json={"paragraph_index": bullet["paragraph_index"], "keyword": "REST APIs", "original_text": bullet["text"], "proposed_text": "Built Python automation and REST APIs for reports.", "operation": "edit"})
         self.assertEqual(applied.status_code, 200, applied.get_json())
         self.assertEqual(self.client.get(f"/api/candidate-profiles/{profile['id']}/keyword-memory").get_json(), [])
-        approved = self.client.post(f"/api/tailoring/drafts/{workspace['draft']['id']}/approve", json={"preparation_id": item["id"]})
+        with patch.object(app_module, "compare_docx_layout", return_value={"available": True, "verified": True, "original_pages": 1, "candidate_pages": 1, "line_mismatches": []}):
+            approved = self.client.post(f"/api/tailoring/drafts/{workspace['draft']['id']}/approve", json={"preparation_id": item["id"]})
         self.assertEqual(approved.status_code, 200, approved.get_json())
         memory = self.client.get(f"/api/candidate-profiles/{profile['id']}/keyword-memory").get_json()
         self.assertEqual(memory[0]["approved_replacement"], "Built Python automation and REST APIs for reports.")

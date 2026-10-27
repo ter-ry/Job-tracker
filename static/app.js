@@ -257,11 +257,16 @@ async function openTailoringStudio(jobId, profileId, resumeId, options = {}) {
   if (error) { error.hidden = true; error.textContent = ""; }
   document.getElementById("tailoring-studio-subtitle").textContent = "Loading the selected résumé and job requirements…";
   if (!options.preserveSelection) studio.scrollIntoView({ behavior: "smooth", block: "start" });
+  const requestStarted = performance.now();
   try {
     const data = await api.get(`/api/tailoring/${jobId}/workspace?candidate_profile_id=${encodeURIComponent(profileId)}&resume_id=${encodeURIComponent(resumeId)}`);
+    data.timings_ms = { ...(data.timings_ms || {}), frontend_workspace_request: Number((performance.now() - requestStarted).toFixed(2)) };
     const persistedOperationState = data.draft?.status === "approved" ? "approved" : (options.operationState || "idle");
     state.tailoring = { draftId: data.draft.id, jobId, profileId, resumeId, data, selectedParagraph: null, selectedKeyword: null, operationState: persistedOperationState, statusMessage: options.statusMessage || "" };
+    const renderStarted = performance.now();
     renderTailoringStudio();
+    data.timings_ms.frontend_rerender = Number((performance.now() - renderStarted).toFixed(2));
+    console.debug("[Tailoring Studio timing]", data.timings_ms);
     if (previous.selectedKeywordKey) selectTailoringRequirement(previous.selectedKeywordKey);
     if (previous.selectedParagraphIndex !== null && previous.selectedParagraphIndex !== undefined) selectTailoringParagraph(previous.selectedParagraphIndex, { preserveStatus: true });
     if (options.statusMessage) {
@@ -607,7 +612,7 @@ async function submitTailoringChange(payload) {
     if (!undoing && !(result.applied || []).some((item) => item.applied)) {
       throw new Error((result.skipped || []).map((item) => item.reason).filter(Boolean).join("; ") || "The edit was not applied to the draft.");
     }
-    const message = undoing ? "Edit undone. Original wording restored." : "Applied to draft. Not yet approved.";
+    const message = undoing ? "Edit undone. Original wording restored." : (result.layout?.pending ? "Applied to draft. Not yet approved. Word layout validation will run when you preview or approve." : "Applied to draft. Not yet approved.");
     await openTailoringStudio(state.tailoring.jobId, state.tailoring.profileId, state.tailoring.resumeId, { preserveSelection: true, operationState: undoing ? "idle" : "applied", statusMessage: message });
   } catch (error) {
     state.tailoring.operationState = "error";
