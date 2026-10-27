@@ -850,7 +850,10 @@ def create_app() -> Flask:
             return jsonify({"error": "This tailoring draft does not belong to the selected application package."}), 409
         if package["status"] == "approved":
             return jsonify({"error": "Approved application packages cannot be changed."}), 409
-        layout = validate_tailoring_draft_layout(draft_id)
+        change_error = validate_tailoring_draft_changes(draft_path, parse_json_array(row["changes_json"]))
+        if change_error:
+            return jsonify({"error": change_error}), 409
+        layout = validate_tailoring_draft_layout(draft_id, expected_version=tailoring_draft_version(draft_path))
         if not layout.get("available") or not layout.get("verified"):
             return jsonify({"error": layout.get("reason") or "Word layout validation did not pass; the résumé draft cannot be approved yet.", "layout": layout}), 409
         target = DATA_DIR / "application_preparations" / str(package["id"]) / f"tailored_resume_draft_{draft_id}.docx"
@@ -3289,22 +3292,30 @@ def rebuild_tailoring_draft(draft_id: int, changes: list[dict[str, Any]], *, rev
         raise ValueError("The source résumé DOCX is no longer available")
     output = tailoring_draft_path(draft_id)
     output.parent.mkdir(parents=True, exist_ok=True)
+    pending_output = output.with_name(f".{output.stem}.{uuid.uuid4().hex}.pending.docx")
     copy_started = time.perf_counter()
-    shutil.copyfile(source, output)
-    document = Document(output)
+    shutil.copyfile(source, pending_output)
+    document = Document(pending_output)
     applied: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     paragraphs = list(document.paragraphs)
+    contexts = collect_resume_paragraph_contexts(document)
     for change in changes:
-        index = clamp_int(change.get("paragraph_index"), 0, max(0, len(paragraphs) - 1))
-        if index >= len(paragraphs):
+        try:
+            index = int(change.get("paragraph_index"))
+        except (TypeError, ValueError):
+            skipped.append({**change, "reason": "Paragraph index is invalid"})
+            continue
+        if index < 0 or index >= len(paragraphs):
             skipped.append({**change, "reason": "Paragraph no longer exists"})
             continue
         paragraph = paragraphs[index]
+        context = contexts[index] if index < len(contexts) else {}
         original = text(change.get("original_text"))
         proposed = text(change.get("proposed_text"))
-        if not is_editable_resume_paragraph(paragraph, "bullet"):
-            skipped.append({**change, "reason": "Only editable résumé bullets can be changed"})
+        kind = resume_paragraph_edit_kind(context)
+        if kind is None or not is_editable_resume_paragraph(paragraph, kind):
+            skipped.append({**change, "reason": "This résumé paragraph is protected or not editable in its section"})
             continue
         if normalize_space(paragraph.text) != normalize_space(original):
             skipped.append({**change, "reason": "Source paragraph changed; review the current résumé before applying"})
@@ -3314,7 +3325,33 @@ def rebuild_tailoring_draft(draft_id: int, changes: list[dict[str, Any]], *, rev
             continue
         replace_paragraph_exact(paragraph, original, proposed)
         applied.append({**change, "applied": True})
-    document.save(output)
+    if skipped:
+        try:
+            pending_output.unlink(missing_ok=True)
+        except OSError:
+            pass
+        reasons = "; ".join(text(item.get("reason")) for item in skipped if text(item.get("reason")))
+        raise ValueError(f"The edit was not applied and was not saved: {reasons or 'one or more changes were rejected.'}")
+    document.save(pending_output)
+    backup_output = output.with_name(f".{output.stem}.{uuid.uuid4().hex}.previous.docx")
+    had_previous = output.is_file()
+    try:
+        if had_previous:
+            shutil.copyfile(output, backup_output)
+        # Promote only after every requested change has been validated. The
+        # rollback preserves the last valid draft if a restricted Windows
+        # workspace rejects the promotion write.
+        shutil.copyfile(pending_output, output)
+    except OSError:
+        if had_previous and backup_output.is_file():
+            shutil.copyfile(backup_output, output)
+        raise
+    finally:
+        for temporary in (pending_output, backup_output):
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
     docx_rebuild_ms = round((time.perf_counter() - copy_started) * 1000, 2)
     version = tailoring_draft_version(output)
     layout = pending_tailoring_layout(version)
@@ -3344,6 +3381,45 @@ def rebuild_tailoring_draft(draft_id: int, changes: list[dict[str, Any]], *, rev
         "pdf_generation": 0.0,
     }
     return {"applied": applied, "skipped": skipped, "layout": layout, "draft_path": str(output), "draft_version": version, "text": text_value, "timings_ms": timings}
+
+
+def resume_paragraph_edit_kind(context: dict[str, Any]) -> str | None:
+    """Return the only edit policy allowed for a résumé paragraph context."""
+    section = text(context.get("section")).lower()
+    if section in {"summary", "skills"}:
+        return section
+    if section in {"experience", "projects"} and bool(context.get("is_bullet")):
+        return "bullet"
+    return None
+
+
+def validate_tailoring_draft_changes(draft_path: Path, changes: list[dict[str, Any]]) -> str:
+    """Ensure every approval-summary change is present in the actual DOCX."""
+    try:
+        document = Document(draft_path)
+    except (OSError, ValueError, zipfile.BadZipFile, KeyError):
+        return "The current résumé draft DOCX could not be read for approval verification."
+    paragraphs = list(document.paragraphs)
+    contexts = collect_resume_paragraph_contexts(document)
+    if not changes:
+        return "No applied résumé changes are available for approval."
+    for change in changes:
+        if change.get("applied") is False or change.get("skipped") or change.get("skip_reason"):
+            return "Approval verification failed because the draft contains a skipped or unapplied change."
+        try:
+            index = int(change.get("paragraph_index"))
+        except (TypeError, ValueError):
+            return "Approval verification failed because a saved change has no valid paragraph index."
+        if index < 0 or index >= len(paragraphs):
+            return f"Approval verification failed because paragraph {index + 1} no longer exists in the current DOCX."
+        context = contexts[index] if index < len(contexts) else {}
+        kind = resume_paragraph_edit_kind(context)
+        if kind is None or not is_editable_resume_paragraph(paragraphs[index], kind):
+            return f"Approval verification failed because paragraph {index + 1} is protected or not editable."
+        proposed = normalize_space(text(change.get("proposed_text")))
+        if not proposed or normalize_space(paragraphs[index].text) != proposed:
+            return f"Approval verification failed because paragraph {index + 1} does not contain its saved proposed wording."
+    return ""
 
 
 def preparation_queue_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:
@@ -5177,7 +5253,10 @@ def collect_resume_paragraph_contexts(document: Document) -> list[dict[str, Any]
         style_name = getattr(getattr(paragraph, "style", None), "name", "") or ""
         is_bullet = style_name.lower().startswith("list") or paragraph_text.startswith(("-", "â€¢", "*"))
         editable = False
-        if current_section == "summary":
+        if section:
+            # The section label itself is metadata, not an editable entry.
+            editable = False
+        elif current_section == "summary":
             editable = is_editable_resume_paragraph(paragraph, "summary")
         elif current_section == "skills":
             editable = is_editable_resume_paragraph(paragraph, "skills")

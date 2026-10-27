@@ -525,6 +525,94 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("Latest edit undone. The previous saved revision is restored.", Path("static/app.js").read_text(encoding="utf-8"))
         self.assertIn('toggleAttribute("disabled"', Path("static/app.js").read_text(encoding="utf-8"))
 
+    def test_tailoring_applies_skills_and_experience_atomically_and_blocks_phantom_approval_changes(self):
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Section Edit QA"}).get_json()
+        document = Document()
+        document.add_paragraph("Taylor Example")
+        document.add_paragraph("Experience")
+        experience = document.add_paragraph("Built Python services for internal reporting.", style="List Bullet")
+        document.add_paragraph("Skills")
+        skills = document.add_paragraph("Technologies: React, Flask, Node.js, Express, REST APIs, PostgreSQL")
+        buffer = io.BytesIO(); document.save(buffer)
+        source_bytes = buffer.getvalue()
+        resume = self.client.post(
+            f"/api/candidate-profiles/{profile['id']}/resumes/upload",
+            data={"file": (io.BytesIO(source_bytes), "section-edit-qa.docx"), "is_default": "true"},
+            content_type="multipart/form-data",
+        ).get_json()
+        job = self.client.post("/api/jobs", json={"company": "Section Edit Co", "title": "Backend Engineer", "job_description": "Python, REST APIs and PostgreSQL required."}).get_json()
+        workspace = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        experience_item = next(item for item in workspace["bullets"] if item["text"] == experience.text)
+        skills_item = next(item for item in workspace["bullets"] if item["text"] == skills.text)
+        self.assertTrue(skills_item["editable"])
+
+        first = self.client.post(f"/api/tailoring/drafts/{workspace['draft']['id']}/apply", json={
+            "paragraph_index": experience_item["paragraph_index"], "original_text": experience.text,
+            "proposed_text": "Built Python REST services for internal reporting.", "operation": "edit",
+        })
+        self.assertEqual(first.status_code, 200, first.get_json())
+        second = self.client.post(f"/api/tailoring/drafts/{workspace['draft']['id']}/apply", json={
+            "paragraph_index": skills_item["paragraph_index"], "original_text": skills.text,
+            "proposed_text": skills.text + ", etc", "operation": "edit",
+        })
+        self.assertEqual(second.status_code, 200, second.get_json())
+        draft_id = workspace["draft"]["id"]
+        draft = self.client.get(f"/api/tailoring/drafts/{draft_id}/download")
+        generated = Document(io.BytesIO(draft.data))
+        generated_text = "\n".join(paragraph.text for paragraph in generated.paragraphs)
+        self.assertIn("Built Python REST services for internal reporting.", generated_text)
+        self.assertIn("Technologies: React, Flask, Node.js, Express, REST APIs, PostgreSQL, etc", generated_text)
+        self.assertEqual(len(self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()["draft"]["changes"]), 2)
+        undone_skill = self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={"paragraph_index": skills_item["paragraph_index"], "operation": "leave_unchanged"})
+        self.assertEqual(undone_skill.status_code, 200, undone_skill.get_json())
+        self.assertIn(skills.text, undone_skill.get_json()["text"])
+        reapplied_skill = self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={
+            "paragraph_index": skills_item["paragraph_index"], "original_text": skills.text,
+            "proposed_text": skills.text + ", etc", "operation": "edit",
+        })
+        self.assertEqual(reapplied_skill.status_code, 200, reapplied_skill.get_json())
+        reverted_skill = self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={"paragraph_index": skills_item["paragraph_index"], "operation": "revert_original"})
+        self.assertEqual(reverted_skill.status_code, 200, reverted_skill.get_json())
+        self.assertIn(skills.text, reverted_skill.get_json()["text"])
+        reapplied_for_review = self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={
+            "paragraph_index": skills_item["paragraph_index"], "original_text": skills.text,
+            "proposed_text": skills.text + ", etc", "operation": "edit",
+        })
+        self.assertEqual(reapplied_for_review.status_code, 200, reapplied_for_review.get_json())
+
+        protected = self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={
+            "paragraph_index": 1, "original_text": "Experience", "proposed_text": "Education", "operation": "edit",
+        })
+        self.assertEqual(protected.status_code, 409)
+        self.assertIn("not saved", protected.get_json()["error"])
+        after_rejection = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        self.assertEqual(len(after_rejection["draft"]["changes"]), 2)
+        self.assertIn("etc", after_rejection["preview"]["text"])
+
+        with app_module.app.app_context():
+            app_module.get_db().execute("INSERT INTO application_preparation_queue(job_id, status, candidate_profile_id, resume_id) VALUES (?, 'queued', ?, ?)", [job["id"], profile["id"], resume["id"]])
+            app_module.get_db().execute("UPDATE tailoring_drafts SET changes_json = ? WHERE id = ?", [json.dumps(after_rejection["draft"]["changes"] + [{"paragraph_index": skills_item["paragraph_index"], "original_text": skills.text, "proposed_text": "Technologies: fabricated", "keyword": "skills"}]), draft_id])
+            app_module.get_db().commit()
+        with patch.object(app_module, "validate_tailoring_draft_layout", return_value={"available": True, "verified": True, "original_pages": 1, "candidate_pages": 1, "line_mismatches": []}):
+            approval = self.client.post(f"/api/tailoring/drafts/{draft_id}/approve")
+        self.assertEqual(approval.status_code, 409)
+        self.assertIn("does not contain its saved proposed wording", approval.get_json()["error"])
+        frontend = Path("static/app.js").read_text(encoding="utf-8")
+        self.assertIn('"Failed to undo" : "Failed to apply"', frontend)
+
+    def test_tailoring_protected_metadata_is_not_offered_as_editable(self):
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Protected Metadata QA"}).get_json()
+        document = Document(); document.add_heading("Taylor Example", level=1); document.add_paragraph("Experience")
+        document.add_paragraph("Built Python services for reporting.", style="List Bullet"); document.add_paragraph("Skills")
+        document.add_paragraph("Python, SQL")
+        buffer = io.BytesIO(); document.save(buffer)
+        resume = self.client.post(f"/api/candidate-profiles/{profile['id']}/resumes/upload", data={"file": (io.BytesIO(buffer.getvalue()), "protected.docx"), "is_default": "true"}, content_type="multipart/form-data").get_json()
+        job = self.client.post("/api/jobs", json={"company": "Protected Co", "title": "Engineer", "job_description": "Python required."}).get_json()
+        workspace = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        headings = [item for item in workspace["bullets"] if item["text"] in {"Taylor Example", "Experience", "Skills"}]
+        self.assertTrue(headings)
+        self.assertTrue(all(not item["editable"] for item in headings))
+
     def test_tailoring_revision_history_supports_stepwise_undo_and_revert(self):
         profile = self.client.post("/api/candidate-profiles", json={"name": "Revision History QA"}).get_json()
         document = Document(); document.add_paragraph("Taylor Example"); document.add_paragraph("Experience")

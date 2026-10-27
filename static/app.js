@@ -652,8 +652,8 @@ async function submitTailoringChange(payload) {
     await openTailoringStudio(state.tailoring.jobId, state.tailoring.profileId, state.tailoring.resumeId, { preserveSelection: true, operationState: undoing ? "idle" : "applied", statusMessage: message });
   } catch (error) {
     state.tailoring.operationState = "error";
-    state.tailoring.statusMessage = error.message;
-    document.getElementById("tailoring-edit-status").textContent = error.message;
+    state.tailoring.statusMessage = `${undoing ? "Failed to undo" : "Failed to apply"}: ${error.message}`;
+    document.getElementById("tailoring-edit-status").textContent = state.tailoring.statusMessage;
     renderTailoringEditor();
   }
 }
