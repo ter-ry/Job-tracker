@@ -1764,15 +1764,23 @@ def create_app() -> Flask:
         if job is None:
             return jsonify({"error": "Job not found"}), 404
         values: dict[str, Any] = {}
+        errors: dict[str, str] = {}
         for kind, package_field in (("resume", "prepared_resume_path"), ("cover_letter", "prepared_cover_letter_path")):
-            path = safe_preparation_artifact_path(item[package_field])
+            raw_path = text(item[package_field])
+            path = safe_preparation_artifact_path(raw_path)
             values[kind] = ""
-            if path and path.is_file():
+            if not raw_path:
+                errors[kind] = f"Prepared {kind.replace('_', ' ')} file is not recorded for this package."
+            elif path is None:
+                errors[kind] = f"Prepared {kind.replace('_', ' ')} file is outside the active application package directory."
+            elif not path.is_file():
+                errors[kind] = f"Prepared {kind.replace('_', ' ')} file is missing from this application environment."
+            else:
                 try:
                     values[kind] = "\n".join(paragraph.text for paragraph in iter_document_paragraphs(Document(io.BytesIO(path.read_bytes()))) if paragraph.text.strip())
                 except (OSError, ValueError, zipfile.BadZipFile):
-                    values[kind] = ""
-        return jsonify({"resume": values["resume"], "cover_letter": values["cover_letter"], "status": item["status"], "job_id": item["job_id"]})
+                    errors[kind] = f"Prepared {kind.replace('_', ' ')} DOCX could not be read."
+        return jsonify({"resume": values["resume"], "cover_letter": values["cover_letter"], "errors": errors, "status": item["status"], "job_id": item["job_id"], "company": text(job["company"]), "title": text(job["title"])})
 
     @app.get("/api/preparation/<int:item_id>/download/<kind>")
     def download_preparation_document(item_id: int, kind: str) -> Response:

@@ -4792,7 +4792,34 @@ class JobAssistantTest(unittest.TestCase):
         preview = response.get_json()
         self.assertEqual(preview["resume"], "PACKAGE RESUME")
         self.assertEqual(preview["cover_letter"], "PACKAGE COVER LETTER")
+        self.assertEqual(preview["errors"], {})
+        self.assertEqual(preview["company"], "Preview Co")
+        self.assertEqual(preview["title"], "Developer")
         self.assertNotIn("CURRENT JOB", preview["resume"] + preview["cover_letter"])
+
+    def test_preparation_preview_reports_missing_package_artifacts_explicitly(self):
+        job = self.client.post("/api/jobs", json={"company": "Missing Preview Co", "title": "Developer"}).get_json()
+        with app_module.app.app_context():
+            item_id = app_module.get_db().execute(
+                "INSERT INTO application_preparation_queue (job_id, status, prepared_resume_path, prepared_cover_letter_path) VALUES (?, 'ready_for_review', ?, ?)",
+                [job["id"], str(app_module.generated_applications_dir() / "missing-resume.docx"), ""],
+            ).lastrowid
+            app_module.get_db().commit()
+        response = self.client.get(f"/api/preparation/{item_id}/preview")
+        self.assertEqual(response.status_code, 200)
+        errors = response.get_json()["errors"]
+        self.assertIn("missing from this application environment", errors["resume"])
+        self.assertIn("not recorded", errors["cover_letter"])
+
+    def test_preparation_preview_is_inline_and_tailoring_approval_uses_compact_diff(self):
+        frontend = Path(app_module.BASE_DIR, "static", "app.js").read_text(encoding="utf-8")
+        template = Path(app_module.BASE_DIR, "templates", "index.html").read_text(encoding="utf-8")
+        self.assertIn("preparationPreviews", frontend)
+        self.assertIn("preparation-preview-inline", frontend)
+        self.assertIn("tailoringDiffMarkup", frontend)
+        self.assertIn("tailoring-compact-diff", frontend)
+        self.assertNotIn('insertAdjacentHTML("afterbegin", `<details class="preparation-preview"', frontend)
+        self.assertIn('id="tailoring-diff-heading"', template)
 
     def test_manual_discovery_preparation_requires_explicit_profile_and_docx_pair(self):
         frontend = Path(app_module.BASE_DIR, "static", "app.js").read_text(encoding="utf-8")
