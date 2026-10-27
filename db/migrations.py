@@ -184,6 +184,53 @@ def _migration_010_tailoring_revision_history(db: sqlite3.Connection) -> None:
     if "revision_history_json" not in existing:
         db.execute("ALTER TABLE tailoring_drafts ADD COLUMN revision_history_json TEXT NOT NULL DEFAULT '{}'")
 
+
+def _migration_011_versioned_tailoring_drafts(db: sqlite3.Connection) -> None:
+    """Allow immutable approved drafts and independent later revisions."""
+    columns = {row[1] for row in db.execute("PRAGMA table_info(tailoring_drafts)")}
+    if "revision_number" in columns and "parent_draft_id" in columns and "superseded_by_draft_id" in columns:
+        return
+    db.executescript(
+        """
+        CREATE TABLE tailoring_drafts_versioned (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id INTEGER NOT NULL,
+            candidate_profile_id INTEGER NOT NULL,
+            resume_id INTEGER NOT NULL,
+            source_path TEXT NOT NULL DEFAULT '',
+            draft_path TEXT NOT NULL DEFAULT '',
+            changes_json TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL DEFAULT 'draft',
+            layout_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            approved_at TEXT NOT NULL DEFAULT '',
+            approved_tailoring_draft_id INTEGER NOT NULL DEFAULT 0,
+            approved_tailored_resume_path TEXT NOT NULL DEFAULT '',
+            revision_history_json TEXT NOT NULL DEFAULT '{}',
+            parent_draft_id INTEGER NOT NULL DEFAULT 0,
+            revision_number INTEGER NOT NULL DEFAULT 1,
+            superseded_by_draft_id INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+        );
+        INSERT INTO tailoring_drafts_versioned(
+            id, job_id, candidate_profile_id, resume_id, source_path, draft_path,
+            changes_json, status, layout_json, created_at, updated_at, approved_at,
+            approved_tailoring_draft_id, approved_tailored_resume_path,
+            revision_history_json, revision_number
+        )
+        SELECT id, job_id, candidate_profile_id, resume_id, source_path, draft_path,
+            changes_json, status, layout_json, created_at, updated_at, approved_at,
+            approved_tailoring_draft_id, approved_tailored_resume_path,
+            revision_history_json, 1
+        FROM tailoring_drafts;
+        DROP TABLE tailoring_drafts;
+        ALTER TABLE tailoring_drafts_versioned RENAME TO tailoring_drafts;
+        CREATE INDEX IF NOT EXISTS tailoring_drafts_job_idx ON tailoring_drafts(job_id);
+        CREATE INDEX IF NOT EXISTS tailoring_drafts_scope_idx ON tailoring_drafts(job_id, candidate_profile_id, resume_id, revision_number);
+        """
+    )
+
 MIGRATIONS: tuple[tuple[int, str, Migration], ...] = (
     (1, "legacy baseline", _migration_001_baseline),
     (2, "candidate document profiles", _migration_002_candidate_documents),
@@ -195,6 +242,7 @@ MIGRATIONS: tuple[tuple[int, str, Migration], ...] = (
     (8, "tailoring requirement overrides", _migration_008_tailoring_requirement_overrides),
     (9, "skill confirmation metadata", _migration_009_skill_confirmation_metadata),
     (10, "tailoring revision history", _migration_010_tailoring_revision_history),
+    (11, "versioned tailoring drafts", _migration_011_versioned_tailoring_drafts),
 )
 
 

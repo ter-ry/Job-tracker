@@ -127,6 +127,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("refresh-shortlist").addEventListener("click", loadAll);
   document.getElementById("refresh-preparation-queue")?.addEventListener("click", loadPreparationQueue);
   document.getElementById("close-tailoring-studio")?.addEventListener("click", closeTailoringStudio);
+  document.getElementById("tailoring-new-revision")?.addEventListener("click", createTailoringRevision);
   document.getElementById("tailoring-apply")?.addEventListener("click", applyTailoringEdit);
   document.getElementById("tailoring-leave-unchanged")?.addEventListener("click", leaveTailoringUnchanged);
   document.getElementById("tailoring-ai-improve")?.addEventListener("click", improveTailoringEdit);
@@ -287,10 +288,33 @@ async function openTailoringStudio(jobId, profileId, resumeId, options = {}) {
   }
 }
 
+async function createTailoringRevision() {
+  const tailoring = state.tailoring;
+  if (!tailoring.draftId || tailoring.data?.draft?.status !== "approved" || tailoring.revisionBusy) return;
+  tailoring.revisionBusy = true;
+  tailoring.statusMessage = "Creating a new editable revision…";
+  renderTailoringStudio();
+  try {
+    const result = await api.send(`/api/tailoring/drafts/${tailoring.draftId}/new-revision`, "POST", {});
+    await openTailoringStudio(tailoring.jobId, tailoring.profileId, tailoring.resumeId, {
+      preserveSelection: true,
+      statusMessage: result.message || "New editable résumé revision created.",
+    });
+  } catch (error) {
+    tailoring.statusMessage = `Failed to create new revision: ${error.message}`;
+    renderTailoringStudio();
+    const status = document.getElementById("tailoring-edit-status");
+    if (status) status.textContent = tailoring.statusMessage;
+  } finally {
+    tailoring.revisionBusy = false;
+    if (tailoring.data) renderTailoringStudio();
+  }
+}
+
 function closeTailoringStudio() {
   const studio = document.getElementById("tailoring-studio");
   if (studio) studio.hidden = true;
-  state.tailoring = { draftId: null, jobId: null, profileId: null, resumeId: null, data: null, selectedParagraph: null, selectedKeyword: null, operationState: "idle", statusMessage: "" };
+  state.tailoring = { draftId: null, jobId: null, profileId: null, resumeId: null, data: null, selectedParagraph: null, selectedKeyword: null, operationState: "idle", statusMessage: "", revisionBusy: false };
 }
 
 function tailoringTitle(value) {
@@ -348,6 +372,26 @@ const sectionRank = { experience: 0, projects: 1, education: 2, skills: 3 };
 function renderTailoringStudio() {
   const data = state.tailoring.data;
   if (!data) return;
+  const draft = data.draft || {};
+  const approved = draft.status === "approved";
+  const versionStatus = document.getElementById("tailoring-version-status");
+  if (versionStatus) {
+    versionStatus.innerHTML = approved
+      ? `<strong>${escapeHtml(draft.version_label || `Version ${draft.revision_number || 1}`)} · Approved and locked</strong><p class="muted helper">This version is immutable and remains in its application package. Create a new revision to make further changes.</p>`
+      : `<strong>${escapeHtml(draft.version_label || `Version ${draft.revision_number || 1}`)} · Draft · Not yet approved</strong><p class="muted helper">Edits remain in this draft until you explicitly approve them for the application package.</p>`;
+  }
+  const newRevision = document.getElementById("tailoring-new-revision");
+  if (newRevision) {
+    newRevision.hidden = !approved;
+    newRevision.disabled = Boolean(state.tailoring.revisionBusy);
+    newRevision.textContent = state.tailoring.revisionBusy ? "Creating revision…" : "Create new revision";
+  }
+  const history = document.getElementById("tailoring-version-history");
+  const versions = draft.versions || [];
+  if (history) {
+    history.hidden = versions.length < 2;
+    history.innerHTML = versions.length < 2 ? "" : `<h3>Version history</h3>${versions.map((version) => `<div class="tailoring-version-row"><strong>${escapeHtml(version.version_label || `Version ${version.revision_number}`)}</strong><span>${escapeHtml(version.status === "approved" ? "Approved and locked" : "Draft · editable")}</span></div>`).join("")}`;
+  }
   document.getElementById("tailoring-studio-subtitle").textContent = `${data.job.company || "Employer"} · ${data.job.title || "Role"} · ${data.resume.name || "Selected résumé"}`;
   const original = data.original_keywords || {};
   const current = data.keywords || {};
@@ -508,12 +552,17 @@ function renderTailoringEditor() {
   if (!original || !proposed) return;
   const bullet = state.tailoring.selectedParagraph;
   const busy = ["applying", "undoing"].includes(state.tailoring.operationState);
+  const approved = state.tailoring.data?.draft?.status === "approved";
   const hasAppliedChange = Boolean(bullet?.applied_change);
   const hasMeaningfulChange = Boolean(bullet) && normalizeClientText(bullet.text) !== normalizeClientText(proposed.value);
-  document.getElementById("tailoring-apply")?.toggleAttribute("disabled", !bullet || !hasMeaningfulChange || busy || state.tailoring.operationState === "approved");
-  document.getElementById("tailoring-leave-unchanged")?.toggleAttribute("disabled", !bullet || !hasAppliedChange || busy || state.tailoring.operationState === "approved");
-  document.getElementById("tailoring-revert-original")?.toggleAttribute("disabled", !bullet || !hasAppliedChange || busy || state.tailoring.operationState === "approved");
-  document.getElementById("tailoring-ai-improve")?.toggleAttribute("disabled", !bullet || busy || state.tailoring.operationState === "approved");
+  document.getElementById("tailoring-apply")?.toggleAttribute("disabled", !bullet || !hasMeaningfulChange || busy || approved);
+  document.getElementById("tailoring-leave-unchanged")?.toggleAttribute("disabled", !bullet || !hasAppliedChange || busy || approved);
+  document.getElementById("tailoring-revert-original")?.toggleAttribute("disabled", !bullet || !hasAppliedChange || busy || approved);
+  document.getElementById("tailoring-ai-improve")?.toggleAttribute("disabled", !bullet || busy || approved);
+  document.getElementById("tailoring-approve")?.toggleAttribute("disabled", approved || busy || !state.tailoring.draftId);
+  proposed.disabled = approved || busy;
+  proposed.setAttribute("aria-readonly", approved ? "true" : "false");
+  original.disabled = false;
   if (!bullet) { renderTailoringDiff("", ""); return; }
   const summary = document.getElementById("tailoring-approval-summary");
   const diffHeading = document.getElementById("tailoring-diff-heading");
@@ -527,6 +576,7 @@ function renderTailoringEditor() {
   document.getElementById("tailoring-diff")?.toggleAttribute("hidden", hideStandaloneDiff);
   renderTailoringDiff(original.value || bullet.text, proposed.value || bullet.text);
   proposed.oninput = () => {
+    if (state.tailoring.data?.draft?.status === "approved") return;
     state.tailoring.operationState = hasAppliedChange ? "applied" : "modified";
     state.tailoring.statusMessage = "Modified wording is not applied to the draft yet.";
     renderTailoringDiff(original.value || bullet.text, proposed.value);

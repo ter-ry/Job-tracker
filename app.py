@@ -612,18 +612,16 @@ def create_app() -> Flask:
             return jsonify({"error": str(exc)}), 400
         job = job_to_dict(row)
         source_text = extract_docx_text(selection["resume_path"].read_bytes())
-        draft_row = query_db(
-            "SELECT * FROM tailoring_drafts WHERE job_id = ? AND candidate_profile_id = ? AND resume_id = ?",
-            [job_id, int(selection["profile_row"]["id"]), int(selection["resume"]["id"])], one=True,
-        )
+        draft_row = current_tailoring_draft(job_id, int(selection["profile_row"]["id"]), int(selection["resume"]["id"]))
         if draft_row is None:
             cursor = get_db().execute(
-                "INSERT INTO tailoring_drafts(job_id, candidate_profile_id, resume_id, source_path, draft_path) VALUES (?, ?, ?, ?, '')",
+                "INSERT INTO tailoring_drafts(job_id, candidate_profile_id, resume_id, source_path, draft_path, revision_number) VALUES (?, ?, ?, ?, '', 1)",
                 [job_id, int(selection["profile_row"]["id"]), int(selection["resume"]["id"]), str(selection["resume_path"])],
             )
             get_db().commit()
             draft_row = query_db("SELECT * FROM tailoring_drafts WHERE id = ?", [cursor.lastrowid], one=True)
         draft = tailoring_draft_to_dict(draft_row)
+        draft["versions"] = tailoring_draft_versions(job_id, int(selection["profile_row"]["id"]), int(selection["resume"]["id"]))
         draft_text = source_text
         draft_path = safe_local_path(text(draft.get("draft_path")))
         if draft_path and draft_path.is_file():
@@ -757,12 +755,52 @@ def create_app() -> Flask:
             selection = resolve_tailoring_resume_profile(payload)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
-        existing = query_db("SELECT * FROM tailoring_drafts WHERE job_id = ? AND candidate_profile_id = ? AND resume_id = ?", [job_id, int(selection["profile_row"]["id"]), int(selection["resume"]["id"])], one=True)
+        existing = current_tailoring_draft(job_id, int(selection["profile_row"]["id"]), int(selection["resume"]["id"]))
         if existing is None:
-            cursor = get_db().execute("INSERT INTO tailoring_drafts(job_id, candidate_profile_id, resume_id, source_path) VALUES (?, ?, ?, ?)", [job_id, int(selection["profile_row"]["id"]), int(selection["resume"]["id"]), str(selection["resume_path"])])
+            cursor = get_db().execute("INSERT INTO tailoring_drafts(job_id, candidate_profile_id, resume_id, source_path, revision_number) VALUES (?, ?, ?, ?, 1)", [job_id, int(selection["profile_row"]["id"]), int(selection["resume"]["id"]), str(selection["resume_path"])])
             get_db().commit()
             existing = query_db("SELECT * FROM tailoring_drafts WHERE id = ?", [cursor.lastrowid], one=True)
         return jsonify(tailoring_draft_to_dict(existing)), 201 if existing and int(existing["id"]) == int(cursor.lastrowid if 'cursor' in locals() else -1) else 200
+
+    @app.post("/api/tailoring/drafts/<int:draft_id>/new-revision")
+    def create_tailoring_revision(draft_id: int) -> Response:
+        row = query_db("SELECT * FROM tailoring_drafts WHERE id = ?", [draft_id], one=True)
+        if row is None:
+            return jsonify({"error": "Tailoring draft was not found"}), 404
+        if text(row["status"]) != "approved":
+            return jsonify({"error": "Create a new revision only from an approved résumé draft."}), 409
+        existing = editable_tailoring_draft(int(row["job_id"]), int(row["candidate_profile_id"]), int(row["resume_id"]))
+        if existing is not None:
+            return jsonify({"created": False, "draft": tailoring_draft_to_dict(existing), "message": "An editable revision already exists."}), 200
+        approved_path = safe_local_path(text(row["approved_tailored_resume_path"]))
+        if approved_path is None or not approved_path.is_file():
+            return jsonify({"error": "The approved résumé artifact is unavailable; no new revision was created."}), 409
+        next_revision = int(query_db(
+            "SELECT COALESCE(MAX(revision_number), 0) + 1 AS next_revision FROM tailoring_drafts WHERE job_id = ? AND candidate_profile_id = ? AND resume_id = ?",
+            [row["job_id"], row["candidate_profile_id"], row["resume_id"]], one=True,
+        )["next_revision"])
+        db = get_db()
+        cursor = db.execute(
+            "INSERT INTO tailoring_drafts(job_id, candidate_profile_id, resume_id, source_path, draft_path, parent_draft_id, revision_number) VALUES (?, ?, ?, ?, '', ?, ?)",
+            [row["job_id"], row["candidate_profile_id"], row["resume_id"], str(approved_path), int(row["id"]), next_revision],
+        )
+        new_id = int(cursor.lastrowid)
+        target = tailoring_draft_path(new_id)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(approved_path, target)
+            db.execute("UPDATE tailoring_drafts SET draft_path = ?, layout_json = ? WHERE id = ?", [str(target), dumps_json(pending_tailoring_layout(tailoring_draft_version(target))), new_id])
+            db.execute("UPDATE tailoring_drafts SET superseded_by_draft_id = ? WHERE id = ?", [new_id, int(row["id"])])
+            db.commit()
+        except OSError as exc:
+            db.rollback()
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return jsonify({"error": f"The new résumé revision could not be created: {exc}"}), 409
+        created = query_db("SELECT * FROM tailoring_drafts WHERE id = ?", [new_id], one=True)
+        return jsonify({"created": True, "draft": tailoring_draft_to_dict(created), "message": f"Version {next_revision} is ready for editing."}), 201
 
     @app.get("/api/tailoring/drafts/<int:draft_id>/download")
     def download_tailoring_draft(draft_id: int) -> Response:
@@ -836,6 +874,10 @@ def create_app() -> Flask:
         row = query_db("SELECT * FROM tailoring_drafts WHERE id = ?", [draft_id], one=True)
         if row is None:
             return jsonify({"error": "Tailoring draft was not found"}), 404
+        if text(row["status"]) == "approved":
+            return jsonify({"error": "This résumé draft is already approved and locked. Create a new revision before making changes."}), 409
+        if text(row["status"]) != "draft":
+            return jsonify({"error": "Only an editable draft can be approved."}), 409
         draft_path = safe_local_path(text(row["draft_path"]))
         if draft_path is None or not draft_path.is_file():
             return jsonify({"error": "Apply at least one valid edit before approving this résumé draft"}), 409
@@ -3217,10 +3259,53 @@ def tailoring_draft_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:
     item["changes"] = parse_json_array(item.get("changes_json"))
     item["revision_history"] = parse_json_object(item.get("revision_history_json"))
     item["layout"] = parse_json_object(item.get("layout_json"))
+    item["revision_number"] = int(item.get("revision_number") or 1)
+    item["version_label"] = f"Version {item['revision_number']}"
+    item["locked"] = text(item.get("status")) == "approved"
     item.pop("changes_json", None)
     item.pop("revision_history_json", None)
     item.pop("layout_json", None)
     return item
+
+
+def editable_tailoring_draft(job_id: int, profile_id: int, resume_id: int) -> sqlite3.Row | None:
+    """Return the one editable revision for a tailoring scope, if any."""
+    return query_db(
+        """SELECT * FROM tailoring_drafts
+           WHERE job_id = ? AND candidate_profile_id = ? AND resume_id = ? AND status = 'draft'
+           ORDER BY revision_number DESC, id DESC LIMIT 1""",
+        [job_id, profile_id, resume_id], one=True,
+    )
+
+
+def current_tailoring_draft(job_id: int, profile_id: int, resume_id: int) -> sqlite3.Row | None:
+    """Prefer an editable revision; otherwise expose the latest approved revision."""
+    return editable_tailoring_draft(job_id, profile_id, resume_id) or query_db(
+        """SELECT * FROM tailoring_drafts
+           WHERE job_id = ? AND candidate_profile_id = ? AND resume_id = ? AND status = 'approved'
+           ORDER BY revision_number DESC, id DESC LIMIT 1""",
+        [job_id, profile_id, resume_id], one=True,
+    )
+
+
+def tailoring_draft_versions(job_id: int, profile_id: int, resume_id: int) -> list[dict[str, Any]]:
+    rows = query_db(
+        """SELECT id, status, revision_number, parent_draft_id, superseded_by_draft_id,
+                  created_at, updated_at, approved_at
+           FROM tailoring_drafts
+           WHERE job_id = ? AND candidate_profile_id = ? AND resume_id = ?
+           ORDER BY revision_number DESC, id DESC""",
+        [job_id, profile_id, resume_id],
+    )
+    return [
+        {
+            **dict(row),
+            "revision_number": int(row["revision_number"] or 1),
+            "version_label": f"Version {int(row['revision_number'] or 1)}",
+            "locked": text(row["status"]) == "approved",
+        }
+        for row in rows
+    ]
 
 
 def tailoring_resume_filename(row: sqlite3.Row | dict[str, Any], *, draft: bool = False) -> str:

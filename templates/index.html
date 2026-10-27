@@ -230,8 +230,10 @@
           <div id="preparation-queue" class="generated-output empty">No application packages queued.</div>
         </section>
         <section id="tailoring-studio" class="panel tailoring-studio-panel" hidden>
-          <div class="panel-header"><div><h2>Résumé tailoring studio</h2><p id="tailoring-studio-subtitle" class="muted helper">Review grounded keyword opportunities and edit a copied résumé draft.</p></div><button class="button ghost small" type="button" id="close-tailoring-studio">Close studio</button></div>
+          <div class="panel-header"><div><h2>Résumé tailoring studio</h2><p id="tailoring-studio-subtitle" class="muted helper">Review grounded keyword opportunities and edit a copied résumé draft.</p></div><div class="actions compact"><button class="button small" type="button" id="tailoring-new-revision" hidden>Create new revision</button><button class="button ghost small" type="button" id="close-tailoring-studio">Close studio</button></div></div>
           <p id="tailoring-studio-error" class="risk high" role="alert" hidden></p>
+          <section id="tailoring-version-status" class="nested-panel tailoring-version-status" aria-live="polite"></section>
+          <section id="tailoring-version-history" class="nested-panel tailoring-version-history" hidden></section>
           <section class="tailoring-scorebar nested-panel" aria-label="Résumé keyword coverage"><div id="tailoring-score-summary"></div></section>
           <div class="tailoring-studio-grid">
             <aside class="tailoring-controls">
