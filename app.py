@@ -967,6 +967,7 @@ def create_app() -> Flask:
         layout = validate_tailoring_draft_layout(draft_id, expected_version=draft_version)
         pdf = {"available": False, "reason": layout.get("reason") or "Word layout validation is unavailable."}
         pdf_cached = False
+        pdf_generation_ms = 0.0
         if layout.get("available") and layout.get("verified"):
             cached_version = ""
             if preview_meta.is_file():
@@ -980,7 +981,8 @@ def create_app() -> Flask:
             else:
                 export_started = time.perf_counter()
                 pdf = export_docx_to_pdf(draft_path, preview_pdf)
-                pdf.setdefault("timings_ms", {})["pdf_generation"] = round((time.perf_counter() - export_started) * 1000, 2)
+                pdf_generation_ms = round((time.perf_counter() - export_started) * 1000, 2)
+                pdf.setdefault("timings_ms", {})["pdf_generation"] = pdf_generation_ms
                 if pdf.get("available") and tailoring_draft_version(draft_path) == draft_version:
                     try:
                         preview_meta.write_text(json.dumps({"draft_version": draft_version}), encoding="utf-8")
@@ -992,7 +994,7 @@ def create_app() -> Flask:
         preview_text = extract_docx_text(draft_path.read_bytes())
         text_ms = round((time.perf_counter() - text_started) * 1000, 2)
         timings = dict(layout.get("timings_ms") or {})
-        timings["pdf_generation"] = float((pdf.get("timings_ms") or {}).get("pdf_generation", 0.0))
+        timings["pdf_generation"] = pdf_generation_ms
         timings["preview_text_extraction"] = text_ms
         timings["preview_total"] = round((time.perf_counter() - preview_started) * 1000, 2)
         return jsonify({
