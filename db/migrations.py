@@ -178,6 +178,12 @@ def _migration_009_skill_confirmation_metadata(db: sqlite3.Connection) -> None:
         if name not in existing:
             db.execute(f"ALTER TABLE keyword_memory ADD COLUMN {name} {definition}")
 
+
+def _migration_010_tailoring_revision_history(db: sqlite3.Connection) -> None:
+    existing = {row[1] for row in db.execute("PRAGMA table_info(tailoring_drafts)")}
+    if "revision_history_json" not in existing:
+        db.execute("ALTER TABLE tailoring_drafts ADD COLUMN revision_history_json TEXT NOT NULL DEFAULT '{}'")
+
 MIGRATIONS: tuple[tuple[int, str, Migration], ...] = (
     (1, "legacy baseline", _migration_001_baseline),
     (2, "candidate document profiles", _migration_002_candidate_documents),
@@ -188,6 +194,7 @@ MIGRATIONS: tuple[tuple[int, str, Migration], ...] = (
     (7, "keyword memory paragraph identity", _migration_007_keyword_memory_paragraph),
     (8, "tailoring requirement overrides", _migration_008_tailoring_requirement_overrides),
     (9, "skill confirmation metadata", _migration_009_skill_confirmation_metadata),
+    (10, "tailoring revision history", _migration_010_tailoring_revision_history),
 )
 
 

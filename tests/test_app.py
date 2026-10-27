@@ -522,8 +522,50 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("Built Python services for internal reporting.", after_undo["preview"]["text"])
         self.assertIn("Created SQL validation and audit workflows for operations.", after_undo["preview"]["text"])
         self.assertIn("Applied to draft", Path("static/app.js").read_text(encoding="utf-8"))
-        self.assertIn("Edit undone. Original wording restored.", Path("static/app.js").read_text(encoding="utf-8"))
+        self.assertIn("Latest edit undone. The previous saved revision is restored.", Path("static/app.js").read_text(encoding="utf-8"))
         self.assertIn('toggleAttribute("disabled"', Path("static/app.js").read_text(encoding="utf-8"))
+
+    def test_tailoring_revision_history_supports_stepwise_undo_and_revert(self):
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Revision History QA"}).get_json()
+        document = Document(); document.add_paragraph("Taylor Example"); document.add_paragraph("Experience")
+        bullet = document.add_paragraph("Built Python services for reporting.", style="List Bullet")
+        buffer = io.BytesIO(); document.save(buffer)
+        resume = self.client.post(
+            f"/api/candidate-profiles/{profile['id']}/resumes/upload",
+            data={"file": (io.BytesIO(buffer.getvalue()), "revision-qa.docx"), "is_default": "true"},
+            content_type="multipart/form-data",
+        ).get_json()
+        job = self.client.post("/api/jobs", json={"company": "Revision QA", "title": "Backend Engineer", "job_description": "Python required."}).get_json()
+        workspace = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        draft_id = workspace["draft"]["id"]
+        index = next(item["paragraph_index"] for item in workspace["bullets"] if item["editable"])
+        original = "Built Python services for reporting."
+        edit_a = "Built Python backend services for reporting."
+        edit_b = "Built Python backend services and APIs for reporting."
+        self.assertEqual(self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={"paragraph_index": index, "original_text": original, "proposed_text": edit_a, "operation": "edit"}).status_code, 200)
+        self.assertEqual(self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={"paragraph_index": index, "original_text": edit_a, "proposed_text": edit_b, "operation": "edit"}).status_code, 200)
+        undone = self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={"paragraph_index": index, "operation": "leave_unchanged"})
+        self.assertEqual(undone.status_code, 200, undone.get_json())
+        self.assertIn(edit_a, undone.get_json()["text"])
+        refreshed = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        self.assertEqual(refreshed["draft"]["changes"][0]["proposed_text"], edit_a)
+        undone_again = self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={"paragraph_index": index, "operation": "leave_unchanged"})
+        self.assertEqual(undone_again.status_code, 200, undone_again.get_json())
+        self.assertIn(original, undone_again.get_json()["text"])
+        reapplied = self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={"paragraph_index": index, "original_text": original, "proposed_text": edit_a, "operation": "edit"})
+        self.assertEqual(reapplied.status_code, 200)
+        reverted = self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={"paragraph_index": index, "operation": "revert_original"})
+        self.assertEqual(reverted.status_code, 200, reverted.get_json())
+        self.assertIn(original, reverted.get_json()["text"])
+        download = self.client.get(f"/api/tailoring/drafts/{draft_id}/download")
+        self.assertIn("Revision_History_QA_Resume_Backend_Engineer_Draft.docx", download.headers.get("Content-Disposition", ""))
+
+    def test_preparation_download_names_are_profile_and_job_specific(self):
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Terry Mak", "applicant_name": "Terry Mak"}).get_json()
+        job = self.client.post("/api/jobs", json={"company": "Name QA", "title": "Senior Backend / API Engineer"}).get_json()
+        with app_module.app.app_context():
+            row = {"candidate_profile_id": profile["id"], "job_id": job["id"]}
+            self.assertEqual(app_module.tailoring_resume_filename(row, draft=True), "Terry_Mak_Resume_Senior_Backend_API_Engineer_Draft.docx")
 
     def test_tailoring_apply_defers_word_validation_and_preview_cache_tracks_draft_version(self):
         profile = self.client.post("/api/candidate-profiles", json={"name": "Tailoring Performance QA"}).get_json()

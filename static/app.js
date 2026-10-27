@@ -128,6 +128,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("tailoring-leave-unchanged")?.addEventListener("click", leaveTailoringUnchanged);
   document.getElementById("tailoring-ai-improve")?.addEventListener("click", improveTailoringEdit);
   document.getElementById("tailoring-approve")?.addEventListener("click", approveTailoringDraft);
+  document.getElementById("tailoring-revert-original")?.addEventListener("click", revertTailoringOriginal);
   document.getElementById("refresh-keyword-memory")?.addEventListener("click", loadKeywordMemory);
   document.getElementById("preparation-status-filter")?.addEventListener("change", loadPreparationQueue);
   document.getElementById("generate").addEventListener("click", generateMaterials);
@@ -396,7 +397,11 @@ async function openTailoringDocumentPreview() {
   const frame = document.getElementById("tailoring-preview-pdf");
   const textPreview = document.getElementById("tailoring-preview-text");
   if (!dialog) return;
-  mode.textContent = "Loading the current draft DOCX preview…";
+  if (state.tailoring.previewLoading) return;
+  state.tailoring.previewLoading = true;
+  const previewButton = document.getElementById("tailoring-open-preview");
+  if (previewButton) { previewButton.disabled = true; previewButton.innerHTML = '<span class="spinner" aria-hidden="true"></span> Generating Word preview...'; }
+  mode.innerHTML = '<span class="spinner" aria-hidden="true"></span> Generating Word preview...';
   frame.hidden = true;
   textPreview.hidden = true;
   dialog.showModal();
@@ -415,6 +420,9 @@ async function openTailoringDocumentPreview() {
     textPreview.textContent = "The draft preview could not be loaded.";
     textPreview.hidden = false;
     mode.textContent = error.message;
+  } finally {
+    state.tailoring.previewLoading = false;
+    if (previewButton) { previewButton.disabled = false; previewButton.textContent = "Open draft preview"; }
   }
 }
 
@@ -494,8 +502,15 @@ function renderTailoringEditor() {
   const hasMeaningfulChange = Boolean(bullet) && normalizeClientText(bullet.text) !== normalizeClientText(proposed.value);
   document.getElementById("tailoring-apply")?.toggleAttribute("disabled", !bullet || !hasMeaningfulChange || busy || state.tailoring.operationState === "approved");
   document.getElementById("tailoring-leave-unchanged")?.toggleAttribute("disabled", !bullet || !hasAppliedChange || busy || state.tailoring.operationState === "approved");
+  document.getElementById("tailoring-revert-original")?.toggleAttribute("disabled", !bullet || !hasAppliedChange || busy || state.tailoring.operationState === "approved");
   document.getElementById("tailoring-ai-improve")?.toggleAttribute("disabled", !bullet || busy || state.tailoring.operationState === "approved");
   if (!bullet) { renderTailoringDiff("", ""); return; }
+  const summary = document.getElementById("tailoring-approval-summary");
+  const changes = state.tailoring.data?.draft?.changes || [];
+  if (summary) {
+    summary.hidden = !changes.length;
+    summary.innerHTML = changes.length ? `<strong>Approval review</strong><p class="muted">${changes.length} modified bullet${changes.length === 1 ? "" : "s"}. Review the exact source, proposed wording and current draft version before approval.</p>${changes.map((item) => `<article><small>${escapeHtml(item.source_section || "Résumé")} · paragraph ${Number(item.paragraph_index) + 1}</small><div><del>${escapeHtml(item.original_text || "")}</del></div><div><ins>${escapeHtml(item.proposed_text || "")}</ins></div></article>`).join("")}` : "";
+  }
   renderTailoringDiff(original.value || bullet.text, proposed.value || bullet.text);
   proposed.oninput = () => {
     state.tailoring.operationState = hasAppliedChange ? "applied" : "modified";
@@ -600,8 +615,15 @@ async function leaveTailoringUnchanged() {
   await submitTailoringChange({ paragraph_index: bullet.paragraph_index, operation: "leave_unchanged" });
 }
 
+async function revertTailoringOriginal() {
+  const bullet = state.tailoring.selectedParagraph;
+  if (!bullet || !bullet.applied_change) return;
+  if (["applying", "undoing", "approved"].includes(state.tailoring.operationState)) return;
+  await submitTailoringChange({ paragraph_index: bullet.paragraph_index, operation: "revert_original" });
+}
+
 async function submitTailoringChange(payload) {
-  const undoing = payload.operation === "leave_unchanged";
+  const undoing = ["leave_unchanged", "revert_original"].includes(payload.operation);
   state.tailoring.operationState = undoing ? "undoing" : "applying";
   state.tailoring.statusMessage = undoing ? "Undoing draft edit…" : "Applying edit to the draft…";
   const status = document.getElementById("tailoring-edit-status");
@@ -612,7 +634,7 @@ async function submitTailoringChange(payload) {
     if (!undoing && !(result.applied || []).some((item) => item.applied)) {
       throw new Error((result.skipped || []).map((item) => item.reason).filter(Boolean).join("; ") || "The edit was not applied to the draft.");
     }
-    const message = undoing ? "Edit undone. Original wording restored." : (result.layout?.pending ? "Applied to draft. Not yet approved. Word layout validation will run when you preview or approve." : "Applied to draft. Not yet approved.");
+    const message = undoing ? (payload.operation === "revert_original" ? "Reverted this bullet to the untouched source wording." : "Latest edit undone. The previous saved revision is restored.") : (result.layout?.pending ? "Applied to draft. Not yet approved. Word layout validation will run when you preview or approve." : "Applied to draft. Not yet approved.");
     await openTailoringStudio(state.tailoring.jobId, state.tailoring.profileId, state.tailoring.resumeId, { preserveSelection: true, operationState: undoing ? "idle" : "applied", statusMessage: message });
   } catch (error) {
     state.tailoring.operationState = "error";

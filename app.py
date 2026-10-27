@@ -628,6 +628,7 @@ def create_app() -> Flask:
         draft_path = safe_local_path(text(draft.get("draft_path")))
         if draft_path and draft_path.is_file():
             draft_text = extract_docx_text(draft_path.read_bytes())
+            draft["draft_version"] = tailoring_draft_version(draft_path)
         draft_docx = draft_path if draft_path and draft_path.is_file() else selection["resume_path"]
         current_bullets = tailoring_paragraphs(draft_docx)
         memory_rows = query_db("SELECT * FROM keyword_memory WHERE candidate_profile_id = ? ORDER BY normalized_keyword", [int(selection["profile_row"]["id"])])
@@ -765,13 +766,13 @@ def create_app() -> Flask:
 
     @app.get("/api/tailoring/drafts/<int:draft_id>/download")
     def download_tailoring_draft(draft_id: int) -> Response:
-        row = query_db("SELECT draft_path FROM tailoring_drafts WHERE id = ?", [draft_id], one=True)
+        row = query_db("SELECT * FROM tailoring_drafts WHERE id = ?", [draft_id], one=True)
         if row is None:
             return jsonify({"error": "Tailoring draft was not found"}), 404
         path = safe_local_path(text(row["draft_path"]))
         if path is None or not path.is_file():
             return jsonify({"error": "The copied résumé DOCX is not available until an edit has been applied."}), 404
-        return send_file(path, as_attachment=True, download_name="tailored-resume-draft.docx", mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        return send_file(path, as_attachment=True, download_name=tailoring_resume_filename(row, draft=True), mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
     @app.post("/api/tailoring/drafts/<int:draft_id>/apply")
     def apply_tailoring_draft_change(draft_id: int) -> Response:
@@ -779,10 +780,27 @@ def create_app() -> Flask:
         row = query_db("SELECT * FROM tailoring_drafts WHERE id = ?", [draft_id], one=True)
         if row is None:
             return jsonify({"error": "Tailoring draft was not found"}), 404
+        if text(row["status"]) == "approved":
+            return jsonify({"error": "This résumé draft is approved and locked for its application package. Create a new draft to make further changes."}), 409
         changes = parse_json_array(row["changes_json"])
         operation = text(payload.get("operation")) or "replace"
-        if operation == "leave_unchanged":
-            changes = [item for item in changes if int(item.get("paragraph_index", -1)) != int(payload.get("paragraph_index", -1))]
+        paragraph_index = int(payload.get("paragraph_index", -1))
+        history = parse_json_object(row["revision_history_json"] if "revision_history_json" in row.keys() else "{}")
+        key = str(paragraph_index)
+        revisions = list(history.get(key) or [])
+        if operation in {"leave_unchanged", "revert_original"}:
+            prior = next((item for item in changes if int(item.get("paragraph_index", -1)) == paragraph_index), None)
+            if operation == "leave_unchanged" and revisions:
+                revisions.pop()
+                history[key] = revisions
+                if revisions and prior:
+                    prior["proposed_text"] = text(revisions[-1].get("proposed_text"))
+                    changes = [prior if int(item.get("paragraph_index", -1)) == paragraph_index else item for item in changes]
+                else:
+                    changes = [item for item in changes if int(item.get("paragraph_index", -1)) != paragraph_index]
+            else:
+                history.pop(key, None)
+                changes = [item for item in changes if int(item.get("paragraph_index", -1)) != paragraph_index]
         else:
             try:
                 paragraph_index = int(payload.get("paragraph_index"))
@@ -795,14 +813,22 @@ def create_app() -> Flask:
             if operation not in {"edit", "replace"}:
                 return jsonify({"error": "This first studio release supports edit, replace or leave unchanged"}), 400
             prior = next((item for item in changes if int(item.get("paragraph_index", -1)) == paragraph_index), None)
-            change = {"paragraph_index": paragraph_index, "keyword": normalize_keyword(text(payload.get("keyword")) or text(prior.get("keyword") if prior else "")), "original_text": text(prior.get("original_text")) if prior else original, "proposed_text": proposed, "operation": operation}
+            source_section = "Résumé"
+            source_path = safe_local_path(text(row["source_path"]))
+            if source_path and source_path.is_file():
+                source_bullet = next((item for item in tailoring_paragraphs(source_path) if int(item["paragraph_index"]) == paragraph_index), None)
+                source_section = text(source_bullet.get("section")) if source_bullet else source_section
+            change = {"paragraph_index": paragraph_index, "source_section": source_section, "keyword": normalize_keyword(text(payload.get("keyword")) or text(prior.get("keyword") if prior else "")), "original_text": text(prior.get("original_text")) if prior else original, "proposed_text": proposed, "operation": operation}
+            if not revisions or text(revisions[-1].get("proposed_text")) != proposed:
+                revisions.append({"proposed_text": proposed, "keyword": change["keyword"], "saved_at": datetime.now().isoformat(timespec="seconds")})
+            history[key] = revisions
             changes = [item for item in changes if int(item.get("paragraph_index", -1)) != paragraph_index]
             changes.append(change)
         try:
-            result = rebuild_tailoring_draft(draft_id, changes, draft_row=row)
+            result = rebuild_tailoring_draft(draft_id, changes, revision_history=history, draft_row=row)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 409
-        return jsonify({"draft_id": draft_id, "changes": changes, **result})
+        return jsonify({"draft_id": draft_id, "changes": changes, "revision_history": history, **result})
 
     @app.post("/api/tailoring/drafts/<int:draft_id>/approve")
     def approve_tailoring_draft(draft_id: int) -> Response:
@@ -892,7 +918,8 @@ def create_app() -> Flask:
         changes = [item for item in changes if int(item.get("paragraph_index", -1)) != paragraph_index]
         changes.append(change)
         try:
-            result = rebuild_tailoring_draft(draft_id, changes, draft_row=row)
+            history = parse_json_object(row["revision_history_json"] if "revision_history_json" in row.keys() else "{}")
+            result = rebuild_tailoring_draft(draft_id, changes, revision_history=history, draft_row=row)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 409
         return jsonify({"draft_id": draft_id, "changes": changes, "memory_applied": True, **result})
@@ -1753,7 +1780,13 @@ def create_app() -> Flask:
         path = safe_preparation_artifact_path(item[field])
         if path is None or not path.is_file():
             return jsonify({"error": "The generated document for this package is unavailable"}), 404
-        return send_file(path, as_attachment=True, download_name=secure_filename(path.name) or "document.docx", mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        profile = query_db("SELECT applicant_name, name FROM candidate_profiles WHERE id = ?", [item["candidate_profile_id"]], one=True)
+        job = query_db("SELECT title FROM jobs WHERE id = ?", [item["job_id"]], one=True)
+        applicant = text(profile["applicant_name"] if profile and text(profile["applicant_name"]) else profile["name"] if profile else "Applicant")
+        role = text(job["title"] if job else "Application")
+        document_label = "Resume" if kind == "resume" else "Cover_Letter"
+        download_name = f"{safe_filename(applicant)}_{document_label}_{safe_filename(role)}.docx"
+        return send_file(path, as_attachment=True, download_name=download_name, mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
     @app.get("/api/discovery/runs")
     def discovery_runs() -> Response:
@@ -3166,10 +3199,22 @@ def tailoring_draft_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:
         return {}
     item = dict(row)
     item["changes"] = parse_json_array(item.get("changes_json"))
+    item["revision_history"] = parse_json_object(item.get("revision_history_json"))
     item["layout"] = parse_json_object(item.get("layout_json"))
     item.pop("changes_json", None)
+    item.pop("revision_history_json", None)
     item.pop("layout_json", None)
     return item
+
+
+def tailoring_resume_filename(row: sqlite3.Row | dict[str, Any], *, draft: bool = False) -> str:
+    """Build a readable user-facing name without exposing internal IDs."""
+    profile = query_db("SELECT applicant_name, name FROM candidate_profiles WHERE id = ?", [row["candidate_profile_id"]], one=True)
+    job = query_db("SELECT title FROM jobs WHERE id = ?", [row["job_id"]], one=True)
+    applicant = text(profile["applicant_name"] if profile and text(profile["applicant_name"]) else profile["name"] if profile else "Applicant")
+    role = text(job["title"] if job else "Resume")
+    suffix = "_Draft" if draft else ""
+    return f"{safe_filename(applicant)}_Resume_{safe_filename(role)}{suffix}.docx"
 
 
 def tailoring_draft_path(draft_id: int) -> Path:
@@ -3221,7 +3266,7 @@ def validate_tailoring_draft_layout(draft_id: int, expected_version: str | None 
     return layout
 
 
-def rebuild_tailoring_draft(draft_id: int, changes: list[dict[str, Any]], *, draft_row: sqlite3.Row | None = None) -> dict[str, Any]:
+def rebuild_tailoring_draft(draft_id: int, changes: list[dict[str, Any]], *, revision_history: dict[str, Any] | None = None, draft_row: sqlite3.Row | None = None) -> dict[str, Any]:
     started = time.perf_counter()
     row = draft_row or query_db("SELECT * FROM tailoring_drafts WHERE id = ?", [draft_id], one=True)
     if row is None:
@@ -3265,7 +3310,16 @@ def rebuild_tailoring_draft(draft_id: int, changes: list[dict[str, Any]], *, dra
     extraction_ms = round((time.perf_counter() - extraction_started) * 1000, 2)
     db_started = time.perf_counter()
     db = get_db()
-    db.execute("UPDATE tailoring_drafts SET draft_path = ?, changes_json = ?, layout_json = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [str(output), dumps_json(changes), dumps_json(layout), "draft", draft_id])
+    # Any edit, stepwise undo, or explicit revert makes the old Word/PDF
+    # preview stale. Remove it eagerly as well as version-checking on read.
+    preview_pdf = DATA_DIR / "tailoring_drafts" / str(draft_id) / "preview.pdf"
+    preview_meta = preview_pdf.with_suffix(".meta.json")
+    for stale_path in (preview_pdf, preview_meta):
+        try:
+            stale_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    db.execute("UPDATE tailoring_drafts SET draft_path = ?, changes_json = ?, revision_history_json = ?, layout_json = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [str(output), dumps_json(changes), dumps_json(revision_history or {}), dumps_json(layout), "draft", draft_id])
     db.commit()
     sqlite_write_ms = round((time.perf_counter() - db_started) * 1000, 2)
     timings = {
@@ -5564,6 +5618,7 @@ def _cover_letter_stale_visible_text(content: str) -> bool:
 def safe_filename(value: str) -> str:
     cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", value)
     cleaned = re.sub(r"\s+", "_", cleaned).strip("._ ")
+    cleaned = re.sub(r"_+", "_", cleaned)
     return (cleaned or "document")[:160]
 
 
