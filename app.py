@@ -915,10 +915,15 @@ def create_app() -> Flask:
         changes = parse_json_array(row["changes_json"])
         prior = next((item for item in changes if int(item.get("paragraph_index", -1)) == paragraph_index), None)
         change = {"paragraph_index": paragraph_index, "keyword": keyword, "original_text": text(prior.get("original_text")) if prior else current, "proposed_text": text(memory["approved_replacement"]), "operation": "edit"}
+        history = parse_json_object(row["revision_history_json"] if "revision_history_json" in row.keys() else "{}")
+        history_key = str(paragraph_index)
+        revisions = list(history.get(history_key) or [])
+        if not revisions or text(revisions[-1].get("proposed_text")) != change["proposed_text"]:
+            revisions.append({"proposed_text": change["proposed_text"], "keyword": keyword, "saved_at": datetime.now().isoformat(timespec="seconds")})
+        history[history_key] = revisions
         changes = [item for item in changes if int(item.get("paragraph_index", -1)) != paragraph_index]
         changes.append(change)
         try:
-            history = parse_json_object(row["revision_history_json"] if "revision_history_json" in row.keys() else "{}")
             result = rebuild_tailoring_draft(draft_id, changes, revision_history=history, draft_row=row)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 409
