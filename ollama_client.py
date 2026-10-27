@@ -160,26 +160,41 @@ def request_json_completion(config: OllamaConfig, prompt: str, system: str = "")
             "num_predict": config.max_output_tokens,
         },
     }
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=config.timeout_seconds) as response:
-            raw = response.read().decode("utf-8")
-    except Exception as exc:
-        return {"ok": False, "error": str(exc), "data": {}}
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return {"ok": False, "error": "Ollama returned invalid JSON.", "data": {}}
-    text = _text(parsed.get("response")) if isinstance(parsed, dict) else ""
-    if not text:
-        return {"ok": False, "error": "Ollama returned an empty response.", "data": {}}
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        return {"ok": False, "error": "Ollama response was not valid JSON.", "data": {}, "raw": text}
-    return {"ok": True, "error": "", "data": data, "raw": text}
+    last_error: dict[str, Any] = {"ok": False, "error": "Ollama did not return a usable JSON response.", "data": {}}
+    for attempt in range(2):
+        attempt_payload = dict(payload)
+        if attempt:
+            attempt_payload["prompt"] = prompt + "\nReturn only one valid JSON object. Do not use markdown fences or commentary."
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(attempt_payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=config.timeout_seconds) as response:
+                raw = response.read().decode("utf-8")
+        except Exception as exc:
+            return {"ok": False, "error": str(exc), "data": {}}
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return {"ok": False, "error": "Ollama returned invalid JSON.", "data": {}}
+        response_text = _text(parsed.get("response")) if isinstance(parsed, dict) else ""
+        if not response_text:
+            return {"ok": False, "error": "Ollama returned an empty response.", "data": {}}
+        candidate = response_text.strip()
+        if candidate.startswith("```"):
+            candidate = candidate.strip("`").split("\n", 1)[-1].strip()
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            start, end = candidate.find("{"), candidate.rfind("}")
+            try:
+                data = json.loads(candidate[start:end + 1]) if start >= 0 and end > start else None
+            except json.JSONDecodeError:
+                data = None
+        if isinstance(data, dict):
+            return {"ok": True, "error": "", "data": data, "raw": response_text, "attempts": attempt + 1}
+        last_error = {"ok": False, "error": "Ollama response was not valid JSON.", "data": {}, "raw": response_text, "attempts": attempt + 1}
+    return last_error

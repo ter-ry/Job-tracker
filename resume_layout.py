@@ -39,6 +39,23 @@ finally {
 }
 '''
 
+_EXPORT_POWERSHELL = r'''
+$ErrorActionPreference = "Stop"
+$word = $null
+$document = $null
+try {
+  $word = New-Object -ComObject Word.Application
+  $word.Visible = $false
+  $document = $word.Documents.Open($env:JOB_TRACKER_LAYOUT_PATH)
+  $document.ExportAsFixedFormat($env:JOB_TRACKER_PDF_PATH, 17)
+  [pscustomobject]@{ available = $true; path = $env:JOB_TRACKER_PDF_PATH } | ConvertTo-Json -Compress
+}
+finally {
+  if ($document -ne $null) { $document.Close($false) }
+  if ($word -ne $null) { $word.Quit() }
+}
+'''
+
 
 def measure_docx_layout(path: str | Path) -> dict[str, Any]:
     """Measure rendered paragraphs/pages through Word COM when available."""
@@ -100,3 +117,35 @@ def compare_docx_layout(original: str | Path, candidate: str | Path) -> dict[str
         "original": original_measurement,
         "candidate": candidate_measurement,
     }
+
+
+def export_docx_to_pdf(path: str | Path, output: str | Path) -> dict[str, Any]:
+    """Export the exact DOCX through Word for an authoritative browser preview."""
+    if os.name != "nt":
+        return {"available": False, "reason": "Microsoft Word PDF export is only available on Windows."}
+    source = str(Path(path).resolve())
+    target = Path(output).resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        environment = os.environ.copy()
+        environment["JOB_TRACKER_LAYOUT_PATH"] = source
+        environment["JOB_TRACKER_PDF_PATH"] = str(target)
+        completed = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", _EXPORT_POWERSHELL],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=90,
+            check=False,
+            env=environment,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"available": False, "reason": str(exc)}
+    if completed.returncode != 0 or not target.is_file() or target.stat().st_size == 0:
+        return {"available": False, "reason": completed.stderr.strip() or "Word PDF export failed."}
+    try:
+        result = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        result = {"available": True, "path": str(target)}
+    return result if isinstance(result, dict) else {"available": True, "path": str(target)}

@@ -319,6 +319,18 @@ class JobAssistantTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "Ollama returned an empty response.")
 
+    def test_ollama_json_completion_retries_bounded_malformed_output(self):
+        responses = iter([
+            FakeUrlopenResponse({"response": "Here is the answer: not JSON"}),
+            FakeUrlopenResponse({"response": "```json\n{\"proposed_bullet\": \"Built Python services.\"}\n```"}),
+        ])
+        config = ollama_client.OllamaConfig(True, "http://127.0.0.1:11434", "qwen3:4b", 1, 120, 24000)
+        with patch.object(ollama_client.urllib.request, "urlopen", side_effect=lambda request, timeout: next(responses)):
+            result = ollama_client.request_json_completion(config, "Return JSON.")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["attempts"], 2)
+        self.assertEqual(result["data"]["proposed_bullet"], "Built Python services.")
+
     def test_job_create_scores_and_dashboard(self):
         self.seed_profile_for_documents(with_template=True)
         response = self.client.post(
@@ -410,6 +422,18 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn('candidate-profile-form-error', html)
         self.assertIn('.candidate-profile-manager [hidden]', Path('static/styles.css').read_text(encoding='utf-8'))
         self.assertIn('refreshCandidateProfiles', Path('static/app.js').read_text(encoding='utf-8'))
+        self.assertIn('openTailoringStudio', Path('static/app.js').read_text(encoding='utf-8'))
+        self.assertIn('tailoring-studio', html)
+        self.assertIn('keyword-memory-list', html)
+        self.assertIn('tailoring-requirement-search', html)
+        self.assertIn('tailoring-requirement-detail', html)
+        self.assertIn('tailoring-editor', html)
+        self.assertIn('tailoring-diff', html)
+        self.assertIn('tailoring-open-preview', html)
+        self.assertIn('tailoring-suggested-bullet', Path('static/app.js').read_text(encoding='utf-8'))
+        self.assertIn('tailoring-requirement-filters', html)
+        self.assertIn('buildTailoringRequirementGroups', Path('static/app.js').read_text(encoding='utf-8'))
+        self.assertIn('Related résumé evidence for review', Path('static/app.js').read_text(encoding='utf-8'))
 
     def test_candidate_profile_creation_is_committed_and_returned_by_list_endpoint(self):
         response = self.client.post(
@@ -424,11 +448,565 @@ class JobAssistantTest(unittest.TestCase):
         saved = next(profile for profile in profiles.get_json() if profile["id"] == profile_id)
         self.assertEqual(saved["name"], "Software Engineering")
         self.assertEqual(saved["identity_mode"], "shared")
+
+    def test_tailoring_studio_analyzes_selected_resume_and_applies_copy_edit(self):
+        self.client.post("/api/profile", json={"name": "Terry Mak", "email": "terry@example.com"})
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Software Engineering", "identity_mode": "shared"}).get_json()
+        document = Document()
+        document.add_heading("Terry Mak", level=1)
+        document.add_paragraph("Experience")
+        bullet = document.add_paragraph("Built Python automation for internal reporting.", style="List Bullet")
+        bullet.runs[0].font.bold = True
+        document.add_paragraph("Skills")
+        document.add_paragraph("Python, SQL, Flask")
+        buffer = io.BytesIO()
+        document.save(buffer)
+        upload = self.client.post(
+            f"/api/candidate-profiles/{profile['id']}/resumes/upload",
+            data={"file": (io.BytesIO(buffer.getvalue()), "base.docx"), "is_default": "true"},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(upload.status_code, 201)
+        resume_id = upload.get_json()["id"]
+        job = self.client.post("/api/jobs", json={"company": "Example Co", "title": "Backend Developer", "job_description": "Python and REST APIs required. Kafka preferred."}).get_json()
+        workspace = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume_id}")
+        self.assertEqual(workspace.status_code, 200, workspace.get_json())
+        body = workspace.get_json()
+        self.assertGreaterEqual(body["keywords"]["matched_count"], 1)
+        editable = next(item for item in body["bullets"] if item["editable"])
+        result = self.client.post(f"/api/tailoring/drafts/{body['draft']['id']}/apply", json={"paragraph_index": editable["paragraph_index"], "original_text": editable["text"], "proposed_text": "Built Python and REST API automation for internal reporting.", "operation": "edit"})
+        self.assertEqual(result.status_code, 200, result.get_json())
+        self.assertIn("REST API", result.get_json()["text"])
+        draft_download = self.client.get(f"/api/tailoring/drafts/{body['draft']['id']}/download")
+        self.assertEqual(draft_download.status_code, 200)
+        self.assertEqual(draft_download.mimetype, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        second = self.client.post(f"/api/tailoring/drafts/{body['draft']['id']}/apply", json={"paragraph_index": editable["paragraph_index"], "original_text": "Built Python and REST API automation for internal reporting.", "proposed_text": "Built Python REST API automation for internal reporting.", "operation": "edit"})
+        self.assertEqual(second.status_code, 200, second.get_json())
+        self.assertIn("Built Python REST API automation", second.get_json()["text"])
+        refreshed = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume_id}").get_json()
+        self.assertGreaterEqual(refreshed["keywords"]["matched_count"], body["keywords"]["matched_count"])
+        self.assertNotIn("REST API", app_module.extract_docx_text(Path(upload.get_json()["path"]).read_bytes()))
+
+    def test_tailoring_apply_and_undo_rebuild_only_selected_draft_edit(self):
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Tailoring Undo QA"}).get_json()
+        document = Document()
+        document.add_paragraph("Taylor Example")
+        document.add_paragraph("Experience")
+        first = document.add_paragraph("Built Python services for internal reporting.", style="List Bullet")
+        second = document.add_paragraph("Created SQL validation workflows for operations.", style="List Bullet")
+        buffer = io.BytesIO(); document.save(buffer)
+        resume = self.client.post(
+            f"/api/candidate-profiles/{profile['id']}/resumes/upload",
+            data={"file": (io.BytesIO(buffer.getvalue()), "undo-qa.docx"), "is_default": "true"},
+            content_type="multipart/form-data",
+        ).get_json()
+        job = self.client.post("/api/jobs", json={"company": "Undo QA", "title": "Backend Engineer", "job_description": "Python, SQL and REST APIs required."}).get_json()
+        workspace = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        bullets = [item for item in workspace["bullets"] if item["editable"]]
+        self.assertGreaterEqual(len(bullets), 2)
+        draft_id = workspace["draft"]["id"]
+        for bullet, replacement in zip(bullets[:2], ["Built Python REST services for internal reporting.", "Created SQL validation and audit workflows for operations."]):
+            applied = self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={
+                "paragraph_index": bullet["paragraph_index"], "original_text": bullet["text"],
+                "proposed_text": replacement, "operation": "edit",
+            })
+            self.assertEqual(applied.status_code, 200, applied.get_json())
+        before_undo = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        self.assertEqual(len(before_undo["draft"]["changes"]), 2)
+        undone = self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={
+            "paragraph_index": bullets[0]["paragraph_index"], "operation": "leave_unchanged",
+        })
+        self.assertEqual(undone.status_code, 200, undone.get_json())
+        after_undo = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        self.assertEqual([change["paragraph_index"] for change in after_undo["draft"]["changes"]], [bullets[1]["paragraph_index"]])
+        self.assertIn("Built Python services for internal reporting.", after_undo["preview"]["text"])
+        self.assertIn("Created SQL validation and audit workflows for operations.", after_undo["preview"]["text"])
+        self.assertIn("Applied to draft", Path("static/app.js").read_text(encoding="utf-8"))
+        self.assertIn("Latest edit undone. The previous saved revision is restored.", Path("static/app.js").read_text(encoding="utf-8"))
+        self.assertIn('toggleAttribute("disabled"', Path("static/app.js").read_text(encoding="utf-8"))
+
+    def test_tailoring_applies_skills_and_experience_atomically_and_blocks_phantom_approval_changes(self):
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Section Edit QA"}).get_json()
+        document = Document()
+        document.add_paragraph("Taylor Example")
+        document.add_paragraph("Experience")
+        experience = document.add_paragraph("Built Python services for internal reporting.", style="List Bullet")
+        document.add_paragraph("Skills")
+        skills = document.add_paragraph("Technologies: React, Flask, Node.js, Express, REST APIs, PostgreSQL")
+        buffer = io.BytesIO(); document.save(buffer)
+        source_bytes = buffer.getvalue()
+        resume = self.client.post(
+            f"/api/candidate-profiles/{profile['id']}/resumes/upload",
+            data={"file": (io.BytesIO(source_bytes), "section-edit-qa.docx"), "is_default": "true"},
+            content_type="multipart/form-data",
+        ).get_json()
+        job = self.client.post("/api/jobs", json={"company": "Section Edit Co", "title": "Backend Engineer", "job_description": "Python, REST APIs and PostgreSQL required."}).get_json()
+        workspace = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        experience_item = next(item for item in workspace["bullets"] if item["text"] == experience.text)
+        skills_item = next(item for item in workspace["bullets"] if item["text"] == skills.text)
+        self.assertTrue(skills_item["editable"])
+
+        first = self.client.post(f"/api/tailoring/drafts/{workspace['draft']['id']}/apply", json={
+            "paragraph_index": experience_item["paragraph_index"], "original_text": experience.text,
+            "proposed_text": "Built Python REST services for internal reporting.", "operation": "edit",
+        })
+        self.assertEqual(first.status_code, 200, first.get_json())
+        second = self.client.post(f"/api/tailoring/drafts/{workspace['draft']['id']}/apply", json={
+            "paragraph_index": skills_item["paragraph_index"], "original_text": skills.text,
+            "proposed_text": skills.text + ", etc", "operation": "edit",
+        })
+        self.assertEqual(second.status_code, 200, second.get_json())
+        draft_id = workspace["draft"]["id"]
+        draft = self.client.get(f"/api/tailoring/drafts/{draft_id}/download")
+        generated = Document(io.BytesIO(draft.data))
+        generated_text = "\n".join(paragraph.text for paragraph in generated.paragraphs)
+        self.assertIn("Built Python REST services for internal reporting.", generated_text)
+        self.assertIn("Technologies: React, Flask, Node.js, Express, REST APIs, PostgreSQL, etc", generated_text)
+        self.assertEqual(len(self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()["draft"]["changes"]), 2)
+        undone_skill = self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={"paragraph_index": skills_item["paragraph_index"], "operation": "leave_unchanged"})
+        self.assertEqual(undone_skill.status_code, 200, undone_skill.get_json())
+        self.assertIn(skills.text, undone_skill.get_json()["text"])
+        reapplied_skill = self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={
+            "paragraph_index": skills_item["paragraph_index"], "original_text": skills.text,
+            "proposed_text": skills.text + ", etc", "operation": "edit",
+        })
+        self.assertEqual(reapplied_skill.status_code, 200, reapplied_skill.get_json())
+        reverted_skill = self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={"paragraph_index": skills_item["paragraph_index"], "operation": "revert_original"})
+        self.assertEqual(reverted_skill.status_code, 200, reverted_skill.get_json())
+        self.assertIn(skills.text, reverted_skill.get_json()["text"])
+        reapplied_for_review = self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={
+            "paragraph_index": skills_item["paragraph_index"], "original_text": skills.text,
+            "proposed_text": skills.text + ", etc", "operation": "edit",
+        })
+        self.assertEqual(reapplied_for_review.status_code, 200, reapplied_for_review.get_json())
+
+        protected = self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={
+            "paragraph_index": 1, "original_text": "Experience", "proposed_text": "Education", "operation": "edit",
+        })
+        self.assertEqual(protected.status_code, 409)
+        self.assertIn("not saved", protected.get_json()["error"])
+        after_rejection = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        self.assertEqual(len(after_rejection["draft"]["changes"]), 2)
+        self.assertIn("etc", after_rejection["preview"]["text"])
+
+        with app_module.app.app_context():
+            app_module.get_db().execute("INSERT INTO application_preparation_queue(job_id, status, candidate_profile_id, resume_id) VALUES (?, 'queued', ?, ?)", [job["id"], profile["id"], resume["id"]])
+            app_module.get_db().execute("UPDATE tailoring_drafts SET changes_json = ? WHERE id = ?", [json.dumps(after_rejection["draft"]["changes"] + [{"paragraph_index": skills_item["paragraph_index"], "original_text": skills.text, "proposed_text": "Technologies: fabricated", "keyword": "skills"}]), draft_id])
+            app_module.get_db().commit()
+        with patch.object(app_module, "validate_tailoring_draft_layout", return_value={"available": True, "verified": True, "original_pages": 1, "candidate_pages": 1, "line_mismatches": []}):
+            approval = self.client.post(f"/api/tailoring/drafts/{draft_id}/approve")
+        self.assertEqual(approval.status_code, 409)
+        self.assertIn("does not contain its saved proposed wording", approval.get_json()["error"])
+        frontend = Path("static/app.js").read_text(encoding="utf-8")
+        self.assertIn('"Failed to undo" : "Failed to apply"', frontend)
+
+    def test_tailoring_protected_metadata_is_not_offered_as_editable(self):
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Protected Metadata QA"}).get_json()
+        document = Document(); document.add_heading("Taylor Example", level=1); document.add_paragraph("Experience")
+        document.add_paragraph("Built Python services for reporting.", style="List Bullet"); document.add_paragraph("Skills")
+        document.add_paragraph("Python, SQL")
+        buffer = io.BytesIO(); document.save(buffer)
+        resume = self.client.post(f"/api/candidate-profiles/{profile['id']}/resumes/upload", data={"file": (io.BytesIO(buffer.getvalue()), "protected.docx"), "is_default": "true"}, content_type="multipart/form-data").get_json()
+        job = self.client.post("/api/jobs", json={"company": "Protected Co", "title": "Engineer", "job_description": "Python required."}).get_json()
+        workspace = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        headings = [item for item in workspace["bullets"] if item["text"] in {"Taylor Example", "Experience", "Skills"}]
+        self.assertTrue(headings)
+        self.assertTrue(all(not item["editable"] for item in headings))
+
+    def test_tailoring_revision_history_supports_stepwise_undo_and_revert(self):
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Revision History QA"}).get_json()
+        document = Document(); document.add_paragraph("Taylor Example"); document.add_paragraph("Experience")
+        bullet = document.add_paragraph("Built Python services for reporting.", style="List Bullet")
+        buffer = io.BytesIO(); document.save(buffer)
+        resume = self.client.post(
+            f"/api/candidate-profiles/{profile['id']}/resumes/upload",
+            data={"file": (io.BytesIO(buffer.getvalue()), "revision-qa.docx"), "is_default": "true"},
+            content_type="multipart/form-data",
+        ).get_json()
+        job = self.client.post("/api/jobs", json={"company": "Revision QA", "title": "Backend Engineer", "job_description": "Python required."}).get_json()
+        workspace = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        draft_id = workspace["draft"]["id"]
+        index = next(item["paragraph_index"] for item in workspace["bullets"] if item["editable"])
+        original = "Built Python services for reporting."
+        edit_a = "Built Python backend services for reporting."
+        edit_b = "Built Python backend services and APIs for reporting."
+        self.assertEqual(self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={"paragraph_index": index, "original_text": original, "proposed_text": edit_a, "operation": "edit"}).status_code, 200)
+        self.assertEqual(self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={"paragraph_index": index, "original_text": edit_a, "proposed_text": edit_b, "operation": "edit"}).status_code, 200)
+        undone = self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={"paragraph_index": index, "operation": "leave_unchanged"})
+        self.assertEqual(undone.status_code, 200, undone.get_json())
+        self.assertIn(edit_a, undone.get_json()["text"])
+        refreshed = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        self.assertEqual(refreshed["draft"]["changes"][0]["proposed_text"], edit_a)
+        undone_again = self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={"paragraph_index": index, "operation": "leave_unchanged"})
+        self.assertEqual(undone_again.status_code, 200, undone_again.get_json())
+        self.assertIn(original, undone_again.get_json()["text"])
+        reapplied = self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={"paragraph_index": index, "original_text": original, "proposed_text": edit_a, "operation": "edit"})
+        self.assertEqual(reapplied.status_code, 200)
+        reverted = self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={"paragraph_index": index, "operation": "revert_original"})
+        self.assertEqual(reverted.status_code, 200, reverted.get_json())
+        self.assertIn(original, reverted.get_json()["text"])
+        download = self.client.get(f"/api/tailoring/drafts/{draft_id}/download")
+        self.assertIn("Revision_History_QA_Resume_Backend_Engineer_Draft.docx", download.headers.get("Content-Disposition", ""))
+
+    def test_preparation_download_names_are_profile_and_job_specific(self):
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Terry Mak", "applicant_name": "Terry Mak"}).get_json()
+        job = self.client.post("/api/jobs", json={"company": "Name QA", "title": "Senior Backend / API Engineer"}).get_json()
+        with app_module.app.app_context():
+            row = {"candidate_profile_id": profile["id"], "job_id": job["id"]}
+            self.assertEqual(app_module.tailoring_resume_filename(row, draft=True), "Terry_Mak_Resume_Senior_Backend_API_Engineer_Draft.docx")
+
+    def test_tailoring_apply_defers_word_validation_and_preview_cache_tracks_draft_version(self):
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Tailoring Performance QA"}).get_json()
+        document = Document(); document.add_paragraph("Taylor Example"); document.add_paragraph("Experience")
+        document.add_paragraph("Built Python services for internal reporting.", style="List Bullet")
+        document.add_paragraph("Created SQL validation workflows for operations.", style="List Bullet")
+        buffer = io.BytesIO(); document.save(buffer)
+        resume = self.client.post(
+            f"/api/candidate-profiles/{profile['id']}/resumes/upload",
+            data={"file": (io.BytesIO(buffer.getvalue()), "performance-qa.docx"), "is_default": "true"},
+            content_type="multipart/form-data",
+        ).get_json()
+        job = self.client.post("/api/jobs", json={"company": "Performance QA", "title": "Backend Engineer", "job_description": "Python and SQL required."}).get_json()
+        workspace = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        bullet = next(item for item in workspace["bullets"] if item["editable"])
+        draft_id = workspace["draft"]["id"]
+        with patch.object(app_module, "compare_docx_layout") as layout_mock:
+            applied = self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={
+                "paragraph_index": bullet["paragraph_index"], "original_text": bullet["text"],
+                "proposed_text": "Built Python REST services for internal reporting.", "operation": "edit",
+            })
+        self.assertEqual(applied.status_code, 200, applied.get_json())
+        self.assertFalse(layout_mock.called)
+        self.assertTrue(applied.get_json()["layout"]["pending"])
+        self.assertIn("word_layout_validation", applied.get_json()["timings_ms"])
+
+        layout = {"available": True, "verified": True, "original_pages": 1, "candidate_pages": 1, "line_mismatches": []}
+        def fake_export(_source, output):
+            Path(output).write_bytes(b"%PDF-1.7 performance QA")
+            return {"available": True, "path": str(output)}
+
+        with patch.object(app_module, "compare_docx_layout", return_value=layout) as compare_mock:
+            with patch.object(app_module, "export_docx_to_pdf", side_effect=fake_export) as export_mock:
+                first_preview = self.client.get(f"/api/tailoring/drafts/{draft_id}/preview").get_json()
+                second_preview = self.client.get(f"/api/tailoring/drafts/{draft_id}/preview").get_json()
+        self.assertTrue(first_preview["pdf_available"])
+        self.assertFalse(first_preview["cached"])
+        self.assertTrue(second_preview["cached"])
+        self.assertEqual(compare_mock.call_count, 1)
+        self.assertEqual(export_mock.call_count, 1)
+        self.assertGreaterEqual(first_preview["timings_ms"]["preview_total"], 0)
+
+        with patch.object(app_module, "compare_docx_layout", return_value=layout) as compare_after_change:
+            changed = self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={
+                "paragraph_index": bullet["paragraph_index"], "original_text": "Built Python REST services for internal reporting.",
+                "proposed_text": "Built Python and SQL REST services for internal reporting.", "operation": "edit",
+            })
+        self.assertEqual(changed.status_code, 200, changed.get_json())
+        self.assertFalse(compare_after_change.called)
+        with patch.object(app_module, "compare_docx_layout", return_value=layout) as compare_after_version:
+            with patch.object(app_module, "export_docx_to_pdf", side_effect=fake_export) as export_after_version:
+                refreshed_preview = self.client.get(f"/api/tailoring/drafts/{draft_id}/preview").get_json()
+        self.assertTrue(refreshed_preview["pdf_available"])
+        self.assertFalse(refreshed_preview["cached"])
+        self.assertEqual(compare_after_version.call_count, 1)
+        self.assertEqual(export_after_version.call_count, 1)
+
+    def test_tailoring_workspace_reports_missing_description_then_uses_persisted_description(self):
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Lakeview QA"}).get_json()
+        document = Document(); document.add_paragraph("Alex Rivera"); document.add_paragraph("Built Python services.", style="List Bullet")
+        buffer = io.BytesIO(); document.save(buffer)
+        resume = self.client.post(
+            f"/api/candidate-profiles/{profile['id']}/resumes/upload",
+            data={"file": (io.BytesIO(buffer.getvalue()), "lakeview.docx"), "is_default": "true"},
+            content_type="multipart/form-data",
+        ).get_json()
+        job = self.client.post("/api/jobs", json={"company": "Lakeview Loan Servicing", "title": "Backend Engineer"}).get_json()
+        empty = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        self.assertFalse(empty["keywords"]["available"])
+        self.assertEqual(empty["keywords"]["total"], 0)
+        self.assertIn("complete job description", empty["keywords"]["unavailable_reason"])
+        updated = self.client.put(f"/api/jobs/{job['id']}", json={
+            "paste_description": "Requirements:\n3 to 5+ years of production backend experience. Advanced distributed systems. Python and PostgreSQL. Preferred:\nKafka and Kubernetes.",
+            "required_skills": "3 to 5+ years of production backend experience, advanced distributed systems, Python, PostgreSQL",
+            "preferred_skills": "Kafka, Kubernetes",
+        })
+        self.assertEqual(updated.status_code, 200)
+        self.assertIn("production backend experience", updated.get_json()["job_description"])
+        complete = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        self.assertTrue(complete["keywords"]["available"])
+        self.assertGreater(complete["keywords"]["total"], 1)
+        self.assertTrue(any(item["normalized"] == "messaging and queue platforms" for item in complete["keywords"]["missing"]))
+        override = self.client.post(f"/api/tailoring/{job['id']}/requirement-overrides", json={"normalized_requirement": "messaging and queue platforms", "override": "not_a_requirement"})
+        self.assertEqual(override.status_code, 200)
+        adjusted = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()["keywords"]
+        self.assertEqual(adjusted["excluded_count"], 1)
+        self.assertEqual(adjusted["adjusted_total"], adjusted["total"] - 1)
+        self.assertTrue(any(item.get("excluded_from_adjusted_coverage") for item in adjusted["missing"]))
+        restored = self.client.delete(f"/api/tailoring/{job['id']}/requirement-overrides/messaging%20and%20queue%20platforms")
+        self.assertEqual(restored.status_code, 200)
+
+    def test_tailoring_ai_structured_proposal_is_extracted_without_dictionary_text(self):
+        self.client.post("/api/profile", json={"name": "Terry Mak", "email": "terry@example.com", "resume_text": "Built Python automation."})
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Software Engineering", "identity_mode": "shared"}).get_json()
+        document = Document()
+        document.add_paragraph("Built Python automation for reporting.", style="List Bullet")
+        buffer = io.BytesIO(); document.save(buffer)
+        resume = self.client.post(f"/api/candidate-profiles/{profile['id']}/resumes/upload", data={"file": (io.BytesIO(buffer.getvalue()), "base.docx"), "is_default": "true"}, content_type="multipart/form-data").get_json()
+        job = self.client.post("/api/jobs", json={"company": "Example", "title": "Developer", "job_description": "Python automation"}).get_json()
+        workspace = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        with patch.object(app_module, "request_json_completion", return_value={"ok": True, "data": {"proposed_bullet": "Built Python automation for reporting workflows."}}):
+            with patch.object(app_module.OllamaConfig, "from_mapping", return_value=app_module.OllamaConfig(True, "http://ollama", "qwen3:4b", 10, 100, 1000)):
+                response = self.client.post(f"/api/tailoring/drafts/{workspace['draft']['id']}/improve", json={"original_text": "Built Python automation for reporting."})
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["proposed_text"], "Built Python automation for reporting workflows.")
+        self.assertNotIn("proposed_bullet", response.get_json()["proposed_text"])
+
+    def test_tailoring_ai_improve_numeric_safety_retry_and_successful_diff(self):
+        self.client.post("/api/profile", json={"name": "Terry Mak", "email": "terry@example.com", "resume_text": "Built Flowtally services."})
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Software Engineering", "identity_mode": "shared"}).get_json()
+        document = Document()
+        document.add_paragraph("Built Flowtally services.", style="List Bullet")
+        buffer = io.BytesIO(); document.save(buffer)
+        resume = self.client.post(
+            f"/api/candidate-profiles/{profile['id']}/resumes/upload",
+            data={"file": (io.BytesIO(buffer.getvalue()), "base.docx"), "is_default": "true"},
+            content_type="multipart/form-data",
+        ).get_json()
+        job = self.client.post("/api/jobs", json={"company": "Example", "title": "Developer", "job_description": "Python and REST APIs"}).get_json()
+        workspace = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        config = app_module.OllamaConfig(True, "http://ollama", "qwen3:4b", 10, 100, 1000)
+        with patch.object(app_module, "compare_docx_layout", return_value={"available": False, "verified": False, "reason": "Microsoft Word unavailable"}):
+            with patch.object(app_module, "export_docx_to_pdf", return_value={"available": False, "reason": "Microsoft Word unavailable"}):
+                preview_response = self.client.get(f"/api/tailoring/drafts/{workspace['draft']['id']}/preview")
+        self.assertEqual(preview_response.status_code, 200, preview_response.get_json())
+        self.assertFalse(preview_response.get_json()["pdf_available"])
+        self.assertIn("Microsoft Word unavailable", preview_response.get_json()["pdf_reason"])
+
+        def improve(original, response_values):
+            with patch.object(app_module, "request_json_completion", side_effect=response_values) as request_mock:
+                with patch.object(app_module.OllamaConfig, "from_mapping", return_value=config):
+                    response = self.client.post(f"/api/tailoring/drafts/{workspace['draft']['id']}/improve", json={"original_text": original, "keyword": "REST APIs"})
+            return response, request_mock
+
+        response, request_mock = improve(
+            "Architected REST APIs for the Flowtally platform.",
+            [{"ok": True, "data": {"proposed_bullet": "Designed REST APIs for the Flowtally platform."}}],
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["proposed_text"], "Designed REST APIs for the Flowtally platform.")
+        self.assertEqual(request_mock.call_count, 1)
+
+        response, _ = improve(
+            "Built React 18 services with 75% test coverage.",
+            [{"ok": True, "data": {"proposed_bullet": "Developed React 18 services with 75% test coverage."}}],
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+
+        response, _ = improve(
+            "Built 25+ tests and reduced errors by 75% across 3 services.",
+            [{"ok": True, "data": {"proposed_bullet": "Added 25+ tests and reduced errors by 75% across 3 services."}}],
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+
+        response, request_mock = improve(
+            "Built 25+ tests and reduced errors by 75% across 3 services.",
+            [
+                {"ok": True, "data": {"proposed_bullet": "Built 20+ tests and reduced errors by 75% across 3 services."}},
+                {"ok": True, "data": {"proposed_bullet": "Added 25+ tests and reduced errors by 75% across 3 services."}},
+            ],
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertTrue(response.get_json()["retry_attempted"])
+        self.assertEqual(request_mock.call_count, 2)
+
+        response, request_mock = improve(
+            "Built 25+ tests and reduced errors by 75% across 3 services.",
+            [
+                {"ok": True, "data": {"proposed_bullet": "Built 20+ tests and reduced errors by 75% across 3 services."}},
+                {"ok": True, "data": {"proposed_bullet": "Added 25+ tests and reduced errors by 60% across 3 services."}},
+            ],
+        )
+        self.assertEqual(response.status_code, 422, response.get_json())
+        self.assertTrue(response.get_json()["retry_attempted"])
+        self.assertEqual(response.get_json()["original_text"], "Built 25+ tests and reduced errors by 75% across 3 services.")
+        self.assertEqual(response.get_json()["proposed_text"], response.get_json()["original_text"])
+        self.assertIn("rejected after one safety retry", response.get_json()["error"])
+        self.assertEqual(request_mock.call_count, 2)
+
+    def test_tailoring_ai_rejects_cross_project_claims_omissions_and_long_rewrites(self):
+        original = "Architected a React and TypeScript frontend with a Flask and PostgreSQL backend, implementing REST APIs, Google OAuth, role-based access, tenant isolation, audit trails, and database migrations."
+        cross_project = "Designed and implemented REST APIs for product pricing and inventory systems, using Flask and PostgreSQL to support Google Docs, Amazon, and idempotent operations."
+        omission = "Designed Flask and PostgreSQL APIs for product pricing."
+        long_rewrite = original + " This additional wording is unnecessarily long and should remain review only."
+        self.assertIn("unsupported résumé claims", app_module.validate_tailoring_bullet_suggestion(original, cross_project))
+        self.assertIn("omitted supported résumé facts", app_module.validate_tailoring_bullet_suggestion(original, omission))
+        self.assertIn("target length budget", app_module.validate_tailoring_bullet_suggestion(original, long_rewrite))
+
+    def test_tailoring_ai_improve_flowtally_api_bullet_rejects_trivial_article_deletion(self):
+        self.client.post("/api/profile", json={"name": "Terry Mak", "email": "terry@example.com", "resume_text": "Flowtally"})
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Software Engineering", "identity_mode": "shared"}).get_json()
+        document = Document()
+        original = "Architected a React and TypeScript frontend with a Flask and PostgreSQL backend, implementing REST APIs, Google OAuth, role-based access, tenant isolation, audit trails, and database migrations."
+        document.add_paragraph(original, style="List Bullet")
+        buffer = io.BytesIO(); document.save(buffer)
+        resume = self.client.post(
+            f"/api/candidate-profiles/{profile['id']}/resumes/upload",
+            data={"file": (io.BytesIO(buffer.getvalue()), "flowtally.docx"), "is_default": "true"},
+            content_type="multipart/form-data",
+        ).get_json()
+        job = self.client.post("/api/jobs", json={"company": "Lakeview", "title": "Backend Engineer", "job_description": "Design APIs and services"}).get_json()
+        workspace = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        config = app_module.OllamaConfig(True, "http://ollama", "qwen3:4b", 10, 100, 1000)
+        trivial = "Architected React and TypeScript frontend with Flask and PostgreSQL backend, implementing REST APIs, Google OAuth, role-based access, tenant isolation, audit trails, and database migrations."
+        meaningful = "Architected and implemented REST APIs with a React and TypeScript frontend and a Flask and PostgreSQL backend, preserving Google OAuth, role-based access, tenant isolation, audit trails, and database migrations."
+        with patch.object(app_module, "request_json_completion", side_effect=[{"ok": True, "data": {"proposed_bullet": trivial}}, {"ok": True, "data": {"proposed_bullet": original}}]):
+            with patch.object(app_module.OllamaConfig, "from_mapping", return_value=config):
+                rejected_trivial = self.client.post(f"/api/tailoring/drafts/{workspace['draft']['id']}/improve", json={"original_text": original, "keyword": "API and service design"})
+        self.assertEqual(rejected_trivial.status_code, 200, rejected_trivial.get_json())
+        self.assertEqual(rejected_trivial.get_json()["message"], "The existing bullet is already suitable.")
+        self.assertFalse(rejected_trivial.get_json()["meaningful_improvement"])
+        self.assertEqual(rejected_trivial.get_json()["proposed_text"], original)
+
+        with patch.object(app_module, "request_json_completion", side_effect=[{"ok": True, "data": {"proposed_bullet": trivial}}, {"ok": True, "data": {"proposed_bullet": meaningful}}]):
+            with patch.object(app_module.OllamaConfig, "from_mapping", return_value=config):
+                improved = self.client.post(f"/api/tailoring/drafts/{workspace['draft']['id']}/improve", json={"original_text": original, "keyword": "API and service design"})
+        self.assertEqual(improved.status_code, 200, improved.get_json())
+        self.assertTrue(improved.get_json()["meaningful_improvement"])
+        self.assertEqual(improved.get_json()["proposed_text"], meaningful)
+
+    def test_approved_tailoring_draft_is_immutable_and_new_revision_copies_artifact(self):
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Backend", "identity_mode": "distinct", "applicant_name": "Alex Rivera"}).get_json()
+        resume_doc = Document(); resume_doc.add_paragraph("Alex Rivera"); resume_doc.add_paragraph("Experience"); resume_doc.add_paragraph("Built Python automation for reports.", style="List Bullet")
+        resume_buffer = io.BytesIO(); resume_doc.save(resume_buffer)
+        resume = self.client.post(f"/api/candidate-profiles/{profile['id']}/resumes/upload", data={"file": (io.BytesIO(resume_buffer.getvalue()), "base.docx"), "is_default": "true"}, content_type="multipart/form-data").get_json()
+        cover_doc = Document(); cover_doc.add_paragraph("Alex Rivera"); cover_buffer = io.BytesIO(); cover_doc.save(cover_buffer)
+        cover = self.client.post(f"/api/candidate-profiles/{profile['id']}/cover-letter-templates/upload", data={"file": (io.BytesIO(cover_buffer.getvalue()), "cover.docx"), "is_default": "true"}, content_type="multipart/form-data").get_json()
+        job = self.client.post("/api/jobs", json={"company": "Package Co", "title": "Developer", "required_skills": "Python", "job_description": "Python"}).get_json()
+        package = self.client.post("/api/preparation/queue", json={"job_id": job["id"], "candidate_profile_id": profile["id"], "resume_id": resume["id"], "cover_letter_template_id": cover["id"]}).get_json()
+        workspace = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        draft_id = workspace["draft"]["id"]
+        bullet = next(item for item in workspace["bullets"] if item["editable"])
+        self.assertEqual(self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={"paragraph_index": bullet["paragraph_index"], "original_text": bullet["text"], "proposed_text": "Built Python and REST API automation for reports.", "operation": "edit"}).status_code, 200)
+        with patch.object(app_module, "validate_tailoring_draft_layout", return_value={"available": True, "verified": True, "original_pages": 1, "candidate_pages": 1, "line_mismatches": []}):
+            approved = self.client.post(f"/api/tailoring/drafts/{draft_id}/approve", json={"preparation_id": package["id"]})
+        self.assertEqual(approved.status_code, 200, approved.get_json())
+        approved_path = Path(approved.get_json()["draft"]["approved_tailored_resume_path"])
+        approved_bytes = approved_path.read_bytes()
+        locked_workspace = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        self.assertEqual(locked_workspace["draft"]["status"], "approved")
+        self.assertTrue(locked_workspace["draft"]["locked"])
+        self.assertEqual(self.client.post(f"/api/tailoring/drafts/{draft_id}/apply", json={"paragraph_index": bullet["paragraph_index"], "original_text": bullet["text"], "proposed_text": "Unsafe change", "operation": "edit"}).status_code, 409)
+        created = self.client.post(f"/api/tailoring/drafts/{draft_id}/new-revision", json={})
+        self.assertEqual(created.status_code, 201, created.get_json())
+        revision = created.get_json()["draft"]
+        self.assertNotEqual(revision["id"], draft_id)
+        self.assertEqual(revision["revision_number"], 2)
+        self.assertEqual(Path(revision["draft_path"]).read_bytes(), approved_bytes)
+        repeated = self.client.post(f"/api/tailoring/drafts/{draft_id}/new-revision", json={})
+        self.assertEqual(repeated.status_code, 200, repeated.get_json())
+        self.assertEqual(repeated.get_json()["draft"]["id"], revision["id"])
+        current = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        self.assertEqual(current["draft"]["id"], revision["id"])
+        revision_bullet = next(item for item in current["bullets"] if item["editable"])
+        changed = self.client.post(f"/api/tailoring/drafts/{revision['id']}/apply", json={"paragraph_index": revision_bullet["paragraph_index"], "original_text": revision_bullet["text"], "proposed_text": "Built Python and REST API automation for reviewed reports.", "operation": "edit"})
+        self.assertEqual(changed.status_code, 200, changed.get_json())
+        package_after_edit = self.client.get(f"/api/preparation/queue").get_json()
+        package_after_edit = next(item for item in package_after_edit if int(item["id"]) == int(package["id"]))
+        self.assertEqual(package_after_edit["approved_tailoring_draft_id"], draft_id)
+        self.assertEqual(Path(package_after_edit["approved_tailored_resume_path"]).read_bytes(), approved_bytes)
+        self.assertEqual(approved_path.read_bytes(), approved_bytes)
+
+    def test_approved_tailoring_becomes_package_resume_and_survives_cover_regeneration(self):
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Backend", "identity_mode": "distinct", "applicant_name": "Alex Rivera"}).get_json()
+        resume_doc = Document(); resume_doc.add_paragraph("Alex Rivera"); resume_doc.add_paragraph("Experience"); resume_doc.add_paragraph("Built Python automation for reports.", style="List Bullet")
+        resume_buffer = io.BytesIO(); resume_doc.save(resume_buffer)
+        resume = self.client.post(f"/api/candidate-profiles/{profile['id']}/resumes/upload", data={"file": (io.BytesIO(resume_buffer.getvalue()), "base.docx"), "is_default": "true"}, content_type="multipart/form-data").get_json()
+        cover_doc = Document(); cover_doc.add_paragraph("Alex Rivera"); cover_doc.add_paragraph("I am applying to Package Co.")
+        cover_buffer = io.BytesIO(); cover_doc.save(cover_buffer)
+        cover = self.client.post(f"/api/candidate-profiles/{profile['id']}/cover-letter-templates/upload", data={"file": (io.BytesIO(cover_buffer.getvalue()), "cover.docx"), "is_default": "true"}, content_type="multipart/form-data").get_json()
+        job = self.client.post("/api/jobs", json={"company": "Package Co", "title": "Developer", "overall_score": 90, "remote_eligibility": "canadian_eligible", "required_skills": "Python, REST APIs", "job_description": "Python and REST APIs"}).get_json()
+        item = self.client.post("/api/preparation/queue", json={"job_id": job["id"], "candidate_profile_id": profile["id"], "resume_id": resume["id"], "cover_letter_template_id": cover["id"]}).get_json()
+        workspace = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        bullet = next(entry for entry in workspace["bullets"] if entry["editable"])
+        applied = self.client.post(f"/api/tailoring/drafts/{workspace['draft']['id']}/apply", json={"paragraph_index": bullet["paragraph_index"], "keyword": "REST APIs", "original_text": bullet["text"], "proposed_text": "Built Python automation and REST APIs for reports.", "operation": "edit"})
+        self.assertEqual(applied.status_code, 200, applied.get_json())
+        self.assertEqual(self.client.get(f"/api/candidate-profiles/{profile['id']}/keyword-memory").get_json(), [])
+        with patch.object(app_module, "compare_docx_layout", return_value={"available": True, "verified": True, "original_pages": 1, "candidate_pages": 1, "line_mismatches": []}):
+            approved = self.client.post(f"/api/tailoring/drafts/{workspace['draft']['id']}/approve", json={"preparation_id": item["id"]})
+        self.assertEqual(approved.status_code, 200, approved.get_json())
+        memory = self.client.get(f"/api/candidate-profiles/{profile['id']}/keyword-memory").get_json()
+        self.assertEqual(memory[0]["approved_replacement"], "Built Python automation and REST APIs for reports.")
+        tailored_path = Path(approved.get_json()["preparation"]["approved_tailored_resume_path"])
+        self.assertTrue(tailored_path.is_file())
+        cover_path = app_module.generated_applications_dir() / str(job["id"]) / "cover-output.docx"; cover_path.parent.mkdir(parents=True, exist_ok=True); cover_path.write_bytes(cover_buffer.getvalue())
+        def fake_prepare(job_id, kinds, profile_override):
+            with app_module.app.app_context():
+                app_module.get_db().execute("UPDATE jobs SET resume_generation_status = 'generated', cover_letter_generation_status = 'generated', cover_letter_docx_path = ? WHERE id = ?", [str(cover_path), job_id]); app_module.get_db().commit()
+            return {"resume": "generated", "cover_letter": "generated", "error": ""}
+        with patch.object(app_module, "generate_and_store_shortlist_documents", side_effect=fake_prepare):
+            prepared = self.client.post(f"/api/preparation/{item['id']}/prepare")
+        self.assertEqual(prepared.status_code, 200, prepared.get_json())
+        package = prepared.get_json()
+        self.assertEqual(package["status"], "ready_for_review", package)
+        self.assertEqual(Path(package["prepared_resume_path"]), tailored_path)
+        self.assertIn("rest apis", [item["normalized"] for item in package["keywords_score"].get("matched", [])], {"score": package["keywords_score"], "text": app_module.extract_docx_text(tailored_path.read_bytes()), "job": package["job"].get("required_skills")})
+        self.assertIn("REST APIs", app_module.extract_docx_text(tailored_path.read_bytes()))
+        tailored_path.unlink()
+        unavailable = self.client.post(f"/api/preparation/{item['id']}/regenerate")
+        self.assertEqual(unavailable.status_code, 200)
+        self.assertEqual(unavailable.get_json()["status"], "failed")
+        self.assertIn("approved tailored résumé", unavailable.get_json()["error"])
+        second_job = self.client.post("/api/jobs", json={"company": "Second Co", "title": "Backend Developer", "required_skills": "REST APIs", "job_description": "REST APIs"}).get_json()
+        second_workspace = self.client.get(f"/api/tailoring/{second_job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        reusable = next(item for group in ("matched", "related", "missing") for item in second_workspace["keywords"][group] if item["normalized"] == "api and service design")
+        self.assertTrue(reusable["memory"]["source_matches"])
+        reused = self.client.post(f"/api/tailoring/drafts/{second_workspace['draft']['id']}/apply-memory", json={"keyword": "REST APIs", "paragraph_index": reusable["memory"]["matching_paragraph_index"]})
+        self.assertEqual(reused.status_code, 200, reused.get_json())
+        self.assertIn("REST APIs", reused.get_json()["text"])
+
+    def test_tailoring_keyword_memory_is_profile_scoped_and_editable(self):
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Backend"}).get_json()
+        saved = self.client.post(f"/api/candidate-profiles/{profile['id']}/keyword-memory", json={"keyword": "Kafka", "status": "yes", "resume_id": 7, "project_employer": "Flowtally", "supporting_bullet": "Built Kafka integrations", "source_fingerprint": "abc", "approved_replacement": "Built Kafka integrations for reporting"})
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(saved.get_json()["status"], "yes")
+        updated = self.client.post(f"/api/candidate-profiles/{profile['id']}/keyword-memory", json={"keyword": "Kafka", "status": "no"})
+        self.assertEqual(updated.get_json()["project_employer"], "Flowtally")
+        self.assertEqual(updated.get_json()["resume_id"], 7)
+        listed = self.client.get(f"/api/candidate-profiles/{profile['id']}/keyword-memory").get_json()
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(self.client.delete(f"/api/candidate-profiles/{profile['id']}/keyword-memory/kafka").status_code, 200)
+        self.assertEqual(self.client.get(f"/api/candidate-profiles/{profile['id']}/keyword-memory").get_json(), [])
         self.assertIn('Checking requirements', Path('static/app.js').read_text(encoding='utf-8'))
         self.assertIn('Configure candidate profile documents', Path('static/app.js').read_text(encoding='utf-8'))
         self.assertIn('Candidate profile documents are separate from the legacy Profile documents', Path('static/app.js').read_text(encoding='utf-8'))
         self.assertIn('z-index: 60', Path('static/styles.css').read_text(encoding='utf-8'))
 
+    def test_skill_confirmation_memory_is_individual_profile_scoped_and_does_not_change_coverage(self):
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Backend"}).get_json()
+        document = Document(); document.add_paragraph("Built Python services with REST APIs.", style="List Bullet")
+        buffer = io.BytesIO(); document.save(buffer)
+        resume = self.client.post(f"/api/candidate-profiles/{profile['id']}/resumes/upload", data={"file": (io.BytesIO(buffer.getvalue()), "base.docx"), "is_default": "true"}, content_type="multipart/form-data").get_json()
+        job = self.client.post("/api/jobs", json={"company": "Example", "title": "Backend", "job_description": "Required\nPython or Java\nPreferred\nKafka or RabbitMQ\nResponsibilities\nBuild REST APIs"}).get_json()
+        before = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()["keywords"]
+        group = next(item for item in before["missing"] if item["normalized"] == "messaging and queue platforms")
+        self.assertEqual(group["skill_memory"], {})
+        inventory_names = {item["keyword"] for item in before["skill_inventory"]}
+        self.assertTrue({"kafka", "rabbitmq"}.issubset({name.lower() for name in inventory_names}))
+        self.assertTrue(all(item["parent_keyword"] == "messaging and queue platforms" for item in before["skill_inventory"] if item["keyword"].lower() in {"kafka", "rabbitmq"}))
+        saved = self.client.post(f"/api/candidate-profiles/{profile['id']}/skill-memory", json={"keyword": "Kafka", "status": "no", "notes": "Not used professionally"})
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(saved.get_json()["confirmation_source"], "skill_confirmation")
+        listed = self.client.get(f"/api/candidate-profiles/{profile['id']}/skill-memory").get_json()
+        self.assertEqual([(item["normalized_keyword"], item["status"]) for item in listed], [("kafka", "no")])
+        after = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()["keywords"]
+        group = next(item for item in after["missing"] if item["normalized"] == "messaging and queue platforms")
+        self.assertEqual(group["skill_memory"]["kafka"]["status"], "no")
+        self.assertEqual(after["matched_count"], before["matched_count"])
+        self.client.post(f"/api/candidate-profiles/{profile['id']}/skill-memory", json={"keyword": "RabbitMQ", "status": "yes"})
+        group = next(item for item in self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()["keywords"]["missing"] if item["normalized"] == "messaging and queue platforms")
+        self.assertEqual(group["skill_memory"]["rabbitmq"]["status"], "yes")
+        self.assertEqual(self.client.delete(f"/api/candidate-profiles/{profile['id']}/skill-memory/kafka").status_code, 200)
+        self.assertEqual(self.client.get(f"/api/candidate-profiles/{profile['id']}/skill-memory").get_json()[0]["normalized_keyword"], "rabbitmq")
     def test_jobspy_discovery_requires_keywords(self):
         response = self.client.post("/api/discovery/jobspy", json={"location": "Toronto"})
         self.assertEqual(response.status_code, 400)
@@ -2169,6 +2747,53 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(inventory["kafka"]["requirement_type"], "unclassified")
         self.assertEqual(inventory["figma"]["requirement_type"], "preferred")
         self.assertEqual(inventory["python"]["requirement_type"], "required")
+
+    def test_tailoring_studio_builds_full_lakeview_requirement_inventory(self):
+        job = {
+            "title": "Backend Engineer",
+            "required_skills": "3 to 5+ years of production backend experience, advanced distributed systems, Kafka, Kubernetes",
+            "preferred_skills": "Python, PostgreSQL, Docker",
+            "job_description": (
+                "Requirements:\n"
+                "3 to 5+ years of production backend experience.\n"
+                "Advanced distributed systems expertise.\n"
+                "Build Python services and APIs with PostgreSQL.\n"
+                "Preferred:\nKafka, Kubernetes, Docker.\n"
+                "Collaborate with product teams and participate in code review."
+            ),
+        }
+        resume = "Built Python Flask APIs with PostgreSQL and automated testing. Collaborated with product teams and used Git."
+        report = grounding.build_tailoring_coverage_report(job, resume)
+        inventory = {item["normalized"]: item for group in ("matched", "related", "missing") for item in report[group]}
+        self.assertGreater(report["total"], 1)
+        self.assertIn("backend programming languages", inventory)
+        self.assertIn("distributed and event-driven systems", inventory)
+        self.assertIn("messaging and queue platforms", inventory)
+        self.assertIn("production backend experience", inventory)
+        self.assertEqual(inventory["backend programming languages"]["match_type"], "exact")
+        self.assertEqual(inventory["messaging and queue platforms"]["match_type"], "missing")
+        self.assertEqual(inventory["distributed and event-driven systems"]["match_type"], "missing")
+        self.assertEqual(inventory["distributed and event-driven systems"]["requirement_type"], "required")
+        self.assertTrue(report["review_before_applying"])
+        self.assertLess(report["score_percent"], 100)
+
+    def test_complete_lakeview_fixture_groups_alternatives_and_preserves_sections(self):
+        description = (Path(__file__).parent / "fixtures" / "lakeview_backend_engineer_job.txt").read_text(encoding="utf-8")
+        job = {"title": "Backend Engineer", "job_description": description}
+        report = grounding.build_tailoring_coverage_report(
+            job,
+            "Built Python Flask REST APIs with PostgreSQL, automated testing, AWS and data models.",
+        )
+        inventory = {item["normalized"]: item for group in ("matched", "related", "missing") for item in report[group]}
+        self.assertGreaterEqual(report["total"], 15)
+        self.assertIn("backend programming languages", inventory)
+        self.assertIn("messaging and queue platforms", inventory)
+        self.assertIn("transactional correctness", inventory)
+        self.assertIn("llm and ai orchestration", inventory)
+        self.assertEqual(inventory["messaging and queue platforms"]["requirement_type"], "preferred")
+        self.assertTrue(inventory["api and service design"]["source_evidence"])
+        self.assertNotIn("and the ability to build dependable", {item["keyword"] for item in inventory.values()})
+        self.assertEqual(inventory["backend programming languages"]["match_type"], "exact")
 
     def test_nodejs_alias_substitution_preserves_word_layout_and_reports_final_docx_coverage(self):
         master = Path(self.tmpdir.name) / "nodejs_alias_master.docx"
@@ -4297,7 +4922,44 @@ class JobAssistantTest(unittest.TestCase):
         preview = response.get_json()
         self.assertEqual(preview["resume"], "PACKAGE RESUME")
         self.assertEqual(preview["cover_letter"], "PACKAGE COVER LETTER")
+        self.assertEqual(preview["errors"], {})
+        self.assertEqual(preview["company"], "Preview Co")
+        self.assertEqual(preview["title"], "Developer")
         self.assertNotIn("CURRENT JOB", preview["resume"] + preview["cover_letter"])
+
+    def test_preparation_preview_reports_missing_package_artifacts_explicitly(self):
+        job = self.client.post("/api/jobs", json={"company": "Missing Preview Co", "title": "Developer"}).get_json()
+        with app_module.app.app_context():
+            item_id = app_module.get_db().execute(
+                "INSERT INTO application_preparation_queue (job_id, status, prepared_resume_path, prepared_cover_letter_path) VALUES (?, 'ready_for_review', ?, ?)",
+                [job["id"], str(app_module.generated_applications_dir() / "missing-resume.docx"), ""],
+            ).lastrowid
+            app_module.get_db().commit()
+        response = self.client.get(f"/api/preparation/{item_id}/preview")
+        self.assertEqual(response.status_code, 200)
+        errors = response.get_json()["errors"]
+        self.assertIn("missing from this application environment", errors["resume"])
+        self.assertIn("not recorded", errors["cover_letter"])
+
+    def test_preparation_preview_is_inline_and_tailoring_approval_uses_compact_diff(self):
+        frontend = Path(app_module.BASE_DIR, "static", "app.js").read_text(encoding="utf-8")
+        template = Path(app_module.BASE_DIR, "templates", "index.html").read_text(encoding="utf-8")
+        self.assertIn("preparationPreviews", frontend)
+        self.assertIn("preparation-preview-inline", frontend)
+        self.assertIn("tailoringDiffMarkup", frontend)
+        self.assertIn("tailoring-compact-diff", frontend)
+        self.assertNotIn('insertAdjacentHTML("afterbegin", `<details class="preparation-preview"', frontend)
+        self.assertIn('id="tailoring-diff-heading"', template)
+
+    def test_preparation_preview_retry_discards_stale_responses_and_live_diff_remains_for_new_edits(self):
+        frontend = Path(app_module.BASE_DIR, "static", "app.js").read_text(encoding="utf-8")
+        self.assertIn("async function previewPreparation(id, retry = false)", frontend)
+        self.assertIn("previewPreparation(${item.id}, true)", frontend)
+        self.assertIn("preparationPreviewEpoch", frontend)
+        self.assertIn("preparationPreviewRequests", frontend)
+        self.assertIn("state.preparationPreviewEpoch !== previewEpoch", frontend)
+        self.assertIn("state.preparationPreviewRequests[id] !== requestId", frontend)
+        self.assertIn("const hideStandaloneDiff = Boolean(changes.length && hasAppliedChange && !hasMeaningfulChange)", frontend)
 
     def test_manual_discovery_preparation_requires_explicit_profile_and_docx_pair(self):
         frontend = Path(app_module.BASE_DIR, "static", "app.js").read_text(encoding="utf-8")

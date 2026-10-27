@@ -93,6 +93,55 @@ KEYWORD_ALIASES = {
     "apis": "api",
 }
 
+# Tailoring Studio uses a broader, transparent requirement inventory than the
+# compact Shortlist Keywords Score.  These are generic requirement phrases,
+# not job-specific terms; they are extracted only when present in the current
+# posting and are never used to add résumé claims.
+TAILORING_REQUIREMENT_TERMS = [
+    "distributed systems", "microservices", "microservice architecture", "event-driven architecture",
+    "production backend experience", "backend development", "software development", "software engineering",
+    "object-oriented programming", "design patterns", "data structures", "algorithms", "system design",
+    "api design", "restful apis", "rest apis", "graphql", "authentication", "authorization", "permissions",
+    "database migrations", "relational databases", "data modeling", "database design", "query optimization",
+    "automated testing", "unit testing", "integration testing", "test-driven development", "debugging",
+    "code review", "technical documentation", "production support", "incident response", "monitoring",
+    "continuous integration", "continuous delivery", "ci/cd", "agile", "scrum", "cross-functional collaboration",
+    "stakeholder communication", "cloud infrastructure", "containerization", "kubernetes", "docker",
+    "kafka", "rabbitmq", "postgresql", "mysql", "redis", "linux", "python", "java", "javascript",
+    "typescript", "c#", "c++", ".net", "flask", "django", "sql", "git", "github", "aws", "azure",
+]
+
+TAILORING_REQUIREMENT_ALIASES = {
+    "back-end development": "backend development",
+    "back-end": "backend",
+    "front-end": "frontend",
+    "rest api": "rest apis",
+    "restful api": "rest apis",
+    "restful apis": "rest apis",
+    "relational database": "relational databases",
+    "unit and integration testing": "automated testing",
+    "production backend experience": "production backend experience",
+}
+
+TAILORING_COMPETENCIES = [
+    ("production backend experience", "experience", ("production-grade backend", "production backend", "backend systems", "backend services", "backend applications")),
+    ("backend programming languages", "technical", ("python", "go", "c++", "rust", "java", "kotlin", "scala", "typescript", "c#")),
+    ("distributed and event-driven systems", "architecture", ("distributed systems", "distributed applications", "event-driven", "asynchronous architecture", "event streams")),
+    ("api and service design", "architecture", ("api design", "rest apis", "restful apis", "apis", "service boundaries", "service interfaces", "domain models")),
+    ("database architecture and migrations", "data", ("relational data stores", "non-relational data stores", "data modeling", "database architecture", "schema evolution", "migrations", "data access patterns")),
+    ("transactional correctness", "architecture", ("transactional systems", "idempotency", "consistency", "reconciliation", "auditability")),
+    ("llm and ai orchestration", "ai", ("llms", "llm", "ai-powered", "ai systems", "retrieval", "tool integrations", "workflow orchestration")),
+    ("cloud platforms", "cloud", ("aws", "gcp", "azure", "cloud platforms", "cloud-based")),
+    ("infrastructure as code and ci/cd", "operations", ("infrastructure-as-code", "infrastructure as code", "ci/cd", "continuous integration", "continuous delivery", "deployment automation")),
+    ("observability and production operations", "operations", ("observability", "logging", "tracing", "metrics", "alerting", "incident response", "production support", "production operations")),
+    ("security, identity, and permissions", "security", ("authentication", "authorization", "permissions", "identity", "access control", "audit logging", "data protection")),
+    ("testing and code quality", "quality", ("testing", "debugging", "code quality", "code review", "testable", "reliability")),
+    ("data structures, algorithms, and system design", "fundamentals", ("data structures", "algorithms", "system design", "software engineering fundamentals")),
+    ("messaging and queue platforms", "integration", ("kafka", "rabbitmq", "kinesis", "sqs", "sns", "pub/sub", "message queues", "queues", "streaming")),
+    ("regulated domain experience", "domain", ("fintech", "mortgage", "lending", "payments", "insurance", "banking", "regulated domains")),
+    ("cross-functional communication", "collaboration", ("cross-functional", "stakeholders", "stakeholder", "communication", "business stakeholders")),
+]
+
 RELATED_KEYWORD_EVIDENCE = {
     "data solutions": ("data", "workflow", "reporting", "analytics", "database", "models"),
     "design patterns": ("object oriented", "oop", "software design"),
@@ -293,6 +342,199 @@ def job_text(job: dict[str, Any]) -> str:
 def normalize_keyword(value: str) -> str:
     clean = normalize_space(value).lower().strip(" ,:;()[]{}")
     return KEYWORD_ALIASES.get(clean, clean)
+
+
+def normalize_tailoring_requirement(value: str) -> str:
+    clean = normalize_space(value).lower().strip(" ,:;()[]{}.*")
+    clean = re.sub(r"\b(?:required|preferred|qualifications?|responsibilities|nice to have)\b\s*:?", "", clean)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return TAILORING_REQUIREMENT_ALIASES.get(clean, KEYWORD_ALIASES.get(clean, clean))
+
+
+def _tailoring_requirement_type(job: dict[str, Any], phrase: str) -> str:
+    normalized = normalize_tailoring_requirement(phrase)
+    for field, kind in (("required_skills", "required"), ("preferred_skills", "preferred")):
+        content = str(job.get(field) or "")
+        if keyword_present(content, phrase) or keyword_present(content, normalized):
+            return kind
+    description = str(job.get("job_description") or "")
+    active = "unclassified"
+    for line in description.splitlines():
+        heading = normalize_space(line).lower().strip(" :")
+        if re.match(r"^(required|required qualifications|requirements|minimum qualifications)$", heading):
+            active = "required"
+            continue
+        if re.match(r"^(preferred|preferred qualifications|nice to have|bonus|assets?)$", heading):
+            active = "preferred"
+            continue
+        if (keyword_present(line, phrase) or keyword_present(line, normalized)) and active != "unclassified":
+            return active
+    return "unclassified"
+
+
+def extract_tailoring_requirements(job: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract a broad, deduplicated Studio inventory from the current post.
+
+    The extractor intentionally keeps requirements separate from résumé
+    evidence.  It recognizes posted phrases and requirement sections only;
+    it does not infer that a candidate has any of them.
+    """
+    description = str(job.get("job_description") or "")
+    content = " ".join(str(job.get(field) or "") for field in ("title", "required_skills", "preferred_skills", "responsibilities", "job_description"))
+    lines = [normalize_space(line).strip(" -*•") for line in description.splitlines() if normalize_space(line)]
+    section = "unclassified"
+    sections: list[tuple[str, str, str]] = []
+    for line in lines:
+        heading = line.lower().strip(" :")
+        if re.match(r"^(responsibilities|responsibility|overview|about the role|the role)$", heading):
+            section = "responsibility"
+        elif re.match(r"^(qualifications?|required qualifications?|requirements?)$", heading):
+            section = "required"
+        elif re.match(r"^(preferred experience|preferred qualifications?|nice to have|bonus|assets?)$", heading):
+            section = "preferred"
+        elif not re.search(r"^(full job description|li-remote)$", heading):
+            sections.append((section, line, heading))
+
+    def occurrences(terms: tuple[str, ...]) -> list[tuple[str, str, str]]:
+        hits = []
+        for kind, line, _ in sections:
+            matched_terms = [term for term in terms if keyword_present(line, term)]
+            if matched_terms:
+                hits.append((kind, line, matched_terms[0]))
+        return hits
+
+    records: list[dict[str, Any]] = []
+    for canonical, category, terms in TAILORING_COMPETENCIES:
+        hits = occurrences(terms)
+        field_hits = []
+        for field, kind in (("required_skills", "required"), ("preferred_skills", "preferred")):
+            value = str(job.get(field) or "")
+            if any(keyword_present(value, term) for term in terms):
+                field_hits.append(kind)
+        if not hits and not field_hits:
+            if not any(keyword_present(content, term) for term in terms):
+                continue
+        kinds = field_hits + [hit[0] for hit in hits]
+        requirement_type = "required" if "required" in kinds else "preferred" if "preferred" in kinds else "responsibility" if "responsibility" in kinds else "unclassified"
+        source_lines = list(dict.fromkeys(hit[1] for hit in hits))
+        source_sections = list(dict.fromkeys({
+            "required": "Required qualifications",
+            "preferred": "Preferred qualifications",
+            "responsibility": "Responsibilities",
+            "unclassified": "Job description",
+        }.get(hit[0], "Job description") for hit in hits))
+        matched_terms = list(dict.fromkeys(
+            term for term in terms
+            if any(keyword_present(line, term) for _, line, _ in hits)
+        ))
+        records.append({
+            "keyword": canonical,
+            "normalized": normalize_tailoring_requirement(canonical),
+            "category": category,
+            "requirement_type": requirement_type,
+            "source_fields": ["job_description"] if hits else ["required_skills" if "required" in field_hits else "preferred_skills"],
+            "source_evidence": source_lines[:4],
+            "alternative_terms": matched_terms,
+        })
+
+    years = re.search(r"\b\d+\s*(?:to|-|–)\s*\d+\+?\s+years?\s+of\s+experience\b[^.\n]*", content, re.I)
+    if years:
+        hits = occurrences((years.group(0),))
+        records.append({"keyword": normalize_space(years.group(0)), "normalized": normalize_tailoring_requirement(years.group(0)), "category": "experience", "requirement_type": "required" if any(hit[0] == "required" for hit in hits) else "unclassified", "source_fields": ["job_description"], "source_evidence": [hit[1] for hit in hits][:3], "source_sections": ["Required qualifications" if hit[0] == "required" else "Job description" for hit in hits][:3], "alternative_terms": []})
+    return sorted(records, key=lambda item: (item["requirement_type"] == "unclassified", item["requirement_type"] == "responsibility", item["normalized"]))
+
+
+def match_tailoring_requirements(job: dict[str, Any], resume_text: str) -> dict[str, list[dict[str, Any]]]:
+    """Match Studio requirements with exact, equivalent, partial or missing evidence."""
+    evidence = build_candidate_evidence({"resume_text": resume_text})
+    full_text = evidence["full_text"]
+    units = evidence["units"]
+    result = {"matched": [], "related": [], "missing": []}
+    alias_pairs = [(source, target) for source, target in {**KEYWORD_ALIASES, **TAILORING_REQUIREMENT_ALIASES}.items()]
+    for requirement in extract_tailoring_requirements(job):
+        normalized = requirement["normalized"]
+        alternatives = tuple(requirement.get("alternative_terms") or ())
+        exact_source = next((term for term in alternatives if keyword_present(full_text, term)), None)
+        exact = bool(exact_source)
+        equivalent_source = next((source for source, target in alias_pairs if target == normalized and keyword_present(full_text, source)), None)
+        if not equivalent_source and not exact and normalized != requirement["keyword"] and keyword_present(full_text, normalized):
+            equivalent_source = normalized
+        source_phrase = equivalent_source or requirement["keyword"]
+        if exact_source:
+            source_phrase = exact_source
+        unit = next((item for item in units if keyword_present(item["text"], source_phrase) or keyword_present(item["text"], normalized)), None)
+        if normalized == "api and service design" and exact and keyword_present(full_text, "rest apis"):
+            exact = False
+            equivalent_source = "REST APIs"
+            source_phrase = "REST APIs"
+        record = {**requirement, "match_type": "exact" if exact else "equivalent" if equivalent_source else "missing", "found_as": source_phrase if exact or equivalent_source else "", "source_section": unit.get("section", "Résumé") if unit else "Résumé", "evidence": evidence_snippet(unit["text"], source_phrase) if unit and (exact or equivalent_source) else ""}
+        if exact or equivalent_source:
+            result["matched"].append(record)
+            continue
+        words = [word for word in re.findall(r"[a-z0-9+#.]+", " ".join(alternatives or (normalized,))) if len(word) > 2 and word not in COMMON_JOB_WORDS]
+        partial_unit = next((item for item in units if sum(keyword_present(item["text"], word) for word in words) >= max(1, len(words) // 2)), None)
+        if partial_unit:
+            record["match_type"] = "partial"
+            record["source_section"] = partial_unit.get("section", "Résumé")
+            record["evidence"] = evidence_snippet(partial_unit["text"], words[0] if words else normalized)
+            result["related"].append(record)
+        else:
+            result["missing"].append(record)
+    return result
+
+
+def build_tailoring_coverage_report(job: dict[str, Any], resume_text: str) -> dict[str, Any]:
+    source_text = " ".join(str(job.get(field) or "").strip() for field in ("job_description", "required_skills", "preferred_skills", "responsibilities"))
+    if not normalize_space(source_text):
+        return {
+            "available": False,
+            "unavailable_reason": "The complete job description is not stored for this posting. Edit or refresh the job with the original description before reviewing tailoring requirements.",
+            "score_percent": None,
+            "matched_count": 0,
+            "total": 0,
+            "matched": [],
+            "related": [],
+            "missing": [],
+            "required": {"status": "not_assessed", "matched": 0, "total": 0, "score_percent": None},
+            "preferred": {"status": "not_assessed", "matched": 0, "total": 0, "score_percent": None},
+            "unclassified": 0,
+            "unclassified_keywords": [],
+            "review_before_applying": False,
+            "heuristic_note": "Coverage is unavailable until the complete job description is stored. This is not a zero-percent qualification result.",
+        }
+    result = match_tailoring_requirements(job, resume_text)
+    inventory = extract_tailoring_requirements(job)
+    matched = result["matched"]
+    required = [item for item in inventory if item["requirement_type"] == "required"]
+    preferred = [item for item in inventory if item["requirement_type"] == "preferred"]
+    def subset(items: list[dict[str, Any]]) -> dict[str, Any]:
+        keys = {item["normalized"] for item in items}
+        hits = [item for item in matched if item["normalized"] in keys]
+        return {"status": "assessed" if items else "not_assessed", "matched": len(hits), "total": len(items), "score_percent": round(len(hits) / len(items) * 100) if items else None}
+    total = len(inventory)
+    return {"available": True, "score_percent": round(len(matched) / total * 100) if total else 0, "matched_count": len(matched), "total": total, "matched": matched, "related": result["related"], "missing": result["missing"], "required": subset(required), "preferred": subset(preferred), "unclassified": sum(1 for item in inventory if item["requirement_type"] == "unclassified"), "unclassified_keywords": [item for item in inventory if item["requirement_type"] == "unclassified"], "review_threshold_percent": 70, "review_before_applying": bool(total and len(matched) / total * 100 < 70), "heuristic_note": "Tailoring coverage is a transparent keyword and requirement review heuristic, not a qualification score. Partial evidence is shown separately and is not counted as matched."}
+
+
+def apply_tailoring_requirement_overrides(report: dict[str, Any], overrides: dict[str, str]) -> dict[str, Any]:
+    """Exclude only job-scoped user-marked non-requirements from adjusted coverage."""
+    if not report.get("available"):
+        return report
+    excluded = {normalize_tailoring_requirement(key) for key, value in overrides.items() if value == "not_a_requirement"}
+    all_items = report.get("matched", []) + report.get("related", []) + report.get("missing", [])
+    for item in all_items:
+        item["user_override"] = overrides.get(item.get("normalized"), "")
+        item["excluded_from_adjusted_coverage"] = item.get("normalized") in excluded
+    eligible = [item for item in all_items if item.get("normalized") not in excluded]
+    matched = [item for item in report.get("matched", []) if item.get("normalized") not in excluded]
+    report["excluded_count"] = len(excluded)
+    report["adjusted_total"] = len(eligible)
+    report["adjusted_matched_count"] = len(matched)
+    report["adjusted_score_percent"] = round(len(matched) / len(eligible) * 100) if eligible else None
+    report["score_percent"] = report["adjusted_score_percent"]
+    report["matched_count"] = len(matched)
+    report["original_total"] = len(all_items)
+    report["original_matched_count"] = len(report.get("matched", []))
+    return report
 
 
 def keyword_present(content: str, phrase: str) -> bool:

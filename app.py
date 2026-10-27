@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import csv
+from collections import Counter
+import difflib
+import hashlib
 import html
 import importlib.metadata
 import io
@@ -12,6 +15,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from urllib.parse import urlencode
@@ -37,9 +41,13 @@ from grounding import (
     contains_contact_details,
     contains_resume_section_heading,
     build_keywords_score_report,
+    build_tailoring_coverage_report,
+    apply_tailoring_requirement_overrides,
     evidence_has_generation_source,
     is_corrupted_text,
     job_keywords,
+    normalize_keyword,
+    normalize_tailoring_requirement,
     stable_hash as grounding_hash,
     supporting_snippets,
     validate_cover_letter_output,
@@ -63,7 +71,7 @@ from werkzeug.utils import secure_filename
 from db.migrations import run_migrations
 from profile_store import CandidateProfileStore
 from services.document_generation import DocumentGenerationService
-from resume_layout import compare_docx_layout
+from resume_layout import compare_docx_layout, export_docx_to_pdf
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -102,7 +110,7 @@ DISCOVERY_DATE_WINDOWS = {
 # Keep the public diagnostics field stable for existing API clients.  The
 # database itself is now tracked independently by the migration runner.
 APP_SCHEMA_VERSION = 1
-CURRENT_DB_SCHEMA_VERSION = 3
+CURRENT_DB_SCHEMA_VERSION = 9
 DISCOVERY_DEBUG_SNAPSHOT_LIMIT = 25
 GEOCODING_FAILURE_CACHE_SECONDS = 15 * 60
 DISCOVERY_TASK_NAME = "Job Tracker Discovery"
@@ -588,6 +596,594 @@ def create_app() -> Flask:
             return jsonify(CandidateProfileStore(get_db()).set_default(profile_id, "cover_letter_template", document_id))
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
+
+    @app.get("/api/tailoring/<int:job_id>/workspace")
+    def tailoring_workspace(job_id: int) -> Response:
+        workspace_started = time.perf_counter()
+        db_started = time.perf_counter()
+        row = query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)
+        initial_db_ms = round((time.perf_counter() - db_started) * 1000, 2)
+        if row is None:
+            return jsonify({"error": "Job not found"}), 404
+        payload = {key: request.args.get(key) for key in ("candidate_profile_id", "resume_id")}
+        try:
+            selection = resolve_tailoring_resume_profile(payload)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        job = job_to_dict(row)
+        source_text = extract_docx_text(selection["resume_path"].read_bytes())
+        draft_row = current_tailoring_draft(job_id, int(selection["profile_row"]["id"]), int(selection["resume"]["id"]))
+        if draft_row is None:
+            cursor = get_db().execute(
+                "INSERT INTO tailoring_drafts(job_id, candidate_profile_id, resume_id, source_path, draft_path, revision_number) VALUES (?, ?, ?, ?, '', 1)",
+                [job_id, int(selection["profile_row"]["id"]), int(selection["resume"]["id"]), str(selection["resume_path"])],
+            )
+            get_db().commit()
+            draft_row = query_db("SELECT * FROM tailoring_drafts WHERE id = ?", [cursor.lastrowid], one=True)
+        draft = tailoring_draft_to_dict(draft_row)
+        draft["versions"] = tailoring_draft_versions(job_id, int(selection["profile_row"]["id"]), int(selection["resume"]["id"]))
+        draft_text = source_text
+        draft_path = safe_local_path(text(draft.get("draft_path")))
+        if draft_path and draft_path.is_file():
+            draft_text = extract_docx_text(draft_path.read_bytes())
+            draft["draft_version"] = tailoring_draft_version(draft_path)
+        draft_docx = draft_path if draft_path and draft_path.is_file() else selection["resume_path"]
+        current_bullets = tailoring_paragraphs(draft_docx)
+        memory_rows = query_db("SELECT * FROM keyword_memory WHERE candidate_profile_id = ? ORDER BY normalized_keyword", [int(selection["profile_row"]["id"])])
+        memory = {item["normalized_keyword"]: dict(item) for item in memory_rows}
+        for item in memory.values():
+            item["source_matches"] = False
+            item["matching_paragraph_index"] = None
+            if item.get("status") == "yes" and int(item.get("resume_id") or 0) == int(selection["resume"]["id"]) and text(item.get("source_fingerprint")):
+                match = next((bullet for bullet in current_bullets if bullet.get("editable") and grounding_hash(normalize_space(bullet.get("text"))) == text(item["source_fingerprint"])), None)
+                if match:
+                    item["source_matches"] = True
+                    item["matching_paragraph_index"] = int(match["paragraph_index"])
+        original_report = score_tailoring_text(job, selection["profile"], source_text)
+        report = score_tailoring_text(job, selection["profile"], draft_text)
+        override_rows = query_db("SELECT normalized_requirement, override FROM tailoring_requirement_overrides WHERE job_id = ?", [job_id])
+        overrides = {text(item["normalized_requirement"]): text(item["override"]) for item in override_rows}
+        report = apply_tailoring_requirement_overrides(report, overrides)
+        report["coverage_improvement_count"] = int(report.get("original_matched_count", report.get("matched_count", 0))) - int(original_report.get("matched_count", 0))
+        skill_rows = query_db(
+            "SELECT * FROM keyword_memory WHERE candidate_profile_id = ? AND confirmation_source = 'skill_confirmation' ORDER BY normalized_keyword",
+            [int(selection["profile_row"]["id"])],
+        )
+        skill_memory = {row["normalized_keyword"]: dict(row) for row in skill_rows}
+        for group in ("matched", "related", "missing"):
+            for item in report.get(group, []):
+                saved = memory.get(item["normalized"])
+                if saved is None:
+                    saved = next(
+                        (memory.get(normalize_keyword(alias)) for alias in item.get("alternative_terms", ())
+                         if memory.get(normalize_keyword(alias))),
+                        None,
+                    )
+                item["memory"] = saved or {}
+                item["skill_memory"] = {
+                    alias: skill_memory[normalize_keyword(alias)]
+                    for alias in item.get("alternative_terms", ())
+                    if normalize_keyword(alias) in skill_memory
+                }
+        skill_inventory = []
+        stop_words = {"and", "or", "with", "for", "the", "of", "to", "in", "experience", "using", "such", "as"}
+        for group_name in ("matched", "related", "missing"):
+            for item in report.get(group_name, []):
+                alternatives = list(item.get("alternative_terms") or [item.get("keyword")])
+                found_as = normalize_keyword(item.get("found_as"))
+                for term in alternatives:
+                    term = text(term)
+                    term_normalized = normalize_keyword(term)
+                    term_match = item.get("match_type", "missing") if found_as and term_normalized == found_as else "missing"
+                    term_memory = (item.get("skill_memory") or {}).get(term, {})
+                    term_words = [word for word in re.findall(r"[a-z0-9+#.]+", term.lower()) if len(word) > 2 and word not in stop_words]
+                    suggestions = []
+                    if term_match in {"missing", "partial"}:
+                        for bullet in current_bullets:
+                            if not bullet.get("editable"):
+                                continue
+                            bullet_words = set(re.findall(r"[a-z0-9+#.]+", text(bullet.get("text")).lower()))
+                            overlap = [word for word in term_words if word in bullet_words]
+                            if overlap:
+                                suggestions.append({"paragraph_index": bullet["paragraph_index"], "text": bullet["text"], "section": bullet.get("section", "Résumé"), "source_location": f"{bullet.get('section', 'Résumé')} · paragraph {bullet['paragraph_index'] + 1}", "overlap": overlap})
+                        suggestions = suggestions[:3]
+                    skill_inventory.append({
+                        "keyword": term,
+                        "normalized": term_normalized,
+                        "parent_keyword": item.get("keyword", term),
+                        "parent_normalized": item.get("normalized", term_normalized),
+                        "semantic_group": item.get("keyword", term),
+                        "alternative_terms": alternatives,
+                        "requirement_type": item.get("requirement_type", "unclassified"),
+                        "match_type": term_match,
+                        "parent_match_type": item.get("match_type", "missing"),
+                        "found_as": item.get("found_as", "") if term_match != "missing" else "",
+                        "source_evidence": item.get("source_evidence", []),
+                        "source_sections": item.get("source_sections", []),
+                        "evidence": item.get("evidence", "") if term_match != "missing" else "",
+                        "source_section": item.get("source_section", "Résumé") if term_match != "missing" else "",
+                        "skill_memory": term_memory,
+                        "suggested_bullets": suggestions,
+                    })
+        report["skill_inventory"] = skill_inventory
+        response = {
+            "job": job,
+            "candidate_profile": selection["profile_row"],
+            "resume": selection["resume"],
+            "draft": draft,
+            "bullets": current_bullets,
+            "keywords": report,
+            "original_keywords": original_report,
+            "preview": {"text": draft_text, "layout": draft.get("layout", {}), "approximate": not bool(draft.get("layout", {}).get("available"))},
+        }
+        response["timings_ms"] = {
+            "sqlite_initial_read": initial_db_ms,
+            "workspace_total": round((time.perf_counter() - workspace_started) * 1000, 2),
+        }
+        return jsonify(response)
+
+    @app.post("/api/tailoring/<int:job_id>/requirement-overrides")
+    def save_tailoring_requirement_override(job_id: int) -> Response:
+        payload = request.get_json(silent=True) or {}
+        normalized = normalize_tailoring_requirement(text(payload.get("normalized_requirement") or payload.get("keyword")))
+        override = text(payload.get("override"))
+        if not normalized or override not in {"yes", "no", "not_a_requirement", "unknown"}:
+            return jsonify({"error": "A requirement and a valid override are required."}), 400
+        if query_db("SELECT id FROM jobs WHERE id = ?", [job_id], one=True) is None:
+            return jsonify({"error": "Job not found"}), 404
+        get_db().execute(
+            "INSERT INTO tailoring_requirement_overrides(job_id, normalized_requirement, override) VALUES (?, ?, ?) ON CONFLICT(job_id, normalized_requirement) DO UPDATE SET override = excluded.override, updated_at = CURRENT_TIMESTAMP",
+            [job_id, normalized, override],
+        )
+        get_db().commit()
+        return jsonify({"job_id": job_id, "normalized_requirement": normalized, "override": override})
+
+    @app.delete("/api/tailoring/<int:job_id>/requirement-overrides/<path:normalized_requirement>")
+    def delete_tailoring_requirement_override(job_id: int, normalized_requirement: str) -> Response:
+        normalized = normalize_tailoring_requirement(normalized_requirement)
+        get_db().execute("DELETE FROM tailoring_requirement_overrides WHERE job_id = ? AND normalized_requirement = ?", [job_id, normalized])
+        get_db().commit()
+        return jsonify({"job_id": job_id, "normalized_requirement": normalized, "override": ""})
+
+    @app.post("/api/tailoring/<int:job_id>/draft")
+    def create_tailoring_draft(job_id: int) -> Response:
+        payload = request.get_json(force=True) or {}
+        row = query_db("SELECT id FROM jobs WHERE id = ?", [job_id], one=True)
+        if row is None:
+            return jsonify({"error": "Job not found"}), 404
+        try:
+            selection = resolve_tailoring_resume_profile(payload)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        existing = current_tailoring_draft(job_id, int(selection["profile_row"]["id"]), int(selection["resume"]["id"]))
+        if existing is None:
+            cursor = get_db().execute("INSERT INTO tailoring_drafts(job_id, candidate_profile_id, resume_id, source_path, revision_number) VALUES (?, ?, ?, ?, 1)", [job_id, int(selection["profile_row"]["id"]), int(selection["resume"]["id"]), str(selection["resume_path"])])
+            get_db().commit()
+            existing = query_db("SELECT * FROM tailoring_drafts WHERE id = ?", [cursor.lastrowid], one=True)
+        return jsonify(tailoring_draft_to_dict(existing)), 201 if existing and int(existing["id"]) == int(cursor.lastrowid if 'cursor' in locals() else -1) else 200
+
+    @app.post("/api/tailoring/drafts/<int:draft_id>/new-revision")
+    def create_tailoring_revision(draft_id: int) -> Response:
+        row = query_db("SELECT * FROM tailoring_drafts WHERE id = ?", [draft_id], one=True)
+        if row is None:
+            return jsonify({"error": "Tailoring draft was not found"}), 404
+        if text(row["status"]) != "approved":
+            return jsonify({"error": "Create a new revision only from an approved résumé draft."}), 409
+        existing = editable_tailoring_draft(int(row["job_id"]), int(row["candidate_profile_id"]), int(row["resume_id"]))
+        if existing is not None:
+            return jsonify({"created": False, "draft": tailoring_draft_to_dict(existing), "message": "An editable revision already exists."}), 200
+        approved_path = safe_local_path(text(row["approved_tailored_resume_path"]))
+        if approved_path is None or not approved_path.is_file():
+            return jsonify({"error": "The approved résumé artifact is unavailable; no new revision was created."}), 409
+        next_revision = int(query_db(
+            "SELECT COALESCE(MAX(revision_number), 0) + 1 AS next_revision FROM tailoring_drafts WHERE job_id = ? AND candidate_profile_id = ? AND resume_id = ?",
+            [row["job_id"], row["candidate_profile_id"], row["resume_id"]], one=True,
+        )["next_revision"])
+        db = get_db()
+        cursor = db.execute(
+            "INSERT INTO tailoring_drafts(job_id, candidate_profile_id, resume_id, source_path, draft_path, parent_draft_id, revision_number) VALUES (?, ?, ?, ?, '', ?, ?)",
+            [row["job_id"], row["candidate_profile_id"], row["resume_id"], str(approved_path), int(row["id"]), next_revision],
+        )
+        new_id = int(cursor.lastrowid)
+        target = tailoring_draft_path(new_id)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(approved_path, target)
+            db.execute("UPDATE tailoring_drafts SET draft_path = ?, layout_json = ? WHERE id = ?", [str(target), dumps_json(pending_tailoring_layout(tailoring_draft_version(target))), new_id])
+            db.execute("UPDATE tailoring_drafts SET superseded_by_draft_id = ? WHERE id = ?", [new_id, int(row["id"])])
+            db.commit()
+        except OSError as exc:
+            db.rollback()
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return jsonify({"error": f"The new résumé revision could not be created: {exc}"}), 409
+        created = query_db("SELECT * FROM tailoring_drafts WHERE id = ?", [new_id], one=True)
+        return jsonify({"created": True, "draft": tailoring_draft_to_dict(created), "message": f"Version {next_revision} is ready for editing."}), 201
+
+    @app.get("/api/tailoring/drafts/<int:draft_id>/download")
+    def download_tailoring_draft(draft_id: int) -> Response:
+        row = query_db("SELECT * FROM tailoring_drafts WHERE id = ?", [draft_id], one=True)
+        if row is None:
+            return jsonify({"error": "Tailoring draft was not found"}), 404
+        path = safe_local_path(text(row["draft_path"]))
+        if path is None or not path.is_file():
+            return jsonify({"error": "The copied résumé DOCX is not available until an edit has been applied."}), 404
+        return send_file(path, as_attachment=True, download_name=tailoring_resume_filename(row, draft=True), mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+
+    @app.post("/api/tailoring/drafts/<int:draft_id>/apply")
+    def apply_tailoring_draft_change(draft_id: int) -> Response:
+        payload = request.get_json(force=True) or {}
+        row = query_db("SELECT * FROM tailoring_drafts WHERE id = ?", [draft_id], one=True)
+        if row is None:
+            return jsonify({"error": "Tailoring draft was not found"}), 404
+        if text(row["status"]) == "approved":
+            return jsonify({"error": "This résumé draft is approved and locked for its application package. Create a new draft to make further changes."}), 409
+        changes = parse_json_array(row["changes_json"])
+        operation = text(payload.get("operation")) or "replace"
+        paragraph_index = int(payload.get("paragraph_index", -1))
+        history = parse_json_object(row["revision_history_json"] if "revision_history_json" in row.keys() else "{}")
+        key = str(paragraph_index)
+        revisions = list(history.get(key) or [])
+        if operation in {"leave_unchanged", "revert_original"}:
+            prior = next((item for item in changes if int(item.get("paragraph_index", -1)) == paragraph_index), None)
+            if operation == "leave_unchanged" and revisions:
+                revisions.pop()
+                history[key] = revisions
+                if revisions and prior:
+                    prior["proposed_text"] = text(revisions[-1].get("proposed_text"))
+                    changes = [prior if int(item.get("paragraph_index", -1)) == paragraph_index else item for item in changes]
+                else:
+                    changes = [item for item in changes if int(item.get("paragraph_index", -1)) != paragraph_index]
+            else:
+                history.pop(key, None)
+                changes = [item for item in changes if int(item.get("paragraph_index", -1)) != paragraph_index]
+        else:
+            try:
+                paragraph_index = int(payload.get("paragraph_index"))
+            except (TypeError, ValueError) as exc:
+                return jsonify({"error": "Select an existing résumé bullet first"}), 400
+            original = text(payload.get("original_text"))
+            proposed = text(payload.get("proposed_text"))
+            if not original or not proposed:
+                return jsonify({"error": "Original and proposed bullet text are required"}), 400
+            if operation not in {"edit", "replace"}:
+                return jsonify({"error": "This first studio release supports edit, replace or leave unchanged"}), 400
+            prior = next((item for item in changes if int(item.get("paragraph_index", -1)) == paragraph_index), None)
+            source_section = "Résumé"
+            source_path = safe_local_path(text(row["source_path"]))
+            if source_path and source_path.is_file():
+                source_bullet = next((item for item in tailoring_paragraphs(source_path) if int(item["paragraph_index"]) == paragraph_index), None)
+                source_section = text(source_bullet.get("section")) if source_bullet else source_section
+            change = {"paragraph_index": paragraph_index, "source_section": source_section, "keyword": normalize_keyword(text(payload.get("keyword")) or text(prior.get("keyword") if prior else "")), "original_text": text(prior.get("original_text")) if prior else original, "proposed_text": proposed, "operation": operation}
+            if not revisions or text(revisions[-1].get("proposed_text")) != proposed:
+                revisions.append({"proposed_text": proposed, "keyword": change["keyword"], "saved_at": datetime.now().isoformat(timespec="seconds")})
+            history[key] = revisions
+            changes = [item for item in changes if int(item.get("paragraph_index", -1)) != paragraph_index]
+            changes.append(change)
+        try:
+            result = rebuild_tailoring_draft(draft_id, changes, revision_history=history, draft_row=row)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 409
+        return jsonify({"draft_id": draft_id, "changes": changes, "revision_history": history, **result})
+
+    @app.post("/api/tailoring/drafts/<int:draft_id>/approve")
+    def approve_tailoring_draft(draft_id: int) -> Response:
+        payload = request.get_json(silent=True) or {}
+        row = query_db("SELECT * FROM tailoring_drafts WHERE id = ?", [draft_id], one=True)
+        if row is None:
+            return jsonify({"error": "Tailoring draft was not found"}), 404
+        if text(row["status"]) == "approved":
+            return jsonify({"error": "This résumé draft is already approved and locked. Create a new revision before making changes."}), 409
+        if text(row["status"]) != "draft":
+            return jsonify({"error": "Only an editable draft can be approved."}), 409
+        draft_path = safe_local_path(text(row["draft_path"]))
+        if draft_path is None or not draft_path.is_file():
+            return jsonify({"error": "Apply at least one valid edit before approving this résumé draft"}), 409
+        package_id = int(payload.get("preparation_id") or 0)
+        package = query_db("SELECT * FROM application_preparation_queue WHERE id = ?", [package_id], one=True) if package_id else query_db(
+            "SELECT * FROM application_preparation_queue WHERE job_id = ? AND candidate_profile_id = ? AND resume_id = ? ORDER BY id DESC LIMIT 1",
+            [row["job_id"], row["candidate_profile_id"], row["resume_id"]], one=True,
+        )
+        if package is None:
+            return jsonify({"error": "Queue this job with the same candidate profile and résumé before approving the tailored résumé."}), 409
+        if int(package["job_id"]) != int(row["job_id"]) or int(package["candidate_profile_id"]) != int(row["candidate_profile_id"]) or int(package["resume_id"]) != int(row["resume_id"]):
+            return jsonify({"error": "This tailoring draft does not belong to the selected application package."}), 409
+        if package["status"] == "approved":
+            return jsonify({"error": "Approved application packages cannot be changed."}), 409
+        change_error = validate_tailoring_draft_changes(draft_path, parse_json_array(row["changes_json"]))
+        if change_error:
+            return jsonify({"error": change_error}), 409
+        layout = validate_tailoring_draft_layout(draft_id, expected_version=tailoring_draft_version(draft_path))
+        if not layout.get("available") or not layout.get("verified"):
+            return jsonify({"error": layout.get("reason") or "Word layout validation did not pass; the résumé draft cannot be approved yet.", "layout": layout}), 409
+        target = DATA_DIR / "application_preparations" / str(package["id"]) / f"tailored_resume_draft_{draft_id}.docx"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(draft_path, target)
+        now = datetime.now().isoformat(timespec="seconds")
+        for change in parse_json_array(row["changes_json"]):
+            normalized = normalize_keyword(text(change.get("keyword")))
+            if not normalized:
+                continue
+            get_db().execute(
+                """INSERT INTO keyword_memory(candidate_profile_id, normalized_keyword, keyword, status, project_employer, supporting_bullet, source_fingerprint, approved_replacement, resume_id, source_paragraph_index)
+                   VALUES (?, ?, ?, 'yes', '', ?, ?, ?, ?, ?)
+                   ON CONFLICT(candidate_profile_id, normalized_keyword) DO UPDATE SET keyword=excluded.keyword, status='yes', supporting_bullet=excluded.supporting_bullet, source_fingerprint=excluded.source_fingerprint, approved_replacement=excluded.approved_replacement, resume_id=excluded.resume_id, source_paragraph_index=excluded.source_paragraph_index, updated_at=CURRENT_TIMESTAMP""",
+                [row["candidate_profile_id"], normalized, text(change.get("keyword")), text(change.get("original_text")), grounding_hash(normalize_space(text(change.get("original_text")))), text(change.get("proposed_text")), row["resume_id"], int(change.get("paragraph_index") or -1)],
+            )
+        get_db().execute("UPDATE tailoring_drafts SET status = 'approved', approved_at = ?, approved_tailoring_draft_id = ?, approved_tailored_resume_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [now, draft_id, str(target), draft_id])
+        get_db().execute("UPDATE application_preparation_queue SET approved_tailoring_draft_id = ?, approved_tailored_resume_path = ?, prepared_resume_path = CASE WHEN status = 'ready_for_review' THEN ? ELSE prepared_resume_path END, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [draft_id, str(target), str(target), int(package["id"])])
+        get_db().commit()
+        return jsonify({"approved": True, "draft": tailoring_draft_to_dict(query_db("SELECT * FROM tailoring_drafts WHERE id = ?", [draft_id], one=True)), "preparation": preparation_queue_to_dict(query_db("SELECT * FROM application_preparation_queue WHERE id = ?", [package["id"]], one=True))})
+
+    @app.post("/api/tailoring/drafts/<int:draft_id>/apply-memory")
+    def apply_tailoring_memory(draft_id: int) -> Response:
+        payload = request.get_json(silent=True) or {}
+        row = query_db("SELECT * FROM tailoring_drafts WHERE id = ?", [draft_id], one=True)
+        requested_keyword = text(payload.get("keyword"))
+        keyword = normalize_keyword(requested_keyword)
+        memory = query_db("SELECT * FROM keyword_memory WHERE candidate_profile_id = ? AND normalized_keyword = ?", [row["candidate_profile_id"] if row else 0, keyword], one=True)
+        if memory is None and row is not None:
+            job_row = query_db("SELECT * FROM jobs WHERE id = ?", [row["job_id"]], one=True)
+            requirement = next(
+                (item for item in extract_tailoring_requirements(job_to_dict(job_row))
+                 if item["normalized"] == keyword or any(normalize_keyword(alias) == keyword for alias in item.get("alternative_terms", ()))),
+                None,
+            )
+            if requirement:
+                for alias in requirement.get("alternative_terms", ()):
+                    memory = query_db(
+                        "SELECT * FROM keyword_memory WHERE candidate_profile_id = ? AND normalized_keyword = ?",
+                        [row["candidate_profile_id"], normalize_keyword(alias)], one=True,
+                    )
+                    if memory is not None:
+                        keyword = text(memory["normalized_keyword"])
+                        break
+        if row is None or memory is None:
+            return jsonify({"error": "No saved approved suggestion exists for this profile and keyword."}), 404
+        if memory["status"] != "yes" or not text(memory["approved_replacement"]):
+            return jsonify({"error": "This keyword does not have an approved replacement."}), 409
+        try:
+            paragraph_index = int(payload.get("paragraph_index"))
+        except (TypeError, ValueError):
+            return jsonify({"error": "Select the résumé bullet that the saved suggestion should replace."}), 400
+        draft_path = safe_local_path(text(row["draft_path"])) or safe_local_path(text(row["source_path"]))
+        if draft_path is None or not draft_path.is_file():
+            return jsonify({"error": "The selected résumé draft is unavailable."}), 409
+        paragraphs = list(Document(draft_path).paragraphs)
+        if paragraph_index < 0 or paragraph_index >= len(paragraphs):
+            return jsonify({"error": "The saved suggestion could not be matched safely to this résumé."}), 409
+        current = normalize_space(paragraphs[paragraph_index].text)
+        if text(memory["source_fingerprint"]) and text(memory["source_fingerprint"]) != grounding_hash(current):
+            return jsonify({"error": "The saved suggestion does not match this résumé bullet; choose a bullet manually."}), 409
+        changes = parse_json_array(row["changes_json"])
+        prior = next((item for item in changes if int(item.get("paragraph_index", -1)) == paragraph_index), None)
+        change = {"paragraph_index": paragraph_index, "keyword": keyword, "original_text": text(prior.get("original_text")) if prior else current, "proposed_text": text(memory["approved_replacement"]), "operation": "edit"}
+        history = parse_json_object(row["revision_history_json"] if "revision_history_json" in row.keys() else "{}")
+        history_key = str(paragraph_index)
+        revisions = list(history.get(history_key) or [])
+        if not revisions or text(revisions[-1].get("proposed_text")) != change["proposed_text"]:
+            revisions.append({"proposed_text": change["proposed_text"], "keyword": keyword, "saved_at": datetime.now().isoformat(timespec="seconds")})
+        history[history_key] = revisions
+        changes = [item for item in changes if int(item.get("paragraph_index", -1)) != paragraph_index]
+        changes.append(change)
+        try:
+            result = rebuild_tailoring_draft(draft_id, changes, revision_history=history, draft_row=row)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 409
+        return jsonify({"draft_id": draft_id, "changes": changes, "memory_applied": True, **result})
+
+    @app.post("/api/tailoring/drafts/<int:draft_id>/improve")
+    def improve_tailoring_draft_change(draft_id: int) -> Response:
+        payload = request.get_json(force=True) or {}
+        row = query_db("SELECT * FROM tailoring_drafts WHERE id = ?", [draft_id], one=True)
+        if row is None:
+            return jsonify({"error": "Tailoring draft was not found"}), 404
+        job_row = query_db("SELECT * FROM jobs WHERE id = ?", [row["job_id"]], one=True)
+        try:
+            selection = resolve_tailoring_resume_profile({"candidate_profile_id": row["candidate_profile_id"], "resume_id": row["resume_id"]})
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 409
+        original = text(payload.get("original_text"))
+        if not original:
+            return jsonify({"error": "Select an existing résumé bullet before requesting an improvement"}), 400
+        config = OllamaConfig.from_mapping(load_profile())
+        if not config.enabled:
+            return jsonify({"error": "AI improvement is disabled. Enable the configured local Ollama assistant first."}), 503
+        target_length = max(120, round(len(original) * 1.2))
+        source_context = next((item for item in tailoring_paragraphs(selection["resume_path"]) if normalize_space(item.get("text")) == normalize_space(original)), None)
+        keyword = text(payload.get("keyword"))
+        prompt = json.dumps({"task": "Improve only this résumé bullet", "job": {"title": job_row["title"], "description": job_row["job_description"]}, "keyword": keyword, "source_location": source_context.get("section") if source_context else "Selected résumé bullet", "verified_candidate_evidence": original, "bullet": original, "target_length_characters": target_length, "rules": ["Return JSON with proposed_bullet string only", "Preserve every number, percentage, version, range, plus sign, unit, qualifier, technology, security fact, employer, project and responsibility from the selected bullet", "Do not combine facts from other résumé bullets, projects or employers", "Do not add technologies, integrations, responsibilities or achievements", "Preserve necessary articles and grammatical sentence structure", "Reorganize existing supported facts to foreground the selected job requirement when useful", "Prefer the same length or shorter than the original", "If no meaningful safe improvement is possible, return the original bullet unchanged"]})
+        response = request_json_completion(config, prompt, system="Return exactly one valid JSON object with a proposed_bullet string. Do not include reasoning, markdown, or commentary.")
+        if not response.get("ok") or not text(response.get("data")):
+            return jsonify({"error": response.get("error") or "The local AI assistant did not return a usable suggestion."}), 503
+        raw_data = response.get("data")
+        if isinstance(raw_data, dict):
+            proposed = text(raw_data.get("proposed_bullet") or raw_data.get("proposed_text"))
+        else:
+            proposed = text(raw_data)
+        if not proposed:
+            return jsonify({"error": "The local AI assistant returned JSON without a proposed_bullet string."}), 422
+        if proposed.startswith("```"):
+            proposed = proposed.strip("`").replace("text\n", "", 1).strip()
+        validation_error = validate_tailoring_bullet_suggestion(original, proposed)
+        if validation_error:
+            retry_prompt = f"{prompt}\n\nThe first proposal failed this quality or safety check: {validation_error} Retry once. Preserve necessary articles and grammar, keep all selected-bullet facts, and foreground the requirement only by reorganizing existing supported wording. If no meaningful safe improvement is possible, return the original bullet unchanged. Original bullet: {original}"
+            retry_response = request_json_completion(
+                config,
+                retry_prompt,
+                system="Return exactly one valid JSON object with a proposed_bullet string. Preserve all factual and quantified content exactly. Do not include reasoning, markdown, or commentary.",
+            )
+            retry_data = retry_response.get("data") if retry_response.get("ok") else None
+            if isinstance(retry_data, dict):
+                retry_proposed = text(retry_data.get("proposed_bullet") or retry_data.get("proposed_text"))
+            else:
+                retry_proposed = text(retry_data)
+            retry_error = validate_tailoring_bullet_suggestion(original, retry_proposed) if retry_proposed else "The retry returned no usable suggestion."
+            if retry_error in {TAILORING_ALREADY_SUITABLE, TAILORING_GRAMMAR_WARNING}:
+                return jsonify({"original_text": original, "proposed_text": original, "applied": False, "meaningful_improvement": False, "retry_attempted": True, "message": TAILORING_ALREADY_SUITABLE})
+            if not retry_error:
+                return jsonify({"original_text": original, "proposed_text": retry_proposed, "applied": False, "meaningful_improvement": True, "retry_attempted": True, "message": "AI suggestion is ready for review and has not been applied."})
+            return jsonify({"error": f"AI suggestion rejected after one safety retry: {retry_error}", "original_text": original, "proposed_text": original, "applied": False, "retry_attempted": True}), 422
+        return jsonify({"original_text": original, "proposed_text": proposed, "applied": False, "meaningful_improvement": True, "message": "AI suggestion is ready for review and has not been applied."})
+
+    @app.get("/api/tailoring/drafts/<int:draft_id>/preview")
+    def preview_tailoring_draft(draft_id: int) -> Response:
+        preview_started = time.perf_counter()
+        row = query_db("SELECT * FROM tailoring_drafts WHERE id = ?", [draft_id], one=True)
+        if row is None:
+            return jsonify({"error": "Tailoring draft was not found"}), 404
+        draft_path = safe_local_path(text(row["draft_path"])) or safe_local_path(text(row["source_path"])) or tailoring_draft_path(draft_id)
+        if draft_path is None or not draft_path.is_file():
+            return jsonify({"error": "The current résumé draft DOCX is unavailable."}), 409
+        preview_pdf = DATA_DIR / "tailoring_drafts" / str(draft_id) / "preview.pdf"
+        preview_meta = preview_pdf.with_suffix(".meta.json")
+        preview_pdf.parent.mkdir(parents=True, exist_ok=True)
+        draft_version = tailoring_draft_version(draft_path)
+        layout = validate_tailoring_draft_layout(draft_id, expected_version=draft_version)
+        pdf = {"available": False, "reason": layout.get("reason") or "Word layout validation is unavailable."}
+        pdf_cached = False
+        pdf_generation_ms = 0.0
+        if layout.get("available") and layout.get("verified"):
+            cached_version = ""
+            if preview_meta.is_file():
+                try:
+                    cached_version = text(json.loads(preview_meta.read_text(encoding="utf-8")).get("draft_version"))
+                except (OSError, ValueError, TypeError):
+                    cached_version = ""
+            if preview_pdf.is_file() and cached_version == draft_version:
+                pdf = {"available": True, "path": str(preview_pdf), "cached": True}
+                pdf_cached = True
+            else:
+                export_started = time.perf_counter()
+                pdf = export_docx_to_pdf(draft_path, preview_pdf)
+                pdf_generation_ms = round((time.perf_counter() - export_started) * 1000, 2)
+                pdf.setdefault("timings_ms", {})["pdf_generation"] = pdf_generation_ms
+                if pdf.get("available") and tailoring_draft_version(draft_path) == draft_version:
+                    try:
+                        preview_meta.write_text(json.dumps({"draft_version": draft_version}), encoding="utf-8")
+                    except OSError:
+                        pass
+                elif pdf.get("available"):
+                    pdf = {"available": False, "reason": "The résumé draft changed while the PDF preview was generated. Refresh and try again."}
+        text_started = time.perf_counter()
+        preview_text = extract_docx_text(draft_path.read_bytes())
+        text_ms = round((time.perf_counter() - text_started) * 1000, 2)
+        timings = dict(layout.get("timings_ms") or {})
+        timings["pdf_generation"] = pdf_generation_ms
+        timings["preview_text_extraction"] = text_ms
+        timings["preview_total"] = round((time.perf_counter() - preview_started) * 1000, 2)
+        return jsonify({
+            "draft_id": draft_id,
+            "text": preview_text,
+            "layout": layout,
+            "pdf_available": bool(pdf.get("available")),
+            "pdf_url": f"/api/tailoring/drafts/{draft_id}/preview.pdf" if pdf.get("available") else "",
+            "pdf_reason": text(pdf.get("reason")),
+            "cached": pdf_cached,
+            "timings_ms": timings,
+        })
+
+    @app.get("/api/tailoring/drafts/<int:draft_id>/preview.pdf")
+    def download_tailoring_preview_pdf(draft_id: int) -> Response:
+        row = query_db("SELECT * FROM tailoring_drafts WHERE id = ?", [draft_id], one=True)
+        if row is None:
+            return jsonify({"error": "Tailoring draft was not found"}), 404
+        draft_path = safe_local_path(text(row["draft_path"])) or safe_local_path(text(row["source_path"])) or tailoring_draft_path(draft_id)
+        preview_pdf = DATA_DIR / "tailoring_drafts" / str(draft_id) / "preview.pdf" if draft_path else None
+        preview_meta = preview_pdf.with_suffix(".meta.json") if preview_pdf else None
+        draft_version = tailoring_draft_version(draft_path) if draft_path and draft_path.is_file() else ""
+        cached_version = ""
+        if preview_meta and preview_meta.is_file():
+            try:
+                cached_version = text(json.loads(preview_meta.read_text(encoding="utf-8")).get("draft_version"))
+            except (OSError, ValueError, TypeError):
+                cached_version = ""
+        if preview_pdf is None or not preview_pdf.is_file() or not draft_version or cached_version != draft_version:
+            return jsonify({"error": "An accurate PDF preview is unavailable. Download the current DOCX instead."}), 404
+        return send_file(preview_pdf, mimetype="application/pdf", as_attachment=False, download_name=f"tailoring-draft-{draft_id}.pdf")
+
+    @app.get("/api/candidate-profiles/<int:profile_id>/keyword-memory")
+    def list_keyword_memory(profile_id: int) -> Response:
+        return jsonify([dict(row) for row in query_db("SELECT * FROM keyword_memory WHERE candidate_profile_id = ? ORDER BY normalized_keyword", [profile_id])])
+
+    @app.post("/api/candidate-profiles/<int:profile_id>/keyword-memory")
+    def save_keyword_memory(profile_id: int) -> Response:
+        payload = request.get_json(force=True) or {}
+        keyword = text(payload.get("keyword"))
+        normalized = normalize_keyword(keyword)
+        status = text(payload.get("status")) or "unknown"
+        if not normalized or status not in {"yes", "no", "unknown"}:
+            return jsonify({"error": "Keyword and status (yes, no or unknown) are required"}), 400
+        profile = query_db("SELECT id FROM candidate_profiles WHERE id = ?", [profile_id], one=True)
+        if profile is None:
+            return jsonify({"error": "Candidate profile was not found"}), 404
+        existing = query_db("SELECT * FROM keyword_memory WHERE candidate_profile_id = ? AND normalized_keyword = ?", [profile_id, normalized], one=True)
+        values = {
+            "keyword": keyword,
+            "status": status,
+            "project_employer": text(payload.get("project_employer")) or text(existing["project_employer"] if existing else ""),
+            "supporting_bullet": text(payload.get("supporting_bullet")) or text(existing["supporting_bullet"] if existing else ""),
+            "source_fingerprint": text(payload.get("source_fingerprint")) or text(existing["source_fingerprint"] if existing else ""),
+            "approved_replacement": text(payload.get("approved_replacement")) or text(existing["approved_replacement"] if existing else ""),
+            "resume_id": int(payload.get("resume_id") or (existing["resume_id"] if existing and "resume_id" in existing.keys() else 0)),
+            "source_paragraph_index": int(payload.get("source_paragraph_index") if payload.get("source_paragraph_index") is not None else (existing["source_paragraph_index"] if existing and "source_paragraph_index" in existing.keys() else -1)),
+        }
+        get_db().execute(
+            """INSERT INTO keyword_memory(candidate_profile_id, normalized_keyword, keyword, status, project_employer, supporting_bullet, source_fingerprint, approved_replacement, resume_id, source_paragraph_index)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(candidate_profile_id, normalized_keyword) DO UPDATE SET keyword=excluded.keyword, status=excluded.status, project_employer=excluded.project_employer, supporting_bullet=excluded.supporting_bullet, source_fingerprint=excluded.source_fingerprint, approved_replacement=excluded.approved_replacement, resume_id=excluded.resume_id, source_paragraph_index=excluded.source_paragraph_index, updated_at=CURRENT_TIMESTAMP""",
+            [profile_id, normalized, values["keyword"], values["status"], values["project_employer"], values["supporting_bullet"], values["source_fingerprint"], values["approved_replacement"], values["resume_id"], values["source_paragraph_index"]],
+        )
+        get_db().commit()
+        return jsonify(dict(query_db("SELECT * FROM keyword_memory WHERE candidate_profile_id = ? AND normalized_keyword = ?", [profile_id, normalized], one=True)))
+
+    @app.delete("/api/candidate-profiles/<int:profile_id>/keyword-memory/<path:normalized_keyword>")
+    def delete_keyword_memory(profile_id: int, normalized_keyword: str) -> Response:
+        get_db().execute("DELETE FROM keyword_memory WHERE candidate_profile_id = ? AND normalized_keyword = ?", [profile_id, normalized_keyword])
+        get_db().commit()
+        return jsonify({"ok": True})
+
+    @app.get("/api/candidate-profiles/<int:profile_id>/skill-memory")
+    def list_skill_memory(profile_id: int) -> Response:
+        return jsonify([dict(row) for row in query_db(
+            "SELECT * FROM keyword_memory WHERE candidate_profile_id = ? AND confirmation_source = 'skill_confirmation' ORDER BY normalized_keyword",
+            [profile_id],
+        )])
+
+    @app.post("/api/candidate-profiles/<int:profile_id>/skill-memory")
+    def save_skill_memory(profile_id: int) -> Response:
+        payload = request.get_json(force=True) or {}
+        keyword = text(payload.get("keyword"))
+        normalized = normalize_keyword(keyword)
+        status = text(payload.get("status")) or "unknown"
+        if not normalized or status not in {"yes", "no", "unknown"}:
+            return jsonify({"error": "Keyword and status (yes, no or unknown) are required"}), 400
+        if query_db("SELECT id FROM candidate_profiles WHERE id = ?", [profile_id], one=True) is None:
+            return jsonify({"error": "Candidate profile was not found"}), 404
+        now = datetime.now().isoformat(timespec="seconds")
+        get_db().execute(
+            """INSERT INTO keyword_memory(candidate_profile_id, normalized_keyword, keyword, status, project_employer, supporting_bullet, source_fingerprint, approved_replacement, resume_id, source_paragraph_index, confirmation_source, confirmed_at, notes)
+               VALUES (?, ?, ?, ?, '', '', '', '', 0, -1, 'skill_confirmation', ?, ?)
+               ON CONFLICT(candidate_profile_id, normalized_keyword) DO UPDATE SET keyword=excluded.keyword, status=excluded.status, confirmation_source='skill_confirmation', confirmed_at=excluded.confirmed_at, notes=excluded.notes, updated_at=CURRENT_TIMESTAMP""",
+            [profile_id, normalized, keyword, status, now, text(payload.get("notes"))],
+        )
+        get_db().commit()
+        return jsonify(dict(query_db(
+            "SELECT * FROM keyword_memory WHERE candidate_profile_id = ? AND normalized_keyword = ?",
+            [profile_id, normalized], one=True,
+        )))
+
+    @app.delete("/api/candidate-profiles/<int:profile_id>/skill-memory/<path:normalized_skill>")
+    def delete_skill_memory(profile_id: int, normalized_skill: str) -> Response:
+        normalized = normalize_keyword(normalized_skill)
+        get_db().execute(
+            "DELETE FROM keyword_memory WHERE candidate_profile_id = ? AND normalized_keyword = ? AND confirmation_source = 'skill_confirmation'",
+            [profile_id, normalized],
+        )
+        get_db().commit()
+        return jsonify({"ok": True})
 
     @app.get("/api/ollama/health")
     def ollama_health() -> Response:
@@ -1187,7 +1783,7 @@ def create_app() -> Flask:
                 return jsonify({"error": "Both résumé and cover letter must be generated before approval"}), 409
             if not text(row["prepared_resume_path"]) or not text(row["prepared_cover_letter_path"]):
                 return jsonify({"error": "This package has no recorded generated documents"}), 409
-            if not all(safe_generated_path(row[field]) and safe_generated_path(row[field]).is_file() for field in ("prepared_resume_path", "prepared_cover_letter_path")):
+            if not all(safe_preparation_artifact_path(row[field]) and safe_preparation_artifact_path(row[field]).is_file() for field in ("prepared_resume_path", "prepared_cover_letter_path")):
                 return jsonify({"error": "A generated document for this package is no longer available"}), 409
         return jsonify(_update_preparation_item(item_id, status=status, review_status=review_status))
 
@@ -1213,15 +1809,23 @@ def create_app() -> Flask:
         if job is None:
             return jsonify({"error": "Job not found"}), 404
         values: dict[str, Any] = {}
+        errors: dict[str, str] = {}
         for kind, package_field in (("resume", "prepared_resume_path"), ("cover_letter", "prepared_cover_letter_path")):
-            path = safe_generated_path(item[package_field])
+            raw_path = text(item[package_field])
+            path = safe_preparation_artifact_path(raw_path)
             values[kind] = ""
-            if path and path.is_file():
+            if not raw_path:
+                errors[kind] = f"Prepared {kind.replace('_', ' ')} file is not recorded for this package."
+            elif path is None:
+                errors[kind] = f"Prepared {kind.replace('_', ' ')} file is outside the active application package directory."
+            elif not path.is_file():
+                errors[kind] = f"Prepared {kind.replace('_', ' ')} file is missing from this application environment."
+            else:
                 try:
                     values[kind] = "\n".join(paragraph.text for paragraph in iter_document_paragraphs(Document(io.BytesIO(path.read_bytes()))) if paragraph.text.strip())
                 except (OSError, ValueError, zipfile.BadZipFile):
-                    values[kind] = ""
-        return jsonify({"resume": values["resume"], "cover_letter": values["cover_letter"], "status": item["status"], "job_id": item["job_id"]})
+                    errors[kind] = f"Prepared {kind.replace('_', ' ')} DOCX could not be read."
+        return jsonify({"resume": values["resume"], "cover_letter": values["cover_letter"], "errors": errors, "status": item["status"], "job_id": item["job_id"], "company": text(job["company"]), "title": text(job["title"])})
 
     @app.get("/api/preparation/<int:item_id>/download/<kind>")
     def download_preparation_document(item_id: int, kind: str) -> Response:
@@ -1231,10 +1835,16 @@ def create_app() -> Flask:
         if item is None:
             return jsonify({"error": "Preparation queue item was not found"}), 404
         field = "prepared_resume_path" if kind == "resume" else "prepared_cover_letter_path"
-        path = safe_generated_path(item[field])
+        path = safe_preparation_artifact_path(item[field])
         if path is None or not path.is_file():
             return jsonify({"error": "The generated document for this package is unavailable"}), 404
-        return send_file(path, as_attachment=True, download_name=secure_filename(path.name) or "document.docx", mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        profile = query_db("SELECT applicant_name, name FROM candidate_profiles WHERE id = ?", [item["candidate_profile_id"]], one=True)
+        job = query_db("SELECT title FROM jobs WHERE id = ?", [item["job_id"]], one=True)
+        applicant = text(profile["applicant_name"] if profile and text(profile["applicant_name"]) else profile["name"] if profile else "Applicant")
+        role = text(job["title"] if job else "Application")
+        document_label = "Resume" if kind == "resume" else "Cover_Letter"
+        download_name = f"{safe_filename(applicant)}_{document_label}_{safe_filename(role)}.docx"
+        return send_file(path, as_attachment=True, download_name=download_name, mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
     @app.get("/api/discovery/runs")
     def discovery_runs() -> Response:
@@ -2571,6 +3181,332 @@ def resolve_generation_profile(payload: dict[str, Any] | None) -> dict[str, Any]
     return profile
 
 
+def resolve_tailoring_resume_profile(payload: dict[str, Any]) -> dict[str, Any]:
+    """Resolve only the selected candidate profile and résumé for the studio."""
+    raw_profile_id = payload.get("candidate_profile_id")
+    if raw_profile_id in (None, "", 0):
+        raise ValueError("Select a candidate profile before opening the résumé studio.")
+    try:
+        profile_id = int(raw_profile_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("candidate_profile_id must be an integer") from exc
+    store = CandidateProfileStore(get_db())
+    profile_row = next((item for item in store.list_profiles() if int(item["id"]) == profile_id), None)
+    if profile_row is None:
+        raise ValueError("Selected candidate profile was not found")
+    documents = store.documents_for(profile_id)
+    raw_resume_id = payload.get("resume_id")
+    if raw_resume_id not in (None, "", 0):
+        try:
+            resume_id = int(raw_resume_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("resume_id must be an integer") from exc
+        resume = next((item for item in documents["resumes"] if int(item["id"]) == resume_id), None)
+    else:
+        resume = next((item for item in documents["resumes"] if item.get("is_default")), None) or (documents["resumes"][0] if documents["resumes"] else None)
+    if resume is None:
+        raise ValueError("Selected candidate profile has no base résumé. Upload a DOCX résumé first.")
+    resume_path = safe_local_path(text(resume.get("docx_path")))
+    if resume_path is None or not resume_path.is_file():
+        raise ValueError("The selected résumé DOCX is unavailable. Choose another uploaded résumé.")
+    if text(profile_row.get("identity_mode")) == "distinct":
+        identity = {field: text(profile_row.get(f"applicant_{field}")) for field in ["name", "email", "phone", "location"]}
+    else:
+        shared = load_profile()
+        identity = {field: text(shared.get(field)) for field in ["name", "email", "phone", "location"]}
+    profile = {field: "" for field in PROFILE_COLUMNS}
+    structured = extract_docx_profile_sections(str(resume_path))
+    profile.update({
+        **identity,
+        "resume_text": text(structured.get("resume_text")) or text(resume.get("content")),
+        "work_experience": text(structured.get("work_experience")),
+        "key_skills": text(structured.get("key_skills")),
+        "projects": text(structured.get("projects")),
+        "education": text(structured.get("education")),
+        "resume_docx_template_path": str(resume_path),
+        "_candidate_profile_id": str(profile_id),
+        "_resume_document_id": int(resume.get("id") or 0),
+        "_resume_sections": [
+            {"label": label, "text": structured.get(field, "")}
+            for field, label in (("summary", "Summary"), ("work_experience", "Experience"), ("key_skills", "Skills, Technologies"), ("projects", "Projects"), ("education", "Education"))
+            if text(structured.get(field))
+        ],
+    })
+    return {"profile": profile, "profile_row": profile_row, "resume": resume, "resume_path": resume_path}
+
+
+def tailoring_paragraphs(path: Path) -> list[dict[str, Any]]:
+    document = Document(path)
+    contexts = collect_resume_paragraph_contexts(document)
+    return [
+        {
+            "paragraph_index": index,
+            "text": context["text"],
+            "section": context["section"] or "Résumé",
+            "style": context["style_name"],
+            "editable": bool(context["editable"]),
+            "is_bullet": bool(context["is_bullet"]),
+        }
+        for index, context in enumerate(contexts)
+        if context["text"]
+    ]
+
+
+def tailoring_draft_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:
+    if row is None:
+        return {}
+    item = dict(row)
+    item["changes"] = parse_json_array(item.get("changes_json"))
+    item["revision_history"] = parse_json_object(item.get("revision_history_json"))
+    item["layout"] = parse_json_object(item.get("layout_json"))
+    item["revision_number"] = int(item.get("revision_number") or 1)
+    item["version_label"] = f"Version {item['revision_number']}"
+    item["locked"] = text(item.get("status")) == "approved"
+    item.pop("changes_json", None)
+    item.pop("revision_history_json", None)
+    item.pop("layout_json", None)
+    return item
+
+
+def editable_tailoring_draft(job_id: int, profile_id: int, resume_id: int) -> sqlite3.Row | None:
+    """Return the one editable revision for a tailoring scope, if any."""
+    return query_db(
+        """SELECT * FROM tailoring_drafts
+           WHERE job_id = ? AND candidate_profile_id = ? AND resume_id = ? AND status = 'draft'
+           ORDER BY revision_number DESC, id DESC LIMIT 1""",
+        [job_id, profile_id, resume_id], one=True,
+    )
+
+
+def current_tailoring_draft(job_id: int, profile_id: int, resume_id: int) -> sqlite3.Row | None:
+    """Prefer an editable revision; otherwise expose the latest approved revision."""
+    return editable_tailoring_draft(job_id, profile_id, resume_id) or query_db(
+        """SELECT * FROM tailoring_drafts
+           WHERE job_id = ? AND candidate_profile_id = ? AND resume_id = ? AND status = 'approved'
+           ORDER BY revision_number DESC, id DESC LIMIT 1""",
+        [job_id, profile_id, resume_id], one=True,
+    )
+
+
+def tailoring_draft_versions(job_id: int, profile_id: int, resume_id: int) -> list[dict[str, Any]]:
+    rows = query_db(
+        """SELECT id, status, revision_number, parent_draft_id, superseded_by_draft_id,
+                  created_at, updated_at, approved_at
+           FROM tailoring_drafts
+           WHERE job_id = ? AND candidate_profile_id = ? AND resume_id = ?
+           ORDER BY revision_number DESC, id DESC""",
+        [job_id, profile_id, resume_id],
+    )
+    return [
+        {
+            **dict(row),
+            "revision_number": int(row["revision_number"] or 1),
+            "version_label": f"Version {int(row['revision_number'] or 1)}",
+            "locked": text(row["status"]) == "approved",
+        }
+        for row in rows
+    ]
+
+
+def tailoring_resume_filename(row: sqlite3.Row | dict[str, Any], *, draft: bool = False) -> str:
+    """Build a readable user-facing name without exposing internal IDs."""
+    profile = query_db("SELECT applicant_name, name FROM candidate_profiles WHERE id = ?", [row["candidate_profile_id"]], one=True)
+    job = query_db("SELECT title FROM jobs WHERE id = ?", [row["job_id"]], one=True)
+    applicant = text(profile["applicant_name"] if profile and text(profile["applicant_name"]) else profile["name"] if profile else "Applicant")
+    role = text(job["title"] if job else "Resume")
+    suffix = "_Draft" if draft else ""
+    return f"{safe_filename(applicant)}_Resume_{safe_filename(role)}{suffix}.docx"
+
+
+def tailoring_draft_path(draft_id: int) -> Path:
+    return DATA_DIR / "tailoring_drafts" / str(draft_id) / "resume.docx"
+
+
+def score_tailoring_text(job: dict[str, Any], profile: dict[str, Any], text_value: str) -> dict[str, Any]:
+    return build_tailoring_coverage_report(job, text_value)
+
+
+def tailoring_draft_version(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def pending_tailoring_layout(version: str, reason: str = "Word layout validation is deferred until preview or approval.") -> dict[str, Any]:
+    return {"available": False, "verified": False, "pending": True, "draft_version": version, "reason": reason}
+
+
+def validate_tailoring_draft_layout(draft_id: int, expected_version: str | None = None) -> dict[str, Any]:
+    started = time.perf_counter()
+    row = query_db("SELECT * FROM tailoring_drafts WHERE id = ?", [draft_id], one=True)
+    if row is None:
+        return {"available": False, "verified": False, "reason": "Tailoring draft was not found."}
+    source = safe_local_path(text(row["source_path"]))
+    draft = safe_local_path(text(row["draft_path"])) or source
+    if source is None or not source.is_file() or draft is None or not draft.is_file():
+        return {"available": False, "verified": False, "reason": "The source or current résumé draft DOCX is unavailable."}
+    version = tailoring_draft_version(draft)
+    if expected_version and version != expected_version:
+        return {"available": False, "verified": False, "stale": True, "draft_version": version, "reason": "The résumé draft changed before layout validation completed. Refresh and try again."}
+    current_layout = parse_json_object(row["layout_json"])
+    if current_layout.get("draft_version") == version and current_layout.get("available") and current_layout.get("verified"):
+        current_layout["cached"] = True
+        current_layout.setdefault("timings_ms", {})["word_layout_validation"] = 0.0
+        return current_layout
+    layout = compare_docx_layout(source, draft)
+    after_version = tailoring_draft_version(draft)
+    if after_version != version:
+        return {"available": False, "verified": False, "stale": True, "draft_version": after_version, "reason": "The résumé draft changed during layout validation. Refresh and try again."}
+    layout["draft_version"] = version
+    layout.setdefault("timings_ms", {})["word_layout_validation"] = round((time.perf_counter() - started) * 1000, 2)
+    db = get_db()
+    db.execute("UPDATE tailoring_drafts SET layout_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND draft_path = ?", [dumps_json(layout), draft_id, str(draft)])
+    db.commit()
+    return layout
+
+
+def rebuild_tailoring_draft(draft_id: int, changes: list[dict[str, Any]], *, revision_history: dict[str, Any] | None = None, draft_row: sqlite3.Row | None = None) -> dict[str, Any]:
+    started = time.perf_counter()
+    row = draft_row or query_db("SELECT * FROM tailoring_drafts WHERE id = ?", [draft_id], one=True)
+    if row is None:
+        raise ValueError("Tailoring draft was not found")
+    source = safe_local_path(text(row["source_path"]))
+    if source is None or not source.is_file():
+        raise ValueError("The source résumé DOCX is no longer available")
+    output = tailoring_draft_path(draft_id)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pending_output = output.with_name(f".{output.stem}.{uuid.uuid4().hex}.pending.docx")
+    copy_started = time.perf_counter()
+    shutil.copyfile(source, pending_output)
+    document = Document(pending_output)
+    applied: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    paragraphs = list(document.paragraphs)
+    contexts = collect_resume_paragraph_contexts(document)
+    for change in changes:
+        try:
+            index = int(change.get("paragraph_index"))
+        except (TypeError, ValueError):
+            skipped.append({**change, "reason": "Paragraph index is invalid"})
+            continue
+        if index < 0 or index >= len(paragraphs):
+            skipped.append({**change, "reason": "Paragraph no longer exists"})
+            continue
+        paragraph = paragraphs[index]
+        context = contexts[index] if index < len(contexts) else {}
+        original = text(change.get("original_text"))
+        proposed = text(change.get("proposed_text"))
+        kind = resume_paragraph_edit_kind(context)
+        if kind is None or not is_editable_resume_paragraph(paragraph, kind):
+            skipped.append({**change, "reason": "This résumé paragraph is protected or not editable in its section"})
+            continue
+        if normalize_space(paragraph.text) != normalize_space(original):
+            skipped.append({**change, "reason": "Source paragraph changed; review the current résumé before applying"})
+            continue
+        if not proposed:
+            skipped.append({**change, "reason": "Replacement text is empty"})
+            continue
+        replace_paragraph_exact(paragraph, original, proposed)
+        applied.append({**change, "applied": True})
+    if skipped:
+        try:
+            pending_output.unlink(missing_ok=True)
+        except OSError:
+            pass
+        reasons = "; ".join(text(item.get("reason")) for item in skipped if text(item.get("reason")))
+        raise ValueError(f"The edit was not applied and was not saved: {reasons or 'one or more changes were rejected.'}")
+    document.save(pending_output)
+    backup_output = output.with_name(f".{output.stem}.{uuid.uuid4().hex}.previous.docx")
+    had_previous = output.is_file()
+    try:
+        if had_previous:
+            shutil.copyfile(output, backup_output)
+        # Promote only after every requested change has been validated. The
+        # rollback preserves the last valid draft if a restricted Windows
+        # workspace rejects the promotion write.
+        shutil.copyfile(pending_output, output)
+    except OSError:
+        if had_previous and backup_output.is_file():
+            shutil.copyfile(backup_output, output)
+        raise
+    finally:
+        for temporary in (pending_output, backup_output):
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+    docx_rebuild_ms = round((time.perf_counter() - copy_started) * 1000, 2)
+    version = tailoring_draft_version(output)
+    layout = pending_tailoring_layout(version)
+    extraction_started = time.perf_counter()
+    text_value = extract_docx_text(output.read_bytes())
+    extraction_ms = round((time.perf_counter() - extraction_started) * 1000, 2)
+    db_started = time.perf_counter()
+    db = get_db()
+    # Any edit, stepwise undo, or explicit revert makes the old Word/PDF
+    # preview stale. Remove it eagerly as well as version-checking on read.
+    preview_pdf = DATA_DIR / "tailoring_drafts" / str(draft_id) / "preview.pdf"
+    preview_meta = preview_pdf.with_suffix(".meta.json")
+    for stale_path in (preview_pdf, preview_meta):
+        try:
+            stale_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    db.execute("UPDATE tailoring_drafts SET draft_path = ?, changes_json = ?, revision_history_json = ?, layout_json = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [str(output), dumps_json(changes), dumps_json(revision_history or {}), dumps_json(layout), "draft", draft_id])
+    db.commit()
+    sqlite_write_ms = round((time.perf_counter() - db_started) * 1000, 2)
+    timings = {
+        "docx_rebuild": docx_rebuild_ms,
+        "text_extraction": extraction_ms,
+        "sqlite_write_commit": sqlite_write_ms,
+        "rebuild_total": round((time.perf_counter() - started) * 1000, 2),
+        "word_layout_validation": 0.0,
+        "pdf_generation": 0.0,
+    }
+    return {"applied": applied, "skipped": skipped, "layout": layout, "draft_path": str(output), "draft_version": version, "text": text_value, "timings_ms": timings}
+
+
+def resume_paragraph_edit_kind(context: dict[str, Any]) -> str | None:
+    """Return the only edit policy allowed for a résumé paragraph context."""
+    section = text(context.get("section")).lower()
+    if section in {"summary", "skills"}:
+        return section
+    if section in {"experience", "projects"} and bool(context.get("is_bullet")):
+        return "bullet"
+    return None
+
+
+def validate_tailoring_draft_changes(draft_path: Path, changes: list[dict[str, Any]]) -> str:
+    """Ensure every approval-summary change is present in the actual DOCX."""
+    try:
+        document = Document(draft_path)
+    except (OSError, ValueError, zipfile.BadZipFile, KeyError):
+        return "The current résumé draft DOCX could not be read for approval verification."
+    paragraphs = list(document.paragraphs)
+    contexts = collect_resume_paragraph_contexts(document)
+    if not changes:
+        return "No applied résumé changes are available for approval."
+    for change in changes:
+        if change.get("applied") is False or change.get("skipped") or change.get("skip_reason"):
+            return "Approval verification failed because the draft contains a skipped or unapplied change."
+        try:
+            index = int(change.get("paragraph_index"))
+        except (TypeError, ValueError):
+            return "Approval verification failed because a saved change has no valid paragraph index."
+        if index < 0 or index >= len(paragraphs):
+            return f"Approval verification failed because paragraph {index + 1} no longer exists in the current DOCX."
+        context = contexts[index] if index < len(contexts) else {}
+        kind = resume_paragraph_edit_kind(context)
+        if kind is None or not is_editable_resume_paragraph(paragraphs[index], kind):
+            return f"Approval verification failed because paragraph {index + 1} is protected or not editable."
+        proposed = normalize_space(text(change.get("proposed_text")))
+        if not proposed or normalize_space(paragraphs[index].text) != proposed:
+            return f"Approval verification failed because paragraph {index + 1} does not contain its saved proposed wording."
+    return ""
+
+
 def preparation_queue_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:
     if row is None:
         return {}
@@ -2722,15 +3658,24 @@ def prepare_application_queue_item(item_id: int, *, owner: str = "manual", allow
         if row["cover_letter_template_id"]:
             payload["cover_letter_template_id"] = row["cover_letter_template_id"]
         profile = resolve_generation_profile(payload)
-        generation = generate_and_store_shortlist_documents(int(row["job_id"]), {"resume", "cover_letter"}, profile)
+        approved_resume = safe_local_path(text(row["approved_tailored_resume_path"])) if "approved_tailored_resume_path" in row.keys() else None
+        if text(row["approved_tailored_resume_path"]) and (approved_resume is None or not approved_resume.is_file()):
+            raise ValueError("The approved tailored résumé for this package is unavailable; restore it or explicitly clear the tailoring approval before regenerating.")
+        has_approved_resume = bool(approved_resume and approved_resume.is_file())
+        # An approved tailored résumé is a package artifact, not a new master
+        # résumé. Regeneration may refresh the cover letter, but it must not
+        # silently replace the approved résumé with the base template.
+        generation_kinds = {"cover_letter"} if has_approved_resume else {"resume", "cover_letter"}
+        generation = generate_and_store_shortlist_documents(int(row["job_id"]), generation_kinds, profile)
         refreshed_job = query_db("SELECT * FROM jobs WHERE id = ?", [row["job_id"]], one=True)
-        resume_status = text(generation.get("resume")) or "failed"
+        resume_status = "generated" if has_approved_resume else (text(generation.get("resume")) or "failed")
         cover_status = text(generation.get("cover_letter")) or "failed"
         error = text(generation.get("error"))
-        keywords = build_keywords_score_report(job_to_dict(refreshed_job), profile)
-        resume_path = text(refreshed_job["resume_docx_path"])
+        score_text = extract_docx_text(approved_resume.read_bytes()) if has_approved_resume else ""
+        keywords = build_keywords_score_report(job_to_dict(refreshed_job), profile, final_resume_text=score_text or None)
+        resume_path = str(approved_resume) if has_approved_resume else text(refreshed_job["resume_docx_path"])
         cover_path = text(refreshed_job["cover_letter_docx_path"])
-        status = "ready_for_review" if resume_status == "generated" and cover_status == "generated" and safe_generated_path(resume_path) and safe_generated_path(resume_path).is_file() and safe_generated_path(cover_path) and safe_generated_path(cover_path).is_file() else "failed"
+        status = "ready_for_review" if resume_status == "generated" and cover_status == "generated" and safe_preparation_artifact_path(resume_path) and safe_preparation_artifact_path(resume_path).is_file() and safe_preparation_artifact_path(cover_path) and safe_preparation_artifact_path(cover_path).is_file() else "failed"
         return _finish_preparation_item(item_id, owner, status=status, review_status="pending", resume_status=resume_status, cover_letter_status=cover_status, resume_error=text(generation.get("resume_error")), cover_letter_error=text(generation.get("cover_letter_error")), error=error, keywords_score_json=dumps_json(keywords), prepared_resume_path=resume_path if status == "ready_for_review" else text(row["prepared_resume_path"]), prepared_cover_letter_path=cover_path if status == "ready_for_review" else text(row["prepared_cover_letter_path"]), lease_owner="", lease_expires_at="", prepared_at=datetime.now().isoformat(timespec="seconds"))
     except Exception as exc:
         return _finish_preparation_item(item_id, owner, status="failed", error=f"{type(exc).__name__}: {exc}", lease_owner="", lease_expires_at="")
@@ -4393,7 +5338,10 @@ def collect_resume_paragraph_contexts(document: Document) -> list[dict[str, Any]
         style_name = getattr(getattr(paragraph, "style", None), "name", "") or ""
         is_bullet = style_name.lower().startswith("list") or paragraph_text.startswith(("-", "â€¢", "*"))
         editable = False
-        if current_section == "summary":
+        if section:
+            # The section label itself is metadata, not an editable entry.
+            editable = False
+        elif current_section == "summary":
             editable = is_editable_resume_paragraph(paragraph, "summary")
         elif current_section == "skills":
             editable = is_editable_resume_paragraph(paragraph, "skills")
@@ -4847,6 +5795,7 @@ def _cover_letter_stale_visible_text(content: str) -> bool:
 def safe_filename(value: str) -> str:
     cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", value)
     cleaned = re.sub(r"\s+", "_", cleaned).strip("._ ")
+    cleaned = re.sub(r"_+", "_", cleaned)
     return (cleaned or "document")[:160]
 
 
@@ -4881,6 +5830,17 @@ def safe_generated_path(value: Any) -> Path | None:
     except ValueError:
         return None
     return path
+
+
+def safe_preparation_artifact_path(value: Any) -> Path | None:
+    raw = text(value)
+    if not raw:
+        return None
+    path = Path(raw).resolve()
+    roots = [generated_applications_dir().resolve(), (DATA_DIR / "application_preparations").resolve()]
+    if any(path == root or root in path.parents for root in roots):
+        return path
+    return None
 
 
 def dedupe_keys(job: dict[str, Any], source_job_id: Any = "") -> set[str]:
@@ -7131,12 +8091,14 @@ def update_resume_variant_review(variant_id: int, approved: Any = None, review_n
 
 def normalize_job_payload(payload: dict[str, Any]) -> dict[str, Any]:
     today = date.today().isoformat()
+    supplied_description = text(payload.get("job_description")) or text(payload.get("paste_description")) or text(payload.get("description"))
+    payload_for_extraction = {**payload, "job_description": supplied_description}
     extracted = extract_job_details(
-        text(payload.get("job_description")),
+        supplied_description,
         text(payload.get("source")),
-        existing=payload,
+        existing=payload_for_extraction,
     )
-    clean = {column: text(payload.get(column, extracted.get(column, ""))) for column in JOB_COLUMNS}
+    clean = {column: text(payload_for_extraction.get(column, extracted.get(column, ""))) for column in JOB_COLUMNS}
     clean["date_added"] = text(payload.get("date_added")) or today
     clean["status"] = clean["status"] if clean["status"] in STATUSES else "Saved"
     clean["fit_score"] = clamp_int(payload.get("fit_score"), 0, 100)
@@ -7170,6 +8132,7 @@ def job_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:
     if row is None:
         return {}
     data = dict(row)
+    data["description_completeness"] = classify_job_description_completeness(data.get("job_description"))
     data["score_breakdown"] = parse_json_object(data.get("score_breakdown"))
     if "profile_updated_at" in data and data.get("profile_updated_at"):
         profile_row = query_db("SELECT updated_at FROM profile WHERE id = 1", one=True)
@@ -7191,6 +8154,16 @@ def job_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:
         )
         data["preparation_status"] = text(preparation["status"]) if preparation else ""
     return data
+
+
+def classify_job_description_completeness(value: Any) -> str:
+    """Label stored description availability without inventing provider content."""
+    description = normalize_space(text(value))
+    if not description:
+        return "missing"
+    if len(description) < 800:
+        return "partial"
+    return "complete"
 
 
 def build_qualification_fit(job: dict[str, Any]) -> dict[str, Any]:
@@ -8383,6 +9356,81 @@ def build_answers(profile: dict[str, str], job: dict[str, Any], focus: list[str]
         {"question": COMMON_QUESTIONS[6], "answer": "I would be glad to provide any additional details that help confirm fit for the role."},
     ]
 
+
+def extract_quantified_tokens(value: str) -> Counter[str]:
+    """Extract factual numeric tokens without treating ordinary word digits as claims."""
+    normalized = text(value).replace("−", "-").replace("–", "-").replace("—", "-")
+    tokens = re.findall(r"(?<![A-Za-z0-9])\d+(?:[.,]\d+)?(?:\s*[%+])?(?![A-Za-z0-9])", normalized)
+    return Counter(re.sub(r"\s+", "", token).lower() for token in tokens)
+
+
+AI_CLAIM_TERMS = tuple(dict.fromkeys([
+    *TECHNICAL_TERMS,
+    "oauth", "google docs", "amazon", "idempotent", "idempotency", "real-time synchronization",
+    "external platforms", "product pricing", "inventory systems", "relational data models",
+    "role-based access", "tenant isolation", "audit trails", "database migrations",
+]))
+TAILORING_ALREADY_SUITABLE = "The existing bullet is already suitable."
+TAILORING_GRAMMAR_WARNING = "The suggestion degraded grammar or readability."
+
+
+def _claim_term_present(value: str, term: str) -> bool:
+    normalized_value = normalize_keyword(value)
+    normalized_term = normalize_keyword(term)
+    return bool(normalized_term and re.search(rf"(?<![a-z0-9]){re.escape(normalized_term)}(?![a-z0-9])", normalized_value))
+
+
+def _resume_claim_terms(value: str) -> set[str]:
+    return {term for term in AI_CLAIM_TERMS if _claim_term_present(value, term)}
+
+
+def _has_article_drop(original: str, proposed: str) -> bool:
+    original_lower = normalize_space(original).lower()
+    proposed_lower = normalize_space(proposed).lower()
+    for match in re.finditer(r"\b(a|an|the)\s+([a-z][a-z0-9+#.-]+)", original_lower):
+        article, noun = match.groups()
+        if re.search(rf"\b{re.escape(noun)}\b", proposed_lower) and not re.search(rf"\b{re.escape(article)}\s+{re.escape(noun)}\b", proposed_lower):
+            return True
+    return False
+
+
+def _has_meaningful_word_change(original: str, proposed: str) -> bool:
+    original_words = re.findall(r"[a-z0-9+#.-]+", normalize_space(original).lower())
+    proposed_words = re.findall(r"[a-z0-9+#.-]+", normalize_space(proposed).lower())
+    stop_words = {"a", "an", "the", "and", "or", "of", "to", "in", "for", "with", "on", "by", "as"}
+    matcher = difflib.SequenceMatcher(a=original_words, b=proposed_words)
+    for tag, left_start, left_end, right_start, right_end in matcher.get_opcodes():
+        if tag != "equal" and any(word not in stop_words for word in original_words[left_start:left_end] + proposed_words[right_start:right_end]):
+            return True
+    return False
+
+
+def validate_tailoring_bullet_suggestion(original: str, proposed: str) -> str:
+    if not proposed:
+        return "The AI assistant returned no proposed bullet."
+    if extract_quantified_tokens(original) != extract_quantified_tokens(proposed):
+        return "The suggestion changed quantified facts, versions, ranges, or percentages."
+    original_terms = _resume_claim_terms(original)
+    proposed_terms = _resume_claim_terms(proposed)
+    omitted = sorted(term for term in original_terms if not _claim_term_present(proposed, term))
+    introduced = sorted(term for term in proposed_terms if term not in original_terms)
+    fact_errors = []
+    if omitted:
+        fact_errors.append(f"The suggestion omitted supported résumé facts: {', '.join(omitted[:4])}.")
+    if introduced:
+        fact_errors.append(f"The suggestion introduced unsupported résumé claims: {', '.join(introduced[:4])}.")
+    if fact_errors:
+        return " ".join(fact_errors)
+    if contains_contact_details(proposed):
+        return "The suggestion included contact details that do not belong in a résumé bullet."
+    if normalize_space(original).lower() == normalize_space(proposed).lower() or not _has_meaningful_word_change(original, proposed):
+        return TAILORING_ALREADY_SUITABLE
+    if _has_article_drop(original, proposed):
+        return TAILORING_GRAMMAR_WARNING
+    target_length = max(120, round(len(original) * 1.2))
+    if len(proposed) > target_length:
+        return f"The suggestion exceeded the target length budget of {target_length} characters."
+    return ""
 
 def build_ollama_prompt(kind: str, job: dict[str, Any], evidence: dict[str, Any], payload: dict[str, Any]) -> str:
     return json.dumps(
