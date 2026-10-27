@@ -13,6 +13,8 @@ const state = {
   preparationQueue: [],
   preparationRegenerations: {},
   preparationPreviews: {},
+  preparationPreviewRequests: {},
+  preparationPreviewEpoch: 0,
   candidateProfiles: [],
   generationSelections: {},
   shortlistRegenerations: {},
@@ -236,6 +238,7 @@ async function loadAll() {
 async function loadPreparationQueue() {
   const target = document.getElementById("preparation-queue");
   if (!target) return;
+  state.preparationPreviewEpoch += 1;
   try {
     const status = value("preparation-status-filter");
     state.preparationQueue = await api.get(`/api/preparation/queue${status ? `?status=${encodeURIComponent(status)}` : ""}`);
@@ -519,8 +522,9 @@ function renderTailoringEditor() {
     summary.hidden = !changes.length;
     summary.innerHTML = changes.length ? `<strong>Approval review</strong><p class="muted">${changes.length} modified bullet${changes.length === 1 ? "" : "s"} · version ${escapeHtml(state.tailoring.data?.draft?.draft_version || "current draft")}</p>${changes.map((item) => `<article><small>${escapeHtml(item.source_section || "Résumé")} · paragraph ${Number(item.paragraph_index) + 1}</small><div class="tailoring-compact-diff">${tailoringDiffMarkup(item.original_text || "", item.proposed_text || "")}</div><details><summary>View original and proposed wording</summary><p><strong>Original:</strong> ${escapeHtml(item.original_text || "")}</p><p><strong>Proposed:</strong> ${escapeHtml(item.proposed_text || "")}</p></details></article>`).join("")}` : "";
   }
-  if (diffHeading) diffHeading.hidden = Boolean(changes.length);
-  document.getElementById("tailoring-diff")?.toggleAttribute("hidden", Boolean(changes.length));
+  const hideStandaloneDiff = Boolean(changes.length && hasAppliedChange && !hasMeaningfulChange);
+  if (diffHeading) diffHeading.hidden = hideStandaloneDiff;
+  document.getElementById("tailoring-diff")?.toggleAttribute("hidden", hideStandaloneDiff);
   renderTailoringDiff(original.value || bullet.text, proposed.value || bullet.text);
   proposed.oninput = () => {
     state.tailoring.operationState = hasAppliedChange ? "applied" : "modified";
@@ -775,7 +779,7 @@ function renderPreparationPreview(item) {
   const preview = state.preparationPreviews[item.id];
   if (!preview || !preview.open) return "";
   if (preview.status === "loading") return `<section class="preparation-preview preparation-preview-inline" aria-live="polite"><strong><span class="spinner" aria-hidden="true"></span> Loading package preview...</strong><p class="muted">Reading the documents recorded for ${escapeHtml(item.job?.company || "this application")} · ${escapeHtml(item.job?.title || "the selected role")}.</p></section>`;
-  if (preview.status === "error") return `<section class="preparation-preview preparation-preview-inline error" aria-live="assertive"><div class="preview-heading"><strong>Package preview unavailable</strong><div class="row-actions"><button class="button small" type="button" onclick="previewPreparation(${item.id})">Retry preview</button><button class="button ghost small" type="button" onclick="state.preparationPreviews[${item.id}] = { ...state.preparationPreviews[${item.id}], open: false }; renderPreparationQueue();">Close</button></div></div><p class="risk high">${escapeHtml(preview.message)}</p></section>`;
+  if (preview.status === "error") return `<section class="preparation-preview preparation-preview-inline error" aria-live="assertive"><div class="preview-heading"><strong>Package preview unavailable</strong><div class="row-actions"><button class="button small" type="button" onclick="previewPreparation(${item.id}, true)">Retry preview</button><button class="button ghost small" type="button" onclick="state.preparationPreviews[${item.id}] = { ...state.preparationPreviews[${item.id}], open: false }; renderPreparationQueue();">Close</button></div></div><p class="risk high">${escapeHtml(preview.message)}</p></section>`;
   const data = preview.data || {};
   const errors = data.errors || {};
   return `<section class="preparation-preview preparation-preview-inline"><div class="preview-heading"><strong>${escapeHtml(data.company || item.job?.company || "Application")} · ${escapeHtml(data.title || item.job?.title || "Selected role")}</strong><button class="button ghost small" type="button" onclick="previewPreparation(${item.id})">Close</button></div><div class="preparation-preview-columns"><div><h4>Résumé</h4>${data.resume ? `<pre>${escapeHtml(data.resume)}</pre>` : `<p class="risk high">${escapeHtml(errors.resume || "Prepared résumé content is unavailable.")}</p>`}</div><div><h4>Cover letter</h4>${data.cover_letter ? `<pre>${escapeHtml(data.cover_letter)}</pre>` : `<p class="risk high">${escapeHtml(errors.cover_letter || "Prepared cover letter content is unavailable.")}</p>`}</div></div></section>`;
@@ -859,22 +863,28 @@ async function reviewPreparation(id, action) {
   try { await api.send(`/api/preparation/${id}/review`, "POST", { action }); toast(action === "approve" ? "Package approved for your next manual step" : "Package skipped"); await loadPreparationQueue(); } catch (error) { toast(error.message); }
 }
 
-async function previewPreparation(id) {
+async function previewPreparation(id, retry = false) {
   const current = state.preparationPreviews[id];
   if (current?.status === "loading") return;
-  if (current?.open && current.status !== "loading") {
+  if (current?.open && current.status !== "loading" && !retry) {
     state.preparationPreviews[id] = { ...current, open: false };
     renderPreparationQueue();
     return;
   }
+  const previewEpoch = state.preparationPreviewEpoch;
+  const requestId = (state.preparationPreviewRequests[id] || 0) + 1;
+  state.preparationPreviewRequests[id] = requestId;
   state.preparationPreviews[id] = { status: "loading", open: true };
   renderPreparationQueue();
   try {
     const result = await api.get(`/api/preparation/${id}/preview`);
+    if (state.preparationPreviewEpoch !== previewEpoch || state.preparationPreviewRequests[id] !== requestId) return;
     state.preparationPreviews[id] = { status: "success", open: true, data: result };
   } catch (error) {
+    if (state.preparationPreviewEpoch !== previewEpoch || state.preparationPreviewRequests[id] !== requestId) return;
     state.preparationPreviews[id] = { status: "error", open: true, message: error.message || "The package preview could not be loaded." };
   }
+  if (state.preparationPreviewEpoch !== previewEpoch || state.preparationPreviewRequests[id] !== requestId) return;
   renderPreparationQueue();
 }
 

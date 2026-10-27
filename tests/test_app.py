@@ -4821,6 +4821,16 @@ class JobAssistantTest(unittest.TestCase):
         self.assertNotIn('insertAdjacentHTML("afterbegin", `<details class="preparation-preview"', frontend)
         self.assertIn('id="tailoring-diff-heading"', template)
 
+    def test_preparation_preview_retry_discards_stale_responses_and_live_diff_remains_for_new_edits(self):
+        frontend = Path(app_module.BASE_DIR, "static", "app.js").read_text(encoding="utf-8")
+        self.assertIn("async function previewPreparation(id, retry = false)", frontend)
+        self.assertIn("previewPreparation(${item.id}, true)", frontend)
+        self.assertIn("preparationPreviewEpoch", frontend)
+        self.assertIn("preparationPreviewRequests", frontend)
+        self.assertIn("state.preparationPreviewEpoch !== previewEpoch", frontend)
+        self.assertIn("state.preparationPreviewRequests[id] !== requestId", frontend)
+        self.assertIn("const hideStandaloneDiff = Boolean(changes.length && hasAppliedChange && !hasMeaningfulChange)", frontend)
+
     def test_manual_discovery_preparation_requires_explicit_profile_and_docx_pair(self):
         frontend = Path(app_module.BASE_DIR, "static", "app.js").read_text(encoding="utf-8")
         template = Path(app_module.BASE_DIR, "templates", "index.html").read_text(encoding="utf-8")
