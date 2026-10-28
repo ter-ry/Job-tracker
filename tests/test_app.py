@@ -5042,6 +5042,74 @@ class JobAssistantTest(unittest.TestCase):
         quick = app_module.discovery_search_config({"search_depth": "quick", "enabled_sources": ["linkedin", "indeed"]})
         self.assertEqual(quick["total_cap"], 50)
         self.assertEqual(quick["request_per_source_cap"], 25)
+        three = app_module.discovery_search_config({
+            "enabled_sources": ["linkedin", "indeed", "google"],
+            "per_source_cap": 100,
+            "total_cap": 20,
+        })
+        self.assertEqual(three["request_per_source_cap"], 6)
+        self.assertLessEqual(three["aggregate_request_budget"], 20)
+
+    def test_saved_search_preserves_current_limits_and_is_editable_without_running(self):
+        created = self.client.post("/api/discovery/searches", json={
+            "name": "Saved current search",
+            "keywords": "backend developer",
+            "location": "Toronto",
+            "remote_preference": "hybrid",
+            "distance": 25,
+            "enabled_sources": ["linkedin", "indeed", "google"],
+            "date_window": "7d",
+            "search_depth": "thorough",
+            "per_source_cap": 100,
+            "total_cap": 20,
+        })
+        self.assertEqual(created.status_code, 201)
+        search = created.get_json()
+        self.assertEqual(search["distance"], 25)
+        self.assertEqual(search["total_cap"], 20)
+        self.assertEqual(search["per_source_cap"], 100)
+        self.assertEqual(search["search_depth"], "thorough")
+        self.assertFalse(search["enabled"])
+        updated = self.client.put(f"/api/discovery/searches/{search['id']}", json={**search, "name": "Edited current search", "total_cap": 17, "distance": 40})
+        self.assertEqual(updated.status_code, 200)
+        refreshed = self.client.get("/api/discovery/searches").get_json()
+        saved = next(item for item in refreshed if item["id"] == search["id"])
+        self.assertEqual(saved["name"], "Edited current search")
+        self.assertEqual(saved["total_cap"], 17)
+        self.assertEqual(saved["distance"], 40)
+
+    def test_saved_search_run_uses_persisted_fetch_limits_and_reports_snapshot_separately(self):
+        search = self.client.post("/api/discovery/searches", json={
+            "name": "Limited saved run", "keywords": "backend", "enabled_sources": ["linkedin", "indeed", "google"],
+            "total_cap": 20, "per_source_cap": 100,
+        }).get_json()
+        fake = {"jobs": [], "errors": {}, "source_counts": {}, "source_diagnostics": {}, "source_snapshots": {}}
+        location = {"original_input": "", "normalized_input": "", "distance_origin": "", "discovery_location": "", "resolution_method": "test", "lookup": {}}
+        with patch.object(app_module, "get_geocoding_provider", return_value=FakeGeocodingProvider({})), patch.object(app_module, "resolve_discovery_location_context", return_value=location), patch.object(app_module, "fetch_jobspy_jobs", return_value=fake) as mocked_fetch:
+            response = self.client.post(f"/api/discovery/searches/{search['id']}/run")
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(mocked_fetch.call_args.kwargs["results_wanted"], 6)
+        body = response.get_json()
+        self.assertEqual(body["search"]["total_cap"], 20)
+        self.assertIn("persisted", body)
+        self.assertIn("visible_total", body)
+
+    def test_legacy_saved_search_columns_migrate_without_losing_existing_search(self):
+        self.client.get("/api/discovery/searches")
+        with app_module.app.app_context():
+            cursor = app_module.get_db().execute(
+                "INSERT INTO saved_search_profiles (name, keywords) VALUES (?, ?)",
+                ["Legacy preserved search", "software engineer"],
+            )
+            app_module.get_db().commit()
+            legacy_id = cursor.lastrowid
+        response = self.client.get("/api/discovery/searches")
+        self.assertEqual(response.status_code, 200)
+        legacy = next(item for item in response.get_json() if item["id"] == legacy_id)
+        self.assertEqual(legacy["name"], "Legacy preserved search")
+        self.assertEqual(legacy["total_cap"], 500)
+        self.assertEqual(legacy["per_source_cap"], 100)
+        self.assertEqual(legacy["search_depth"], "standard")
 
     def test_discovery_total_cap_bounds_two_source_fetch_and_reports_separate_counts(self):
         fake_jobs = [
@@ -5083,6 +5151,9 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn('class="panel discovery-results-panel discovery-view-find"', template)
         self.assertIn('class="panel discovery-saved-searches discovery-view-saved"', template)
         self.assertIn("setDiscoverySection", frontend)
+        self.assertIn('id="save-current-discovery-search"', template)
+        self.assertIn("saveCurrentDiscoverySearch", frontend)
+        self.assertIn("Search snapshot:", frontend)
         self.assertIn("discovery-counts", frontend)
         self.assertIn("configured home location", frontend)
 

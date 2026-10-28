@@ -8,7 +8,6 @@ import html
 import importlib.metadata
 import io
 import json
-import math
 import os
 import re
 import shutil
@@ -1662,11 +1661,11 @@ def create_app() -> Flask:
             cursor = get_db().execute(
                 """INSERT INTO saved_search_profiles
                    (name, keywords, location, remote_preference, seniority, minimum_salary,
-                    enabled_sources_json, date_window, distance, interval_minutes, enabled,
+                    enabled_sources_json, date_window, search_depth, distance, per_source_cap, total_cap, interval_minutes, enabled,
                     auto_prepare_enabled, auto_prepare_min_priority, auto_prepare_require_canadian,
                     auto_prepare_candidate_profile_id, auto_prepare_resume_id, auto_prepare_cover_letter_template_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["distance"], search["interval_minutes"], search["enabled"], search["auto_prepare_enabled"], search["auto_prepare_min_priority"], search["auto_prepare_require_canadian"], search["auto_prepare_candidate_profile_id"], search["auto_prepare_resume_id"], search["auto_prepare_cover_letter_template_id"]],
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["search_depth"], search["distance"], search["per_source_cap"], search["total_cap"], search["interval_minutes"], search["enabled"], search["auto_prepare_enabled"], search["auto_prepare_min_priority"], search["auto_prepare_require_canadian"], search["auto_prepare_candidate_profile_id"], search["auto_prepare_resume_id"], search["auto_prepare_cover_letter_template_id"]],
             )
             get_db().commit()
         except sqlite3.IntegrityError:
@@ -1685,11 +1684,11 @@ def create_app() -> Flask:
         try:
             get_db().execute(
                 """UPDATE saved_search_profiles SET name = ?, keywords = ?, location = ?, remote_preference = ?,
-                   seniority = ?, minimum_salary = ?, enabled_sources_json = ?, date_window = ?, distance = ?,
-                   interval_minutes = ?, enabled = ?, auto_prepare_enabled = ?, auto_prepare_min_priority = ?,
+                   seniority = ?, minimum_salary = ?, enabled_sources_json = ?, date_window = ?, search_depth = ?, distance = ?,
+                   per_source_cap = ?, total_cap = ?, interval_minutes = ?, enabled = ?, auto_prepare_enabled = ?, auto_prepare_min_priority = ?,
                    auto_prepare_require_canadian = ?, auto_prepare_candidate_profile_id = ?, auto_prepare_resume_id = ?,
                    auto_prepare_cover_letter_template_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
-                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["distance"], search["interval_minutes"], search["enabled"], search["auto_prepare_enabled"], search["auto_prepare_min_priority"], search["auto_prepare_require_canadian"], search["auto_prepare_candidate_profile_id"], search["auto_prepare_resume_id"], search["auto_prepare_cover_letter_template_id"], search_id],
+                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["search_depth"], search["distance"], search["per_source_cap"], search["total_cap"], search["interval_minutes"], search["enabled"], search["auto_prepare_enabled"], search["auto_prepare_min_priority"], search["auto_prepare_require_canadian"], search["auto_prepare_candidate_profile_id"], search["auto_prepare_resume_id"], search["auto_prepare_cover_letter_template_id"], search_id],
             )
             get_db().commit()
         except sqlite3.IntegrityError:
@@ -2378,6 +2377,9 @@ def normalize_saved_search_payload(payload: dict[str, Any], existing: dict[str, 
     if not name or not keywords:
         raise ValueError("A saved search name and job keywords are required")
     date_window = normalize_choice(payload.get("date_window", existing.get("date_window")), set(DISCOVERY_DATE_WINDOWS)) or "14d"
+    search_depth = normalize_choice(payload.get("search_depth", existing.get("search_depth")), set(DISCOVERY_SEARCH_DEPTHS)) or "standard"
+    per_source_cap = clamp_int_default(payload.get("per_source_cap", existing.get("per_source_cap")), 100, 1, 1000)
+    total_cap = clamp_int_default(payload.get("total_cap", existing.get("total_cap")), 200, 1, 5000)
     remote_preference = normalize_choice(payload.get("remote_preference", existing.get("remote_preference")), {"", "remote", "hybrid", "on-site"})
     interval_minutes = clamp_int_default(payload.get("interval_minutes", existing.get("interval_minutes")), 360, 15, 10080)
     minimum_salary = clamp_int_default(payload.get("minimum_salary", existing.get("minimum_salary")), 0, 0, 1000000)
@@ -2404,7 +2406,10 @@ def normalize_saved_search_payload(payload: dict[str, Any], existing: dict[str, 
         "minimum_salary": minimum_salary,
         "enabled_sources": enabled_sources,
         "date_window": date_window,
+        "search_depth": search_depth,
         "distance": distance,
+        "per_source_cap": per_source_cap,
+        "total_cap": total_cap,
         "interval_minutes": interval_minutes,
         "enabled": 1 if as_bool(payload.get("enabled", existing.get("enabled", False))) else 0,
         "auto_prepare_enabled": auto_prepare_enabled,
@@ -2434,9 +2439,9 @@ def saved_search_to_discovery_payload(search: dict[str, Any]) -> dict[str, Any]:
     return {
         **search,
         "enabled_sources": search.get("enabled_sources") or ["linkedin", "indeed"],
-        "search_depth": "standard",
-        "total_cap": 500,
-        "per_source_cap": 100,
+        "search_depth": search.get("search_depth") or "standard",
+        "total_cap": int(search.get("total_cap") or 200),
+        "per_source_cap": int(search.get("per_source_cap") or 100),
     }
 
 
@@ -6233,7 +6238,11 @@ def discovery_search_config(payload: dict[str, Any]) -> dict[str, Any]:
     # results_wanted per provider, so divide that budget across enabled
     # providers instead of silently raising it to the per-source cap.
     source_count = max(1, len(enabled_sources))
-    request_per_source_cap = min(per_source_cap, max(1, math.ceil(total_cap / source_count)))
+    # Keep the aggregate provider request budget at or below total_cap for
+    # normal multi-source searches. A floor is intentional: ceil would
+    # silently exceed the user's aggregate limit when it is not divisible by
+    # the number of enabled sources.
+    request_per_source_cap = min(per_source_cap, max(1, total_cap // source_count))
     return {
         "search_depth": depth,
         "date_window": date_window,
@@ -7624,7 +7633,10 @@ def init_db() -> None:
             minimum_salary INTEGER NOT NULL DEFAULT 0,
             enabled_sources_json TEXT NOT NULL DEFAULT '["linkedin", "indeed"]',
             date_window TEXT NOT NULL DEFAULT '14d',
+            search_depth TEXT NOT NULL DEFAULT 'standard',
             distance INTEGER NOT NULL DEFAULT 50,
+            per_source_cap INTEGER NOT NULL DEFAULT 100,
+            total_cap INTEGER NOT NULL DEFAULT 500,
             interval_minutes INTEGER NOT NULL DEFAULT 360,
             enabled INTEGER NOT NULL DEFAULT 0,
             last_run_at TEXT NOT NULL DEFAULT '',
@@ -7690,7 +7702,10 @@ def init_db() -> None:
             "minimum_salary": "INTEGER NOT NULL DEFAULT 0",
             "enabled_sources_json": "TEXT NOT NULL DEFAULT '[\"linkedin\", \"indeed\"]'",
             "date_window": "TEXT NOT NULL DEFAULT '14d'",
+            "search_depth": "TEXT NOT NULL DEFAULT 'standard'",
             "distance": "INTEGER NOT NULL DEFAULT 50",
+            "per_source_cap": "INTEGER NOT NULL DEFAULT 100",
+            "total_cap": "INTEGER NOT NULL DEFAULT 500",
             "interval_minutes": "INTEGER NOT NULL DEFAULT 360",
             "enabled": "INTEGER NOT NULL DEFAULT 0",
             "last_run_at": "TEXT NOT NULL DEFAULT ''",

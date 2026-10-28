@@ -71,9 +71,13 @@
               <label>Keywords<input id="saved-search-keywords" required placeholder="software engineer"></label>
               <label>Location<input id="saved-search-location" placeholder="Toronto, Ontario"></label>
               <label>Remote preference<select id="saved-search-remote"><option value="">Any</option><option value="remote">Remote</option><option value="hybrid">Hybrid</option><option value="on-site">On-site</option></select></label>
+              <label>Distance<input id="saved-search-distance" type="number" min="0" step="1" placeholder="50 km"></label>
               <label>Seniority<input id="saved-search-seniority" placeholder="junior, intermediate"></label>
               <label>Minimum salary<input id="saved-search-minimum-salary" type="number" min="0" step="1000"></label>
               <label>Posting recency<select id="saved-search-date-window"><option value="24h">24 hours</option><option value="3d">3 days</option><option value="7d">7 days</option><option value="14d" selected>14 days</option><option value="30d">30 days</option><option value="any">Any</option></select></label>
+              <label>Search depth<select id="saved-search-depth"><option value="quick">Quick</option><option value="standard" selected>Standard</option><option value="thorough">Thorough</option></select></label>
+              <label>Aggregate fetch limit<input id="saved-search-total-cap" type="number" min="1" step="1" value="200"></label>
+              <label>Per-source cap<input id="saved-search-per-source-cap" type="number" min="1" step="1" value="100"></label>
               <label>Interval (minutes)<input id="saved-search-interval" type="number" min="15" step="15" value="360"></label>
               <label class="checkline"><input id="saved-search-enabled" type="checkbox"> Enable scheduled search</label>
               <label class="checkline"><input id="saved-search-auto-prepare" type="checkbox"> Automatically prepare qualifying packages</label>
@@ -142,6 +146,7 @@
             <div id="discovery-source-test-output" class="muted helper" aria-live="polite"></div>
             <div class="actions">
               <button class="button" type="submit" id="discovery-submit">Search jobs</button>
+              <button class="button ghost" type="button" id="save-current-discovery-search">Save current search</button>
               <button class="button ghost" type="button" id="discovery-test-sources">Test job sources</button>
             </div>
           </form>

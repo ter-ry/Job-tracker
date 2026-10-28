@@ -127,6 +127,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("refresh-discovery-task-status")?.addEventListener("click", loadDiscoveryTaskStatus);
   document.getElementById("csv-import-form").addEventListener("submit", importCsv);
   document.getElementById("discovery-test-sources").addEventListener("click", testJobSources);
+  document.getElementById("save-current-discovery-search").addEventListener("click", saveCurrentDiscoverySearch);
   document.getElementById("refresh-shortlist").addEventListener("click", loadAll);
   document.getElementById("refresh-preparation-queue")?.addEventListener("click", loadPreparationQueue);
   document.getElementById("close-tailoring-studio")?.addEventListener("click", closeTailoringStudio);
@@ -962,7 +963,7 @@ async function loadSavedSearches() {
     const searches = await api.get("/api/discovery/searches");
     list.innerHTML = searches.length ? searches.map((search) => `
       <article class="saved-search-row">
-        <div><strong>${escapeHtml(search.name)}</strong><span class="muted">${escapeHtml(search.keywords)} · ${escapeHtml(search.location || "Anywhere")}</span><span class="muted">${search.enabled ? "Scheduled" : "Manual only"} · ${escapeHtml((search.enabled_sources || []).map(sourceLabel).join(", "))} · ${search.auto_prepare_enabled ? `Auto preparation at ${Number(search.auto_prepare_min_priority || 75)}+ for new discovery results` : "Preparation manual"}</span></div>
+        <div><strong>${escapeHtml(search.name)}</strong><span class="muted">${escapeHtml(search.keywords)} · ${escapeHtml(search.location || "Anywhere")}</span><span class="muted">${search.enabled ? "Scheduled" : "Manual only"} · ${escapeHtml((search.enabled_sources || []).map(sourceLabel).join(", "))} · ${Number(search.total_cap || 200)} aggregate / ${Number(search.per_source_cap || 100)} per source · ${search.auto_prepare_enabled ? `Auto preparation at ${Number(search.auto_prepare_min_priority || 75)}+ for new discovery results` : "Preparation manual"}</span></div>
         <div class="actions compact"><button class="button small" type="button" onclick="runSavedSearch(${search.id})">Run now</button><button class="button ghost small" type="button" onclick='editSavedSearch(${JSON.stringify(search).replaceAll("'", "&apos;")} )'>Edit</button></div>
       </article>`).join("") : `<p class="muted">No saved searches yet.</p>`;
   } catch (error) { list.innerHTML = `<p class="muted">${escapeHtml(error.message)}</p>`; }
@@ -981,9 +982,13 @@ function editSavedSearch(search) {
   setValue("saved-search-keywords", search.keywords);
   setValue("saved-search-location", search.location);
   setValue("saved-search-remote", search.remote_preference);
+  setValue("saved-search-distance", search.distance ?? 50);
   setValue("saved-search-seniority", search.seniority);
   setValue("saved-search-minimum-salary", search.minimum_salary || "");
   setValue("saved-search-date-window", search.date_window || "14d");
+  setValue("saved-search-depth", search.search_depth || "standard");
+  setValue("saved-search-total-cap", search.total_cap || 200);
+  setValue("saved-search-per-source-cap", search.per_source_cap || 100);
   setValue("saved-search-interval", search.interval_minutes || 360);
   setChecked("saved-search-enabled", Boolean(search.enabled));
   setChecked("saved-search-auto-prepare", Boolean(search.auto_prepare_enabled));
@@ -997,20 +1002,50 @@ async function saveSavedSearch(event) {
   const id = value("saved-search-id");
   const body = {
     name: value("saved-search-name"), keywords: value("saved-search-keywords"), location: value("saved-search-location"),
-    remote_preference: value("saved-search-remote"), seniority: value("saved-search-seniority"), minimum_salary: Number(value("saved-search-minimum-salary") || 0),
-    date_window: value("saved-search-date-window"), interval_minutes: Number(value("saved-search-interval") || 360), enabled: checked("saved-search-enabled"),
+    remote_preference: value("saved-search-remote"), distance: Number(value("saved-search-distance") || 50), seniority: value("saved-search-seniority"), minimum_salary: Number(value("saved-search-minimum-salary") || 0),
+    date_window: value("saved-search-date-window"), search_depth: value("saved-search-depth") || "standard",
+    total_cap: Number(value("saved-search-total-cap") || 200), per_source_cap: Number(value("saved-search-per-source-cap") || 100),
+    interval_minutes: Number(value("saved-search-interval") || 360), enabled: checked("saved-search-enabled"),
     auto_prepare_enabled: checked("saved-search-auto-prepare"), auto_prepare_min_priority: Number(value("saved-search-auto-min-priority") || 75),
     auto_prepare_candidate_profile_id: Number(value("saved-search-auto-profile") || 0),
     enabled_sources: [...document.querySelectorAll('input[name="saved-search-source"]:checked')].map((input) => input.value),
   };
   try {
     await api.send(id ? `/api/discovery/searches/${id}` : "/api/discovery/searches", id ? "PUT" : "POST", body);
-    toast("Saved search updated"); toggleSavedSearchForm(false); await loadSavedSearches();
+    toast(id ? "Saved search updated" : "Search saved. It is ready under Saved searches and was not run."); toggleSavedSearchForm(false); await loadSavedSearches();
   } catch (error) { toast(error.message); }
 }
 
+function saveCurrentDiscoverySearch() {
+  const criteria = discoverySearchCriteriaFromControls();
+  toggleSavedSearchForm(true);
+  setDiscoverySection("saved");
+  setValue("saved-search-id", "");
+  setValue("saved-search-name", criteria.keywords ? `${criteria.keywords} search` : "New job search");
+  setValue("saved-search-keywords", criteria.keywords);
+  setValue("saved-search-location", criteria.location);
+  setValue("saved-search-remote", criteria.remote_preference);
+  setValue("saved-search-distance", criteria.distance || 50);
+  setValue("saved-search-seniority", "");
+  setValue("saved-search-minimum-salary", "");
+  setValue("saved-search-date-window", criteria.date_window);
+  setValue("saved-search-depth", criteria.search_depth);
+  setValue("saved-search-total-cap", criteria.total_cap);
+  setValue("saved-search-per-source-cap", criteria.per_source_cap);
+  setValue("saved-search-interval", 360);
+  setChecked("saved-search-enabled", false);
+  setChecked("saved-search-auto-prepare", false);
+  setValue("saved-search-auto-min-priority", 75);
+  setValue("saved-search-auto-profile", "");
+  document.querySelectorAll('input[name="saved-search-source"]').forEach((input) => { input.checked = criteria.enabled_sources.includes(input.value); });
+}
+
 async function runSavedSearch(id) {
-  try { const result = await api.send(`/api/discovery/searches/${id}/run`, "POST", {}); toast(`Discovery found ${result.persisted.new} new and ${result.persisted.duplicate} existing jobs`); await Promise.all([loadSavedSearches(), loadDiscoveryInbox()]); }
+  try {
+    const result = await api.send(`/api/discovery/searches/${id}/run`, "POST", {});
+    toast(`Search snapshot: ${Number(result.total || 0)} fetched, ${Number(result.visible_total || 0)} visible. Saved jobs: ${Number(result.persisted?.new || 0)} new, ${Number(result.persisted?.duplicate || 0)} already saved.`);
+    await Promise.all([loadSavedSearches(), loadDiscoveryInbox()]);
+  }
   catch (error) { toast(error.message); }
 }
 
