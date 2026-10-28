@@ -1661,11 +1661,11 @@ def create_app() -> Flask:
             cursor = get_db().execute(
                 """INSERT INTO saved_search_profiles
                    (name, keywords, location, remote_preference, seniority, minimum_salary,
-                    enabled_sources_json, date_window, distance, interval_minutes, enabled,
+                    enabled_sources_json, date_window, search_depth, distance, per_source_cap, total_cap, interval_minutes, enabled,
                     auto_prepare_enabled, auto_prepare_min_priority, auto_prepare_require_canadian,
                     auto_prepare_candidate_profile_id, auto_prepare_resume_id, auto_prepare_cover_letter_template_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["distance"], search["interval_minutes"], search["enabled"], search["auto_prepare_enabled"], search["auto_prepare_min_priority"], search["auto_prepare_require_canadian"], search["auto_prepare_candidate_profile_id"], search["auto_prepare_resume_id"], search["auto_prepare_cover_letter_template_id"]],
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["search_depth"], search["distance"], search["per_source_cap"], search["total_cap"], search["interval_minutes"], search["enabled"], search["auto_prepare_enabled"], search["auto_prepare_min_priority"], search["auto_prepare_require_canadian"], search["auto_prepare_candidate_profile_id"], search["auto_prepare_resume_id"], search["auto_prepare_cover_letter_template_id"]],
             )
             get_db().commit()
         except sqlite3.IntegrityError:
@@ -1684,11 +1684,11 @@ def create_app() -> Flask:
         try:
             get_db().execute(
                 """UPDATE saved_search_profiles SET name = ?, keywords = ?, location = ?, remote_preference = ?,
-                   seniority = ?, minimum_salary = ?, enabled_sources_json = ?, date_window = ?, distance = ?,
-                   interval_minutes = ?, enabled = ?, auto_prepare_enabled = ?, auto_prepare_min_priority = ?,
+                   seniority = ?, minimum_salary = ?, enabled_sources_json = ?, date_window = ?, search_depth = ?, distance = ?,
+                   per_source_cap = ?, total_cap = ?, interval_minutes = ?, enabled = ?, auto_prepare_enabled = ?, auto_prepare_min_priority = ?,
                    auto_prepare_require_canadian = ?, auto_prepare_candidate_profile_id = ?, auto_prepare_resume_id = ?,
                    auto_prepare_cover_letter_template_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
-                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["distance"], search["interval_minutes"], search["enabled"], search["auto_prepare_enabled"], search["auto_prepare_min_priority"], search["auto_prepare_require_canadian"], search["auto_prepare_candidate_profile_id"], search["auto_prepare_resume_id"], search["auto_prepare_cover_letter_template_id"], search_id],
+                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["search_depth"], search["distance"], search["per_source_cap"], search["total_cap"], search["interval_minutes"], search["enabled"], search["auto_prepare_enabled"], search["auto_prepare_min_priority"], search["auto_prepare_require_canadian"], search["auto_prepare_candidate_profile_id"], search["auto_prepare_resume_id"], search["auto_prepare_cover_letter_template_id"], search_id],
             )
             get_db().commit()
         except sqlite3.IntegrityError:
@@ -1857,13 +1857,18 @@ def create_app() -> Flask:
         if row is None:
             return jsonify({"error": "Saved search not found"}), 404
         search = saved_search_to_dict(row)
+        try:
+            saved_payload = saved_search_to_discovery_payload(search)
+            discovery_search_config(saved_payload)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         owner = f"manual:{uuid.uuid4()}"
         if not acquire_discovery_search_lease(search_id, owner):
             return jsonify({"error": "This saved search is already running; try again when the active run completes."}), 409
         heartbeat_stop, heartbeat_thread = start_discovery_search_lease_heartbeat(search_id, owner)
         run_id = create_discovery_run(search_id, "manual")
         try:
-            result = run_discovery_pipeline(saved_search_to_discovery_payload(search), search_id=search_id, run_id=run_id)
+            result = run_discovery_pipeline(saved_payload, search_id=search_id, run_id=run_id)
             finish_discovery_run(run_id, status="completed", fetched=result["total"], new_count=result["persisted"]["new"], duplicate_count=result["persisted"]["duplicate"], errors=len(result["errors"]), outcomes=result["source_diagnostics"])
             now = datetime.now().isoformat(timespec="seconds")
             next_run = (datetime.now() + timedelta(minutes=int(search["interval_minutes"]))).isoformat(timespec="seconds")
@@ -1929,7 +1934,10 @@ def create_app() -> Flask:
             return jsonify({"error": "Keywords are required"}), 400
         bypass_cache = as_bool(payload.get("bypass_cache"))
 
-        search = discovery_search_config(payload)
+        try:
+            search = discovery_search_config(payload)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         search_key = discovery_search_signature(payload)
         stored_preferences = load_discovery_preferences(search_key)
         preferences = stored_preferences or discovery_preferences_payload({})
@@ -1953,7 +1961,7 @@ def create_app() -> Flask:
             distance=search["distance"],
             remote_preference=search["remote_preference"],
             job_type=None,
-            results_wanted=search["per_source_cap"],
+            results_wanted=search["request_per_source_cap"],
             hours_old=search["hours_old"],
             enabled_sources=search["enabled_sources"],
             country_indeed=text(payload.get("country_indeed")) or "Canada",
@@ -1963,7 +1971,9 @@ def create_app() -> Flask:
         existing_keys = existing_job_dedupe_keys()
         seen_keys: set[str] = set()
         jobs: list[dict[str, Any]] = []
-        duplicates = 0
+        duplicates_in_search = 0
+        already_saved_matches = 0
+        excluded_count = 0
         geocoding_success = 0
         geocoding_cached = 0
         geocoding_unknown = 0
@@ -1989,20 +1999,17 @@ def create_app() -> Flask:
             clean["already_saved"] = False
             clean["duplicate_in_search"] = False
             keys = dedupe_keys(clean, clean.get("source_job_id"))
-            duplicate_found = False
+            if keys & seen_keys:
+                clean["duplicate_in_search"] = True
+                duplicates_in_search += 1
+                continue
             if keys & existing_keys:
                 clean["already_saved"] = True
+                already_saved_matches += 1
                 existing_match = find_existing_job_match(clean)
                 if existing_match is not None:
                     clean["saved_job_id"] = int(existing_match["id"])
                     clean["saved_job_status"] = text(existing_match["status"])
-                duplicate_found = True
-            if keys & seen_keys:
-                clean["duplicate_in_search"] = True
-                duplicates += 1
-                continue
-            if duplicate_found:
-                duplicates += 1
             seen_keys.update(keys)
             jobs.append(clean)
 
@@ -2014,6 +2021,7 @@ def create_app() -> Flask:
                 if source in source_counts:
                     source_counts[source] += 1
 
+        capped_count = max(0, len(jobs) - search["total_cap"])
         diagnostics = {
             "bypass_cache": bypass_cache,
             "cache_hit": False,
@@ -2036,10 +2044,15 @@ def create_app() -> Flask:
             "source_counts": source_counts,
             "source_errors": fetched.get("errors", {}),
             "source_diagnostics": fetched.get("source_diagnostics", {}),
-            "duplicates_removed": duplicates,
+            "duplicates_removed": duplicates_in_search,
+            "duplicates_in_search": duplicates_in_search,
+            "already_saved_matches": already_saved_matches,
+            "excluded_count": excluded_count,
+            "capped_count": capped_count,
+            "visible_count": min(len(jobs), search["total_cap"]),
             "raw_jobs_returned": len(raw_jobs),
             "displayed_jobs": min(len(jobs), search["total_cap"]),
-            "cap_reached": len(jobs) > search["total_cap"],
+            "cap_reached": capped_count > 0,
             "geocoding_errors": geocoding_errors,
             "discovery_location": search["discovery_location"],
             "distance_origin": search["distance_origin"],
@@ -2072,11 +2085,15 @@ def create_app() -> Flask:
                 "source_counts": source_counts,
                 "total": len(raw_jobs),
                 "visible_total": len(jobs),
-                "duplicates": duplicates,
+                "duplicates": duplicates_in_search,
+                "duplicates_in_search": duplicates_in_search,
+                "already_saved_matches": already_saved_matches,
+                "excluded_count": excluded_count,
+                "capped_count": capped_count,
                 "search_key": search_key,
                 "search": search,
                 "raw_jobs_returned": len(raw_jobs),
-                "cap_reached": len(raw_jobs) > search["total_cap"],
+                "cap_reached": capped_count > 0,
                 "preferences": preferences,
                 "bypass_cache": bypass_cache,
                 "diagnostics": diagnostics,
@@ -2368,6 +2385,9 @@ def normalize_saved_search_payload(payload: dict[str, Any], existing: dict[str, 
     if not name or not keywords:
         raise ValueError("A saved search name and job keywords are required")
     date_window = normalize_choice(payload.get("date_window", existing.get("date_window")), set(DISCOVERY_DATE_WINDOWS)) or "14d"
+    search_depth = normalize_choice(payload.get("search_depth", existing.get("search_depth")), set(DISCOVERY_SEARCH_DEPTHS)) or "standard"
+    per_source_cap = clamp_int_default(payload.get("per_source_cap", existing.get("per_source_cap")), 100, 1, 1000)
+    total_cap = clamp_int_default(payload.get("total_cap", existing.get("total_cap")), 200, 1, 5000)
     remote_preference = normalize_choice(payload.get("remote_preference", existing.get("remote_preference")), {"", "remote", "hybrid", "on-site"})
     interval_minutes = clamp_int_default(payload.get("interval_minutes", existing.get("interval_minutes")), 360, 15, 10080)
     minimum_salary = clamp_int_default(payload.get("minimum_salary", existing.get("minimum_salary")), 0, 0, 1000000)
@@ -2379,6 +2399,7 @@ def normalize_saved_search_payload(payload: dict[str, Any], existing: dict[str, 
         except (TypeError, json.JSONDecodeError):
             existing_sources = []
     enabled_sources = normalize_discovery_sources(payload.get("enabled_sources", existing_sources))
+    validate_discovery_budget(total_cap, enabled_sources)
     auto_prepare_enabled = 1 if as_bool(payload.get("auto_prepare_enabled", existing.get("auto_prepare_enabled", False))) else 0
     auto_prepare_min_priority = clamp_int_default(payload.get("auto_prepare_min_priority", existing.get("auto_prepare_min_priority")), 75, 0, 100)
     auto_prepare_require_canadian = 1 if as_bool(payload.get("auto_prepare_require_canadian", existing.get("auto_prepare_require_canadian", True))) else 0
@@ -2394,7 +2415,10 @@ def normalize_saved_search_payload(payload: dict[str, Any], existing: dict[str, 
         "minimum_salary": minimum_salary,
         "enabled_sources": enabled_sources,
         "date_window": date_window,
+        "search_depth": search_depth,
         "distance": distance,
+        "per_source_cap": per_source_cap,
+        "total_cap": total_cap,
         "interval_minutes": interval_minutes,
         "enabled": 1 if as_bool(payload.get("enabled", existing.get("enabled", False))) else 0,
         "auto_prepare_enabled": auto_prepare_enabled,
@@ -2424,9 +2448,9 @@ def saved_search_to_discovery_payload(search: dict[str, Any]) -> dict[str, Any]:
     return {
         **search,
         "enabled_sources": search.get("enabled_sources") or ["linkedin", "indeed"],
-        "search_depth": "standard",
-        "total_cap": 500,
-        "per_source_cap": 100,
+        "search_depth": search.get("search_depth") or "standard",
+        "total_cap": int(search.get("total_cap") or 200),
+        "per_source_cap": int(search.get("per_source_cap") or 100),
     }
 
 
@@ -2594,7 +2618,7 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         location=search["discovery_location"],
         distance=search["distance"],
         remote_preference=search["remote_preference"],
-        results_wanted=search["per_source_cap"],
+        results_wanted=search["request_per_source_cap"],
         hours_old=search["hours_old"],
         enabled_sources=search["enabled_sources"],
         country_indeed="Canada",
@@ -2602,7 +2626,8 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
     existing_keys = existing_job_dedupe_keys()
     seen_keys: set[str] = set()
     jobs: list[dict[str, Any]] = []
-    duplicates = 0
+    duplicates_in_search = 0
+    already_saved_matches = 0
     filtered = 0
     for raw_job in fetched.get("jobs", []):
         clean = normalize_job_payload(jobspy_result_to_job_payload(raw_job))
@@ -2629,19 +2654,21 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
             clean["filtered_reason"] = "Posting seniority does not match the saved-search seniority preference."
             filtered += 1
             continue
-        clean["already_saved"] = bool(dedupe_keys(clean, clean.get("source_job_id")) & existing_keys)
         keys = dedupe_keys(clean, clean.get("source_job_id"))
         if keys & seen_keys:
-            duplicates += 1
+            duplicates_in_search += 1
             continue
+        clean["already_saved"] = bool(keys & existing_keys)
         if clean["already_saved"]:
-            duplicates += 1
+            already_saved_matches += 1
+        if clean["already_saved"]:
             existing_match = find_existing_job_match(clean)
             if existing_match is not None:
                 clean["saved_job_id"] = int(existing_match["id"])
                 clean["saved_job_status"] = text(existing_match["status"])
         seen_keys.update(keys)
         jobs.append(clean)
+    capped_count = max(0, len(jobs) - search["total_cap"])
     jobs = sort_discovery_jobs(jobs, "overall_score", "desc", "", "asc", "remote_after_local", "last")[: search["total_cap"]]
     persisted = persist_discovery_jobs(jobs, search_id, run_id)
     auto_preparation_queued = enqueue_auto_preparation(search, persisted.get("new_job_ids", [])) if search_id else 0
@@ -2651,7 +2678,12 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         "source_counts": fetched.get("source_counts", {}),
         "source_errors": fetched.get("errors", {}),
         "source_diagnostics": fetched.get("source_diagnostics", {}),
-        "duplicates_removed": duplicates,
+        "duplicates_removed": duplicates_in_search,
+        "duplicates_in_search": duplicates_in_search,
+        "already_saved_matches": already_saved_matches,
+        "excluded_count": filtered,
+        "capped_count": capped_count,
+        "visible_count": len(jobs),
         "raw_jobs_returned": len(fetched.get("jobs", [])),
         "displayed_jobs": len(jobs),
         "filtered_by_saved_search": filtered,
@@ -2668,7 +2700,11 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         "source_diagnostics": fetched.get("source_diagnostics", {}),
         "total": len(fetched.get("jobs", [])),
         "visible_total": len(jobs),
-        "duplicates": duplicates,
+        "duplicates": duplicates_in_search,
+        "duplicates_in_search": duplicates_in_search,
+        "already_saved_matches": already_saved_matches,
+        "excluded_count": filtered,
+        "capped_count": capped_count,
         "persisted": persisted,
         "search_key": search_key,
         "search": search,
@@ -6206,20 +6242,42 @@ def discovery_search_config(payload: dict[str, Any]) -> dict[str, Any]:
     per_source_cap = clamp_int_default(payload.get("per_source_cap"), preset["per_source_cap"], 1, 1000)
     total_cap = clamp_int_default(payload.get("total_cap"), preset["total_cap"], 1, 5000)
     distance = clamp_int_default(payload.get("distance"), 50, 0, 1000)
-    if total_cap < per_source_cap:
-        total_cap = max(total_cap, per_source_cap)
+    enabled_sources = normalize_discovery_sources(payload.get("enabled_sources"))
+    validate_discovery_budget(total_cap, enabled_sources)
+    # total_cap is the user's aggregate fetch/display budget.  JobSpy applies
+    # results_wanted per provider, so divide that budget across enabled
+    # providers instead of silently raising it to the per-source cap.
+    source_count = max(1, len(enabled_sources))
+    # Keep the aggregate provider request budget at or below total_cap for
+    # normal multi-source searches. A floor is intentional: ceil would
+    # silently exceed the user's aggregate limit when it is not divisible by
+    # the number of enabled sources.
+    request_per_source_cap = min(per_source_cap, max(1, total_cap // source_count))
     return {
         "search_depth": depth,
         "date_window": date_window,
         "hours_old": None if date_window == "any" else DISCOVERY_DATE_WINDOWS.get(date_window, preset["days"]) * 24,
         "per_source_cap": per_source_cap,
         "total_cap": total_cap,
+        "request_per_source_cap": request_per_source_cap,
+        "aggregate_request_budget": request_per_source_cap * len(enabled_sources),
+        "enabled_source_count": len(enabled_sources),
         "remote_preference": normalize_choice(payload.get("remote_preference"), {"remote", "hybrid", "on-site"}),
         "keywords": text(payload.get("keywords")),
         "location": text(payload.get("location")),
         "distance": distance,
-        "enabled_sources": normalize_discovery_sources(payload.get("enabled_sources")),
+        "enabled_sources": enabled_sources,
     }
+
+
+def validate_discovery_budget(total_cap: int, enabled_sources: list[str]) -> None:
+    source_count = len(enabled_sources)
+    if total_cap < source_count:
+        source_word = "source" if source_count == 1 else "sources"
+        raise ValueError(
+            f"Aggregate fetch limit must be at least {source_count} for {source_count} enabled {source_word}; "
+            "increase the limit or deselect a source."
+        )
 
 
 def save_discovery_search_run(search_key: str, search_json: dict[str, Any], metadata_json: dict[str, Any], raw_jobs: list[dict[str, Any]]) -> None:
@@ -7595,7 +7653,10 @@ def init_db() -> None:
             minimum_salary INTEGER NOT NULL DEFAULT 0,
             enabled_sources_json TEXT NOT NULL DEFAULT '["linkedin", "indeed"]',
             date_window TEXT NOT NULL DEFAULT '14d',
+            search_depth TEXT NOT NULL DEFAULT 'standard',
             distance INTEGER NOT NULL DEFAULT 50,
+            per_source_cap INTEGER NOT NULL DEFAULT 100,
+            total_cap INTEGER NOT NULL DEFAULT 500,
             interval_minutes INTEGER NOT NULL DEFAULT 360,
             enabled INTEGER NOT NULL DEFAULT 0,
             last_run_at TEXT NOT NULL DEFAULT '',
@@ -7661,7 +7722,10 @@ def init_db() -> None:
             "minimum_salary": "INTEGER NOT NULL DEFAULT 0",
             "enabled_sources_json": "TEXT NOT NULL DEFAULT '[\"linkedin\", \"indeed\"]'",
             "date_window": "TEXT NOT NULL DEFAULT '14d'",
+            "search_depth": "TEXT NOT NULL DEFAULT 'standard'",
             "distance": "INTEGER NOT NULL DEFAULT 50",
+            "per_source_cap": "INTEGER NOT NULL DEFAULT 100",
+            "total_cap": "INTEGER NOT NULL DEFAULT 500",
             "interval_minutes": "INTEGER NOT NULL DEFAULT 360",
             "enabled": "INTEGER NOT NULL DEFAULT 0",
             "last_run_at": "TEXT NOT NULL DEFAULT ''",

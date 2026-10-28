@@ -23,6 +23,11 @@
 
     <main class="layout">
       <section id="discovery" class="tab-panel active">
+        <nav class="discovery-subnav" aria-label="Discovery views">
+          <button class="discovery-subnav-button active" type="button" data-discovery-view="pipeline">Pipeline</button>
+          <button class="discovery-subnav-button" type="button" data-discovery-view="find">Find jobs</button>
+          <button class="discovery-subnav-button" type="button" data-discovery-view="saved">Saved searches</button>
+        </nav>
         <section class="pipeline-dashboard" aria-labelledby="pipeline-title">
           <div class="pipeline-heading">
             <div>
@@ -54,7 +59,7 @@
           <aside id="pipeline-job-details" class="pipeline-job-details" hidden aria-live="polite"></aside>
         </section>
         <section class="workspace discovery-layout">
-          <section class="panel discovery-saved-searches">
+          <section class="panel discovery-saved-searches discovery-view-saved">
             <div class="panel-header">
               <div><h2>Saved searches</h2><p class="muted helper">Scheduled discovery is off until you enable it.</p></div>
               <div class="actions compact"><button class="button ghost small" type="button" id="refresh-saved-searches">Refresh</button><button class="button small" type="button" id="new-saved-search">New search</button></div>
@@ -66,9 +71,13 @@
               <label>Keywords<input id="saved-search-keywords" required placeholder="software engineer"></label>
               <label>Location<input id="saved-search-location" placeholder="Toronto, Ontario"></label>
               <label>Remote preference<select id="saved-search-remote"><option value="">Any</option><option value="remote">Remote</option><option value="hybrid">Hybrid</option><option value="on-site">On-site</option></select></label>
+              <label>Distance<input id="saved-search-distance" type="number" min="0" step="1" placeholder="50 km"></label>
               <label>Seniority<input id="saved-search-seniority" placeholder="junior, intermediate"></label>
               <label>Minimum salary<input id="saved-search-minimum-salary" type="number" min="0" step="1000"></label>
               <label>Posting recency<select id="saved-search-date-window"><option value="24h">24 hours</option><option value="3d">3 days</option><option value="7d">7 days</option><option value="14d" selected>14 days</option><option value="30d">30 days</option><option value="any">Any</option></select></label>
+              <label>Search depth<select id="saved-search-depth"><option value="quick">Quick</option><option value="standard" selected>Standard</option><option value="thorough">Thorough</option></select></label>
+              <label>Aggregate fetch limit<input id="saved-search-total-cap" type="number" min="1" step="1" value="200"></label>
+              <label>Per-source cap<input id="saved-search-per-source-cap" type="number" min="1" step="1" value="100"></label>
               <label>Interval (minutes)<input id="saved-search-interval" type="number" min="15" step="15" value="360"></label>
               <label class="checkline"><input id="saved-search-enabled" type="checkbox"> Enable scheduled search</label>
               <label class="checkline"><input id="saved-search-auto-prepare" type="checkbox"> Automatically prepare qualifying packages</label>
@@ -86,7 +95,7 @@
               <p class="muted helper">To disable it later, run <code>scripts\\uninstall_discovery_task.ps1</code>. No administrator permission is normally required.</p>
             </div>
           </section>
-          <form id="discovery-form" class="panel discovery-search-panel">
+          <form id="discovery-form" class="panel discovery-search-panel discovery-view-find">
             <div class="panel-header"><h2>Live job discovery</h2></div>
             <div class="grid two">
               <label>Keywords<input id="discovery-keywords" required placeholder="software developer"></label>
@@ -137,11 +146,12 @@
             <div id="discovery-source-test-output" class="muted helper" aria-live="polite"></div>
             <div class="actions">
               <button class="button" type="submit" id="discovery-submit">Search jobs</button>
+              <button class="button ghost" type="button" id="save-current-discovery-search">Save current search</button>
               <button class="button ghost" type="button" id="discovery-test-sources">Test job sources</button>
             </div>
           </form>
 
-          <section class="panel discovery-results-panel">
+          <section class="panel discovery-results-panel discovery-view-find">
             <div class="panel-header discovery-toolbar">
               <div>
                 <h2>Discovery results</h2>
@@ -208,12 +218,12 @@
             <div id="discovery-results" class="generated-output empty">Search results will appear here.</div>
           </section>
 
-          <section class="panel discovery-inbox-panel">
+          <section class="panel discovery-inbox-panel discovery-view-saved">
             <div class="panel-header"><div><h2>Discovery inbox</h2><p class="muted helper">New opportunities remain saved, but are never shortlisted automatically.</p></div><button class="button ghost small" type="button" id="refresh-discovery-inbox">Refresh</button></div>
             <div id="discovery-inbox" class="generated-output empty">No discovered opportunities yet.</div>
           </section>
 
-          <form id="csv-import-form" class="panel discovery-secondary-panel">
+          <form id="csv-import-form" class="panel discovery-secondary-panel discovery-view-find">
             <div class="panel-header"><h2>Import jobs</h2></div>
             <label>Import job links from external searches<input id="csv-file" type="file" accept=".csv"></label>
             <div class="actions">
