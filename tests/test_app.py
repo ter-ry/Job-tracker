@@ -416,7 +416,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertNotIn('data-retry-pipeline-preparation', Path('static/app.js').read_text(encoding='utf-8'))
         self.assertIn('pipeline-drawer-in', Path('static/styles.css').read_text(encoding='utf-8'))
         self.assertNotIn('window.state.jobs', Path('static/app.js').read_text(encoding='utf-8'))
-        self.assertNotIn('Download résumé DOCX', Path('static/app.js').read_text(encoding='utf-8'))
+        self.assertIn('Open document viewer', Path('static/app.js').read_text(encoding='utf-8'))
         self.assertIn('pipeline-matches-label', html)
         self.assertIn('Create candidate profile', html)
         self.assertIn('candidate-profile-form-error', html)
@@ -4943,11 +4943,57 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("missing from this application environment", errors["resume"])
         self.assertIn("not recorded", errors["cover_letter"])
 
+    def test_preparation_preview_exports_exact_package_docs_and_caches_by_content_hash(self):
+        job = self.client.post("/api/jobs", json={"company": "PDF Preview Co", "title": "Developer"}).get_json()
+        package_dir = app_module.generated_applications_dir() / str(job["id"])
+        package_dir.mkdir(parents=True, exist_ok=True)
+        document = Document()
+        document.add_paragraph("Package layout preview")
+        content = io.BytesIO()
+        document.save(content)
+        resume = package_dir / "resume.docx"
+        cover = package_dir / "cover.docx"
+        resume.write_bytes(content.getvalue())
+        cover.write_bytes(content.getvalue())
+        with app_module.app.app_context():
+            item_id = app_module.get_db().execute(
+                "INSERT INTO application_preparation_queue (job_id, status, prepared_resume_path, prepared_cover_letter_path) VALUES (?, 'ready_for_review', ?, ?)",
+                [job["id"], str(resume), str(cover)],
+            ).lastrowid
+            app_module.get_db().commit()
+
+        def fake_export(source, output):
+            Path(output).parent.mkdir(parents=True, exist_ok=True)
+            Path(output).write_bytes(b"%PDF-1.4\nmock preview")
+            return {"available": True, "path": str(output)}
+
+        with patch.object(app_module, "export_docx_to_pdf", side_effect=fake_export) as export:
+            first = self.client.get(f"/api/preparation/{item_id}/preview")
+            self.assertEqual(first.status_code, 200)
+            body = first.get_json()
+            self.assertTrue(body["documents"]["resume"]["available"])
+            self.assertTrue(body["documents"]["cover_letter"]["available"])
+            resume_pdf = self.client.get(body["documents"]["resume"]["pdf_url"])
+            self.assertEqual(resume_pdf.status_code, 200)
+            self.assertEqual(resume_pdf.mimetype, "application/pdf")
+            second = self.client.get(f"/api/preparation/{item_id}/preview")
+            self.assertEqual(second.status_code, 200)
+            self.assertEqual(export.call_count, 2)
+            resume.write_bytes(content.getvalue() + b"changed")
+            changed = self.client.get(f"/api/preparation/{item_id}/preview").get_json()
+            self.assertNotEqual(changed["documents"]["resume"]["content_hash"], body["documents"]["resume"]["content_hash"])
+            self.assertEqual(export.call_count, 3)
+            stale = self.client.get(body["documents"]["resume"]["pdf_url"])
+            self.assertEqual(stale.status_code, 409)
+
     def test_preparation_preview_is_inline_and_tailoring_approval_uses_compact_diff(self):
         frontend = Path(app_module.BASE_DIR, "static", "app.js").read_text(encoding="utf-8")
         template = Path(app_module.BASE_DIR, "templates", "index.html").read_text(encoding="utf-8")
         self.assertIn("preparationPreviews", frontend)
         self.assertIn("preparation-preview-inline", frontend)
+        self.assertIn("preparation-document-preview", template)
+        self.assertIn("preparation-preview-pdf", frontend)
+        self.assertIn("Open document viewer", frontend)
         self.assertIn("tailoringDiffMarkup", frontend)
         self.assertIn("tailoring-compact-diff", frontend)
         self.assertNotIn('insertAdjacentHTML("afterbegin", `<details class="preparation-preview"', frontend)

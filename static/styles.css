@@ -1024,6 +1024,14 @@ th {
   padding: 10px;
 }
 
+#preparation-document-preview { width: min(1000px, 94vw); max-height: 90vh; padding: 18px; color: #f4f4f4; background: #111; border: 1px solid #333; border-radius: 10px; }
+#preparation-document-preview::backdrop { background: rgb(0 0 0 / 78%); }
+.preparation-preview-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin: 12px 0; }
+.preparation-preview-document { min-height: min(68vh, 760px); max-height: 68vh; overflow: auto; display: flex; justify-content: center; align-items: flex-start; padding: 16px; background: #242424; border: 1px solid #353535; border-radius: 8px; }
+#preparation-preview-pdf { width: min(850px, 86vw); height: min(66vh, 740px); flex: 0 0 auto; border: 1px solid #303030; background: #fff; transform-origin: top center; }
+#preparation-preview-text { width: min(850px, 86vw); max-height: none; min-height: 620px; flex: 0 0 auto; box-sizing: border-box; transform-origin: top center; margin: 0; background: #151515; color: #ededed; white-space: pre-wrap; overflow-wrap: anywhere; }
+@media (max-width: 700px) { #preparation-document-preview { padding: 12px; } .preparation-preview-document { padding: 8px; } #preparation-preview-pdf, #preparation-preview-text { width: 88vw; } }
+
 .keywords-score-panel {
   margin-top: 14px;
   padding: 14px;

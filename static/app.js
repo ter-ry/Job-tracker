@@ -15,6 +15,9 @@ const state = {
   preparationPreviews: {},
   preparationPreviewRequests: {},
   preparationPreviewEpoch: 0,
+  preparationPreviewItemId: null,
+  preparationPreviewKind: "resume",
+  preparationPreviewZoom: 1,
   candidateProfiles: [],
   generationSelections: {},
   shortlistRegenerations: {},
@@ -139,6 +142,13 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("tailoring-revert-original")?.addEventListener("click", revertTailoringOriginal);
   document.getElementById("refresh-keyword-memory")?.addEventListener("click", loadKeywordMemory);
   document.getElementById("preparation-status-filter")?.addEventListener("change", loadPreparationQueue);
+  document.querySelectorAll("[data-preparation-preview-tab]").forEach((button) => button.addEventListener("click", () => {
+    state.preparationPreviewKind = button.dataset.preparationPreviewTab;
+    renderPreparationDocumentPreview();
+  }));
+  document.getElementById("preparation-preview-zoom-in")?.addEventListener("click", () => { state.preparationPreviewZoom = Math.min(1.5, state.preparationPreviewZoom + 0.1); renderPreparationDocumentPreview(); });
+  document.getElementById("preparation-preview-zoom-out")?.addEventListener("click", () => { state.preparationPreviewZoom = Math.max(0.7, state.preparationPreviewZoom - 0.1); renderPreparationDocumentPreview(); });
+  document.getElementById("preparation-preview-zoom-reset")?.addEventListener("click", () => { state.preparationPreviewZoom = 1; renderPreparationDocumentPreview(); });
   document.getElementById("generate").addEventListener("click", generateMaterials);
   document.getElementById("analyse-resume-match").addEventListener("click", analyseResumeMatch);
   document.getElementById("generate-local-draft").addEventListener("click", generateLocalDraft);
@@ -850,7 +860,9 @@ function renderPreparationPreview(item) {
   if (preview.status === "error") return `<section class="preparation-preview preparation-preview-inline error" aria-live="assertive"><div class="preview-heading"><strong>Package preview unavailable</strong><div class="row-actions"><button class="button small" type="button" onclick="previewPreparation(${item.id}, true)">Retry preview</button><button class="button ghost small" type="button" onclick="state.preparationPreviews[${item.id}] = { ...state.preparationPreviews[${item.id}], open: false }; renderPreparationQueue();">Close</button></div></div><p class="risk high">${escapeHtml(preview.message)}</p></section>`;
   const data = preview.data || {};
   const errors = data.errors || {};
-  return `<section class="preparation-preview preparation-preview-inline"><div class="preview-heading"><strong>${escapeHtml(data.company || item.job?.company || "Application")} · ${escapeHtml(data.title || item.job?.title || "Selected role")}</strong><button class="button ghost small" type="button" onclick="previewPreparation(${item.id})">Close</button></div><div class="preparation-preview-columns"><div><h4>Résumé</h4>${data.resume ? `<pre>${escapeHtml(data.resume)}</pre>` : `<p class="risk high">${escapeHtml(errors.resume || "Prepared résumé content is unavailable.")}</p>`}</div><div><h4>Cover letter</h4>${data.cover_letter ? `<pre>${escapeHtml(data.cover_letter)}</pre>` : `<p class="risk high">${escapeHtml(errors.cover_letter || "Prepared cover letter content is unavailable.")}</p>`}</div></div></section>`;
+  const documents = data.documents || {};
+  const pdfCount = Object.values(documents).filter((document) => document.available).length;
+  return `<section class="preparation-preview preparation-preview-inline"><div class="preview-heading"><strong>${escapeHtml(data.company || item.job?.company || "Application")} · ${escapeHtml(data.title || item.job?.title || "Selected role")}</strong><button class="button ghost small" type="button" onclick="previewPreparation(${item.id})">Close</button></div><p class="muted">${pdfCount ? `${pdfCount} document layout preview${pdfCount === 1 ? "" : "s"} rendered from the exact package DOCX.` : "Word PDF rendering is unavailable; text fallback is shown in the viewer."}</p><div class="actions compact"><button class="button small" type="button" onclick="openPreparationDocumentPreview(${item.id})">Open document viewer</button>${item.prepared_resume_path ? `<a class="button ghost small" href="/api/preparation/${item.id}/download/resume">Download résumé DOCX</a>` : ""}${item.prepared_cover_letter_path ? `<a class="button ghost small" href="/api/preparation/${item.id}/download/cover-letter">Download cover letter DOCX</a>` : ""}</div></section>`;
 }
 
 async function queueDiscoveryJob(id) {
@@ -954,6 +966,60 @@ async function previewPreparation(id, retry = false) {
   }
   if (state.preparationPreviewEpoch !== previewEpoch || state.preparationPreviewRequests[id] !== requestId) return;
   renderPreparationQueue();
+  if (state.preparationPreviews[id]?.status === "success") openPreparationDocumentPreview(id);
+}
+
+function openPreparationDocumentPreview(id) {
+  const preview = state.preparationPreviews[id];
+  if (!preview || preview.status !== "success") return;
+  state.preparationPreviewItemId = id;
+  state.preparationPreviewKind = "resume";
+  state.preparationPreviewZoom = 1;
+  renderPreparationDocumentPreview();
+  const dialog = document.getElementById("preparation-document-preview");
+  if (dialog && !dialog.open) dialog.showModal();
+}
+
+function renderPreparationDocumentPreview() {
+  const id = state.preparationPreviewItemId;
+  const preview = id == null ? null : state.preparationPreviews[id];
+  const dialog = document.getElementById("preparation-document-preview");
+  if (!dialog || !preview?.data) return;
+  const data = preview.data;
+  const documents = data.documents || {};
+  const kind = state.preparationPreviewKind === "cover_letter" ? "cover_letter" : "resume";
+  const previewDocument = documents[kind] || { available: false, text: data[kind] || "", reason: "Document preview is unavailable." };
+  const frame = document.getElementById("preparation-preview-pdf");
+  const textPreview = document.getElementById("preparation-preview-text");
+  const mode = document.getElementById("preparation-preview-mode");
+  const title = document.getElementById("preparation-preview-title");
+  const openPdf = document.getElementById("preparation-preview-open-pdf");
+  const download = document.getElementById("preparation-preview-download-docx");
+  title.textContent = `${data.company || "Application"} · ${data.title || "Selected role"}`;
+  document.querySelectorAll("[data-preparation-preview-tab]").forEach((button) => {
+    const selected = button.dataset.preparationPreviewTab === kind;
+    button.classList.toggle("active", selected);
+    button.classList.toggle("ghost", !selected);
+  });
+  document.getElementById("preparation-preview-zoom-label").textContent = `${Math.round(state.preparationPreviewZoom * 100)}%`;
+  frame.hidden = !previewDocument.available;
+  textPreview.hidden = Boolean(previewDocument.available);
+  if (previewDocument.available) {
+    if (frame.dataset.source !== previewDocument.pdf_url) { frame.src = `${previewDocument.pdf_url}&viewer=1`; frame.dataset.source = previewDocument.pdf_url; }
+    frame.style.transform = `scale(${state.preparationPreviewZoom})`;
+    mode.textContent = `Rendered from the exact ${kind === "resume" ? "résumé" : "cover letter"} DOCX through Microsoft Word PDF export.`;
+    openPdf.href = previewDocument.pdf_url;
+    openPdf.hidden = false;
+  } else {
+    frame.removeAttribute("src");
+    frame.dataset.source = "";
+    textPreview.textContent = previewDocument.text || data[kind] || "No extracted text is available.";
+    textPreview.style.transform = `scale(${state.preparationPreviewZoom})`;
+    mode.textContent = `Accurate Word rendering is unavailable: ${previewDocument.reason || "download the original DOCX for authoritative formatting."}`;
+    openPdf.hidden = true;
+  }
+  download.href = `/api/preparation/${id}/download/${kind === "resume" ? "resume" : "cover-letter"}`;
+  download.hidden = !data[kind] && !previewDocument.text;
 }
 
 async function loadSavedSearches() {
