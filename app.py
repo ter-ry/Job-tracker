@@ -1857,13 +1857,18 @@ def create_app() -> Flask:
         if row is None:
             return jsonify({"error": "Saved search not found"}), 404
         search = saved_search_to_dict(row)
+        try:
+            saved_payload = saved_search_to_discovery_payload(search)
+            discovery_search_config(saved_payload)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         owner = f"manual:{uuid.uuid4()}"
         if not acquire_discovery_search_lease(search_id, owner):
             return jsonify({"error": "This saved search is already running; try again when the active run completes."}), 409
         heartbeat_stop, heartbeat_thread = start_discovery_search_lease_heartbeat(search_id, owner)
         run_id = create_discovery_run(search_id, "manual")
         try:
-            result = run_discovery_pipeline(saved_search_to_discovery_payload(search), search_id=search_id, run_id=run_id)
+            result = run_discovery_pipeline(saved_payload, search_id=search_id, run_id=run_id)
             finish_discovery_run(run_id, status="completed", fetched=result["total"], new_count=result["persisted"]["new"], duplicate_count=result["persisted"]["duplicate"], errors=len(result["errors"]), outcomes=result["source_diagnostics"])
             now = datetime.now().isoformat(timespec="seconds")
             next_run = (datetime.now() + timedelta(minutes=int(search["interval_minutes"]))).isoformat(timespec="seconds")
@@ -1929,7 +1934,10 @@ def create_app() -> Flask:
             return jsonify({"error": "Keywords are required"}), 400
         bypass_cache = as_bool(payload.get("bypass_cache"))
 
-        search = discovery_search_config(payload)
+        try:
+            search = discovery_search_config(payload)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         search_key = discovery_search_signature(payload)
         stored_preferences = load_discovery_preferences(search_key)
         preferences = stored_preferences or discovery_preferences_payload({})
@@ -2391,6 +2399,7 @@ def normalize_saved_search_payload(payload: dict[str, Any], existing: dict[str, 
         except (TypeError, json.JSONDecodeError):
             existing_sources = []
     enabled_sources = normalize_discovery_sources(payload.get("enabled_sources", existing_sources))
+    validate_discovery_budget(total_cap, enabled_sources)
     auto_prepare_enabled = 1 if as_bool(payload.get("auto_prepare_enabled", existing.get("auto_prepare_enabled", False))) else 0
     auto_prepare_min_priority = clamp_int_default(payload.get("auto_prepare_min_priority", existing.get("auto_prepare_min_priority")), 75, 0, 100)
     auto_prepare_require_canadian = 1 if as_bool(payload.get("auto_prepare_require_canadian", existing.get("auto_prepare_require_canadian", True))) else 0
@@ -6234,6 +6243,7 @@ def discovery_search_config(payload: dict[str, Any]) -> dict[str, Any]:
     total_cap = clamp_int_default(payload.get("total_cap"), preset["total_cap"], 1, 5000)
     distance = clamp_int_default(payload.get("distance"), 50, 0, 1000)
     enabled_sources = normalize_discovery_sources(payload.get("enabled_sources"))
+    validate_discovery_budget(total_cap, enabled_sources)
     # total_cap is the user's aggregate fetch/display budget.  JobSpy applies
     # results_wanted per provider, so divide that budget across enabled
     # providers instead of silently raising it to the per-source cap.
@@ -6258,6 +6268,16 @@ def discovery_search_config(payload: dict[str, Any]) -> dict[str, Any]:
         "distance": distance,
         "enabled_sources": enabled_sources,
     }
+
+
+def validate_discovery_budget(total_cap: int, enabled_sources: list[str]) -> None:
+    source_count = len(enabled_sources)
+    if total_cap < source_count:
+        source_word = "source" if source_count == 1 else "sources"
+        raise ValueError(
+            f"Aggregate fetch limit must be at least {source_count} for {source_count} enabled {source_word}; "
+            "increase the limit or deselect a source."
+        )
 
 
 def save_discovery_search_run(search_key: str, search_json: dict[str, Any], metadata_json: dict[str, Any], raw_jobs: list[dict[str, Any]]) -> None:

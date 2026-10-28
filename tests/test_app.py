@@ -5049,6 +5049,24 @@ class JobAssistantTest(unittest.TestCase):
         })
         self.assertEqual(three["request_per_source_cap"], 6)
         self.assertLessEqual(three["aggregate_request_budget"], 20)
+        minimum = app_module.discovery_search_config({
+            "enabled_sources": ["linkedin", "indeed", "google"],
+            "per_source_cap": 100,
+            "total_cap": 3,
+        })
+        self.assertEqual(minimum["request_per_source_cap"], 1)
+        with self.assertRaisesRegex(ValueError, "at least 3"):
+            app_module.discovery_search_config({
+                "enabled_sources": ["linkedin", "indeed", "google"],
+                "total_cap": 2,
+            })
+
+    def test_manual_search_rejects_aggregate_limit_below_selected_source_count(self):
+        response = self.client.post("/api/discovery/jobspy", json={
+            "keywords": "backend", "enabled_sources": ["linkedin", "indeed", "google"], "total_cap": 2,
+        })
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("at least 3", response.get_json()["error"])
 
     def test_saved_search_preserves_current_limits_and_is_editable_without_running(self):
         created = self.client.post("/api/discovery/searches", json={
@@ -5078,6 +5096,22 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(saved["total_cap"], 17)
         self.assertEqual(saved["distance"], 40)
 
+    def test_saved_search_create_and_edit_reject_invalid_aggregate_budget(self):
+        invalid = self.client.post("/api/discovery/searches", json={
+            "name": "Invalid budget", "keywords": "backend", "enabled_sources": ["linkedin", "indeed", "google"], "total_cap": 2,
+        })
+        self.assertEqual(invalid.status_code, 400)
+        self.assertIn("at least 3", invalid.get_json()["error"])
+        valid = self.client.post("/api/discovery/searches", json={
+            "name": "Editable budget", "keywords": "backend", "enabled_sources": ["linkedin", "indeed", "google"], "total_cap": 3,
+        }).get_json()
+        invalid_update = self.client.put(f"/api/discovery/searches/{valid['id']}", json={**valid, "total_cap": 2})
+        self.assertEqual(invalid_update.status_code, 400)
+        self.assertIn("at least 3", invalid_update.get_json()["error"])
+        preserved = self.client.get("/api/discovery/searches").get_json()
+        stored = next(item for item in preserved if item["id"] == valid["id"])
+        self.assertEqual(stored["total_cap"], 3)
+
     def test_saved_search_run_uses_persisted_fetch_limits_and_reports_snapshot_separately(self):
         search = self.client.post("/api/discovery/searches", json={
             "name": "Limited saved run", "keywords": "backend", "enabled_sources": ["linkedin", "indeed", "google"],
@@ -5093,6 +5127,38 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(body["search"]["total_cap"], 20)
         self.assertIn("persisted", body)
         self.assertIn("visible_total", body)
+
+    def test_saved_search_run_rejects_invalid_aggregate_budget_before_provider_call(self):
+        self.client.get("/api/discovery/searches")
+        with app_module.app.app_context():
+            cursor = app_module.get_db().execute(
+                "INSERT INTO saved_search_profiles (name, keywords, enabled_sources_json, total_cap) VALUES (?, ?, ?, ?)",
+                ["Invalid legacy budget", "backend", '["linkedin", "indeed", "google"]', 2],
+            )
+            app_module.get_db().commit()
+            search_id = cursor.lastrowid
+        response = self.client.post(f"/api/discovery/searches/{search_id}/run")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("at least 3", response.get_json()["error"])
+
+    def test_worker_records_invalid_budget_without_requesting_providers(self):
+        from scripts.discovery_worker import run_due_searches
+
+        search = self.client.post("/api/discovery/searches", json={
+            "name": "Worker invalid budget", "keywords": "backend", "enabled_sources": ["linkedin", "indeed", "google"], "total_cap": 3, "enabled": True,
+        }).get_json()
+        with app_module.app.app_context():
+            app_module.get_db().execute("UPDATE saved_search_profiles SET total_cap = 2, next_run_at = '' WHERE id = ?", [search["id"]])
+            app_module.get_db().execute("INSERT INTO app_settings (key, value) VALUES ('discovery_scheduler_enabled', '1') ON CONFLICT(key) DO UPDATE SET value = '1'")
+            app_module.get_db().commit()
+            with patch.object(app_module, "fetch_jobspy_jobs") as mocked_fetch:
+                result = run_due_searches()
+        self.assertEqual(result["runs"], 0)
+        self.assertEqual(result["errors"], 1)
+        mocked_fetch.assert_not_called()
+        run = self.client.get("/api/discovery/runs").get_json()[0]
+        self.assertEqual(run["status"], "failed")
+        self.assertIn("at least 3", run["error"])
 
     def test_legacy_saved_search_columns_migrate_without_losing_existing_search(self):
         self.client.get("/api/discovery/searches")
