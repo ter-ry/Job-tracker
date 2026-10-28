@@ -112,6 +112,9 @@ const api = {
 
 document.addEventListener("DOMContentLoaded", () => {
   document.querySelectorAll(".tab").forEach((tab) => tab.addEventListener("click", switchTab));
+  document.querySelectorAll("[data-discovery-view]").forEach((button) => {
+    button.addEventListener("click", () => setDiscoverySection(button.dataset.discoveryView));
+  });
   document.getElementById("job-form").addEventListener("submit", saveJob);
   document.getElementById("profile-form").addEventListener("submit", saveProfile);
   document.getElementById("discovery-form").addEventListener("submit", searchDiscovery);
@@ -155,6 +158,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("discovery-filter-toggle").addEventListener("click", toggleDiscoveryFilters);
   document.getElementById("discovery-clear-filters").addEventListener("click", clearDiscoveryFilters);
   document.getElementById("discovery-show-all").addEventListener("click", showAllFetchedDiscoveryJobs);
+  setDiscoverySection("pipeline");
   ["search", "status-filter", "fit-filter", "role-filter", "remote-filter", "risk-filter", "sort-by"].forEach((id) => {
     document.getElementById(id).addEventListener("input", renderJobs);
     document.getElementById(id).addEventListener("change", renderJobs);
@@ -199,6 +203,19 @@ document.addEventListener("DOMContentLoaded", () => {
   loadDiscoveryScheduler();
   loadDiscoveryTaskStatus();
 });
+
+function setDiscoverySection(view) {
+  const selected = ["pipeline", "find", "saved"].includes(view) ? view : "pipeline";
+  document.querySelectorAll("[data-discovery-view]").forEach((button) => {
+    const active = button.dataset.discoveryView === selected;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  const pipeline = document.querySelector(".pipeline-dashboard");
+  if (pipeline) pipeline.hidden = selected !== "pipeline";
+  document.querySelectorAll(".discovery-view-find").forEach((element) => { element.hidden = selected !== "find"; });
+  document.querySelectorAll(".discovery-view-saved").forEach((element) => { element.hidden = selected !== "saved"; });
+}
 
 async function loadAll() {
   try {
@@ -1192,6 +1209,7 @@ function switchTab(event) {
   const target = event.currentTarget.dataset.tab;
   document.querySelectorAll(".tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === target));
   document.querySelectorAll(".tab-panel").forEach((panel) => panel.classList.toggle("active", panel.id === target));
+  if (target === "discovery") setDiscoverySection("pipeline");
 }
 
 async function focusPreparationPackage(itemId) {
@@ -2356,9 +2374,22 @@ function renderDiscoveryResults(result) {
     body = "<p>Distance filter unavailable - save a postal code or location in Profile.</p>" + body;
   }
   const rawSummary = renderDiscoveryDiagnostics(diagnostics, visibleCount, totalCount);
+  const fetchedCount = Number(diagnostics.raw_jobs_returned ?? totalCount ?? 0);
+  const duplicateCount = Number(diagnostics.duplicates_in_search ?? diagnostics.duplicates_removed ?? result.duplicates ?? 0);
+  const savedCount = Number(diagnostics.already_saved_matches ?? result.already_saved_matches ?? 0);
+  const excludedCount = Number(diagnostics.excluded_count ?? 0);
+  const cappedCount = Number(diagnostics.capped_count ?? 0);
   container.innerHTML = `
     <div class="discovery-summary">
-      <p><strong>${totalCount}</strong> raw jobs | <strong>${Number(result.duplicates || state.discoveryMeta.duplicates || 0)}</strong> duplicates | <strong>${visibleCount}</strong> visible</p>
+      <p>Results are limited by your aggregate fetch limit of <strong>${escapeHtml(String(diagnostics.search_criteria?.total_cap || totalCount))}</strong>.</p>
+      <div class="discovery-counts" aria-label="Discovery result counts">
+        <div><strong>${fetchedCount}</strong><span>Fetched</span></div>
+        <div><strong>${duplicateCount}</strong><span>Duplicate in search</span></div>
+        <div><strong>${savedCount}</strong><span>Already saved</span></div>
+        <div><strong>${excludedCount}</strong><span>Excluded</span></div>
+        <div><strong>${cappedCount}</strong><span>Capped</span></div>
+        <div><strong>${visibleCount}</strong><span>Visible</span></div>
+      </div>
       <p class="muted">${escapeHtml(countText || "No source counts returned")}</p>
       ${errorText}
     </div>
@@ -2375,9 +2406,8 @@ function renderDiscoveryOriginSummary() {
     element.textContent = "Distance calculated from: not configured. Save a home postal code or location in Profile.";
     return;
   }
-  const normalized = profile.home_location_normalized || profile.location || "saved location";
   const precision = profile.home_location_precision || "approximate";
-  element.textContent = `Distance calculated from: ${normalized} (${precision})`;
+  element.textContent = `Distance calculated from: configured home location (${precision})`;
 }
 
 function renderDiscoveryDiagnostics(diagnostics, visibleCount, totalCount) {
@@ -2415,11 +2445,9 @@ function renderDiscoveryDiagnostics(diagnostics, visibleCount, totalCount) {
     diagnostics.location_resolution_method ? `method=${diagnostics.location_resolution_method}` : "",
   ].filter(Boolean).join("; ") || "not configured")}</li>`);
   details.push(`<li><strong>Origin:</strong> ${escapeHtml([
-    origin.original_input ? `input=${origin.original_input}` : "",
-    origin.normalized ? `normalized=${origin.normalized}` : "",
     diagnostics.origin_geocode_status ? `status=${diagnostics.origin_geocode_status}` : "",
     diagnostics.origin_precision ? `precision=${diagnostics.origin_precision}` : "",
-  ].filter(Boolean).join("; ") || "not configured")}</li>`);
+  ].filter(Boolean).join("; ") || (origin.status ? "configured" : "not configured"))}</li>`);
   details.push(`<li><strong>Raw fetched:</strong> ${fetched}</li>`);
   details.push(`<li><strong>Visible after local filters:</strong> ${Number(visibleCount || 0)}</li>`);
   details.push(`<li><strong>Hidden by local filters:</strong> ${hiddenByLocalFilters}</li>`);
@@ -2443,7 +2471,7 @@ function renderDiscoveryDiagnostics(diagnostics, visibleCount, totalCount) {
     details.push("<li><strong>Local filters:</strong> Jobs were fetched, but the current local filters hide all visible results.</li>");
   }
   return `
-    <details class="score-details" open>
+    <details class="score-details">
       <summary>Discovery diagnostics</summary>
       <ul class="score-breakdown-list">${details.join("")}</ul>
     </details>

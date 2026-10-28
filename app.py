@@ -8,6 +8,7 @@ import html
 import importlib.metadata
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -1953,7 +1954,7 @@ def create_app() -> Flask:
             distance=search["distance"],
             remote_preference=search["remote_preference"],
             job_type=None,
-            results_wanted=search["per_source_cap"],
+            results_wanted=search["request_per_source_cap"],
             hours_old=search["hours_old"],
             enabled_sources=search["enabled_sources"],
             country_indeed=text(payload.get("country_indeed")) or "Canada",
@@ -1963,7 +1964,9 @@ def create_app() -> Flask:
         existing_keys = existing_job_dedupe_keys()
         seen_keys: set[str] = set()
         jobs: list[dict[str, Any]] = []
-        duplicates = 0
+        duplicates_in_search = 0
+        already_saved_matches = 0
+        excluded_count = 0
         geocoding_success = 0
         geocoding_cached = 0
         geocoding_unknown = 0
@@ -1989,20 +1992,17 @@ def create_app() -> Flask:
             clean["already_saved"] = False
             clean["duplicate_in_search"] = False
             keys = dedupe_keys(clean, clean.get("source_job_id"))
-            duplicate_found = False
+            if keys & seen_keys:
+                clean["duplicate_in_search"] = True
+                duplicates_in_search += 1
+                continue
             if keys & existing_keys:
                 clean["already_saved"] = True
+                already_saved_matches += 1
                 existing_match = find_existing_job_match(clean)
                 if existing_match is not None:
                     clean["saved_job_id"] = int(existing_match["id"])
                     clean["saved_job_status"] = text(existing_match["status"])
-                duplicate_found = True
-            if keys & seen_keys:
-                clean["duplicate_in_search"] = True
-                duplicates += 1
-                continue
-            if duplicate_found:
-                duplicates += 1
             seen_keys.update(keys)
             jobs.append(clean)
 
@@ -2014,6 +2014,7 @@ def create_app() -> Flask:
                 if source in source_counts:
                     source_counts[source] += 1
 
+        capped_count = max(0, len(jobs) - search["total_cap"])
         diagnostics = {
             "bypass_cache": bypass_cache,
             "cache_hit": False,
@@ -2036,10 +2037,15 @@ def create_app() -> Flask:
             "source_counts": source_counts,
             "source_errors": fetched.get("errors", {}),
             "source_diagnostics": fetched.get("source_diagnostics", {}),
-            "duplicates_removed": duplicates,
+            "duplicates_removed": duplicates_in_search,
+            "duplicates_in_search": duplicates_in_search,
+            "already_saved_matches": already_saved_matches,
+            "excluded_count": excluded_count,
+            "capped_count": capped_count,
+            "visible_count": min(len(jobs), search["total_cap"]),
             "raw_jobs_returned": len(raw_jobs),
             "displayed_jobs": min(len(jobs), search["total_cap"]),
-            "cap_reached": len(jobs) > search["total_cap"],
+            "cap_reached": capped_count > 0,
             "geocoding_errors": geocoding_errors,
             "discovery_location": search["discovery_location"],
             "distance_origin": search["distance_origin"],
@@ -2072,11 +2078,15 @@ def create_app() -> Flask:
                 "source_counts": source_counts,
                 "total": len(raw_jobs),
                 "visible_total": len(jobs),
-                "duplicates": duplicates,
+                "duplicates": duplicates_in_search,
+                "duplicates_in_search": duplicates_in_search,
+                "already_saved_matches": already_saved_matches,
+                "excluded_count": excluded_count,
+                "capped_count": capped_count,
                 "search_key": search_key,
                 "search": search,
                 "raw_jobs_returned": len(raw_jobs),
-                "cap_reached": len(raw_jobs) > search["total_cap"],
+                "cap_reached": capped_count > 0,
                 "preferences": preferences,
                 "bypass_cache": bypass_cache,
                 "diagnostics": diagnostics,
@@ -2594,7 +2604,7 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         location=search["discovery_location"],
         distance=search["distance"],
         remote_preference=search["remote_preference"],
-        results_wanted=search["per_source_cap"],
+        results_wanted=search["request_per_source_cap"],
         hours_old=search["hours_old"],
         enabled_sources=search["enabled_sources"],
         country_indeed="Canada",
@@ -2602,7 +2612,8 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
     existing_keys = existing_job_dedupe_keys()
     seen_keys: set[str] = set()
     jobs: list[dict[str, Any]] = []
-    duplicates = 0
+    duplicates_in_search = 0
+    already_saved_matches = 0
     filtered = 0
     for raw_job in fetched.get("jobs", []):
         clean = normalize_job_payload(jobspy_result_to_job_payload(raw_job))
@@ -2629,19 +2640,21 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
             clean["filtered_reason"] = "Posting seniority does not match the saved-search seniority preference."
             filtered += 1
             continue
-        clean["already_saved"] = bool(dedupe_keys(clean, clean.get("source_job_id")) & existing_keys)
         keys = dedupe_keys(clean, clean.get("source_job_id"))
         if keys & seen_keys:
-            duplicates += 1
+            duplicates_in_search += 1
             continue
+        clean["already_saved"] = bool(keys & existing_keys)
         if clean["already_saved"]:
-            duplicates += 1
+            already_saved_matches += 1
+        if clean["already_saved"]:
             existing_match = find_existing_job_match(clean)
             if existing_match is not None:
                 clean["saved_job_id"] = int(existing_match["id"])
                 clean["saved_job_status"] = text(existing_match["status"])
         seen_keys.update(keys)
         jobs.append(clean)
+    capped_count = max(0, len(jobs) - search["total_cap"])
     jobs = sort_discovery_jobs(jobs, "overall_score", "desc", "", "asc", "remote_after_local", "last")[: search["total_cap"]]
     persisted = persist_discovery_jobs(jobs, search_id, run_id)
     auto_preparation_queued = enqueue_auto_preparation(search, persisted.get("new_job_ids", [])) if search_id else 0
@@ -2651,7 +2664,12 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         "source_counts": fetched.get("source_counts", {}),
         "source_errors": fetched.get("errors", {}),
         "source_diagnostics": fetched.get("source_diagnostics", {}),
-        "duplicates_removed": duplicates,
+        "duplicates_removed": duplicates_in_search,
+        "duplicates_in_search": duplicates_in_search,
+        "already_saved_matches": already_saved_matches,
+        "excluded_count": filtered,
+        "capped_count": capped_count,
+        "visible_count": len(jobs),
         "raw_jobs_returned": len(fetched.get("jobs", [])),
         "displayed_jobs": len(jobs),
         "filtered_by_saved_search": filtered,
@@ -2668,7 +2686,11 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         "source_diagnostics": fetched.get("source_diagnostics", {}),
         "total": len(fetched.get("jobs", [])),
         "visible_total": len(jobs),
-        "duplicates": duplicates,
+        "duplicates": duplicates_in_search,
+        "duplicates_in_search": duplicates_in_search,
+        "already_saved_matches": already_saved_matches,
+        "excluded_count": filtered,
+        "capped_count": capped_count,
         "persisted": persisted,
         "search_key": search_key,
         "search": search,
@@ -6206,19 +6228,26 @@ def discovery_search_config(payload: dict[str, Any]) -> dict[str, Any]:
     per_source_cap = clamp_int_default(payload.get("per_source_cap"), preset["per_source_cap"], 1, 1000)
     total_cap = clamp_int_default(payload.get("total_cap"), preset["total_cap"], 1, 5000)
     distance = clamp_int_default(payload.get("distance"), 50, 0, 1000)
-    if total_cap < per_source_cap:
-        total_cap = max(total_cap, per_source_cap)
+    enabled_sources = normalize_discovery_sources(payload.get("enabled_sources"))
+    # total_cap is the user's aggregate fetch/display budget.  JobSpy applies
+    # results_wanted per provider, so divide that budget across enabled
+    # providers instead of silently raising it to the per-source cap.
+    source_count = max(1, len(enabled_sources))
+    request_per_source_cap = min(per_source_cap, max(1, math.ceil(total_cap / source_count)))
     return {
         "search_depth": depth,
         "date_window": date_window,
         "hours_old": None if date_window == "any" else DISCOVERY_DATE_WINDOWS.get(date_window, preset["days"]) * 24,
         "per_source_cap": per_source_cap,
         "total_cap": total_cap,
+        "request_per_source_cap": request_per_source_cap,
+        "aggregate_request_budget": request_per_source_cap * len(enabled_sources),
+        "enabled_source_count": len(enabled_sources),
         "remote_preference": normalize_choice(payload.get("remote_preference"), {"remote", "hybrid", "on-site"}),
         "keywords": text(payload.get("keywords")),
         "location": text(payload.get("location")),
         "distance": distance,
-        "enabled_sources": normalize_discovery_sources(payload.get("enabled_sources")),
+        "enabled_sources": enabled_sources,
     }
 
 
