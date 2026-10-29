@@ -48,6 +48,7 @@ from grounding import (
     job_keywords,
     normalize_keyword,
     normalize_tailoring_requirement,
+    rank_resume_bullets_for_requirement,
     stable_hash as grounding_hash,
     supporting_snippets,
     validate_cover_letter_output,
@@ -682,16 +683,7 @@ def create_app() -> Flask:
                     term_match = item.get("match_type", "missing") if found_as and term_normalized == found_as else "missing"
                     term_memory = (item.get("skill_memory") or {}).get(term, {})
                     term_words = [word for word in re.findall(r"[a-z0-9+#.]+", term.lower()) if len(word) > 2 and word not in stop_words]
-                    suggestions = []
-                    if term_match in {"missing", "partial"}:
-                        for bullet in current_bullets:
-                            if not bullet.get("editable"):
-                                continue
-                            bullet_words = set(re.findall(r"[a-z0-9+#.]+", text(bullet.get("text")).lower()))
-                            overlap = [word for word in term_words if word in bullet_words]
-                            if overlap:
-                                suggestions.append({"paragraph_index": bullet["paragraph_index"], "text": bullet["text"], "section": bullet.get("section", "Résumé"), "source_location": f"{bullet.get('section', 'Résumé')} · paragraph {bullet['paragraph_index'] + 1}", "overlap": overlap})
-                        suggestions = suggestions[:3]
+                    suggestions = rank_resume_bullets_for_requirement(term, current_bullets) if term_match in {"missing", "partial"} else []
                     skill_inventory.append({
                         "keyword": term,
                         "normalized": term_normalized,
@@ -709,6 +701,7 @@ def create_app() -> Flask:
                         "source_section": item.get("source_section", "Résumé") if term_match != "missing" else "",
                         "skill_memory": term_memory,
                         "suggested_bullets": suggestions,
+                        "suggestion_summary": "A stronger existing résumé bullet is available for review." if suggestions else "No safe existing résumé bullet was found; AI Improve may correctly leave the wording unchanged.",
                     })
         report["skill_inventory"] = skill_inventory
         response = {

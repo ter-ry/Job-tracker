@@ -356,7 +356,10 @@ function buildTailoringRequirementGroups(records) {
     const group = groups.get(key);
     group.members.push(item); group.indices.push(index);
     [item.keyword, ...(item.alternative_terms || [])].filter(Boolean).forEach((term) => group.terms.add(term));
-    (item.suggested_bullets || []).forEach((bullet) => group.suggestions.set(bullet.paragraph_index, bullet));
+    (item.suggested_bullets || []).forEach((bullet) => {
+      const existing = group.suggestions.get(bullet.paragraph_index);
+      if (!existing || Number(bullet.relevance_score ?? 0) > Number(existing.relevance_score ?? 0)) group.suggestions.set(bullet.paragraph_index, bullet);
+    });
   });
   const importanceRank = { required: 4, preferred: 3, responsibility: 2, unclassified: 1 };
   return [...groups.values()].map((group) => {
@@ -381,15 +384,7 @@ function buildTailoringRequirementGroups(records) {
     group.source_sections = [...new Set(group.members.flatMap((item) => item.source_sections || []))];
     group.evidence = [...group.members].sort((a, b) => (b.evidence ? 1 : 0) - (a.evidence ? 1 : 0)).find((item) => item.evidence)?.evidence || "";
     group.source_section = group.members.find((item) => item.evidence)?.source_section || "Résumé";
-const sectionRank = { experience: 0, projects: 1, education: 2, skills: 3 };
-    const evidenceScore = (bullet) => {
-      const text = String(bullet.text || "").toLowerCase();
-      const direct = (text.match(/\b(api|apis|rest|service|backend|flask|postgres|database|kafka|rabbitmq|cloud|event|observability|testing)\b/g) || []).length;
-      const overlap = (bullet.overlap || []).length;
-      const section = sectionRank[String(bullet.section || bullet.source_location || "").split(" ")[0].toLowerCase()] ?? 9;
-      return direct * 10 + overlap * 2 - section;
-    };
-    group.suggested_bullets = [...group.suggestions.values()].sort((a, b) => evidenceScore(b) - evidenceScore(a));
+    group.suggested_bullets = [...group.suggestions.values()].sort((a, b) => Number(b.relevance_score ?? 0) - Number(a.relevance_score ?? 0) || Number(a.paragraph_index ?? 0) - Number(b.paragraph_index ?? 0));
     group.relatedEvidence = group.evidence ? "" : group.suggested_bullets[0]?.text || "";
     group.memory = group.members.find((item) => item.skill_memory?.status && item.skill_memory.status !== "unknown")?.skill_memory || representative?.skill_memory || {};
     return group;
@@ -528,8 +523,9 @@ function renderTailoringRequirementDetail() {
   }).join("");
   const source = group.source_evidence.map((line) => `<li>${escapeHtml(line)}</li>`).join("") || "<li>No source excerpt was captured.</li>";
   const evidence = group.evidence ? `<p><strong>${escapeHtml(group.source_section || "Résumé")}</strong>: ${escapeHtml(group.evidence)}</p>` : group.relatedEvidence ? `<p><strong>Related résumé evidence for review</strong>: ${escapeHtml(group.relatedEvidence)}</p>` : "<p class=\"muted\">No exact résumé evidence for this competency.</p>";
-  const suggestions = group.suggested_bullets.map((bullet) => `<button class="tailoring-suggested-bullet" type="button" data-suggested-paragraph="${bullet.paragraph_index}"><span>${escapeHtml(bullet.source_location || bullet.section || "Résumé")}</span><strong>${escapeHtml(bullet.text)}</strong><small>Edit this bullet · overlap: ${escapeHtml((bullet.overlap || []).join(", "))}</small></button>`).join("");
-  target.innerHTML = `<section><h4>Employer requirement</h4><p><strong>${escapeHtml(tailoringTitle(group.parent_keyword || group.primaryKeyword))}</strong> · ${escapeHtml(importance)}</p><p class="muted">${escapeHtml(group.alternative_terms.join(" · "))}</p></section><section><h4>Acceptable alternatives</h4><ul class="tailoring-alternatives">${alternatives || "<li class=\"muted\">No alternatives listed.</li>"}</ul></section><details><summary>Original job description</summary><p class="job-evidence">${source}</p><p class="muted">Source section: ${escapeHtml(group.source_sections.join(", ") || "Job description")}</p></details><section><h4>Résumé evidence</h4>${evidence}</section><section><h4>Matching assessment</h4><p><strong>${assessment}</strong> · ${escapeHtml(reason)}</p></section><section><h4>Suggested next action</h4>${suggestions || `<p class="muted">No safe adjacent résumé bullet was found. Confirm the experience only if it is genuine; do not add unsupported claims.</p>`}</section>`;
+  const suggestions = group.suggested_bullets.map((bullet) => `<button class="tailoring-suggested-bullet" type="button" data-suggested-paragraph="${bullet.paragraph_index}"><span>${escapeHtml(bullet.source_location || bullet.section || "Résumé")}</span><strong>${escapeHtml(bullet.text)}</strong><small>Edit this bullet · overlap: ${escapeHtml((bullet.overlap || []).join(", "))}${bullet.evidence_strength ? ` · ${escapeHtml(bullet.evidence_strength)}` : ""}</small></button>`).join("");
+  const suggestionNote = group.suggested_bullets.length ? `<p class="muted helper">The strongest existing evidence is shown first. AI Improve may correctly leave wording unchanged when no safe rewrite is needed.</p>` : `<p class="muted helper">No safe adjacent résumé bullet was found. Confirm the experience only if it is genuine; do not add unsupported claims.</p>`;
+  target.innerHTML = `<section><h4>Employer requirement</h4><p><strong>${escapeHtml(tailoringTitle(group.parent_keyword || group.primaryKeyword))}</strong> · ${escapeHtml(importance)}</p><p class="muted">${escapeHtml(group.alternative_terms.join(" · "))}</p></section><section><h4>Acceptable alternatives</h4><ul class="tailoring-alternatives">${alternatives || "<li class=\"muted\">No alternatives listed.</li>"}</ul></section><details><summary>Original job description</summary><p class="job-evidence">${source}</p><p class="muted">Source section: ${escapeHtml(group.source_sections.join(", ") || "Job description")}</p></details><section><h4>Résumé evidence</h4>${evidence}</section><section><h4>Matching assessment</h4><p><strong>${assessment}</strong> · ${escapeHtml(reason)}</p></section><section><h4>Suggested next action</h4>${suggestionNote + suggestions || `<p class="muted">No safe adjacent résumé bullet was found. Confirm the experience only if it is genuine; do not add unsupported claims.</p>`}</section>`;
   target.querySelectorAll("[data-skill-status]").forEach((select) => select.addEventListener("change", () => saveTailoringSkillMemory(select.dataset.skillStatus, select.value)));
   target.querySelectorAll("[data-suggested-paragraph]").forEach((button) => button.addEventListener("click", () => { selectTailoringParagraph(Number(button.dataset.suggestedParagraph)); document.getElementById("tailoring-selected-original")?.scrollIntoView({ block: "nearest" }); }));
 }
@@ -780,11 +776,17 @@ async function improveTailoringEdit() {
         document.getElementById("tailoring-proposed-text").value = result.proposed_text || bullet.text;
         renderTailoringDiff(bullet.text, document.getElementById("tailoring-proposed-text").value);
         state.tailoring.operationState = result.meaningful_improvement === false ? "suitable" : "modified";
-        status.textContent = result.status === "unchanged" ? "The existing bullet is already suitable. No wording change was made." : `${result.message} It has not been applied.`;
+        const selectedSuggestion = (state.tailoring.selectedKeyword?.suggested_bullets || []).find((item) => Number(item.paragraph_index) === Number(bullet.paragraph_index));
+        const selectedRelevance = Number(selectedSuggestion?.relevance_score ?? Number.NEGATIVE_INFINITY);
+        const strongerEvidence = (state.tailoring.selectedKeyword?.suggested_bullets || []).some((item) => Number(item.relevance_score ?? Number.NEGATIVE_INFINITY) > selectedRelevance);
+        status.textContent = result.status === "unchanged" ? `The selected bullet is already suitable for this requirement. No wording change was made.${strongerEvidence ? " A stronger existing résumé bullet is available in the requirement details for review." : ""}` : `${result.message} It has not been applied.`;
       } else if (result.status === "cancelled") {
         status.textContent = "AI improvement cancelled. Original wording was preserved.";
       } else if (result.status === "rejected") {
-        status.textContent = `AI suggestion rejected: ${result.error || "the safety checks did not pass."} Original wording was preserved.`;
+        const selectedSuggestion = (state.tailoring.selectedKeyword?.suggested_bullets || []).find((item) => Number(item.paragraph_index) === Number(bullet.paragraph_index));
+        const selectedRelevance = Number(selectedSuggestion?.relevance_score ?? Number.NEGATIVE_INFINITY);
+        const strongerEvidence = (state.tailoring.selectedKeyword?.suggested_bullets || []).some((item) => Number(item.relevance_score ?? Number.NEGATIVE_INFINITY) > selectedRelevance);
+        status.textContent = `AI suggestion rejected: ${result.error || "the safety checks did not pass."} Original wording was preserved.${strongerEvidence ? " Review the stronger existing evidence in the requirement details instead." : ""}`;
       } else if (result.status === "unavailable") {
         status.textContent = `AI model unavailable: ${result.error || "the local model did not complete."} Original wording was preserved.`;
       } else {

@@ -923,6 +923,68 @@ def useful_tokens(content: str) -> set[str]:
     }
 
 
+def resume_requirement_token_forms(token: str) -> set[str]:
+    """Return conservative morphology for résumé requirement matching."""
+    clean = re.sub(r"[^a-z0-9+#.]", "", token.lower())
+    if not clean:
+        return set()
+    forms = {clean}
+    if clean.endswith("ies") and len(clean) > 4:
+        forms.add(clean[:-3] + "y")
+    if clean.endswith("ing") and len(clean) > 5:
+        stem = clean[:-3]
+        forms.update({stem, stem + "s"})
+    if clean.endswith("ed") and len(clean) > 4:
+        forms.add(clean[:-2])
+    if clean.endswith("es") and len(clean) > 4:
+        forms.add(clean[:-2])
+    if clean.endswith("s") and len(clean) > 3:
+        forms.add(clean[:-1])
+    return forms
+
+
+def rank_resume_bullets_for_requirement(requirement: str, bullets: list[dict[str, Any]], limit: int = 3) -> list[dict[str, Any]]:
+    """Rank editable résumé evidence using conservative morphology and context."""
+    stop_words = {"and", "or", "with", "for", "the", "of", "to", "in", "experience", "using", "such", "as"}
+    requirement_tokens = [token for token in re.findall(r"[a-z0-9+#.]+", str(requirement).lower()) if len(token) > 2 and token not in stop_words]
+    if not requirement_tokens:
+        return []
+    requirement_forms = {token: resume_requirement_token_forms(token) for token in requirement_tokens}
+    ranked = []
+    for bullet in bullets:
+        if not bullet.get("editable"):
+            continue
+        bullet_text = str(bullet.get("text") or "")
+        bullet_tokens = re.findall(r"[a-z0-9+#.]+", bullet_text.lower())
+        matched_tokens = []
+        for requirement_token in requirement_tokens:
+            forms = requirement_forms[requirement_token]
+            matches = [token for token in bullet_tokens if token in forms or requirement_token in resume_requirement_token_forms(token)]
+            if matches:
+                matched_tokens.append(matches[0])
+        if not matched_tokens:
+            continue
+        section = str(bullet.get("section") or "").lower().replace("_", " ")
+        score = len(matched_tokens) * 3
+        if section in {"experience", "work experience", "work", "projects", "project"}:
+            score += 4
+        elif section in {"skills", "technologies", "technical skills"}:
+            score -= 1
+        quantified = len(re.findall(r"(?<![a-z])(?:\d+(?:\.\d+)?%?|\d+\+)", bullet_text.lower()))
+        score += min(quantified, 3) * 2
+        ranked.append({
+            "paragraph_index": bullet.get("paragraph_index"),
+            "text": bullet_text,
+            "section": bullet.get("section", "Résumé"),
+            "source_location": bullet.get("source_location") or f"{bullet.get('section', 'Résumé')} · paragraph {int(bullet.get('paragraph_index', 0)) + 1}",
+            "overlap": matched_tokens,
+            "relevance_score": score,
+            "evidence_strength": "quantified substantive evidence" if quantified and section not in {"skills", "technologies", "technical skills"} else "substantive evidence" if section not in {"skills", "technologies", "technical skills"} else "keyword evidence",
+        })
+    ranked.sort(key=lambda item: (-item["relevance_score"], int(item["paragraph_index"] or 0)))
+    return ranked[:limit]
+
+
 def contains_phrase(content: str, phrase: str) -> bool:
     return phrase.lower() in content.lower()
 
