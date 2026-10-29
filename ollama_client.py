@@ -4,6 +4,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urljoin
@@ -98,7 +99,8 @@ def build_ollama_health_report(config: OllamaConfig) -> dict[str, Any]:
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
     try:
         with urllib.request.urlopen(request, timeout=config.timeout_seconds) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            raw = response.read().decode("utf-8")
+            payload = json.loads(raw)
     except urllib.error.HTTPError as exc:
         report["status"] = "error"
         report["failure_reason"] = f"HTTP {exc.code} from Ollama."
@@ -143,58 +145,78 @@ def build_ollama_health_report(config: OllamaConfig) -> dict[str, Any]:
     return report
 
 
-def request_json_completion(config: OllamaConfig, prompt: str, system: str = "") -> dict[str, Any]:
+def request_json_completion(
+    config: OllamaConfig,
+    prompt: str,
+    system: str = "",
+    *,
+    max_attempts: int = 2,
+    cancel_event: Any = None,
+    keep_alive: int | str | None = None,
+    deadline: float | None = None,
+) -> dict[str, Any]:
     if not config.enabled:
         return {"ok": False, "error": "Ollama is disabled.", "data": {}}
     url = urljoin(config.base_url.rstrip("/") + "/", "api/generate")
-    payload = {
-        "model": config.model,
-        "prompt": prompt,
-        "system": system,
-        "stream": False,
-        "format": "json",
-        # Qwen3 can spend the entire response budget in its reasoning channel
-        # unless thinking is explicitly disabled for this structured endpoint.
-        "think": False,
-        "options": {
-            "num_predict": config.max_output_tokens,
-        },
-    }
+    payload = {"model": config.model, "prompt": prompt, "system": system, "stream": False if cancel_event is None else True, "format": "json", "think": False, "options": {"num_predict": config.max_output_tokens}}
+    if keep_alive is not None:
+        payload["keep_alive"] = keep_alive
     last_error: dict[str, Any] = {"ok": False, "error": "Ollama did not return a usable JSON response.", "data": {}}
-    for attempt in range(2):
+    for attempt in range(max(1, max_attempts)):
+        if deadline is not None and time.monotonic() >= deadline:
+            return {"ok": False, "deadline_exceeded": True, "error": "Ollama request exceeded its total time limit.", "data": {}, "attempts": attempt}
+        if cancel_event is not None and cancel_event.is_set():
+            return {"ok": False, "cancelled": True, "error": "AI improvement was cancelled.", "data": {}, "attempts": attempt}
         attempt_payload = dict(payload)
         if attempt:
             attempt_payload["prompt"] = prompt + "\nReturn only one valid JSON object. Do not use markdown fences or commentary."
-        request = urllib.request.Request(
-            url,
-            data=json.dumps(attempt_payload).encode("utf-8"),
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
-            method="POST",
-        )
+        request = urllib.request.Request(url, data=json.dumps(attempt_payload).encode("utf-8"), headers={"Content-Type": "application/json", "Accept": "application/json"}, method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=config.timeout_seconds) as response:
-                raw = response.read().decode("utf-8")
+            remaining = max(0.1, deadline - time.monotonic()) if deadline is not None else config.timeout_seconds
+            with urllib.request.urlopen(request, timeout=min(config.timeout_seconds, remaining)) as response:
+                if cancel_event is not None and hasattr(response, "readline"):
+                    lines: list[str] = []
+                    while True:
+                        if deadline is not None and time.monotonic() >= deadline:
+                            try: response.close()
+                            except Exception: pass
+                            return {"ok": False, "deadline_exceeded": True, "error": "Ollama request exceeded its total time limit.", "data": {}, "attempts": attempt + 1}
+                        if cancel_event.is_set():
+                            try: response.close()
+                            except Exception: pass
+                            return {"ok": False, "cancelled": True, "error": "AI improvement was cancelled.", "data": {}, "attempts": attempt + 1}
+                        line = response.readline()
+                        if not line: break
+                        lines.append(line.decode("utf-8") if isinstance(line, bytes) else str(line))
+                        try:
+                            if json.loads(lines[-1]).get("done"): break
+                        except (TypeError, json.JSONDecodeError): pass
+                    raw = "".join(lines)
+                else:
+                    raw = response.read().decode("utf-8")
         except Exception as exc:
-            return {"ok": False, "error": str(exc), "data": {}}
+            if cancel_event is not None and cancel_event.is_set():
+                return {"ok": False, "cancelled": True, "error": "AI improvement was cancelled.", "data": {}, "attempts": attempt + 1}
+            return {"ok": False, "error": str(exc), "data": {}, "attempts": attempt + 1}
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError:
-            return {"ok": False, "error": "Ollama returned invalid JSON.", "data": {}}
-        response_text = _text(parsed.get("response")) if isinstance(parsed, dict) else ""
-        if not response_text:
-            return {"ok": False, "error": "Ollama returned an empty response.", "data": {}}
+            records = []
+            for line in raw.splitlines():
+                try: records.append(json.loads(line))
+                except json.JSONDecodeError: continue
+            parsed = records if records else None
+        if parsed is None: return {"ok": False, "error": "Ollama returned invalid JSON.", "data": {}, "attempts": attempt + 1}
+        if isinstance(parsed, list): response_text = "".join(_text(item.get("response")) for item in parsed if isinstance(item, dict))
+        else: response_text = _text(parsed.get("response")) if isinstance(parsed, dict) else ""
+        if not response_text: return {"ok": False, "error": "Ollama returned an empty response.", "data": {}, "attempts": attempt + 1}
         candidate = response_text.strip()
-        if candidate.startswith("```"):
-            candidate = candidate.strip("`").split("\n", 1)[-1].strip()
-        try:
-            data = json.loads(candidate)
+        if candidate.startswith("```"): candidate = candidate.strip("`").split("\n", 1)[-1].strip()
+        try: data = json.loads(candidate)
         except json.JSONDecodeError:
             start, end = candidate.find("{"), candidate.rfind("}")
-            try:
-                data = json.loads(candidate[start:end + 1]) if start >= 0 and end > start else None
-            except json.JSONDecodeError:
-                data = None
-        if isinstance(data, dict):
-            return {"ok": True, "error": "", "data": data, "raw": response_text, "attempts": attempt + 1}
+            try: data = json.loads(candidate[start:end + 1]) if start >= 0 and end > start else None
+            except json.JSONDecodeError: data = None
+        if isinstance(data, dict): return {"ok": True, "error": "", "data": data, "raw": response_text, "attempts": attempt + 1}
         last_error = {"ok": False, "error": "Ollama response was not valid JSON.", "data": {}, "raw": response_text, "attempts": attempt + 1}
     return last_error

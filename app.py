@@ -86,6 +86,11 @@ PREPARATION_STATUSES = {"queued", "preparing", "ready_for_review", "approved", "
 PREPARATION_LEASE_MINUTES = 10
 PREPARATION_LEASE_RENEW_SECONDS = 30
 
+TAILORING_AI_JOBS: dict[str, dict[str, Any]] = {}
+TAILORING_AI_JOBS_LOCK = threading.Lock()
+TAILORING_AI_INFERENCE_SLOT = threading.BoundedSemaphore(1)
+TAILORING_AI_JOB_RETENTION_SECONDS = 600
+
 DISCOVERY_SCORE_WEIGHTS = {
     "skill_match": 35,
     "role_fit": 20,
@@ -978,56 +983,51 @@ def create_app() -> Flask:
     def improve_tailoring_draft_change(draft_id: int) -> Response:
         payload = request.get_json(force=True) or {}
         row = query_db("SELECT * FROM tailoring_drafts WHERE id = ?", [draft_id], one=True)
-        if row is None:
-            return jsonify({"error": "Tailoring draft was not found"}), 404
+        if row is None: return jsonify({"error": "Tailoring draft was not found", "status": "unavailable"}), 404
         job_row = query_db("SELECT * FROM jobs WHERE id = ?", [row["job_id"]], one=True)
-        try:
-            selection = resolve_tailoring_resume_profile({"candidate_profile_id": row["candidate_profile_id"], "resume_id": row["resume_id"]})
-        except ValueError as exc:
-            return jsonify({"error": str(exc)}), 409
+        try: selection = resolve_tailoring_resume_profile({"candidate_profile_id": row["candidate_profile_id"], "resume_id": row["resume_id"]})
+        except ValueError as exc: return jsonify({"error": str(exc), "status": "unavailable"}), 409
         original = text(payload.get("original_text"))
-        if not original:
-            return jsonify({"error": "Select an existing résumé bullet before requesting an improvement"}), 400
-        config = OllamaConfig.from_mapping(load_profile())
-        if not config.enabled:
-            return jsonify({"error": "AI improvement is disabled. Enable the configured local Ollama assistant first."}), 503
-        target_length = max(120, round(len(original) * 1.2))
+        if not original: return jsonify({"error": "Select an existing résumé bullet before requesting an improvement", "status": "unavailable"}), 400
+        config = tailoring_ai_config(OllamaConfig.from_mapping(load_profile()))
+        if not config.enabled: return jsonify({"error": "AI improvement is unavailable because the local model is disabled.", "status": "unavailable"}), 503
+        cleanup_tailoring_ai_jobs()
+        if not TAILORING_AI_INFERENCE_SLOT.acquire(blocking=False):
+            return jsonify({"error": "Another AI improvement is already running. Please wait for it to finish.", "status": "busy"}), 429
         source_context = next((item for item in tailoring_paragraphs(selection["resume_path"]) if normalize_space(item.get("text")) == normalize_space(original)), None)
         keyword = text(payload.get("keyword"))
-        prompt = json.dumps({"task": "Improve only this résumé bullet", "job": {"title": job_row["title"], "description": job_row["job_description"]}, "keyword": keyword, "source_location": source_context.get("section") if source_context else "Selected résumé bullet", "verified_candidate_evidence": original, "bullet": original, "target_length_characters": target_length, "rules": ["Return JSON with proposed_bullet string only", "Preserve every number, percentage, version, range, plus sign, unit, qualifier, technology, security fact, employer, project and responsibility from the selected bullet", "Do not combine facts from other résumé bullets, projects or employers", "Do not add technologies, integrations, responsibilities or achievements", "Preserve necessary articles and grammatical sentence structure", "Reorganize existing supported facts to foreground the selected job requirement when useful", "Prefer the same length or shorter than the original", "If no meaningful safe improvement is possible, return the original bullet unchanged"]})
-        response = request_json_completion(config, prompt, system="Return exactly one valid JSON object with a proposed_bullet string. Do not include reasoning, markdown, or commentary.")
-        if not response.get("ok") or not text(response.get("data")):
-            return jsonify({"error": response.get("error") or "The local AI assistant did not return a usable suggestion."}), 503
-        raw_data = response.get("data")
-        if isinstance(raw_data, dict):
-            proposed = text(raw_data.get("proposed_bullet") or raw_data.get("proposed_text"))
-        else:
-            proposed = text(raw_data)
-        if not proposed:
-            return jsonify({"error": "The local AI assistant returned JSON without a proposed_bullet string."}), 422
-        if proposed.startswith("```"):
-            proposed = proposed.strip("`").replace("text\n", "", 1).strip()
-        validation_error = validate_tailoring_bullet_suggestion(original, proposed)
-        if validation_error:
-            retry_prompt = f"{prompt}\n\nThe first proposal failed this quality or safety check: {validation_error} Retry once. Preserve necessary articles and grammar, keep all selected-bullet facts, and foreground the requirement only by reorganizing existing supported wording. If no meaningful safe improvement is possible, return the original bullet unchanged. Original bullet: {original}"
-            retry_response = request_json_completion(
-                config,
-                retry_prompt,
-                system="Return exactly one valid JSON object with a proposed_bullet string. Preserve all factual and quantified content exactly. Do not include reasoning, markdown, or commentary.",
-            )
-            retry_data = retry_response.get("data") if retry_response.get("ok") else None
-            if isinstance(retry_data, dict):
-                retry_proposed = text(retry_data.get("proposed_bullet") or retry_data.get("proposed_text"))
-            else:
-                retry_proposed = text(retry_data)
-            retry_error = validate_tailoring_bullet_suggestion(original, retry_proposed) if retry_proposed else "The retry returned no usable suggestion."
-            if retry_error in {TAILORING_ALREADY_SUITABLE, TAILORING_GRAMMAR_WARNING}:
-                return jsonify({"original_text": original, "proposed_text": original, "applied": False, "meaningful_improvement": False, "retry_attempted": True, "message": TAILORING_ALREADY_SUITABLE})
-            if not retry_error:
-                return jsonify({"original_text": original, "proposed_text": retry_proposed, "applied": False, "meaningful_improvement": True, "retry_attempted": True, "message": "AI suggestion is ready for review and has not been applied."})
-            return jsonify({"error": f"AI suggestion rejected after one safety retry: {retry_error}", "original_text": original, "proposed_text": original, "applied": False, "retry_attempted": True}), 422
-        return jsonify({"original_text": original, "proposed_text": proposed, "applied": False, "meaningful_improvement": True, "message": "AI suggestion is ready for review and has not been applied."})
+        prompt = json.dumps({"task": "Improve one résumé bullet only", "job": {"title": text(job_row["title"]), "description": text(job_row["job_description"])[:4000]}, "keyword": keyword, "source_location": source_context.get("section") if source_context else "Selected résumé bullet", "verified_candidate_evidence": original, "target_length_characters": max(80, round(len(original) * 1.05)), "rules": ["Return JSON with proposed_bullet string only", "Preserve every fact, number, percentage, range, technology, security fact, employer, project and responsibility", "Do not combine facts from other bullets or employers", "Reorganize supported wording only when it materially improves the selected requirement", "Prefer the same length or shorter", "Return the original unchanged if no meaningful improvement is safe"]})
+        job_id = uuid.uuid4().hex
+        started = time.monotonic()
+        deadline = started + config.timeout_seconds
+        with TAILORING_AI_JOBS_LOCK:
+            TAILORING_AI_JOBS[job_id] = {"status": "running", "started_at": started, "deadline": deadline, "started_at_iso": datetime.now().isoformat(timespec="seconds"), "cancel_event": threading.Event(), "original_text": original}
+        thread = threading.Thread(target=run_tailoring_ai_job, args=(job_id, config, prompt, original, deadline), name=f"tailoring-ai-{job_id[:8]}", daemon=True)
+        thread.start()
+        return jsonify({"job_id": job_id, "status": "running", "message": "AI improvement started.", "timeout_seconds": config.timeout_seconds, "max_output_tokens": config.max_output_tokens}), 202
 
+    @app.get("/api/tailoring/improve-jobs/<job_id>")
+    def tailoring_ai_job_status(job_id: str) -> Response:
+        cleanup_tailoring_ai_jobs()
+        with TAILORING_AI_JOBS_LOCK: job = dict(TAILORING_AI_JOBS.get(job_id) or {})
+        if not job: return jsonify({"error": "AI improvement job was not found", "status": "unavailable"}), 404
+        job.pop("cancel_event", None)
+        if job.get("status") == "running":
+            job["elapsed_seconds"] = round(time.monotonic() - float(job.get("started_at", time.monotonic())), 2)
+            return jsonify(job), 202
+        job.pop("started_at", None)
+        return jsonify(job), 422 if job.get("status") == "rejected" else 503 if job.get("status") in {"unavailable", "cancelled"} else 200
+
+    @app.post("/api/tailoring/improve-jobs/<job_id>/cancel")
+    def cancel_tailoring_ai_job(job_id: str) -> Response:
+        cleanup_tailoring_ai_jobs()
+        with TAILORING_AI_JOBS_LOCK:
+            job = TAILORING_AI_JOBS.get(job_id)
+            if not job: return jsonify({"error": "AI improvement job was not found or has expired."}), 404
+            if job.get("status") != "running": return jsonify({"status": job.get("status"), "message": "The AI improvement is already complete."}), 409
+            job["cancel_event"].set()
+            job["cancel_requested"] = True
+        return jsonify({"job_id": job_id, "status": "cancelling", "message": "Cancellation requested; the model connection will be closed at the next response boundary."}), 202
     @app.get("/api/tailoring/drafts/<int:draft_id>/preview")
     def preview_tailoring_draft(draft_id: int) -> Response:
         preview_started = time.perf_counter()
@@ -9544,6 +9544,125 @@ def validate_tailoring_bullet_suggestion(original: str, proposed: str) -> str:
     if len(proposed) > target_length:
         return f"The suggestion exceeded the target length budget of {target_length} characters."
     return ""
+
+
+def tailoring_ai_config(config: OllamaConfig) -> OllamaConfig:
+    """Use a short, separately configurable budget for one-bullet editing."""
+    try: timeout = max(5, int(os.environ.get("OLLAMA_TAILORING_TIMEOUT_SECONDS", "30")))
+    except ValueError: timeout = 30
+    try: tokens = max(96, int(os.environ.get("OLLAMA_TAILORING_MAX_OUTPUT_TOKENS", "256")))
+    except ValueError: tokens = 256
+    return OllamaConfig(config.enabled, config.base_url, config.model, min(config.timeout_seconds, timeout), min(config.max_output_tokens, tokens), min(config.max_prompt_chars, 8000))
+
+
+def cleanup_tailoring_ai_jobs() -> None:
+    now = time.monotonic()
+    with TAILORING_AI_JOBS_LOCK:
+        expired = [
+            job_id
+            for job_id, job in TAILORING_AI_JOBS.items()
+            if job.get("status") != "running"
+            and now - float(job.get("finished_monotonic", now)) >= TAILORING_AI_JOB_RETENTION_SECONDS
+        ]
+        for job_id in expired:
+            TAILORING_AI_JOBS.pop(job_id, None)
+
+
+def _tailoring_ai_config_for_deadline(config: OllamaConfig, deadline: float) -> OllamaConfig | None:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    return OllamaConfig(
+        config.enabled,
+        config.base_url,
+        config.model,
+        min(float(config.timeout_seconds), max(0.1, remaining)),
+        config.max_output_tokens,
+        config.max_prompt_chars,
+    )
+
+
+def run_tailoring_ai_job(job_id: str, config: OllamaConfig, prompt: str, original: str, deadline: float) -> None:
+    with TAILORING_AI_JOBS_LOCK:
+        job = TAILORING_AI_JOBS.get(job_id)
+    if not job:
+        TAILORING_AI_INFERENCE_SLOT.release()
+        return
+    cancel_event = job["cancel_event"]
+    started = job["started_at"]
+    result: dict[str, Any]
+    try:
+        if cancel_event.is_set():
+            result = {"status": "cancelled", "error": "AI improvement was cancelled before inference started.", "original_text": original, "proposed_text": original, "retry_attempted": False}
+        else:
+            request_config = _tailoring_ai_config_for_deadline(config, deadline)
+            if request_config is None:
+                result = {"status": "unavailable", "error": "AI improvement exceeded its total time limit before inference started.", "original_text": original, "proposed_text": original, "retry_attempted": False}
+            else:
+                response = request_json_completion(
+                    request_config,
+                    prompt,
+                    system="Return exactly one valid JSON object with a proposed_bullet string. Do not include reasoning, markdown, or commentary.",
+                    max_attempts=1,
+                    cancel_event=cancel_event,
+                    keep_alive=0,
+                    deadline=deadline,
+                )
+                if response.get("cancelled") or cancel_event.is_set():
+                    result = {"status": "cancelled", "error": response.get("error") or "AI improvement was cancelled.", "original_text": original, "proposed_text": original, "retry_attempted": False, "attempts": response.get("attempts", 1)}
+                elif time.monotonic() >= deadline:
+                    result = {"status": "unavailable", "error": "AI improvement exceeded its total time limit.", "original_text": original, "proposed_text": original, "retry_attempted": False, "attempts": response.get("attempts", 1)}
+                elif not response.get("ok"):
+                    result = {"status": "unavailable", "error": response.get("error") or "The local AI assistant did not return a usable suggestion.", "original_text": original, "proposed_text": original, "retry_attempted": False, "attempts": response.get("attempts", 1)}
+                else:
+                    raw_data = response.get("data") or {}
+                    proposed = text(raw_data.get("proposed_bullet") or raw_data.get("proposed_text")) if isinstance(raw_data, dict) else text(raw_data)
+                    validation_error = validate_tailoring_bullet_suggestion(original, proposed) if proposed else "The local AI assistant returned JSON without a proposed_bullet string."
+                    if validation_error == TAILORING_ALREADY_SUITABLE:
+                        result = {"status": "unchanged", "message": TAILORING_ALREADY_SUITABLE, "original_text": original, "proposed_text": original, "meaningful_improvement": False, "retry_attempted": False, "attempts": response.get("attempts", 1)}
+                    elif not validation_error:
+                        result = {"status": "completed", "message": "AI suggestion is ready for review and has not been applied.", "original_text": original, "proposed_text": proposed, "meaningful_improvement": True, "retry_attempted": False, "attempts": response.get("attempts", 1)}
+                    else:
+                        retry_config = _tailoring_ai_config_for_deadline(config, deadline)
+                        if retry_config is None:
+                            result = {"status": "rejected", "error": f"AI suggestion rejected: {validation_error}. The total AI time limit was reached before a safety retry.", "original_text": original, "proposed_text": original, "retry_attempted": False, "attempts": response.get("attempts", 1)}
+                        else:
+                            retry_prompt = prompt + f"\n\nThe first proposal failed this quality or safety check: {validation_error} Retry once only. Preserve all selected-bullet facts and grammar. If no meaningful safe improvement is possible, return the original bullet unchanged. Original bullet: {original}"
+                            retry = request_json_completion(
+                                retry_config,
+                                retry_prompt,
+                                system="Return exactly one valid JSON object with a proposed_bullet string. Preserve all factual and quantified content exactly. Do not include reasoning, markdown, or commentary.",
+                                max_attempts=1,
+                                cancel_event=cancel_event,
+                                keep_alive=0,
+                                deadline=deadline,
+                            )
+                            attempts = response.get("attempts", 1) + retry.get("attempts", 1)
+                            retry_data = retry.get("data") if retry.get("ok") else None
+                            retry_proposed = text(retry_data.get("proposed_bullet") or retry_data.get("proposed_text")) if isinstance(retry_data, dict) else text(retry_data)
+                            retry_error = validate_tailoring_bullet_suggestion(original, retry_proposed) if retry_proposed else (retry.get("error") or "The retry returned no usable suggestion.")
+                            if retry.get("cancelled") or cancel_event.is_set():
+                                result = {"status": "cancelled", "error": retry.get("error") or "AI improvement was cancelled.", "original_text": original, "proposed_text": original, "retry_attempted": True, "attempts": attempts}
+                            elif time.monotonic() >= deadline:
+                                result = {"status": "rejected", "error": "AI suggestion retry exceeded the total time limit and was not accepted.", "original_text": original, "proposed_text": original, "retry_attempted": True, "attempts": attempts}
+                            elif retry_error == TAILORING_ALREADY_SUITABLE or retry_error == TAILORING_GRAMMAR_WARNING:
+                                result = {"status": "unchanged", "message": TAILORING_ALREADY_SUITABLE, "original_text": original, "proposed_text": original, "meaningful_improvement": False, "retry_attempted": True, "attempts": attempts}
+                            elif not retry_error:
+                                result = {"status": "completed", "message": "AI suggestion is ready for review and has not been applied.", "original_text": original, "proposed_text": retry_proposed, "meaningful_improvement": True, "retry_attempted": True, "attempts": attempts}
+                            else:
+                                result = {"status": "rejected", "error": f"AI suggestion rejected after one safety retry: {retry_error}", "original_text": original, "proposed_text": original, "retry_attempted": True, "attempts": attempts}
+    except Exception as exc:
+        if cancel_event.is_set():
+            result = {"status": "cancelled", "error": "AI improvement was cancelled.", "original_text": original, "proposed_text": original, "retry_attempted": False}
+        else:
+            result = {"status": "unavailable", "error": f"AI improvement failed: {exc}", "original_text": original, "proposed_text": original, "retry_attempted": False}
+    result["elapsed_seconds"] = round(time.monotonic() - started, 2)
+    with TAILORING_AI_JOBS_LOCK:
+        if job_id in TAILORING_AI_JOBS:
+            TAILORING_AI_JOBS[job_id].update(result)
+            TAILORING_AI_JOBS[job_id]["finished_at"] = datetime.now().isoformat(timespec="seconds")
+            TAILORING_AI_JOBS[job_id]["finished_monotonic"] = time.monotonic()
+    TAILORING_AI_INFERENCE_SLOT.release()
 
 def build_ollama_prompt(kind: str, job: dict[str, Any], evidence: dict[str, Any], payload: dict[str, Any]) -> str:
     return json.dumps(
