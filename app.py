@@ -9562,7 +9562,7 @@ def cleanup_tailoring_ai_jobs() -> None:
             job_id
             for job_id, job in TAILORING_AI_JOBS.items()
             if job.get("status") != "running"
-            and now - float(job.get("finished_monotonic", now)) > TAILORING_AI_JOB_RETENTION_SECONDS
+            and now - float(job.get("finished_monotonic", now)) >= TAILORING_AI_JOB_RETENTION_SECONDS
         ]
         for job_id in expired:
             TAILORING_AI_JOBS.pop(job_id, None)
