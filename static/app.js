@@ -15,6 +15,9 @@ const state = {
   preparationPreviews: {},
   preparationPreviewRequests: {},
   preparationPreviewEpoch: 0,
+  preparationPreviewItemId: null,
+  preparationPreviewKind: "resume",
+  preparationPreviewZoom: 1,
   candidateProfiles: [],
   generationSelections: {},
   shortlistRegenerations: {},
@@ -850,7 +853,18 @@ function renderPreparationPreview(item) {
   if (preview.status === "error") return `<section class="preparation-preview preparation-preview-inline error" aria-live="assertive"><div class="preview-heading"><strong>Package preview unavailable</strong><div class="row-actions"><button class="button small" type="button" onclick="previewPreparation(${item.id}, true)">Retry preview</button><button class="button ghost small" type="button" onclick="state.preparationPreviews[${item.id}] = { ...state.preparationPreviews[${item.id}], open: false }; renderPreparationQueue();">Close</button></div></div><p class="risk high">${escapeHtml(preview.message)}</p></section>`;
   const data = preview.data || {};
   const errors = data.errors || {};
-  return `<section class="preparation-preview preparation-preview-inline"><div class="preview-heading"><strong>${escapeHtml(data.company || item.job?.company || "Application")} · ${escapeHtml(data.title || item.job?.title || "Selected role")}</strong><button class="button ghost small" type="button" onclick="previewPreparation(${item.id})">Close</button></div><div class="preparation-preview-columns"><div><h4>Résumé</h4>${data.resume ? `<pre>${escapeHtml(data.resume)}</pre>` : `<p class="risk high">${escapeHtml(errors.resume || "Prepared résumé content is unavailable.")}</p>`}</div><div><h4>Cover letter</h4>${data.cover_letter ? `<pre>${escapeHtml(data.cover_letter)}</pre>` : `<p class="risk high">${escapeHtml(errors.cover_letter || "Prepared cover letter content is unavailable.")}</p>`}</div></div></section>`;
+  const documents = data.documents || {};
+  const renderDocumentPane = (kind, label, downloadKind) => {
+    const document = documents[kind] || { available: false, text: data[kind] || "", reason: "Document preview is unavailable." };
+    const pdf = document.available
+      ? `<iframe class="preparation-preview-pdf" title="${label} PDF preview" src="${escapeAttribute(document.pdf_url)}&viewer=1"></iframe>`
+      : `<pre class="preparation-preview-text">${escapeHtml(document.text || data[kind] || document.reason || "No extracted text is available.")}</pre>`;
+    const mode = document.available
+      ? "Rendered from the exact package DOCX through Microsoft Word PDF export."
+      : `Word rendering unavailable for this document: ${document.reason || "download the DOCX for authoritative formatting."}`;
+    return `<article class="preparation-preview-pane"><div class="preparation-preview-pane-header"><h4>${label}</h4><span class="muted">${escapeHtml(mode)}</span></div><div class="preparation-preview-document">${pdf}</div><div class="actions compact">${document.available ? `<a class="button ghost small" target="_blank" rel="noreferrer" href="${escapeAttribute(document.pdf_url)}">Open PDF separately</a>` : ""}${item[`prepared_${downloadKind}_path`] ? `<a class="button ghost small" href="/api/preparation/${item.id}/download/${downloadKind === "cover_letter" ? "cover-letter" : "resume"}">Download ${label} DOCX</a>` : ""}</div></article>`;
+  };
+  return `<section class="preparation-preview preparation-preview-inline"><div class="preview-heading"><strong>${escapeHtml(data.company || item.job?.company || "Application")} · ${escapeHtml(data.title || item.job?.title || "Selected role")}</strong><button class="button ghost small" type="button" onclick="previewPreparation(${item.id})">Close</button></div><p class="muted">These previews are rendered from the exact package DOCX files. Close collapses only this panel.</p><div class="preparation-preview-columns">${renderDocumentPane("resume", "Résumé", "resume")}${renderDocumentPane("cover_letter", "Cover letter", "cover_letter")}</div></section>`;
 }
 
 async function queueDiscoveryJob(id) {

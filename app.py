@@ -1810,22 +1810,52 @@ def create_app() -> Flask:
             return jsonify({"error": "Job not found"}), 404
         values: dict[str, Any] = {}
         errors: dict[str, str] = {}
+        documents: dict[str, dict[str, Any]] = {}
         for kind, package_field in (("resume", "prepared_resume_path"), ("cover_letter", "prepared_cover_letter_path")):
             raw_path = text(item[package_field])
             path = safe_preparation_artifact_path(raw_path)
             values[kind] = ""
             if not raw_path:
                 errors[kind] = f"Prepared {kind.replace('_', ' ')} file is not recorded for this package."
+                documents[kind] = {"available": False, "text": "", "reason": errors[kind], "content_hash": "", "pdf_url": ""}
             elif path is None:
                 errors[kind] = f"Prepared {kind.replace('_', ' ')} file is outside the active application package directory."
+                documents[kind] = {"available": False, "text": "", "reason": errors[kind], "content_hash": "", "pdf_url": ""}
             elif not path.is_file():
                 errors[kind] = f"Prepared {kind.replace('_', ' ')} file is missing from this application environment."
+                documents[kind] = {"available": False, "text": "", "reason": errors[kind], "content_hash": "", "pdf_url": ""}
             else:
                 try:
-                    values[kind] = "\n".join(paragraph.text for paragraph in iter_document_paragraphs(Document(io.BytesIO(path.read_bytes()))) if paragraph.text.strip())
+                    content = path.read_bytes()
+                    values[kind] = "\n".join(paragraph.text for paragraph in iter_document_paragraphs(Document(io.BytesIO(content))) if paragraph.text.strip())
+                    pdf_preview = build_preparation_pdf_preview(item_id, kind, path, content)
+                    documents[kind] = {"available": bool(pdf_preview.get("available")), "text": values[kind], "reason": text(pdf_preview.get("reason")), "content_hash": text(pdf_preview.get("content_hash")), "pdf_url": f"/api/preparation/{item_id}/preview/{kind}.pdf?hash={pdf_preview.get('content_hash')}" if pdf_preview.get("available") else "", "cached": bool(pdf_preview.get("cached"))}
+                    if not pdf_preview.get("available"):
+                        documents[kind]["fallback"] = "text"
                 except (OSError, ValueError, zipfile.BadZipFile):
                     errors[kind] = f"Prepared {kind.replace('_', ' ')} DOCX could not be read."
-        return jsonify({"resume": values["resume"], "cover_letter": values["cover_letter"], "errors": errors, "status": item["status"], "job_id": item["job_id"], "company": text(job["company"]), "title": text(job["title"])})
+                    documents[kind] = {"available": False, "text": "", "reason": errors[kind], "content_hash": "", "pdf_url": ""}
+        return jsonify({"resume": values["resume"], "cover_letter": values["cover_letter"], "documents": documents, "errors": errors, "status": item["status"], "job_id": item["job_id"], "company": text(job["company"]), "title": text(job["title"])})
+
+    @app.get("/api/preparation/<int:item_id>/preview/<kind>.pdf")
+    def preparation_preview_pdf(item_id: int, kind: str) -> Response:
+        if kind not in {"resume", "cover_letter"}:
+            return jsonify({"error": "Document kind must be resume or cover_letter"}), 400
+        item = query_db("SELECT * FROM application_preparation_queue WHERE id = ?", [item_id], one=True)
+        if item is None:
+            return jsonify({"error": "Preparation queue item was not found"}), 404
+        field = "prepared_resume_path" if kind == "resume" else "prepared_cover_letter_path"
+        path = safe_preparation_artifact_path(item[field])
+        if path is None or not path.is_file():
+            return jsonify({"error": "The package document is unavailable for PDF preview."}), 404
+        content = path.read_bytes()
+        content_hash = hashlib.sha256(content).hexdigest()
+        if text(request.args.get("hash")) != content_hash:
+            return jsonify({"error": "This preview is stale because the package document changed. Refresh the package preview."}), 409
+        pdf_preview = build_preparation_pdf_preview(item_id, kind, path, content)
+        if not pdf_preview.get("available"):
+            return jsonify({"error": pdf_preview.get("reason") or "Accurate Word PDF preview is unavailable."}), 503
+        return send_file(pdf_preview["path"], as_attachment=False, download_name=f"package-{item_id}-{kind}.pdf", mimetype="application/pdf")
 
     @app.get("/api/preparation/<int:item_id>/download/<kind>")
     def download_preparation_document(item_id: int, kind: str) -> Response:
@@ -5877,6 +5907,25 @@ def safe_preparation_artifact_path(value: Any) -> Path | None:
     if any(path == root or root in path.parents for root in roots):
         return path
     return None
+
+
+def build_preparation_pdf_preview(item_id: int, kind: str, source: Path, content: bytes | None = None) -> dict[str, Any]:
+    """Export one exact package DOCX and cache the PDF by its content hash."""
+    content = content if content is not None else source.read_bytes()
+    content_hash = hashlib.sha256(content).hexdigest()
+    cache_path = DATA_DIR / "application_preparation_previews" / str(item_id) / f"{kind}-{content_hash}.pdf"
+    if cache_path.is_file() and cache_path.stat().st_size > 0:
+        return {"available": True, "path": str(cache_path), "content_hash": content_hash, "cached": True}
+    exported = export_docx_to_pdf(source, cache_path)
+    if not exported.get("available") or not cache_path.is_file() or cache_path.stat().st_size == 0:
+        return {"available": False, "reason": text(exported.get("reason")) or "Microsoft Word PDF export is unavailable.", "content_hash": content_hash, "cached": False}
+    if hashlib.sha256(source.read_bytes()).hexdigest() != content_hash:
+        try:
+            cache_path.unlink()
+        except OSError:
+            pass
+        return {"available": False, "reason": "The package document changed while its PDF preview was generated. Refresh and try again.", "content_hash": content_hash, "cached": False}
+    return {"available": True, "path": str(cache_path), "content_hash": content_hash, "cached": False}
 
 
 def dedupe_keys(job: dict[str, Any], source_job_id: Any = "") -> set[str]:
