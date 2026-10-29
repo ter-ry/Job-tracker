@@ -274,9 +274,14 @@ async function loadPreparationQueue() {
     // Queue refreshes can replace package artifact paths after regeneration. Do not
     // keep displaying a preview fetched from the previous package version.
     state.preparationPreviews = {};
-    if (!state.preparationQueue.some((item) => Number(item.id) === Number(state.selectedPreparationId))) {
+    const requestedId = Number(new URLSearchParams(window.location.search).get("application_id")) || null;
+    const persistedId = requestedId || Number(state.selectedPreparationId) || null;
+    if (state.preparationQueue.some((item) => Number(item.id) === persistedId)) {
+      state.selectedPreparationId = persistedId;
+    } else {
       state.selectedPreparationId = state.preparationQueue[0]?.id || null;
     }
+    persistSelectedPreparation();
     renderPreparationQueue();
   } catch (error) { target.textContent = error.message; }
 }
@@ -912,10 +917,24 @@ function renderPreparationQueue() {
 
 function selectPreparationPackage(id) {
   state.selectedPreparationId = Number(id);
+  persistSelectedPreparation();
   renderPreparationQueue();
 }
 
+function persistSelectedPreparation() {
+  const url = new URL(window.location.href);
+  if (state.selectedPreparationId) url.searchParams.set("application_id", String(state.selectedPreparationId));
+  else url.searchParams.delete("application_id");
+  window.history.replaceState({}, "", url);
+}
+
 function preparationNextAction(item) {
+  const applicationStatus = String(item.job?.status || "").toLowerCase();
+  if (applicationStatus === "applied") return "Application recorded as submitted. Track the employer response here.";
+  if (applicationStatus === "interview") return "Interview stage recorded. Continue tracking the employer response here.";
+  if (applicationStatus === "offer") return "Offer stage recorded. Review and update the application outcome here.";
+  if (applicationStatus === "rejected") return "Application marked rejected. Keep the package for reference or archive it.";
+  if (applicationStatus === "archived") return "Application archived. Restore the job status if you need to continue tracking it.";
   if (item.status === "approved") return "Package approved. Submit manually, then record the outcome here.";
   if (item.status === "ready_for_review") return "Review the documents and Keywords Score, then approve this package.";
   if (item.status === "preparing") return "Documents are being generated. Return here when preparation completes.";

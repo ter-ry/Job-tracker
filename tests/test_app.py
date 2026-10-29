@@ -5494,9 +5494,19 @@ class JobAssistantTest(unittest.TestCase):
         frontend = Path(app_module.BASE_DIR, "static", "app.js").read_text(encoding="utf-8")
         self.assertIn("application-workspace-grid", frontend)
         self.assertIn("selectPreparationPackage", frontend)
+        self.assertIn("application_id", frontend)
+        self.assertIn("persistSelectedPreparation", frontend)
         self.assertIn("preparationNextAction", frontend)
         self.assertIn("/api/preparation/${id}/application-status", frontend)
         self.assertIn("Open employer application page", frontend)
+
+    def test_application_workspace_next_action_uses_underlying_job_status(self):
+        frontend = Path(app_module.BASE_DIR, "static", "app.js").read_text(encoding="utf-8")
+        for status in ("applied", "interview", "offer", "rejected", "archived"):
+            self.assertIn(f'applicationStatus === "{status}"', frontend)
+        self.assertIn("Application recorded as submitted", frontend)
+        self.assertIn("Interview stage recorded", frontend)
+        self.assertIn("Offer stage recorded", frontend)
 
     def test_word_preview_cache_requires_matching_docx_fingerprints_and_invalidates_on_edit(self):
         original = Path(self.tmpdir.name) / "original.docx"
