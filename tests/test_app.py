@@ -5508,6 +5508,13 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("Interview stage recorded", frontend)
         self.assertIn("Offer stage recorded", frontend)
 
+    def test_approved_application_keeps_final_preview_and_download_actions(self):
+        frontend = Path(app_module.BASE_DIR, "static", "app.js").read_text(encoding="utf-8")
+        self.assertIn('item.status === "approved"', frontend)
+        self.assertIn('onclick="previewPreparation(${item.id})"', frontend)
+        self.assertIn('/api/preparation/${item.id}/download/resume', frontend)
+        self.assertIn('/api/preparation/${item.id}/download/cover-letter', frontend)
+
     def test_word_preview_cache_requires_matching_docx_fingerprints_and_invalidates_on_edit(self):
         original = Path(self.tmpdir.name) / "original.docx"
         candidate = Path(self.tmpdir.name) / "candidate.docx"

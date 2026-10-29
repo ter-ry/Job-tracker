@@ -896,6 +896,8 @@ function renderPreparationQueue() {
             : "";
     const actions = item.status === "ready_for_review"
       ? `<button class="button small" type="button" onclick="reviewPreparation(${item.id}, 'approve')">Approve package</button><button class="button ghost small" type="button" onclick="previewPreparation(${item.id})">Preview</button><button class="button ghost small" type="button" ${regenerating ? "disabled" : ""} onclick="regeneratePreparation(${item.id})">${regenerating ? '<span class="spinner" aria-hidden="true"></span> Regenerating...' : "Regenerate"}</button>${item.prepared_resume_path ? `<a class="button ghost small" href="/api/preparation/${item.id}/download/resume">Download résumé</a>` : ""}${item.prepared_cover_letter_path ? `<a class="button ghost small" href="/api/preparation/${item.id}/download/cover-letter">Download cover letter</a>` : ""}`
+      : item.status === "approved"
+        ? `<button class="button ghost small" type="button" onclick="previewPreparation(${item.id})">Preview</button>${item.prepared_resume_path ? `<a class="button ghost small" href="/api/preparation/${item.id}/download/resume">Download résumé</a>` : ""}${item.prepared_cover_letter_path ? `<a class="button ghost small" href="/api/preparation/${item.id}/download/cover-letter">Download cover letter</a>` : ""}`
       : item.status === "queued" || item.status === "failed"
         ? `${item.review_status === "manual_eligibility" ? `<button class="button small" type="button" onclick="reviewEligibility(${item.id})">Confirm Canadian eligibility</button>` : `<button class="button small" type="button" onclick="prepareQueueItem(${item.id})">${item.status === "failed" ? "Retry preparation" : "Prepare package"}</button>`}`
         : "";
