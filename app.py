@@ -1049,6 +1049,7 @@ def create_app() -> Flask:
             if preview_pdf.is_file() and cached_version == draft_version:
                 pdf = {"available": True, "path": str(preview_pdf), "cached": True}
                 pdf_cached = True
+                layout = {**layout, "cached": True, "timings_ms": {**(layout.get("timings_ms") or {}), "word_layout_validation": 0.0, "pdf_generation": 0.0}}
         if not pdf_cached:
             export_started = time.perf_counter()
             combined = compare_docx_layout_and_export(safe_local_path(text(row["source_path"])), draft_path, preview_pdf)
