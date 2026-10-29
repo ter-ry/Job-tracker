@@ -696,15 +696,17 @@ class JobAssistantTest(unittest.TestCase):
             Path(output).write_bytes(b"%PDF-1.7 performance QA")
             return {"available": True, "path": str(output)}
 
-        with patch.object(app_module, "compare_docx_layout", return_value=layout) as compare_mock:
-            with patch.object(app_module, "export_docx_to_pdf", side_effect=fake_export) as export_mock:
+        def fake_combined(_source, _candidate, output):
+            Path(output).write_bytes(b"%PDF-1.7 performance QA")
+            return {**layout, "available": True, "verified": True, "pdf_path": str(output)}
+
+        with patch.object(app_module, "compare_docx_layout_and_export", side_effect=fake_combined) as combined_mock:
                 first_preview = self.client.get(f"/api/tailoring/drafts/{draft_id}/preview").get_json()
                 second_preview = self.client.get(f"/api/tailoring/drafts/{draft_id}/preview").get_json()
         self.assertTrue(first_preview["pdf_available"])
         self.assertFalse(first_preview["cached"])
         self.assertTrue(second_preview["cached"])
-        self.assertEqual(compare_mock.call_count, 1)
-        self.assertEqual(export_mock.call_count, 1)
+        self.assertEqual(combined_mock.call_count, 1)
         self.assertGreaterEqual(first_preview["timings_ms"]["preview_total"], 0)
 
         with patch.object(app_module, "compare_docx_layout", return_value=layout) as compare_after_change:
@@ -714,13 +716,11 @@ class JobAssistantTest(unittest.TestCase):
             })
         self.assertEqual(changed.status_code, 200, changed.get_json())
         self.assertFalse(compare_after_change.called)
-        with patch.object(app_module, "compare_docx_layout", return_value=layout) as compare_after_version:
-            with patch.object(app_module, "export_docx_to_pdf", side_effect=fake_export) as export_after_version:
+        with patch.object(app_module, "compare_docx_layout_and_export", side_effect=fake_combined) as combined_after_version:
                 refreshed_preview = self.client.get(f"/api/tailoring/drafts/{draft_id}/preview").get_json()
         self.assertTrue(refreshed_preview["pdf_available"])
         self.assertFalse(refreshed_preview["cached"])
-        self.assertEqual(compare_after_version.call_count, 1)
-        self.assertEqual(export_after_version.call_count, 1)
+        self.assertEqual(combined_after_version.call_count, 1)
 
     def test_tailoring_workspace_reports_missing_description_then_uses_persisted_description(self):
         profile = self.client.post("/api/candidate-profiles", json={"name": "Lakeview QA"}).get_json()
@@ -786,8 +786,7 @@ class JobAssistantTest(unittest.TestCase):
         job = self.client.post("/api/jobs", json={"company": "Example", "title": "Developer", "job_description": "Python and REST APIs"}).get_json()
         workspace = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
         config = app_module.OllamaConfig(True, "http://ollama", "qwen3:4b", 10, 100, 1000)
-        with patch.object(app_module, "compare_docx_layout", return_value={"available": False, "verified": False, "reason": "Microsoft Word unavailable"}):
-            with patch.object(app_module, "export_docx_to_pdf", return_value={"available": False, "reason": "Microsoft Word unavailable"}):
+        with patch.object(app_module, "compare_docx_layout_and_export", return_value={"available": False, "verified": False, "reason": "Microsoft Word unavailable"}):
                 preview_response = self.client.get(f"/api/tailoring/drafts/{workspace['draft']['id']}/preview")
         self.assertEqual(preview_response.status_code, 200, preview_response.get_json())
         self.assertFalse(preview_response.get_json()["pdf_available"])
@@ -2638,6 +2637,28 @@ class JobAssistantTest(unittest.TestCase):
         self.assertFalse(result["verified"])
         self.assertTrue(result["page_mismatch"])
         self.assertTrue(result["line_mismatches"])
+
+    def test_word_layout_measurement_cache_uses_content_fingerprint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "resume.docx"
+            path.write_bytes(f"stable document {time.time_ns()}".encode())
+            measurement = {"available": True, "pages": 1, "paragraphs": [{"index": 0, "lines": 1}]}
+            with patch.object(resume_layout, "_run_word", return_value=(measurement, None)) as run_word:
+                first = resume_layout.measure_docx_layout(path)
+                second = resume_layout.measure_docx_layout(path)
+            self.assertTrue(first["available"])
+            self.assertTrue(second["cached"])
+            self.assertEqual(run_word.call_count, 1)
+            path.write_bytes(f"changed document {time.time_ns()}".encode())
+            with patch.object(resume_layout, "_run_word", return_value=(measurement, None)) as changed_run:
+                resume_layout.measure_docx_layout(path)
+            self.assertEqual(changed_run.call_count, 1)
+
+    def test_application_workspace_header_keeps_existing_queue_as_single_workflow(self):
+        html = self.client.get("/").data.decode("utf-8")
+        self.assertIn('data-tab="shortlist" type="button">Application workspace', html)
+        self.assertIn("Discover in Pipeline, prepare and tailor here", html)
+        self.assertIn('class="application-workflow-rail"', html)
 
     def test_keyword_coverage_deduplicates_aliases_and_warns_on_unsupported_groups(self):
         job = {"title": "Software Engineer", "required_skills": "NodeJS, Node.js, Kubernetes, database design", "preferred_skills": "Postgres, PostgreSQL"}

@@ -931,6 +931,24 @@ th {
   margin-bottom: 18px;
 }
 
+.application-workflow-rail {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 12px;
+  padding: 8px 10px;
+  border: 1px solid #292929;
+  border-radius: 8px;
+  background: #101010;
+}
+.application-workflow-rail span {
+  padding: 4px 9px;
+  color: #999;
+  font-size: .76rem;
+}
+.application-workflow-rail span + span::before { content: "→"; margin-right: 9px; color: #555; }
+.application-workflow-rail .active { color: #f2f2f2; font-weight: 600; }
+
 .preparation-queue-panel .generated-output {
   display: grid;
   gap: 8px;

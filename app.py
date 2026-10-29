@@ -72,7 +72,7 @@ from werkzeug.utils import secure_filename
 from db.migrations import run_migrations
 from profile_store import CandidateProfileStore
 from services.document_generation import DocumentGenerationService
-from resume_layout import compare_docx_layout, export_docx_to_pdf
+from resume_layout import compare_docx_layout, compare_docx_layout_and_export, export_docx_to_pdf
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -1034,7 +1034,8 @@ def create_app() -> Flask:
         preview_meta = preview_pdf.with_suffix(".meta.json")
         preview_pdf.parent.mkdir(parents=True, exist_ok=True)
         draft_version = tailoring_draft_version(draft_path)
-        layout = validate_tailoring_draft_layout(draft_id, expected_version=draft_version)
+        stored_layout = parse_json_object(row["layout_json"])
+        layout = stored_layout if stored_layout.get("draft_version") == draft_version and stored_layout.get("available") and stored_layout.get("verified") else pending_tailoring_layout(draft_version)
         pdf = {"available": False, "reason": layout.get("reason") or "Word layout validation is unavailable."}
         pdf_cached = False
         pdf_generation_ms = 0.0
@@ -1048,18 +1049,24 @@ def create_app() -> Flask:
             if preview_pdf.is_file() and cached_version == draft_version:
                 pdf = {"available": True, "path": str(preview_pdf), "cached": True}
                 pdf_cached = True
-            else:
-                export_started = time.perf_counter()
-                pdf = export_docx_to_pdf(draft_path, preview_pdf)
-                pdf_generation_ms = round((time.perf_counter() - export_started) * 1000, 2)
-                pdf.setdefault("timings_ms", {})["pdf_generation"] = pdf_generation_ms
-                if pdf.get("available") and tailoring_draft_version(draft_path) == draft_version:
+        if not pdf_cached:
+            export_started = time.perf_counter()
+            combined = compare_docx_layout_and_export(safe_local_path(text(row["source_path"])), draft_path, preview_pdf)
+            pdf_generation_ms = round((time.perf_counter() - export_started) * 1000, 2)
+            if combined.get("available"):
+                layout = {**combined, "draft_version": draft_version, "timings_ms": {"word_layout_validation": pdf_generation_ms, "pdf_generation": pdf_generation_ms}}
+                pdf = {"available": bool(combined.get("verified")), "path": str(preview_pdf), "cached": False, "reason": combined.get("reason")}
+                if tailoring_draft_version(draft_path) == draft_version:
+                    get_db().execute("UPDATE tailoring_drafts SET layout_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND draft_path = ?", [dumps_json(layout), draft_id, str(draft_path)])
+                    get_db().commit()
                     try:
                         preview_meta.write_text(json.dumps({"draft_version": draft_version}), encoding="utf-8")
                     except OSError:
                         pass
-                elif pdf.get("available"):
+                else:
                     pdf = {"available": False, "reason": "The résumé draft changed while the PDF preview was generated. Refresh and try again."}
+            else:
+                pdf = {"available": False, "reason": combined.get("reason") or "Word layout validation and PDF export failed."}
         text_started = time.perf_counter()
         preview_text = extract_docx_text(draft_path.read_bytes())
         text_ms = round((time.perf_counter() - text_started) * 1000, 2)
