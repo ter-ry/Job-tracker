@@ -2808,6 +2808,35 @@ class JobAssistantTest(unittest.TestCase):
         self.assertNotIn("and the ability to build dependable", {item["keyword"] for item in inventory.values()})
         self.assertEqual(inventory["backend programming languages"]["match_type"], "exact")
 
+    def test_gatekeeper_testing_suggestions_match_morphology_and_prefer_quantified_experience(self):
+        description = (Path(__file__).parent / "fixtures" / "lakeview_backend_engineer_job.txt").read_text(encoding="utf-8")
+        self.assertIn("testing", description.lower())
+        bullets = [
+            {
+                "paragraph_index": 12,
+                "text": "Used Codex to accelerate debugging and automated testing while preparing changes for review.",
+                "section": "projects",
+                "editable": True,
+            },
+            {
+                "paragraph_index": 27,
+                "text": "Added conflict protection, validation, migrations, and 25+ automated backend tests across purchasing, inventory, and reporting workflows.",
+                "section": "work_experience",
+                "editable": True,
+            },
+            {
+                "paragraph_index": 4,
+                "text": "Technologies: Python, Flask, PostgreSQL, testing",
+                "section": "skills",
+                "editable": True,
+            },
+        ]
+        suggestions = grounding.rank_resume_bullets_for_requirement("testing", bullets)
+        self.assertEqual(suggestions[0]["paragraph_index"], 27)
+        self.assertIn("tests", suggestions[0]["overlap"])
+        self.assertEqual(suggestions[0]["evidence_strength"], "quantified substantive evidence")
+        self.assertIn("test", grounding.resume_requirement_token_forms("testing") & grounding.resume_requirement_token_forms("tests"))
+        self.assertIn("testing", description.lower())
     def test_nodejs_alias_substitution_preserves_word_layout_and_reports_final_docx_coverage(self):
         master = Path(self.tmpdir.name) / "nodejs_alias_master.docx"
         document = Document()
