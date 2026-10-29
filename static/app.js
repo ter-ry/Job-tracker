@@ -945,7 +945,7 @@ function preparationNextAction(item) {
 
 function renderApplicationStatusControls(item) {
   const status = item.job?.status || "Saved";
-  const options = ["Applied", "Interview", "Offer", "Rejected", "Archived"].map((value) => `<option value="${value}" ${value === status ? "selected" : ""}>${value}</option>`).join("");
+  const options = [{ value: "shortlisted", label: "Shortlisted" }, { value: "Applied", label: "Applied" }, { value: "Interview", label: "Interview" }, { value: "Offer", label: "Offer" }, { value: "Rejected", label: "Rejected" }, { value: "Archived", label: "Archived" }].map(({ value, label }) => `<option value="${value}" ${value === status ? "selected" : ""}>${label}</option>`).join("");
   return `<section class="application-tracking"><h4>After manual application</h4><p class="muted">Approval does not submit anything. Record the outcome only after you apply yourself.</p><div class="application-status-controls"><select id="application-status-${item.id}" aria-label="Application status">${options}</select><button class="button small" type="button" onclick="updateApplicationStatus(${item.id})">Save status</button></div></section>`;
 }
 
