@@ -72,7 +72,7 @@ from werkzeug.utils import secure_filename
 from db.migrations import run_migrations
 from profile_store import CandidateProfileStore
 from services.document_generation import DocumentGenerationService
-from resume_layout import compare_docx_layout, export_docx_to_pdf
+from resume_layout import compare_docx_layout, compare_docx_layout_and_export, export_docx_to_pdf
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -1034,7 +1034,8 @@ def create_app() -> Flask:
         preview_meta = preview_pdf.with_suffix(".meta.json")
         preview_pdf.parent.mkdir(parents=True, exist_ok=True)
         draft_version = tailoring_draft_version(draft_path)
-        layout = validate_tailoring_draft_layout(draft_id, expected_version=draft_version)
+        stored_layout = parse_json_object(row["layout_json"])
+        layout = stored_layout if stored_layout.get("draft_version") == draft_version and stored_layout.get("available") and stored_layout.get("verified") else pending_tailoring_layout(draft_version)
         pdf = {"available": False, "reason": layout.get("reason") or "Word layout validation is unavailable."}
         pdf_cached = False
         pdf_generation_ms = 0.0
@@ -1048,18 +1049,28 @@ def create_app() -> Flask:
             if preview_pdf.is_file() and cached_version == draft_version:
                 pdf = {"available": True, "path": str(preview_pdf), "cached": True}
                 pdf_cached = True
-            else:
-                export_started = time.perf_counter()
-                pdf = export_docx_to_pdf(draft_path, preview_pdf)
-                pdf_generation_ms = round((time.perf_counter() - export_started) * 1000, 2)
-                pdf.setdefault("timings_ms", {})["pdf_generation"] = pdf_generation_ms
-                if pdf.get("available") and tailoring_draft_version(draft_path) == draft_version:
+                layout = {**layout, "cached": True, "timings_ms": {**(layout.get("timings_ms") or {}), "word_layout_validation": 0.0, "pdf_generation": 0.0}}
+        if not pdf_cached:
+            export_started = time.perf_counter()
+            combined = compare_docx_layout_and_export(safe_local_path(text(row["source_path"])), draft_path, preview_pdf)
+            combined_elapsed_ms = round((time.perf_counter() - export_started) * 1000, 2)
+            if combined.get("available"):
+                combined_timings = combined.get("timings_ms") if isinstance(combined.get("timings_ms"), dict) else {}
+                pdf_generation_ms = float(combined_timings.get("pdf_generation") or 0.0)
+                layout = {**combined, "draft_version": draft_version, "timings_ms": {"word_layout_validation": float(combined_timings.get("word_layout_validation") or combined_elapsed_ms), "pdf_generation": pdf_generation_ms, "word_operation_total": float(combined_timings.get("total") or combined_elapsed_ms)}}
+                pdf = {"available": bool(combined.get("verified")), "path": str(preview_pdf), "cached": False, "reason": combined.get("reason")}
+                if tailoring_draft_version(draft_path) == draft_version:
+                    get_db().execute("UPDATE tailoring_drafts SET layout_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND draft_path = ?", [dumps_json(layout), draft_id, str(draft_path)])
+                    get_db().commit()
                     try:
                         preview_meta.write_text(json.dumps({"draft_version": draft_version}), encoding="utf-8")
                     except OSError:
                         pass
-                elif pdf.get("available"):
+                else:
                     pdf = {"available": False, "reason": "The résumé draft changed while the PDF preview was generated. Refresh and try again."}
+            else:
+                pdf_generation_ms = combined_elapsed_ms
+                pdf = {"available": False, "reason": combined.get("reason") or "Word layout validation and PDF export failed."}
         text_started = time.perf_counter()
         preview_text = extract_docx_text(draft_path.read_bytes())
         text_ms = round((time.perf_counter() - text_started) * 1000, 2)
@@ -1779,6 +1790,36 @@ def create_app() -> Flask:
             if not all(safe_preparation_artifact_path(row[field]) and safe_preparation_artifact_path(row[field]).is_file() for field in ("prepared_resume_path", "prepared_cover_letter_path")):
                 return jsonify({"error": "A generated document for this package is no longer available"}), 409
         return jsonify(_update_preparation_item(item_id, status=status, review_status=review_status))
+
+    @app.post("/api/preparation/<int:item_id>/application-status")
+    def update_preparation_application_status(item_id: int) -> Response:
+        """Update the underlying job's application status from the workspace.
+
+        Preparation state remains owned by the queue. This endpoint only provides
+        the explicit, in-context tracking action after the user has reviewed the
+        package; it never submits an application or changes package approval.
+        """
+        row = query_db("SELECT * FROM application_preparation_queue WHERE id = ?", [item_id], one=True)
+        if row is None:
+            return jsonify({"error": "Application package was not found"}), 404
+        payload = request.get_json(silent=True) or {}
+        requested = text(payload.get("status"))
+        allowed = {"shortlisted", "Drafting", "Applied", "Interview", "Offer", "Rejected", "Archived"}
+        if requested not in allowed:
+            return jsonify({"error": "Choose a valid application status"}), 400
+        job = query_db("SELECT * FROM jobs WHERE id = ?", [row["job_id"]], one=True)
+        if job is None:
+            return jsonify({"error": "The job associated with this package was not found"}), 404
+        updates = [requested]
+        sql = "UPDATE jobs SET status = ?, updated_at = CURRENT_TIMESTAMP"
+        if requested == "Applied":
+            sql += ", date_applied = ?"
+            updates.append(date.today().isoformat())
+        sql += " WHERE id = ?"
+        updates.append(int(row["job_id"]))
+        get_db().execute(sql, updates)
+        get_db().commit()
+        return jsonify(preparation_queue_to_dict(query_db("SELECT * FROM application_preparation_queue WHERE id = ?", [item_id], one=True)))
 
     @app.post("/api/preparation/<int:item_id>/eligibility-review")
     def review_preparation_eligibility(item_id: int) -> Response:
