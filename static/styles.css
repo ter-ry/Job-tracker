@@ -996,6 +996,33 @@ th {
 }
 .application-list-item span { font-size: .82rem; }
 .application-selected { min-width: 0; }
+.application-selected .preparation-row {
+  display: block;
+  padding: 0;
+  border-top: 0;
+}
+.application-selected .preparation-main {
+  display: block;
+  min-width: 0;
+}
+.application-selected .preparation-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-items: initial;
+  gap: 8px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid #292929;
+}
+.application-selected .preparation-meta .row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  gap: 7px;
+  padding-top: 0;
+  border-top: 0;
+}
 .application-detail-heading {
   display: flex;
   justify-content: space-between;
