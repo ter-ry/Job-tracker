@@ -5446,5 +5446,11 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("Original wording was preserved.", frontend)
         self.assertIn('result.status === "cancelled"', frontend)
 
+    def test_tailoring_frontend_preserves_backend_evidence_ranking(self):
+        frontend = Path(app_module.BASE_DIR, "static", "app.js").read_text(encoding="utf-8")
+        self.assertIn("const existing = group.suggestions.get(bullet.paragraph_index)", frontend)
+        self.assertIn("Number(b.relevance_score ?? 0) - Number(a.relevance_score ?? 0)", frontend)
+        self.assertIn("Number(item.relevance_score ?? Number.NEGATIVE_INFINITY) > selectedRelevance", frontend)
+        self.assertNotIn("const evidenceScore =", frontend)
 if __name__ == "__main__":
     unittest.main()
