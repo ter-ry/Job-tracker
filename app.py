@@ -1053,9 +1053,11 @@ def create_app() -> Flask:
         if not pdf_cached:
             export_started = time.perf_counter()
             combined = compare_docx_layout_and_export(safe_local_path(text(row["source_path"])), draft_path, preview_pdf)
-            pdf_generation_ms = round((time.perf_counter() - export_started) * 1000, 2)
+            combined_elapsed_ms = round((time.perf_counter() - export_started) * 1000, 2)
             if combined.get("available"):
-                layout = {**combined, "draft_version": draft_version, "timings_ms": {"word_layout_validation": pdf_generation_ms, "pdf_generation": pdf_generation_ms}}
+                combined_timings = combined.get("timings_ms") if isinstance(combined.get("timings_ms"), dict) else {}
+                pdf_generation_ms = float(combined_timings.get("pdf_generation") or 0.0)
+                layout = {**combined, "draft_version": draft_version, "timings_ms": {"word_layout_validation": float(combined_timings.get("word_layout_validation") or combined_elapsed_ms), "pdf_generation": pdf_generation_ms, "word_operation_total": float(combined_timings.get("total") or combined_elapsed_ms)}}
                 pdf = {"available": bool(combined.get("verified")), "path": str(preview_pdf), "cached": False, "reason": combined.get("reason")}
                 if tailoring_draft_version(draft_path) == draft_version:
                     get_db().execute("UPDATE tailoring_drafts SET layout_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND draft_path = ?", [dumps_json(layout), draft_id, str(draft_path)])
@@ -1067,6 +1069,7 @@ def create_app() -> Flask:
                 else:
                     pdf = {"available": False, "reason": "The résumé draft changed while the PDF preview was generated. Refresh and try again."}
             else:
+                pdf_generation_ms = combined_elapsed_ms
                 pdf = {"available": False, "reason": combined.get("reason") or "Word layout validation and PDF export failed."}
         text_started = time.perf_counter()
         preview_text = extract_docx_text(draft_path.read_bytes())
@@ -1787,6 +1790,36 @@ def create_app() -> Flask:
             if not all(safe_preparation_artifact_path(row[field]) and safe_preparation_artifact_path(row[field]).is_file() for field in ("prepared_resume_path", "prepared_cover_letter_path")):
                 return jsonify({"error": "A generated document for this package is no longer available"}), 409
         return jsonify(_update_preparation_item(item_id, status=status, review_status=review_status))
+
+    @app.post("/api/preparation/<int:item_id>/application-status")
+    def update_preparation_application_status(item_id: int) -> Response:
+        """Update the underlying job's application status from the workspace.
+
+        Preparation state remains owned by the queue. This endpoint only provides
+        the explicit, in-context tracking action after the user has reviewed the
+        package; it never submits an application or changes package approval.
+        """
+        row = query_db("SELECT * FROM application_preparation_queue WHERE id = ?", [item_id], one=True)
+        if row is None:
+            return jsonify({"error": "Application package was not found"}), 404
+        payload = request.get_json(silent=True) or {}
+        requested = text(payload.get("status"))
+        allowed = {"shortlisted", "Drafting", "Applied", "Interview", "Offer", "Rejected", "Archived"}
+        if requested not in allowed:
+            return jsonify({"error": "Choose a valid application status"}), 400
+        job = query_db("SELECT * FROM jobs WHERE id = ?", [row["job_id"]], one=True)
+        if job is None:
+            return jsonify({"error": "The job associated with this package was not found"}), 404
+        updates = [requested]
+        sql = "UPDATE jobs SET status = ?, updated_at = CURRENT_TIMESTAMP"
+        if requested == "Applied":
+            sql += ", date_applied = ?"
+            updates.append(date.today().isoformat())
+        sql += " WHERE id = ?"
+        updates.append(int(row["job_id"]))
+        get_db().execute(sql, updates)
+        get_db().commit()
+        return jsonify(preparation_queue_to_dict(query_db("SELECT * FROM application_preparation_queue WHERE id = ?", [item_id], one=True)))
 
     @app.post("/api/preparation/<int:item_id>/eligibility-review")
     def review_preparation_eligibility(item_id: int) -> Response:

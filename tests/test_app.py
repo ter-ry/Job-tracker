@@ -5473,5 +5473,59 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("Number(b.relevance_score ?? 0) - Number(a.relevance_score ?? 0)", frontend)
         self.assertIn("Number(item.relevance_score ?? Number.NEGATIVE_INFINITY) > selectedRelevance", frontend)
         self.assertNotIn("const evidenceScore =", frontend)
+
+    def test_application_workspace_updates_status_only_after_explicit_manual_action(self):
+        job = self.client.post("/api/jobs", json={"company": "Workspace Co", "title": "Developer", "status": "Saved"}).get_json()
+        with app_module.app.app_context():
+            cursor = app_module.get_db().execute(
+                "INSERT INTO application_preparation_queue (job_id, status, review_status) VALUES (?, 'approved', 'approved')",
+                [job["id"]],
+            )
+            app_module.get_db().commit()
+            item_id = cursor.lastrowid
+        response = self.client.post(f"/api/preparation/{item_id}/application-status", json={"status": "Applied"})
+        self.assertEqual(response.status_code, 200, response.get_json())
+        refreshed = self.client.get("/api/jobs").get_json()[0]
+        self.assertEqual(refreshed["status"], "Applied")
+        self.assertTrue(refreshed["date_applied"])
+        self.assertEqual(self.client.post(f"/api/preparation/{item_id}/application-status", json={"status": "Nope"}).status_code, 400)
+
+    def test_application_workspace_has_master_detail_contextual_actions(self):
+        frontend = Path(app_module.BASE_DIR, "static", "app.js").read_text(encoding="utf-8")
+        self.assertIn("application-workspace-grid", frontend)
+        self.assertIn("selectPreparationPackage", frontend)
+        self.assertIn("preparationNextAction", frontend)
+        self.assertIn("/api/preparation/${id}/application-status", frontend)
+        self.assertIn("Open employer application page", frontend)
+
+    def test_word_preview_cache_requires_matching_docx_fingerprints_and_invalidates_on_edit(self):
+        original = Path(self.tmpdir.name) / "original.docx"
+        candidate = Path(self.tmpdir.name) / "candidate.docx"
+        output = Path(self.tmpdir.name) / "preview.pdf"
+        original.write_bytes(b"original-docx")
+        candidate.write_bytes(b"candidate-v1")
+        output.write_bytes(b"stale-pdf")
+        output.with_name(f"{output.name}.fingerprints.json").write_text(json.dumps({"original": "old", "candidate": "old"}), encoding="utf-8")
+        calls = []
+
+        def fake_word(_command, environment):
+            calls.append(environment["JOB_TRACKER_PDF_PATH"])
+            Path(environment["JOB_TRACKER_PDF_PATH"]).write_bytes(b"fresh-pdf")
+            measurement = {"available": True, "pages": 1, "paragraphs": [{"index": 0, "lines": 1}]}
+            return {"available": True, "original": measurement, "candidate": measurement, "timings_ms": {"word_layout_validation": 8.0, "pdf_generation": 12.0, "total": 20.0}}, None
+
+        with patch.object(resume_layout, "_run_word", side_effect=fake_word):
+            first = resume_layout.compare_docx_layout_and_export(original, candidate, output)
+            second = resume_layout.compare_docx_layout_and_export(original, candidate, output)
+            candidate.write_bytes(b"candidate-v2")
+            third = resume_layout.compare_docx_layout_and_export(original, candidate, output)
+        self.assertIn("available", first, first)
+        self.assertFalse(first.get("cached", False), first)
+        self.assertTrue(second.get("cached"), second)
+        self.assertFalse(third.get("cached", False), third)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(output.read_bytes(), b"fresh-pdf")
+        self.assertEqual(third["timings_ms"]["word_layout_validation"], 8.0)
+        self.assertEqual(third["timings_ms"]["pdf_generation"], 12.0)
 if __name__ == "__main__":
     unittest.main()

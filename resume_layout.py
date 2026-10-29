@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import threading
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -64,14 +66,20 @@ function Measure-Document($path) {
   return [pscustomobject]@{ available = $true; pages = $pages; paragraphs = $paragraphs }
 }
 try {
+  $totalWatch = [Diagnostics.Stopwatch]::StartNew()
   $word = New-Object -ComObject Word.Application
   $word.Visible = $false
+  $measureWatch = [Diagnostics.Stopwatch]::StartNew()
   $original = Measure-Document $env:JOB_TRACKER_ORIGINAL_PATH
   $candidate = Measure-Document $env:JOB_TRACKER_CANDIDATE_PATH
+  $measureWatch.Stop()
+  $exportWatch = [Diagnostics.Stopwatch]::StartNew()
   $document = $word.Documents.Open($env:JOB_TRACKER_CANDIDATE_PATH)
   $document.ExportAsFixedFormat($env:JOB_TRACKER_PDF_PATH, 17)
   $document.Close($false)
-  [pscustomobject]@{ available = $true; original = $original; candidate = $candidate; pdf_path = $env:JOB_TRACKER_PDF_PATH } | ConvertTo-Json -Compress -Depth 8
+  $exportWatch.Stop()
+  $totalWatch.Stop()
+  [pscustomobject]@{ available = $true; original = $original; candidate = $candidate; pdf_path = $env:JOB_TRACKER_PDF_PATH; timings_ms = [pscustomobject]@{ word_layout_validation = $measureWatch.Elapsed.TotalMilliseconds; pdf_generation = $exportWatch.Elapsed.TotalMilliseconds; total = $totalWatch.Elapsed.TotalMilliseconds } } | ConvertTo-Json -Compress -Depth 8
 }
 finally {
   if ($word -ne $null) { $word.Quit() }
@@ -190,14 +198,33 @@ def compare_docx_layout_and_export(original: str | Path, candidate: str | Path, 
     candidate_measurement = _cached_measurement(candidate)
     target = Path(output).resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
-    if original_measurement and candidate_measurement and target.is_file() and target.stat().st_size:
-        return {"available": True, "cached": True, **_compare_measurements(original_measurement, candidate_measurement), "original": original_measurement, "candidate": candidate_measurement, "pdf_path": str(target)}
+    try:
+        original_fingerprint = _content_fingerprint(original)
+        candidate_fingerprint = _content_fingerprint(candidate)
+    except OSError as exc:
+        return {"available": False, "verified": False, "reason": str(exc)}
+    fingerprint_meta = target.with_name(f"{target.name}.fingerprints.json")
+    cached_fingerprints: dict[str, Any] = {}
+    if fingerprint_meta.is_file():
+        try:
+            loaded = json.loads(fingerprint_meta.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                cached_fingerprints = loaded
+        except (OSError, ValueError, TypeError):
+            cached_fingerprints = {}
+    if original_measurement and candidate_measurement and target.is_file() and target.stat().st_size and cached_fingerprints.get("original") == original_fingerprint and cached_fingerprints.get("candidate") == candidate_fingerprint:
+        return {"available": True, "cached": True, **_compare_measurements(original_measurement, candidate_measurement), "original": original_measurement, "candidate": candidate_measurement, "pdf_path": str(target), "timings_ms": {"word_layout_validation": 0.0, "pdf_generation": 0.0, "total": 0.0}}
+    pending_target = target.with_name(f".{target.name}.{uuid.uuid4().hex}.pending")
     environment = os.environ.copy()
     environment["JOB_TRACKER_ORIGINAL_PATH"] = str(Path(original).resolve())
     environment["JOB_TRACKER_CANDIDATE_PATH"] = str(Path(candidate).resolve())
-    environment["JOB_TRACKER_PDF_PATH"] = str(target)
+    environment["JOB_TRACKER_PDF_PATH"] = str(pending_target)
     result, error = _run_word(_COMBINED_POWERSHELL, environment)
-    if error or not result:
+    if error or not result or not pending_target.is_file() or pending_target.stat().st_size == 0:
+        try:
+            pending_target.unlink(missing_ok=True)
+        except OSError:
+            pass
         return {"available": False, "verified": False, "reason": error or "Word COM operation failed."}
     original_measurement = result.get("original") or {"available": False}
     candidate_measurement = result.get("candidate") or {"available": False}
@@ -205,7 +232,33 @@ def compare_docx_layout_and_export(original: str | Path, candidate: str | Path, 
         _store_measurement(original, original_measurement)
     if candidate_measurement.get("available"):
         _store_measurement(candidate, candidate_measurement)
-    return {"available": True, **_compare_measurements(original_measurement, candidate_measurement), "original": original_measurement, "candidate": candidate_measurement, "pdf_path": str(target)}
+    try:
+        if _content_fingerprint(original) != original_fingerprint or _content_fingerprint(candidate) != candidate_fingerprint:
+            pending_target.unlink(missing_ok=True)
+            return {"available": False, "verified": False, "stale": True, "reason": "A DOCX changed while Word was rendering the preview. Refresh and try again."}
+        try:
+            pending_target.replace(target)
+        except PermissionError:
+            # Some managed Windows folders deny replacing an existing file even
+            # when ordinary writes are allowed. Copy only as a controlled
+            # fallback; a partial copy still fails the operation below.
+            shutil.copyfile(pending_target, target)
+            pending_target.unlink(missing_ok=True)
+        metadata_temp = fingerprint_meta.with_name(f".{fingerprint_meta.name}.{uuid.uuid4().hex}.pending")
+        metadata_temp.write_text(json.dumps({"original": original_fingerprint, "candidate": candidate_fingerprint}), encoding="utf-8")
+        try:
+            metadata_temp.replace(fingerprint_meta)
+        except PermissionError:
+            shutil.copyfile(metadata_temp, fingerprint_meta)
+            metadata_temp.unlink(missing_ok=True)
+    except OSError as exc:
+        try:
+            pending_target.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return {"available": False, "verified": False, "reason": f"Word preview promotion failed: {exc}"}
+    result_timings = result.get("timings_ms") if isinstance(result.get("timings_ms"), dict) else {}
+    return {"available": True, **_compare_measurements(original_measurement, candidate_measurement), "original": original_measurement, "candidate": candidate_measurement, "pdf_path": str(target), "timings_ms": result_timings}
 
 
 def export_docx_to_pdf(path: str | Path, output: str | Path) -> dict[str, Any]:
