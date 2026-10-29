@@ -484,10 +484,14 @@ async function openTailoringDocumentPreview() {
       frame.src = `${preview.pdf_url}?v=${Date.now()}`;
       frame.hidden = false;
       mode.textContent = "Rendered from the current draft DOCX through Microsoft Word PDF export.";
+      const layoutStatus = document.getElementById("tailoring-layout-status");
+      if (layoutStatus) layoutStatus.textContent = preview.layout?.verified ? "Word layout validation passed for the current draft." : "Word PDF rendered; review the current draft layout before approving.";
     } else {
       textPreview.textContent = preview.text || "No extracted preview is available.";
       textPreview.hidden = false;
       mode.textContent = `Accurate Word rendering is unavailable: ${preview.pdf_reason || "download the DOCX for authoritative formatting."}`;
+      const layoutStatus = document.getElementById("tailoring-layout-status");
+      if (layoutStatus) layoutStatus.textContent = `Accurate Word layout validation is unavailable: ${preview.pdf_reason || "download the DOCX for authoritative formatting."}`;
     }
   } catch (error) {
     textPreview.textContent = "The draft preview could not be loaded.";
