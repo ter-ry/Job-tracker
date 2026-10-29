@@ -4,6 +4,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urljoin
@@ -98,7 +99,8 @@ def build_ollama_health_report(config: OllamaConfig) -> dict[str, Any]:
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
     try:
         with urllib.request.urlopen(request, timeout=config.timeout_seconds) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            raw = response.read().decode("utf-8")
+            payload = json.loads(raw)
     except urllib.error.HTTPError as exc:
         report["status"] = "error"
         report["failure_reason"] = f"HTTP {exc.code} from Ollama."
@@ -151,6 +153,7 @@ def request_json_completion(
     max_attempts: int = 2,
     cancel_event: Any = None,
     keep_alive: int | str | None = None,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
     if not config.enabled:
         return {"ok": False, "error": "Ollama is disabled.", "data": {}}
@@ -160,6 +163,8 @@ def request_json_completion(
         payload["keep_alive"] = keep_alive
     last_error: dict[str, Any] = {"ok": False, "error": "Ollama did not return a usable JSON response.", "data": {}}
     for attempt in range(max(1, max_attempts)):
+        if deadline is not None and time.monotonic() >= deadline:
+            return {"ok": False, "deadline_exceeded": True, "error": "Ollama request exceeded its total time limit.", "data": {}, "attempts": attempt}
         if cancel_event is not None and cancel_event.is_set():
             return {"ok": False, "cancelled": True, "error": "AI improvement was cancelled.", "data": {}, "attempts": attempt}
         attempt_payload = dict(payload)
@@ -167,10 +172,15 @@ def request_json_completion(
             attempt_payload["prompt"] = prompt + "\nReturn only one valid JSON object. Do not use markdown fences or commentary."
         request = urllib.request.Request(url, data=json.dumps(attempt_payload).encode("utf-8"), headers={"Content-Type": "application/json", "Accept": "application/json"}, method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=config.timeout_seconds) as response:
+            remaining = max(0.1, deadline - time.monotonic()) if deadline is not None else config.timeout_seconds
+            with urllib.request.urlopen(request, timeout=min(config.timeout_seconds, remaining)) as response:
                 if cancel_event is not None and hasattr(response, "readline"):
                     lines: list[str] = []
                     while True:
+                        if deadline is not None and time.monotonic() >= deadline:
+                            try: response.close()
+                            except Exception: pass
+                            return {"ok": False, "deadline_exceeded": True, "error": "Ollama request exceeded its total time limit.", "data": {}, "attempts": attempt + 1}
                         if cancel_event.is_set():
                             try: response.close()
                             except Exception: pass

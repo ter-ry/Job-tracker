@@ -5327,6 +5327,10 @@ class JobAssistantTest(unittest.TestCase):
                 job_id = started.get_json()["job_id"]
                 cancel = self.client.post(f"/api/tailoring/improve-jobs/{job_id}/cancel")
                 result = self.client.get(f"/api/tailoring/improve-jobs/{job_id}")
+                for _ in range(100):
+                    if result.status_code != 202: break
+                    time.sleep(0.01)
+                    result = self.client.get(f"/api/tailoring/improve-jobs/{job_id}")
         self.assertEqual(cancel.status_code, 202)
         self.assertEqual(result.status_code, 503)
         self.assertEqual(result.get_json()["status"], "cancelled")
@@ -5351,6 +5355,67 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(result.get_json()["proposed_text"], original)
         self.assertEqual(request_mock.call_count, 2)
         self.assertTrue(result.get_json()["retry_attempted"])
+
+    def test_tailoring_ai_rejects_concurrent_request_and_recovers_after_cancellation(self):
+        workspace, original, config = self._make_ai_fixture()
+
+        def slow_completion(*args, **kwargs):
+            while not kwargs["cancel_event"].is_set():
+                time.sleep(0.01)
+            return {"ok": False, "cancelled": True, "error": "AI improvement was cancelled.", "data": {}, "attempts": 1}
+
+        with patch.object(app_module, "request_json_completion", side_effect=slow_completion):
+            with patch.object(app_module.OllamaConfig, "from_mapping", return_value=config):
+                first = self.client.post(f"/api/tailoring/drafts/{workspace['draft']['id']}/improve", json={"original_text": original})
+                second = self.client.post(f"/api/tailoring/drafts/{workspace['draft']['id']}/improve", json={"original_text": original})
+                job_id = first.get_json()["job_id"]
+                self.client.post(f"/api/tailoring/improve-jobs/{job_id}/cancel")
+                cancelled = self.client.get(f"/api/tailoring/improve-jobs/{job_id}")
+                for _ in range(100):
+                    if cancelled.status_code != 202: break
+                    time.sleep(0.01)
+                    cancelled = self.client.get(f"/api/tailoring/improve-jobs/{job_id}")
+        self.assertEqual(second.status_code, 429)
+        self.assertEqual(second.get_json()["status"], "busy")
+        self.assertEqual(cancelled.get_json()["status"], "cancelled")
+
+        with patch.object(app_module, "request_json_completion", return_value={"ok": True, "data": {"proposed_bullet": "Built and maintained 25+ automated tests, reducing errors by 75% across 3 services."}, "attempts": 1}):
+            with patch.object(app_module.OllamaConfig, "from_mapping", return_value=config):
+                recovered = self.wait_for_tailoring_ai(self.client.post(f"/api/tailoring/drafts/{workspace['draft']['id']}/improve", json={"original_text": original}))
+        self.assertEqual(recovered.status_code, 200)
+        self.assertEqual(recovered.get_json()["status"], "completed")
+
+    def test_tailoring_ai_completed_jobs_expire_from_memory(self):
+        workspace, original, config = self._make_ai_fixture()
+        old_retention = app_module.TAILORING_AI_JOB_RETENTION_SECONDS
+        app_module.TAILORING_AI_JOB_RETENTION_SECONDS = 600
+        try:
+            with patch.object(app_module, "request_json_completion", return_value={"ok": True, "data": {"proposed_bullet": original}, "attempts": 1}):
+                with patch.object(app_module.OllamaConfig, "from_mapping", return_value=config):
+                    started = self.client.post(f"/api/tailoring/drafts/{workspace['draft']['id']}/improve", json={"original_text": original})
+                    job_id = started.get_json()["job_id"]
+                    result = self.wait_for_tailoring_ai(started)
+            app_module.TAILORING_AI_JOB_RETENTION_SECONDS = 0
+            app_module.cleanup_tailoring_ai_jobs()
+            expired = self.client.get(f"/api/tailoring/improve-jobs/{job_id}")
+            self.assertEqual(result.get_json()["status"], "unchanged")
+            self.assertEqual(expired.status_code, 404)
+        finally:
+            app_module.TAILORING_AI_JOB_RETENTION_SECONDS = old_retention
+    def test_ollama_deadline_is_checked_before_network_request(self):
+        config = ollama_client.OllamaConfig(True, "http://127.0.0.1:11434", "qwen3:4b", 30, 128, 2000)
+        with patch.object(ollama_client.urllib.request, "urlopen") as urlopen:
+            result = ollama_client.request_json_completion(config, "Return JSON.", max_attempts=2, deadline=time.monotonic() - 1, keep_alive=0)
+        self.assertTrue(result.get("deadline_exceeded"))
+        urlopen.assert_not_called()
+
+    def test_tailoring_ai_frontend_consumes_structured_terminal_statuses(self):
+        frontend = Path(app_module.BASE_DIR, "static", "app.js").read_text(encoding="utf-8")
+        self.assertIn("getOutcome", frontend)
+        self.assertIn('result.status === "rejected"', frontend)
+        self.assertIn('result.status === "unavailable"', frontend)
+        self.assertIn("Original wording was preserved.", frontend)
+        self.assertIn('result.status === "cancelled"', frontend)
 
 if __name__ == "__main__":
     unittest.main()

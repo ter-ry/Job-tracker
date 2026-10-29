@@ -91,6 +91,11 @@ const api = {
     }
     return response.json();
   },
+  async getOutcome(path) {
+    const response = await fetch(path);
+    const data = await response.json().catch(() => ({}));
+    return { ok: response.ok, status: response.status, data };
+  },
   async send(path, method, body) {
     const response = await fetch(path, {
       method,
@@ -767,8 +772,10 @@ async function improveTailoringEdit() {
     const poll = async () => {
       const elapsed = ((performance.now() - started) / 1000).toFixed(1);
       status.textContent = `AI improvement is running… ${elapsed}s elapsed. Original wording is preserved until review.`;
-      const result = await api.get(`/api/tailoring/improve-jobs/${jobId}`);
+      const outcome = await api.getOutcome("/api/tailoring/improve-jobs/" + jobId);
+      const result = outcome.data || {};
       if (result.status === "running") { await new Promise((resolve) => setTimeout(resolve, 250)); return poll(); }
+      if (!outcome.ok && result.status !== "completed" && result.status !== "unchanged" && result.status !== "rejected" && result.status !== "cancelled" && result.status !== "unavailable") throw new Error("AI status request failed.");
       if (result.status === "completed" || result.status === "unchanged") {
         document.getElementById("tailoring-proposed-text").value = result.proposed_text || bullet.text;
         renderTailoringDiff(bullet.text, document.getElementById("tailoring-proposed-text").value);
@@ -776,6 +783,10 @@ async function improveTailoringEdit() {
         status.textContent = result.status === "unchanged" ? "The existing bullet is already suitable. No wording change was made." : `${result.message} It has not been applied.`;
       } else if (result.status === "cancelled") {
         status.textContent = "AI improvement cancelled. Original wording was preserved.";
+      } else if (result.status === "rejected") {
+        status.textContent = `AI suggestion rejected: ${result.error || "the safety checks did not pass."} Original wording was preserved.`;
+      } else if (result.status === "unavailable") {
+        status.textContent = `AI model unavailable: ${result.error || "the local model did not complete."} Original wording was preserved.`;
       } else {
         status.textContent = `${result.error || "AI improvement was unavailable."} Original wording was preserved.`;
       }
