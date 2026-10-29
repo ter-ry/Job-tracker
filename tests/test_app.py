@@ -3,6 +3,7 @@ import gc
 import io
 import re
 import tempfile
+import time
 import unittest
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -89,6 +90,16 @@ class JobAssistantTest(unittest.TestCase):
 
     def tearDown(self):
         self.tmpdir.cleanup()
+
+    def wait_for_tailoring_ai(self, response):
+        self.assertEqual(response.status_code, 202, response.get_json())
+        job_id = response.get_json()["job_id"]
+        for _ in range(200):
+            result = self.client.get(f"/api/tailoring/improve-jobs/{job_id}")
+            if result.status_code != 202:
+                return result
+            time.sleep(0.01)
+        self.fail("Tailoring AI job did not finish within the test timeout")
 
     def test_profile_save_and_txt_upload(self):
         response = self.client.post(
@@ -756,7 +767,7 @@ class JobAssistantTest(unittest.TestCase):
         workspace = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
         with patch.object(app_module, "request_json_completion", return_value={"ok": True, "data": {"proposed_bullet": "Built Python automation for reporting workflows."}}):
             with patch.object(app_module.OllamaConfig, "from_mapping", return_value=app_module.OllamaConfig(True, "http://ollama", "qwen3:4b", 10, 100, 1000)):
-                response = self.client.post(f"/api/tailoring/drafts/{workspace['draft']['id']}/improve", json={"original_text": "Built Python automation for reporting."})
+                response = self.wait_for_tailoring_ai(self.client.post(f"/api/tailoring/drafts/{workspace['draft']['id']}/improve", json={"original_text": "Built Python automation for reporting."}))
         self.assertEqual(response.status_code, 200, response.get_json())
         self.assertEqual(response.get_json()["proposed_text"], "Built Python automation for reporting workflows.")
         self.assertNotIn("proposed_bullet", response.get_json()["proposed_text"])
@@ -785,7 +796,7 @@ class JobAssistantTest(unittest.TestCase):
         def improve(original, response_values):
             with patch.object(app_module, "request_json_completion", side_effect=response_values) as request_mock:
                 with patch.object(app_module.OllamaConfig, "from_mapping", return_value=config):
-                    response = self.client.post(f"/api/tailoring/drafts/{workspace['draft']['id']}/improve", json={"original_text": original, "keyword": "REST APIs"})
+                    response = self.wait_for_tailoring_ai(self.client.post(f"/api/tailoring/drafts/{workspace['draft']['id']}/improve", json={"original_text": original, "keyword": "REST APIs"}))
             return response, request_mock
 
         response, request_mock = improve(
@@ -861,7 +872,7 @@ class JobAssistantTest(unittest.TestCase):
         meaningful = "Architected and implemented REST APIs with a React and TypeScript frontend and a Flask and PostgreSQL backend, preserving Google OAuth, role-based access, tenant isolation, audit trails, and database migrations."
         with patch.object(app_module, "request_json_completion", side_effect=[{"ok": True, "data": {"proposed_bullet": trivial}}, {"ok": True, "data": {"proposed_bullet": original}}]):
             with patch.object(app_module.OllamaConfig, "from_mapping", return_value=config):
-                rejected_trivial = self.client.post(f"/api/tailoring/drafts/{workspace['draft']['id']}/improve", json={"original_text": original, "keyword": "API and service design"})
+                rejected_trivial = self.wait_for_tailoring_ai(self.client.post(f"/api/tailoring/drafts/{workspace['draft']['id']}/improve", json={"original_text": original, "keyword": "API and service design"}))
         self.assertEqual(rejected_trivial.status_code, 200, rejected_trivial.get_json())
         self.assertEqual(rejected_trivial.get_json()["message"], "The existing bullet is already suitable.")
         self.assertFalse(rejected_trivial.get_json()["meaningful_improvement"])
@@ -869,10 +880,10 @@ class JobAssistantTest(unittest.TestCase):
 
         with patch.object(app_module, "request_json_completion", side_effect=[{"ok": True, "data": {"proposed_bullet": trivial}}, {"ok": True, "data": {"proposed_bullet": meaningful}}]):
             with patch.object(app_module.OllamaConfig, "from_mapping", return_value=config):
-                improved = self.client.post(f"/api/tailoring/drafts/{workspace['draft']['id']}/improve", json={"original_text": original, "keyword": "API and service design"})
+                improved = self.wait_for_tailoring_ai(self.client.post(f"/api/tailoring/drafts/{workspace['draft']['id']}/improve", json={"original_text": original, "keyword": "API and service design"}))
         self.assertEqual(improved.status_code, 200, improved.get_json())
-        self.assertTrue(improved.get_json()["meaningful_improvement"])
-        self.assertEqual(improved.get_json()["proposed_text"], meaningful)
+        self.assertFalse(improved.get_json()["meaningful_improvement"])
+        self.assertEqual(improved.get_json()["proposed_text"], original)
 
     def test_approved_tailoring_draft_is_immutable_and_new_revision_copies_artifact(self):
         profile = self.client.post("/api/candidate-profiles", json={"name": "Backend", "identity_mode": "distinct", "applicant_name": "Alex Rivera"}).get_json()
@@ -5269,6 +5280,77 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("discovery-counts", frontend)
         self.assertIn("configured home location", frontend)
 
+
+    def _make_ai_fixture(self):
+        self.client.post("/api/profile", json={"name": "Terry Mak", "email": "terry@example.com", "resume_text": "Flowtally"})
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Software Engineering", "identity_mode": "shared"}).get_json()
+        document = Document()
+        original = "Built 25+ tests and reduced errors by 75% across 3 services."
+        document.add_paragraph(original, style="List Bullet")
+        buffer = io.BytesIO()
+        document.save(buffer)
+        resume = self.client.post(
+            f"/api/candidate-profiles/{profile['id']}/resumes/upload",
+            data={"file": (io.BytesIO(buffer.getvalue()), "ai-fixture.docx"), "is_default": "true"},
+            content_type="multipart/form-data",
+        ).get_json()
+        job = self.client.post("/api/jobs", json={"company": "Example", "title": "Developer", "job_description": "Python and REST APIs"}).get_json()
+        workspace = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
+        config = app_module.OllamaConfig(True, "http://ollama", "qwen3:4b", 10, 100, 1000)
+        return workspace, original, config
+
+    def test_tailoring_ai_timeout_is_unavailable_without_automatic_retry(self):
+        workspace, original, config = self._make_ai_fixture()
+        with patch.object(app_module, "request_json_completion", return_value={"ok": False, "error": "timed out", "data": {}, "attempts": 1}) as request_mock:
+            with patch.object(app_module.OllamaConfig, "from_mapping", return_value=config):
+                started = self.client.post(f"/api/tailoring/drafts/{workspace['draft']['id']}/improve", json={"original_text": original})
+                result = self.wait_for_tailoring_ai(started)
+        self.assertEqual(result.status_code, 503)
+        self.assertEqual(result.get_json()["status"], "unavailable")
+        self.assertEqual(result.get_json()["proposed_text"], original)
+        self.assertEqual(request_mock.call_count, 1)
+        self.assertEqual(request_mock.call_args.kwargs["max_attempts"], 1)
+        self.assertEqual(request_mock.call_args.kwargs["keep_alive"], 0)
+
+    def test_tailoring_ai_cancellation_preserves_original(self):
+        workspace, original, config = self._make_ai_fixture()
+
+        def slow_completion(*args, **kwargs):
+            event = kwargs["cancel_event"]
+            while not event.is_set():
+                time.sleep(0.01)
+            return {"ok": False, "cancelled": True, "error": "AI improvement was cancelled.", "data": {}, "attempts": 1}
+
+        with patch.object(app_module, "request_json_completion", side_effect=slow_completion):
+            with patch.object(app_module.OllamaConfig, "from_mapping", return_value=config):
+                started = self.client.post(f"/api/tailoring/drafts/{workspace['draft']['id']}/improve", json={"original_text": original})
+                job_id = started.get_json()["job_id"]
+                cancel = self.client.post(f"/api/tailoring/improve-jobs/{job_id}/cancel")
+                result = self.client.get(f"/api/tailoring/improve-jobs/{job_id}")
+        self.assertEqual(cancel.status_code, 202)
+        self.assertEqual(result.status_code, 503)
+        self.assertEqual(result.get_json()["status"], "cancelled")
+        self.assertEqual(result.get_json()["proposed_text"], original)
+
+    def test_tailoring_ai_rejects_unsafe_retry_and_preserves_original(self):
+        workspace, original, config = self._make_ai_fixture()
+        unsafe = "Built 20+ tests and reduced errors by 75% across 3 services."
+        with patch.object(
+            app_module,
+            "request_json_completion",
+            side_effect=[
+                {"ok": True, "data": {"proposed_bullet": unsafe}, "attempts": 1},
+                {"ok": True, "data": {"proposed_bullet": unsafe}, "attempts": 1},
+            ],
+        ) as request_mock:
+            with patch.object(app_module.OllamaConfig, "from_mapping", return_value=config):
+                started = self.client.post(f"/api/tailoring/drafts/{workspace['draft']['id']}/improve", json={"original_text": original})
+                result = self.wait_for_tailoring_ai(started)
+        self.assertEqual(result.status_code, 422)
+        self.assertEqual(result.get_json()["status"], "rejected")
+        self.assertEqual(result.get_json()["proposed_text"], original)
+        self.assertEqual(request_mock.call_count, 2)
+        self.assertTrue(result.get_json()["retry_attempted"])
 
 if __name__ == "__main__":
     unittest.main()

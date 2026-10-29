@@ -22,7 +22,7 @@ const state = {
   generationSelections: {},
   shortlistRegenerations: {},
   selectedCandidateProfileId: "",
-  tailoring: { draftId: null, jobId: null, profileId: null, resumeId: null, data: null, selectedParagraph: null, selectedKeyword: null },
+  tailoring: { draftId: null, jobId: null, profileId: null, resumeId: null, data: null, selectedParagraph: null, selectedKeyword: null, aiImproveJobId: null },
 };
 
 const jobFields = [
@@ -138,6 +138,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("tailoring-apply")?.addEventListener("click", applyTailoringEdit);
   document.getElementById("tailoring-leave-unchanged")?.addEventListener("click", leaveTailoringUnchanged);
   document.getElementById("tailoring-ai-improve")?.addEventListener("click", improveTailoringEdit);
+  document.getElementById("tailoring-ai-cancel")?.addEventListener("click", cancelTailoringImprove);
   document.getElementById("tailoring-approve")?.addEventListener("click", approveTailoringDraft);
   document.getElementById("tailoring-revert-original")?.addEventListener("click", revertTailoringOriginal);
   document.getElementById("refresh-keyword-memory")?.addEventListener("click", loadKeywordMemory);
@@ -292,7 +293,7 @@ async function openTailoringStudio(jobId, profileId, resumeId, options = {}) {
     const data = await api.get(`/api/tailoring/${jobId}/workspace?candidate_profile_id=${encodeURIComponent(profileId)}&resume_id=${encodeURIComponent(resumeId)}`);
     data.timings_ms = { ...(data.timings_ms || {}), frontend_workspace_request: Number((performance.now() - requestStarted).toFixed(2)) };
     const persistedOperationState = data.draft?.status === "approved" ? "approved" : (options.operationState || "idle");
-    state.tailoring = { draftId: data.draft.id, jobId, profileId, resumeId, data, selectedParagraph: null, selectedKeyword: null, operationState: persistedOperationState, statusMessage: options.statusMessage || "" };
+    state.tailoring = { draftId: data.draft.id, jobId, profileId, resumeId, data, selectedParagraph: null, selectedKeyword: null, aiImproveJobId: null, operationState: persistedOperationState, statusMessage: options.statusMessage || "" };
     const renderStarted = performance.now();
     renderTailoringStudio();
     data.timings_ms.frontend_rerender = Number((performance.now() - renderStarted).toFixed(2));
@@ -335,7 +336,7 @@ async function createTailoringRevision() {
 function closeTailoringStudio() {
   const studio = document.getElementById("tailoring-studio");
   if (studio) studio.hidden = true;
-  state.tailoring = { draftId: null, jobId: null, profileId: null, resumeId: null, data: null, selectedParagraph: null, selectedKeyword: null, operationState: "idle", statusMessage: "", revisionBusy: false };
+  state.tailoring = { draftId: null, jobId: null, profileId: null, resumeId: null, data: null, selectedParagraph: null, selectedKeyword: null, aiImproveJobId: null, operationState: "idle", statusMessage: "", revisionBusy: false };
 }
 
 function tailoringTitle(value) {
@@ -750,25 +751,54 @@ async function approveTailoringDraft() {
 async function improveTailoringEdit() {
   const bullet = state.tailoring.selectedParagraph;
   if (!bullet) return toast("Select an existing résumé bullet first");
+  if (state.tailoring.aiImproveJobId) return;
   const button = document.getElementById("tailoring-ai-improve");
+  const cancel = document.getElementById("tailoring-ai-cancel");
+  const status = document.getElementById("tailoring-edit-status");
   button.disabled = true;
+  cancel.hidden = false;
+  const started = performance.now();
   button.textContent = "Improving…";
+  status.textContent = "AI improvement started… 0.0s elapsed. Original wording is preserved until review.";
   try {
-    const suggestion = await api.send(`/api/tailoring/drafts/${state.tailoring.draftId}/improve`, "POST", { original_text: bullet.text, keyword: state.tailoring.selectedKeyword?.keyword || "" });
-    document.getElementById("tailoring-proposed-text").value = suggestion.proposed_text || bullet.text;
-    renderTailoringDiff(bullet.text, document.getElementById("tailoring-proposed-text").value);
-    state.tailoring.operationState = suggestion.meaningful_improvement === false ? "suitable" : "modified";
-    document.getElementById("tailoring-edit-status").textContent = suggestion.meaningful_improvement === false
-      ? `${suggestion.message || "The existing bullet is already suitable."} No wording change was made; review other evidence for remaining gaps.`
-      : (suggestion.message || "AI suggestion loaded for review. It has not been applied.");
+    const startedJob = await api.send(`/api/tailoring/drafts/${state.tailoring.draftId}/improve`, "POST", { original_text: bullet.text, keyword: state.tailoring.selectedKeyword?.keyword || "" });
+    const jobId = startedJob.job_id;
+    state.tailoring.aiImproveJobId = jobId;
+    const poll = async () => {
+      const elapsed = ((performance.now() - started) / 1000).toFixed(1);
+      status.textContent = `AI improvement is running… ${elapsed}s elapsed. Original wording is preserved until review.`;
+      const result = await api.get(`/api/tailoring/improve-jobs/${jobId}`);
+      if (result.status === "running") { await new Promise((resolve) => setTimeout(resolve, 250)); return poll(); }
+      if (result.status === "completed" || result.status === "unchanged") {
+        document.getElementById("tailoring-proposed-text").value = result.proposed_text || bullet.text;
+        renderTailoringDiff(bullet.text, document.getElementById("tailoring-proposed-text").value);
+        state.tailoring.operationState = result.meaningful_improvement === false ? "suitable" : "modified";
+        status.textContent = result.status === "unchanged" ? "The existing bullet is already suitable. No wording change was made." : `${result.message} It has not been applied.`;
+      } else if (result.status === "cancelled") {
+        status.textContent = "AI improvement cancelled. Original wording was preserved.";
+      } else {
+        status.textContent = `${result.error || "AI improvement was unavailable."} Original wording was preserved.`;
+      }
+    };
+    await poll();
   } catch (error) {
-    document.getElementById("tailoring-proposed-text").value = bullet.text;
-    renderTailoringDiff(bullet.text, bullet.text);
-    document.getElementById("tailoring-edit-status").textContent = `${error.message} Original wording was preserved.`;
+    status.textContent = `${error.message} Original wording was preserved.`;
+  } finally {
+    state.tailoring.aiImproveJobId = null;
+    cancel.hidden = true;
+    button.disabled = false;
+    button.textContent = "AI Improve";
   }
-  finally { button.disabled = false; button.textContent = "AI Improve"; }
 }
 
+async function cancelTailoringImprove() {
+  const jobId = state.tailoring.aiImproveJobId;
+  if (!jobId) return;
+  const status = document.getElementById("tailoring-edit-status");
+  status.textContent = "Requesting cancellation…";
+  try { await api.send(`/api/tailoring/improve-jobs/${jobId}/cancel`, "POST", {}); }
+  catch (error) { status.textContent = `Cancellation could not be requested: ${error.message}`; }
+}
 async function loadKeywordMemory() {
   const target = document.getElementById("keyword-memory-list");
   const profileId = state.selectedCandidateProfileId;
