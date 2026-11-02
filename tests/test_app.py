@@ -251,6 +251,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(onsite["application_priority_score"], 0)
         self.assertEqual(hybrid["application_priority_score"], 0)
         self.assertIsNone(unknown["remote_search_eligible"])
+        self.assertLessEqual(unknown["application_priority_score"], 59)
         self.assertEqual(app_module.discovery_ontario_eligibility({"job_description": "Engineers work on our platform."})[0], "unknown")
         self.assertEqual(app_module.discovery_ontario_eligibility({"job_description": "Remote Canada except Ontario."})[0], "confirmed_ineligible")
         self.assertEqual(app_module.discovery_ontario_eligibility({"job_description": "Remote Ontario."})[0], "confirmed_eligible")

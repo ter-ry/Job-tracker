@@ -7469,6 +7469,7 @@ def apply_discovery_search_constraints(job: dict[str, Any], remote_preference: s
     else:
         job["remote_search_eligible"] = True if arrangement == "remote" else None
         if arrangement == "unknown":
+            job["application_priority_score"] = min(int(job.get("application_priority_score") or 0), 59)
             job.setdefault("application_priority_reasons", []).append("Work arrangement is unknown and requires review for a remote-only search.")
     return job
 
