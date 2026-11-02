@@ -3109,6 +3109,98 @@ class JobAssistantTest(unittest.TestCase):
         self.assertTrue(any("Flowtally" in item["original"] for item in artifact["change_log"]["preserved"]))
         self.assertTrue(any("Pinterest" in item["original"] and "Gatekeeper" in item["replacement"] for item in artifact["change_log"]["applied"]))
 
+    def test_cover_letter_ollama_prompt_contains_full_relevant_job_and_template_body(self):
+        job = {
+            "company": "Intuit",
+            "title": "Software Developer 1",
+            "location": "Toronto, Ontario",
+            "job_description": (
+                "Build backend services with Python and REST APIs. Work with product and design partners. "
+                "Salary and benefits are competitive. Equal opportunity employer."
+            ),
+            "responsibilities": "Implement validation, testing, and maintainable data workflows.",
+        }
+        evidence = grounding.build_candidate_evidence({
+            "work_experience": "Built Python services and validation workflows.",
+            "projects": "Flowtally project: implemented REST APIs and 25+ automated backend tests.",
+            "resume_text": "Built Python services and validation workflows. Implemented REST APIs and 25+ automated backend tests.",
+        })
+        prompt = app_module.build_ollama_prompt(
+            "cover_letter",
+            job,
+            evidence,
+            {"original_cover_letter_body": "I am pleased to apply for a software role."},
+        )
+        self.assertIn("Build backend services with Python and REST APIs", prompt)
+        self.assertIn("Implement validation, testing", prompt)
+        self.assertIn("original_cover_letter_body", prompt)
+        self.assertIn("experience_paragraphs", prompt)
+        self.assertNotIn("Salary and benefits are competitive", prompt)
+        self.assertIn("Do not mention salary", prompt)
+
+    def test_structured_ai_sections_reach_plain_docx_template(self):
+        source = Path(self.tmpdir.name) / "plain_structured_ai_template.docx"
+        document = Document()
+        for value in [
+            "Terry Mak", "October 1, 2026", "Hiring Manager", "Old Company", "Toronto, Ontario",
+            "Re: Old Role", "Dear Hiring Manager,", "Old opening paragraph.",
+            "Old experience paragraph one.", "Old experience paragraph two.",
+            "Old employer motivation.", "Thank you for your consideration.", "Sincerely,", "Terry Mak",
+        ]:
+            document.add_paragraph(value)
+        document.save(source)
+        output_path = Path(self.tmpdir.name) / "plain_structured_ai_output.docx"
+        profile = {
+            "name": "Terry Mak",
+            "email": "terry@example.com",
+            "cover_letter_docx_template_path": str(source),
+            "cover_letter_no_dashes": "true",
+        }
+        job = {
+            "company": "Intuit",
+            "title": "Software Developer 1",
+            "location": "Toronto, Ontario",
+            "job_description": "Build Python backend services and automated tests.",
+        }
+        output = {
+            "cover_letter": "fallback",
+            "candidate_evidence": grounding.build_candidate_evidence({"work_experience": "Built Python services."}),
+            "tailoring_plan": {
+                "cover_letter_ai_sections": {
+                    "opening": "I am pleased to apply for the Software Developer 1 position at Intuit.",
+                    "experience_paragraphs": [
+                        "At Flowtally, I built Python services and implemented REST APIs.",
+                        "I added 25+ automated backend tests to validate reporting workflows.",
+                    ],
+                    "motivation": "Intuit's focus on reliable backend services and testing matches this verified experience.",
+                    "closing": "Thank you for considering my application.",
+                }
+            },
+        }
+        artifact = app_module.build_format_preserving_cover_letter(job, profile, output, output_path)
+        self.assertEqual(artifact["status"], "generated", artifact)
+        text = "\n".join(paragraph.text for paragraph in Document(output_path).paragraphs)
+        self.assertIn("Software Developer 1 position at Intuit", text)
+        self.assertIn("25+ automated backend tests", text)
+        self.assertIn("reliable backend services and testing", text)
+        self.assertNotIn("Old experience paragraph", text)
+        self.assertEqual(artifact["change_log"]["generation_source"], "deterministic_fallback")
+
+    def test_structured_ollama_cover_letter_rejects_compensation_and_unsupported_numbers(self):
+        job = {"company": "Intuit", "title": "Software Developer 1", "job_description": "Build Python services."}
+        evidence = grounding.build_candidate_evidence({"projects": "Built Python services and 25+ automated tests across reporting workflows, validation routines, and internal operations tools."})
+        safe = {
+            "opening": "I am pleased to apply for the Software Developer 1 position at Intuit.",
+            "experience_paragraphs": ["I built Python services and 25+ automated tests."],
+            "motivation": "Intuit's focus on reliable Python services matches this verified experience.",
+            "closing": "Thank you for considering my application.",
+        }
+        accepted = app_module.validate_ollama_suggestion("cover_letter", safe, job, evidence)
+        self.assertTrue(accepted["ok"], accepted)
+        unsafe = dict(safe, motivation="The salary and benefits are attractive and I delivered 99 services.")
+        rejected = app_module.validate_ollama_suggestion("cover_letter", unsafe, job, evidence)
+        self.assertFalse(rejected["ok"])
+
     def test_structured_template_replaces_selected_identity_email_hyperlink(self):
         template = Path(self.tmpdir.name) / "structured_hyperlinked_identity.docx"
         document = Document()
@@ -3268,6 +3360,19 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(lakeview_map["motivation"].lower().count("python"), 1)
         self.assertNotIn("Kafka", lakeview_map["motivation"])
         self.assertNotIn("Kubernetes", lakeview_map["motivation"])
+
+    def test_cover_letter_motivation_ignores_compensation_boilerplate(self):
+        job = {
+            "company": "Intuit",
+            "title": "Software Developer 1",
+            "job_description": (
+                "Intuit offers competitive salary and benefits. Intuit builds backend services and maintains reliable data workflows."
+            ),
+        }
+        motivation = app_module.build_job_motivation(job)
+        self.assertNotIn("salary", motivation.lower())
+        self.assertNotIn("benefits", motivation.lower())
+        self.assertIn("backend services", motivation.lower())
 
     def test_cover_letter_validation_uses_body_boundaries_for_contact_details(self):
         evidence = grounding.build_candidate_evidence(self.software_profile())
