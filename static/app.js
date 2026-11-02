@@ -18,6 +18,7 @@ const state = {
   preparationPreviewItemId: null,
   preparationPreviewKind: "resume",
   preparationPreviewZoom: 1,
+  selectedPreparationId: null,
   candidateProfiles: [],
   generationSelections: {},
   shortlistRegenerations: {},
@@ -273,6 +274,14 @@ async function loadPreparationQueue() {
     // Queue refreshes can replace package artifact paths after regeneration. Do not
     // keep displaying a preview fetched from the previous package version.
     state.preparationPreviews = {};
+    const requestedId = Number(new URLSearchParams(window.location.search).get("application_id")) || null;
+    const persistedId = requestedId || Number(state.selectedPreparationId) || null;
+    if (state.preparationQueue.some((item) => Number(item.id) === persistedId)) {
+      state.selectedPreparationId = persistedId;
+    } else {
+      state.selectedPreparationId = state.preparationQueue[0]?.id || null;
+    }
+    persistSelectedPreparation();
     renderPreparationQueue();
   } catch (error) { target.textContent = error.message; }
 }
@@ -484,10 +493,14 @@ async function openTailoringDocumentPreview() {
       frame.src = `${preview.pdf_url}?v=${Date.now()}`;
       frame.hidden = false;
       mode.textContent = "Rendered from the current draft DOCX through Microsoft Word PDF export.";
+      const layoutStatus = document.getElementById("tailoring-layout-status");
+      if (layoutStatus) layoutStatus.textContent = preview.layout?.verified ? "Word layout validation passed for the current draft." : "Word PDF rendered; review the current draft layout before approving.";
     } else {
       textPreview.textContent = preview.text || "No extracted preview is available.";
       textPreview.hidden = false;
       mode.textContent = `Accurate Word rendering is unavailable: ${preview.pdf_reason || "download the DOCX for authoritative formatting."}`;
+      const layoutStatus = document.getElementById("tailoring-layout-status");
+      if (layoutStatus) layoutStatus.textContent = `Accurate Word layout validation is unavailable: ${preview.pdf_reason || "download the DOCX for authoritative formatting."}`;
     }
   } catch (error) {
     textPreview.textContent = "The draft preview could not be loaded.";
@@ -858,7 +871,10 @@ function renderPreparationQueue() {
   const items = Array.isArray(state.preparationQueue) ? state.preparationQueue : [];
   target.classList.toggle("empty", !items.length);
   if (!items.length) { target.textContent = "No application packages queued."; return; }
-  target.innerHTML = items.map((item) => {
+  const selected = items.find((item) => Number(item.id) === Number(state.selectedPreparationId)) || items[0];
+  state.selectedPreparationId = selected.id;
+  const renderedSelected = items.map((item) => {
+    if (Number(item.id) !== Number(selected.id)) return "";
     const job = item.job || {};
     const regeneration = state.preparationRegenerations[item.id] || {};
     const regenerating = regeneration.status === "preparing";
@@ -880,13 +896,70 @@ function renderPreparationQueue() {
             : "";
     const actions = item.status === "ready_for_review"
       ? `<button class="button small" type="button" onclick="reviewPreparation(${item.id}, 'approve')">Approve package</button><button class="button ghost small" type="button" onclick="previewPreparation(${item.id})">Preview</button><button class="button ghost small" type="button" ${regenerating ? "disabled" : ""} onclick="regeneratePreparation(${item.id})">${regenerating ? '<span class="spinner" aria-hidden="true"></span> Regenerating...' : "Regenerate"}</button>${item.prepared_resume_path ? `<a class="button ghost small" href="/api/preparation/${item.id}/download/resume">Download résumé</a>` : ""}${item.prepared_cover_letter_path ? `<a class="button ghost small" href="/api/preparation/${item.id}/download/cover-letter">Download cover letter</a>` : ""}`
+      : item.status === "approved"
+        ? `<button class="button ghost small" type="button" onclick="previewPreparation(${item.id})">Preview</button>${item.prepared_resume_path ? `<a class="button ghost small" href="/api/preparation/${item.id}/download/resume">Download résumé</a>` : ""}${item.prepared_cover_letter_path ? `<a class="button ghost small" href="/api/preparation/${item.id}/download/cover-letter">Download cover letter</a>` : ""}`
       : item.status === "queued" || item.status === "failed"
         ? `${item.review_status === "manual_eligibility" ? `<button class="button small" type="button" onclick="reviewEligibility(${item.id})">Confirm Canadian eligibility</button>` : `<button class="button small" type="button" onclick="prepareQueueItem(${item.id})">${item.status === "failed" ? "Retry preparation" : "Prepare package"}</button>`}`
         : "";
     const tailorAction = item.candidate_profile_id && item.resume_id ? `<button class="button ghost small" type="button" onclick="openTailoringStudio(${job.id}, ${item.candidate_profile_id}, ${item.resume_id})">Tailor résumé</button>` : "";
     const preview = renderPreparationPreview(item);
-    return `<article class="preparation-row" data-preparation-id="${item.id}"><div class="preparation-main"><h3>${escapeHtml(job.title || "Untitled role")}</h3><p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(job.location || "Location unavailable")}</p><p class="muted">${escapeHtml(job.remote_eligibility || "unknown")} · ${escapeHtml(job.salary || "Salary unavailable")} · Job Priority ${Number(item.job_priority || 0)}</p><p class="muted">Profile ${escapeHtml(String(item.candidate_profile_id || "not selected"))} · Résumé ${escapeHtml(item.resume_status || "pending")} · Cover letter ${escapeHtml(item.cover_letter_status || "pending")}</p>${item.eligibility_note ? `<p class="muted">${escapeHtml(item.eligibility_note)}</p>` : ""}${feedback}${error && regeneration.status !== "error" ? `<p class="risk high">${escapeHtml(error)}</p>` : ""}</div><div class="preparation-meta"><strong>${escapeHtml(item.status.replaceAll("_", " "))}</strong><span>Keywords Score ${escapeHtml(matched)}</span><div class="row-actions">${tailorAction}${actions}${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open application</a>` : ""}<button class="button ghost small" type="button" onclick="reviewPreparation(${item.id}, 'skip')">Skip</button></div></div>${preview}</article>`;
+    const description = job.job_description || job.responsibilities || job.required_skills || "No job description stored.";
+    const tracking = item.status === "approved" ? renderApplicationStatusControls(item) : "";
+    return `<article class="preparation-row" data-preparation-id="${item.id}"><div class="preparation-main"><div class="application-detail-heading"><div><span class="eyebrow">Selected application</span><h2>${escapeHtml(job.title || "Untitled role")}</h2><p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(job.location || "Location unavailable")}</p></div><span class="application-status-badge">${escapeHtml(item.status.replaceAll("_", " "))}</span></div><section class="application-next-action"><strong>Next action</strong><p>${escapeHtml(preparationNextAction(item))}</p></section><div class="application-detail-grid"><section><h4>Job details</h4><p class="muted">${escapeHtml(job.remote_eligibility || "Eligibility unknown")} · ${escapeHtml(job.salary || "Salary unavailable")} · Job Priority ${Number(item.job_priority || 0)}</p><details><summary>Requirements and description</summary><pre>${escapeHtml(description)}</pre></details>${job.url ? `<p><a href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open employer application page</a></p>` : "<p class=\"muted\">Employer application URL unavailable.</p>"}</section><section><h4>Application materials</h4><p class="muted">Candidate profile: ${escapeHtml(String(item.candidate_profile_id || "not selected"))}</p><p class="muted">Résumé: ${escapeHtml(item.resume_status || "pending")} · Cover letter: ${escapeHtml(item.cover_letter_status || "pending")}</p><p class="muted">Keywords Score: ${escapeHtml(matched)}</p>${item.eligibility_note ? `<p class="muted">${escapeHtml(item.eligibility_note)}</p>` : ""}</section></div>${feedback}${error && regeneration.status !== "error" ? `<p class="risk high">${escapeHtml(error)}</p>` : ""}</div><div class="preparation-meta"><strong>${escapeHtml(item.status.replaceAll("_", " "))}</strong><span>Keywords Score ${escapeHtml(matched)}</span><div class="row-actions">${tailorAction}${actions}${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open application</a>` : ""}<button class="button ghost small" type="button" onclick="reviewPreparation(${item.id}, 'skip')">Skip</button></div></div>${tracking}${preview}</article>`;
   }).join("");
+  const applicationList = items.map((item) => {
+    const job = item.job || {};
+    const score = item.keywords_score || {};
+    const matched = score.matched_count != null ? `${score.matched_count}/${score.total || 0}` : "not reviewed";
+    const active = Number(item.id) === Number(selected.id);
+    return `<button class="application-list-item${active ? " selected" : ""}" type="button" aria-selected="${active}" onclick="selectPreparationPackage(${item.id})"><strong>${escapeHtml(job.title || "Untitled role")}</strong><span>${escapeHtml(job.company || "Unknown company")}</span><span class="muted">${escapeHtml(item.status.replaceAll("_", " "))} · Keywords ${escapeHtml(matched)}</span></button>`;
+  }).join("");
+  target.innerHTML = `<div class="application-workspace-grid"><aside class="application-list" aria-label="Applications"><div class="application-list-heading"><strong>Applications</strong><span class="muted">${items.length}</span></div>${applicationList}</aside><section class="application-selected" aria-live="polite">${renderedSelected}</section></div>`;
+}
+
+function selectPreparationPackage(id) {
+  state.selectedPreparationId = Number(id);
+  persistSelectedPreparation();
+  renderPreparationQueue();
+}
+
+function persistSelectedPreparation() {
+  const url = new URL(window.location.href);
+  if (state.selectedPreparationId) url.searchParams.set("application_id", String(state.selectedPreparationId));
+  else url.searchParams.delete("application_id");
+  window.history.replaceState({}, "", url);
+}
+
+function preparationNextAction(item) {
+  const applicationStatus = String(item.job?.status || "").toLowerCase();
+  if (applicationStatus === "applied") return "Application recorded as submitted. Track the employer response here.";
+  if (applicationStatus === "interview") return "Interview stage recorded. Continue tracking the employer response here.";
+  if (applicationStatus === "offer") return "Offer stage recorded. Review and update the application outcome here.";
+  if (applicationStatus === "rejected") return "Application marked rejected. Keep the package for reference or archive it.";
+  if (applicationStatus === "archived") return "Application archived. Restore the job status if you need to continue tracking it.";
+  if (item.status === "approved") return "Package approved. Submit manually, then record the outcome here.";
+  if (item.status === "ready_for_review") return "Review the documents and Keywords Score, then approve this package.";
+  if (item.status === "preparing") return "Documents are being generated. Return here when preparation completes.";
+  if (item.status === "failed") return "Resolve the preparation error and retry this package.";
+  if (item.status === "queued") return item.review_status === "manual_eligibility" ? "Confirm Canadian eligibility before starting preparation." : "Start preparation when you are ready to generate the package.";
+  return "Review this application package and choose the next action.";
+}
+
+function renderApplicationStatusControls(item) {
+  const status = item.job?.status || "Saved";
+  const options = [{ value: "shortlisted", label: "Shortlisted" }, { value: "Applied", label: "Applied" }, { value: "Interview", label: "Interview" }, { value: "Offer", label: "Offer" }, { value: "Rejected", label: "Rejected" }, { value: "Archived", label: "Archived" }].map(({ value, label }) => `<option value="${value}" ${value === status ? "selected" : ""}>${label}</option>`).join("");
+  return `<section class="application-tracking"><h4>After manual application</h4><p class="muted">Approval does not submit anything. Record the outcome only after you apply yourself.</p><div class="application-status-controls"><select id="application-status-${item.id}" aria-label="Application status">${options}</select><button class="button small" type="button" onclick="updateApplicationStatus(${item.id})">Save status</button></div></section>`;
+}
+
+async function updateApplicationStatus(id) {
+  const select = document.getElementById(`application-status-${id}`);
+  if (!select) return;
+  if (select.value === "Applied" && !window.confirm("Confirm that you manually submitted this application?")) return;
+  try {
+    await api.send(`/api/preparation/${id}/application-status`, "POST", { status: select.value });
+    await loadPreparationQueue();
+    toast(`Application status updated to ${select.value}`);
+  } catch (error) { toast(error.message); }
 }
 
 function renderPreparationPreview(item) {

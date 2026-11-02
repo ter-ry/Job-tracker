@@ -72,7 +72,7 @@ from werkzeug.utils import secure_filename
 from db.migrations import run_migrations
 from profile_store import CandidateProfileStore
 from services.document_generation import DocumentGenerationService
-from resume_layout import compare_docx_layout, export_docx_to_pdf
+from resume_layout import compare_docx_layout, compare_docx_layout_and_export, export_docx_to_pdf
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -1034,7 +1034,8 @@ def create_app() -> Flask:
         preview_meta = preview_pdf.with_suffix(".meta.json")
         preview_pdf.parent.mkdir(parents=True, exist_ok=True)
         draft_version = tailoring_draft_version(draft_path)
-        layout = validate_tailoring_draft_layout(draft_id, expected_version=draft_version)
+        stored_layout = parse_json_object(row["layout_json"])
+        layout = stored_layout if stored_layout.get("draft_version") == draft_version and stored_layout.get("available") and stored_layout.get("verified") else pending_tailoring_layout(draft_version)
         pdf = {"available": False, "reason": layout.get("reason") or "Word layout validation is unavailable."}
         pdf_cached = False
         pdf_generation_ms = 0.0
@@ -1048,18 +1049,28 @@ def create_app() -> Flask:
             if preview_pdf.is_file() and cached_version == draft_version:
                 pdf = {"available": True, "path": str(preview_pdf), "cached": True}
                 pdf_cached = True
-            else:
-                export_started = time.perf_counter()
-                pdf = export_docx_to_pdf(draft_path, preview_pdf)
-                pdf_generation_ms = round((time.perf_counter() - export_started) * 1000, 2)
-                pdf.setdefault("timings_ms", {})["pdf_generation"] = pdf_generation_ms
-                if pdf.get("available") and tailoring_draft_version(draft_path) == draft_version:
+                layout = {**layout, "cached": True, "timings_ms": {**(layout.get("timings_ms") or {}), "word_layout_validation": 0.0, "pdf_generation": 0.0}}
+        if not pdf_cached:
+            export_started = time.perf_counter()
+            combined = compare_docx_layout_and_export(safe_local_path(text(row["source_path"])), draft_path, preview_pdf)
+            combined_elapsed_ms = round((time.perf_counter() - export_started) * 1000, 2)
+            if combined.get("available"):
+                combined_timings = combined.get("timings_ms") if isinstance(combined.get("timings_ms"), dict) else {}
+                pdf_generation_ms = float(combined_timings.get("pdf_generation") or 0.0)
+                layout = {**combined, "draft_version": draft_version, "timings_ms": {"word_layout_validation": float(combined_timings.get("word_layout_validation") or combined_elapsed_ms), "pdf_generation": pdf_generation_ms, "word_operation_total": float(combined_timings.get("total") or combined_elapsed_ms)}}
+                pdf = {"available": bool(combined.get("verified")), "path": str(preview_pdf), "cached": False, "reason": combined.get("reason")}
+                if tailoring_draft_version(draft_path) == draft_version:
+                    get_db().execute("UPDATE tailoring_drafts SET layout_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND draft_path = ?", [dumps_json(layout), draft_id, str(draft_path)])
+                    get_db().commit()
                     try:
                         preview_meta.write_text(json.dumps({"draft_version": draft_version}), encoding="utf-8")
                     except OSError:
                         pass
-                elif pdf.get("available"):
+                else:
                     pdf = {"available": False, "reason": "The résumé draft changed while the PDF preview was generated. Refresh and try again."}
+            else:
+                pdf_generation_ms = combined_elapsed_ms
+                pdf = {"available": False, "reason": combined.get("reason") or "Word layout validation and PDF export failed."}
         text_started = time.perf_counter()
         preview_text = extract_docx_text(draft_path.read_bytes())
         text_ms = round((time.perf_counter() - text_started) * 1000, 2)
@@ -1779,6 +1790,36 @@ def create_app() -> Flask:
             if not all(safe_preparation_artifact_path(row[field]) and safe_preparation_artifact_path(row[field]).is_file() for field in ("prepared_resume_path", "prepared_cover_letter_path")):
                 return jsonify({"error": "A generated document for this package is no longer available"}), 409
         return jsonify(_update_preparation_item(item_id, status=status, review_status=review_status))
+
+    @app.post("/api/preparation/<int:item_id>/application-status")
+    def update_preparation_application_status(item_id: int) -> Response:
+        """Update the underlying job's application status from the workspace.
+
+        Preparation state remains owned by the queue. This endpoint only provides
+        the explicit, in-context tracking action after the user has reviewed the
+        package; it never submits an application or changes package approval.
+        """
+        row = query_db("SELECT * FROM application_preparation_queue WHERE id = ?", [item_id], one=True)
+        if row is None:
+            return jsonify({"error": "Application package was not found"}), 404
+        payload = request.get_json(silent=True) or {}
+        requested = text(payload.get("status"))
+        allowed = {"shortlisted", "Drafting", "Applied", "Interview", "Offer", "Rejected", "Archived"}
+        if requested not in allowed:
+            return jsonify({"error": "Choose a valid application status"}), 400
+        job = query_db("SELECT * FROM jobs WHERE id = ?", [row["job_id"]], one=True)
+        if job is None:
+            return jsonify({"error": "The job associated with this package was not found"}), 404
+        updates = [requested]
+        sql = "UPDATE jobs SET status = ?, updated_at = CURRENT_TIMESTAMP"
+        if requested == "Applied":
+            sql += ", date_applied = ?"
+            updates.append(date.today().isoformat())
+        sql += " WHERE id = ?"
+        updates.append(int(row["job_id"]))
+        get_db().execute(sql, updates)
+        get_db().commit()
+        return jsonify(preparation_queue_to_dict(query_db("SELECT * FROM application_preparation_queue WHERE id = ?", [item_id], one=True)))
 
     @app.post("/api/preparation/<int:item_id>/eligibility-review")
     def review_preparation_eligibility(item_id: int) -> Response:
@@ -3223,6 +3264,22 @@ def resolve_generation_profile(payload: dict[str, Any] | None) -> dict[str, Any]
         "_resume_document_id": int((resume or {}).get("id") or 0),
         "_cover_letter_template_id": int((cover or {}).get("id") or 0),
     })
+    # Model configuration is an application preference, not candidate
+    # identity or résumé evidence. Reuse the active profile's local Ollama
+    # settings for reusable candidate profiles so selecting a profile does not
+    # silently disable the configured local generator.
+    active_profile = load_profile()
+    for setting in (
+        "cover_letter_no_dashes",
+        "ollama_enabled",
+        "ollama_base_url",
+        "ollama_model",
+        "ollama_timeout_seconds",
+        "ollama_max_output_tokens",
+        "ollama_max_prompt_chars",
+    ):
+        if text(active_profile.get(setting)):
+            profile[setting] = text(active_profile.get(setting))
     if structured_resume.get("summary"):
         profile["_source_summary"] = structured_resume["summary"]
     profile["_resume_sections"] = [
@@ -3965,6 +4022,7 @@ def build_format_preserving_cover_letter(
     output: dict[str, Any],
     cover_path: Path,
 ) -> dict[str, Any]:
+    generation_source = "local_ollama" if (output.get("ollama_debug") or {}).get("suggestion_ok") else "deterministic_fallback"
     template_raw = text(profile.get("cover_letter_docx_template_path"))
     template_path = safe_local_path(template_raw)
     if not template_raw:
@@ -3978,6 +4036,7 @@ def build_format_preserving_cover_letter(
                 "applied": [],
                 "skipped": [],
                 "template_mode": "standard",
+                "generation_source": generation_source,
             },
         }
     if template_path is None or not template_path.exists():
@@ -3990,6 +4049,7 @@ def build_format_preserving_cover_letter(
                 "applied": [],
                 "skipped": [{"kind": "cover_letter_template", "original": "", "replacement": "", "reason": "Selected DOCX template is unavailable."}],
                 "template_mode": "template_unavailable",
+                "generation_source": generation_source,
             },
         }
 
@@ -4008,6 +4068,7 @@ def build_format_preserving_cover_letter(
                 "applied": [],
                 "skipped": [{"kind": "cover_letter_template", "original": "", "replacement": "", "reason": template_warning or "Template rejected."}],
                 "template_mode": "template_rejected",
+                "generation_source": generation_source,
             },
         }
     change_log = apply_cover_letter_template(document, job, profile, output)
@@ -4022,6 +4083,7 @@ def build_format_preserving_cover_letter(
                 "applied": [],
                 "skipped": change_log.get("skipped", [{"kind": "cover_letter_template", "original": "", "replacement": "", "reason": "No safe template adaptation was applied."}]),
                 "template_mode": "template_rejected",
+                "generation_source": generation_source,
             },
         }
     if str(profile.get("cover_letter_no_dashes", "true")).strip().lower() not in {"0", "false", "no", "off"}:
@@ -4041,6 +4103,7 @@ def build_format_preserving_cover_letter(
                 "applied": [],
                 "skipped": [{"kind": "template_validation", "original": "", "replacement": "", "reason": "Keyword-dump content detected after adaptation."}],
                 "template_mode": "template_rejected",
+                "generation_source": generation_source,
             },
         }
     residual = find_unreplaced_template_content(
@@ -4060,6 +4123,7 @@ def build_format_preserving_cover_letter(
                 "applied": [],
                 "skipped": [{"kind": "template_residual", "original": residual, "reason": "Source template content remained in the generated document."}],
                 "template_mode": "template_rejected",
+                "generation_source": generation_source,
             },
         }
     return {
@@ -4069,6 +4133,7 @@ def build_format_preserving_cover_letter(
             "master_cover_letter_path": str(template_path),
             "output_path": str(cover_path),
             **change_log,
+            "generation_source": generation_source,
         },
     }
 
@@ -4217,6 +4282,7 @@ def build_generation_debug_payload(
             "status": text(cover_result.get("status")),
             "error": text(cover_result.get("error")),
             "output_path": str(cover_path),
+            "generation_source": text((cover_result.get("change_log") or {}).get("generation_source")),
         },
         "profile_hash": build_candidate_evidence(profile)["hash"],
         "job_company": text(job.get("company")),
@@ -4403,7 +4469,7 @@ def build_cover_letter_section_map(
     evidence_paragraphs = [clean_cover_letter_evidence_sentence(item) for item in evidence_paragraphs if clean_cover_letter_evidence_sentence(item)]
     if not evidence_paragraphs:
         evidence_paragraphs = [select_concrete_evidence_sentence(candidate_evidence)] if select_concrete_evidence_sentence(candidate_evidence) else []
-    concrete_example = evidence_paragraphs[0]
+    concrete_example = evidence_paragraphs[0] if evidence_paragraphs else "My experience includes building reliable software tools and data workflows."
     supporting_example = evidence_paragraphs[1] if len(evidence_paragraphs) > 1 else ""
     if supported_terms:
         opening = f"I am pleased to apply for the {title} role at {company}. My experience with {short_join(supported_terms)} includes building and supporting software tools and data workflows relevant to this role."
@@ -4436,9 +4502,15 @@ def build_job_motivation(job: dict[str, Any], candidate_evidence: dict[str, Any]
     company = text(job.get("company")) or "the company"
     description = text(job.get("job_description"))
     company_lower = company.lower()
+    motivation_exclusions = (
+        "salary", "compensation", "benefits", "vacation", "bonus", "equal opportunity",
+        "accommodation", "background check", "how to apply", "apply now", "privacy policy",
+    )
     for sentence in split_sentences(description):
         clean = normalize_space(sentence).rstrip(".")
         if company_lower not in clean.lower() or len(clean.split()) < 8:
+            continue
+        if any(marker in clean.lower() for marker in motivation_exclusions):
             continue
         match = re.match(
             rf"^{re.escape(company)}(?:\s*\([^)]*\))?\s+((?:is|provides|develops|builds|offers|delivers)\s+.+)$",
@@ -4586,7 +4658,11 @@ def refresh_cover_letter_identity(
             })
 
 
-def render_cover_letter_template_by_structure(document: Document, section_map: dict[str, str]) -> dict[str, list[dict[str, Any]]]:
+def render_cover_letter_template_by_structure(
+    document: Document,
+    section_map: dict[str, str],
+    ai_sections: dict[str, Any] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
     """Refresh a plain cover-letter template while preserving its paragraph layout."""
     paragraphs = list(document.paragraphs)
     nonempty = [(index, paragraph) for index, paragraph in enumerate(paragraphs) if normalize_space(paragraph.text)]
@@ -4672,16 +4748,28 @@ def render_cover_letter_template_by_structure(document: Document, section_map: d
     preserved_body: list[dict[str, Any]] = []
     body_replacements: dict[int, tuple[str, str]] = {}
     paragraph_by_index = dict(nonempty)
+    ai_sections = ai_sections or {}
+    ai_experience = [text(item) for item in ai_sections.get("experience_paragraphs", []) if text(item)]
     if body_indexes:
         opening_index = body_indexes[0]
         opening_original = paragraph_by_index_text(document, opening_index)
-        opening = adapt_cover_letter_opening(opening_original, section_map)
+        opening = text(ai_sections.get("opening")) or adapt_cover_letter_opening(opening_original, section_map)
         body_replacements[opening_index] = (opening, "Updated the prior application title and company while preserving the source opening.")
+    if ai_experience:
+        # Replace only the first available evidence paragraphs. The remaining
+        # source paragraphs stay intact, preserving the approved template's
+        # writing and formatting without allowing an AI response to rewrite the
+        # whole document.
+        for index, paragraph_text in zip(body_indexes[1:-1], ai_experience[: max(0, len(body_indexes) - 2)]):
+            body_replacements[index] = (
+                paragraph_text,
+                "Replaced a source experience paragraph with grounded local AI wording for this job.",
+            )
     if len(body_indexes) > 1:
         motivation_index = body_indexes[-1]
         motivation_original = paragraph_by_index_text(document, motivation_index)
         body_replacements[motivation_index] = (
-            section_map.get("motivation", section_map.get("fit", "")),
+            text(ai_sections.get("motivation")) or section_map.get("motivation", section_map.get("fit", "")),
             "Replaced the prior employer specific motivation with job description grounded motivation.",
         )
     for index in body_indexes:
@@ -4881,8 +4969,15 @@ def apply_cover_letter_template(
     generated_sections = tailoring_plan.get("cover_letter_paragraphs") or []
     candidate_evidence = output.get("candidate_evidence") or build_candidate_evidence(profile)
     section_map = build_cover_letter_section_map(profile, job, list(output.get("supported_keywords", [])[:4]), candidate_evidence)
+    ai_sections = tailoring_plan.get("cover_letter_ai_sections") or {}
+    if ai_sections:
+        section_map["opening"] = text(ai_sections.get("opening")) or section_map["opening"]
+        section_map["experience"] = "\n\n".join(text(item) for item in ai_sections.get("experience_paragraphs", []) if text(item)) or section_map["experience"]
+        section_map["motivation"] = text(ai_sections.get("motivation")) or section_map["motivation"]
+        section_map["fit"] = section_map["motivation"]
+        section_map["closing"] = text(ai_sections.get("closing")) or section_map["closing"]
     has_placeholders = any(marker in paragraph.text for paragraph in iter_document_paragraphs(document) for marker in ("{{DATE}}", "{{COMPANY}}", "{{LOCATION}}", "{{JOB_TITLE}}", "{{HIRING_MANAGER}}", "{{OPENING_PARAGRAPH}}", "{{EXPERIENCE_PARAGRAPH}}", "{{FIT_PARAGRAPH}}", "{{CLOSING_PARAGRAPH}}"))
-    if generated_sections and has_placeholders:
+    if generated_sections and has_placeholders and not ai_sections:
         if len(generated_sections) > 4:
             section_map["opening"] = generated_sections[4]
         if len(generated_sections) > 5:
@@ -4933,7 +5028,7 @@ def apply_cover_letter_template(
             skipped.append({"kind": "placeholder", "original": original, "replacement": replacement, "reason": "Template marker present but paragraph did not match."})
     refresh_cover_letter_identity(document, section_map, applied)
     if not has_placeholders:
-        return render_cover_letter_template_by_structure(document, section_map)
+        return render_cover_letter_template_by_structure(document, section_map, ai_sections=ai_sections)
     return {
         "applied": applied,
         "skipped": skipped,
@@ -8885,6 +8980,7 @@ def generate_application_materials(
         prompt_payload = {
             "max_output_tokens": ollama_config.max_output_tokens,
             "selected_evidence_ids": [text(item.get("id")) for item in selected_approved_evidence if item.get("id") is not None],
+            "original_cover_letter_body": extract_cover_letter_template_body(profile),
         }
         ollama_response = request_json_completion(
             ollama_config,
@@ -8900,9 +8996,12 @@ def generate_application_materials(
             ollama_debug["validation_error"] = text(ollama_validation.get("error"))
             ollama_debug["used_fallback"] = not bool(ollama_validation.get("ok"))
             if ollama_validation.get("ok"):
-                suggestion = text(ollama_validation.get("suggestion"))
-                if suggestion:
-                    cover_letter = suggestion
+                if ollama_validation.get("sections"):
+                    tailoring_plan["cover_letter_ai_sections"] = ollama_validation["sections"]
+                    cover_letter = compose_ai_cover_letter(profile, job, ollama_validation["sections"])
+                else:
+                    cover_letter = text(ollama_validation.get("suggestion"))
+                if cover_letter:
                     cover_validation = validate_cover_letter_output(cover_letter, candidate_evidence, job)
     if str(profile.get("cover_letter_no_dashes", "true")).strip().lower() not in {"0", "false", "no", "off"}:
         cover_letter = re.sub(r"(?<=\d)[-–—](?=\d)", " to ", cover_letter)
@@ -9657,7 +9756,108 @@ def run_tailoring_ai_job(job_id: str, config: OllamaConfig, prompt: str, origina
             TAILORING_AI_JOBS[job_id]["finished_monotonic"] = time.monotonic()
     TAILORING_AI_INFERENCE_SLOT.release()
 
+def extract_cover_letter_template_body(profile: dict[str, Any]) -> str:
+    raw_path = text(profile.get("cover_letter_docx_template_path"))
+    path = safe_local_path(raw_path)
+    if path is None or not path.is_file():
+        return ""
+    try:
+        document = Document(path)
+        return "\n\n".join(
+            normalize_space(paragraph.text)
+            for paragraph in iter_document_paragraphs(document)
+            if normalize_space(paragraph.text)
+        )
+    except (OSError, ValueError, zipfile.BadZipFile):
+        return ""
+
+
+def clean_cover_letter_job_description(job: dict[str, Any]) -> str:
+    """Keep role evidence while removing common recruitment boilerplate."""
+    fields = [
+        text(job.get("job_description")),
+        text(job.get("responsibilities")),
+        text(job.get("required_skills")),
+        text(job.get("preferred_skills")),
+    ]
+    boilerplate = (
+        "equal opportunity", "accommodation", "benefits", "compensation", "salary",
+        "vacation", "bonus", "background check", "how to apply", "apply now",
+        "privacy policy", "recruitment agency", "we thank all applicants",
+    )
+    kept: list[str] = []
+    seen: set[str] = set()
+    for field in fields:
+        for sentence in split_sentences(field) or [normalize_space(field)]:
+            clean = normalize_space(sentence)
+            if not clean or any(marker in clean.lower() for marker in boilerplate):
+                continue
+            key = clean.lower()
+            if key not in seen:
+                seen.add(key)
+                kept.append(clean)
+    return "\n".join(kept)[:18000]
+
+
+def compose_ai_cover_letter(profile: dict[str, Any], job: dict[str, Any], sections: dict[str, Any]) -> str:
+    company = text(job.get("company")) or "the company"
+    title = text(job.get("title")) or "the role"
+    location = text(job.get("location"))
+    experience = sections.get("experience_paragraphs") or []
+    if not isinstance(experience, list):
+        experience = [experience]
+    body = [
+        format_cover_letter_date(date.today()),
+        f"{company}, {location}" if location else company,
+        text(sections.get("greeting")) or f"Dear {company} Hiring Team,",
+        f"Re: Application for {title}",
+        text(sections.get("opening")),
+        *[text(item) for item in experience if text(item)],
+        text(sections.get("motivation")),
+        text(sections.get("closing")) or f"Thank you for your consideration. I would welcome the chance to discuss how I can contribute to {company}.",
+        "Sincerely,",
+        text(profile.get("name")),
+    ]
+    return "\n\n".join(item for item in body if item)
+
+
 def build_ollama_prompt(kind: str, job: dict[str, Any], evidence: dict[str, Any], payload: dict[str, Any]) -> str:
+    if kind == "cover_letter":
+        return json.dumps(
+            {
+                "task": "Adapt the candidate's existing cover letter template for this one job.",
+                "job": {
+                    "company": text(job.get("company")),
+                    "title": text(job.get("title")),
+                    "location": text(job.get("location")),
+                    "full_relevant_job_description": clean_cover_letter_job_description(job),
+                },
+                "candidate": {
+                    "verified_resume_evidence": [
+                        {"section": item.get("field", "Résumé"), "text": item.get("text", "")}
+                        for item in evidence.get("sections", [])
+                        if item.get("field") in {"work_experience", "projects", "education", "skills"}
+                    ],
+                    "original_cover_letter_body": text(payload.get("original_cover_letter_body")),
+                },
+                "output_schema": {
+                    "opening": "A concise application introduction naming the exact role and employer.",
+                    "experience_paragraphs": ["One or two paragraphs using only the strongest verified evidence."],
+                    "motivation": "One paragraph connecting actual job responsibilities to verified candidate evidence, never compensation or benefits.",
+                    "closing": "A concise professional closing.",
+                },
+                "rules": [
+                    "Return one JSON object only. No markdown or reasoning.",
+                    "Use the original cover letter as a style and structure reference, not as factual evidence.",
+                    "Select two or three concrete responsibilities from the full job description and connect each to the same employer or project where the evidence occurred.",
+                    "Preserve verified employers, projects, technologies, achievements and quantified results; never combine facts across employers or invent qualifications.",
+                    "Do not mention salary, compensation, benefits, vacation, or recruitment boilerplate.",
+                    "Write natural complete sentences. Do not repeat the same keyword alignment in adjacent paragraphs.",
+                    "Do not use hyphens, en dashes, or em dashes. Express numeric ranges with the word to.",
+                ],
+            },
+            indent=2,
+        )
     return json.dumps(
         {
             "kind": kind,
@@ -9680,6 +9880,36 @@ def build_ollama_prompt(kind: str, job: dict[str, Any], evidence: dict[str, Any]
 
 
 def validate_ollama_suggestion(kind: str, data: dict[str, Any], job: dict[str, Any], evidence: dict[str, Any]) -> dict[str, Any]:
+    if kind == "cover_letter" and isinstance(data, dict) and isinstance(data.get("experience_paragraphs"), list):
+        sections = {
+            "opening": text(data.get("opening")),
+            "experience_paragraphs": [text(item) for item in data.get("experience_paragraphs", []) if text(item)],
+            "motivation": text(data.get("motivation")),
+            "closing": text(data.get("closing")),
+            "greeting": text(data.get("greeting")),
+        }
+        if not sections["opening"] or not sections["experience_paragraphs"] or not sections["motivation"]:
+            return {"ok": False, "error": "Ollama returned incomplete structured cover letter sections.", "suggestion": ""}
+        assembled = "\n\n".join([sections["opening"], *sections["experience_paragraphs"], sections["motivation"], sections["closing"]])
+        forbidden = ("salary", "compensation", "benefits", "vacation", "bonus")
+        if any(term in sections["motivation"].lower() for term in forbidden):
+            return {"ok": False, "error": "Ollama selected compensation or benefits language as employer motivation.", "suggestion": ""}
+        # The role title can contain a number (for example, "Developer 1").
+        # Validate quantified claims in the evidence and motivation body, not
+        # job metadata that the generator is required to repeat.
+        claim_text = "\n\n".join([*sections["experience_paragraphs"], sections["motivation"]])
+        if extract_quantified_tokens(claim_text) - extract_quantified_tokens(evidence.get("full_text", "")):
+            return {"ok": False, "error": "Ollama introduced an unsupported quantified claim.", "suggestion": ""}
+        # Validate candidate claims separately from the required application
+        # metadata in the opening (role and employer names may not be resume
+        # evidence and must not be treated as invented technical claims).
+        validation_body = "\n\n".join([*sections["experience_paragraphs"], sections["motivation"], sections["closing"]])
+        validation = validate_cover_letter_output(validation_body, evidence, job)
+        if not validation.get("ok"):
+            return {"ok": False, "error": "; ".join(validation.get("conflicting_phrases", [])) or "Ollama cover letter failed grounding validation.", "suggestion": ""}
+        if text(job.get("company")).lower() not in assembled.lower() or text(job.get("title")).lower() not in assembled.lower():
+            return {"ok": False, "error": "Ollama cover letter missed the exact employer or role.", "suggestion": ""}
+        return {"ok": True, "error": "", "suggestion": assembled, "sections": sections}
     suggestion = text(data.get("suggestion") or data.get("text") or "")
     if not suggestion:
         return {"ok": False, "error": "Ollama returned no suggestion.", "suggestion": ""}

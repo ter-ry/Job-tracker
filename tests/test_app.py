@@ -696,15 +696,17 @@ class JobAssistantTest(unittest.TestCase):
             Path(output).write_bytes(b"%PDF-1.7 performance QA")
             return {"available": True, "path": str(output)}
 
-        with patch.object(app_module, "compare_docx_layout", return_value=layout) as compare_mock:
-            with patch.object(app_module, "export_docx_to_pdf", side_effect=fake_export) as export_mock:
+        def fake_combined(_source, _candidate, output):
+            Path(output).write_bytes(b"%PDF-1.7 performance QA")
+            return {**layout, "available": True, "verified": True, "pdf_path": str(output)}
+
+        with patch.object(app_module, "compare_docx_layout_and_export", side_effect=fake_combined) as combined_mock:
                 first_preview = self.client.get(f"/api/tailoring/drafts/{draft_id}/preview").get_json()
                 second_preview = self.client.get(f"/api/tailoring/drafts/{draft_id}/preview").get_json()
         self.assertTrue(first_preview["pdf_available"])
         self.assertFalse(first_preview["cached"])
         self.assertTrue(second_preview["cached"])
-        self.assertEqual(compare_mock.call_count, 1)
-        self.assertEqual(export_mock.call_count, 1)
+        self.assertEqual(combined_mock.call_count, 1)
         self.assertGreaterEqual(first_preview["timings_ms"]["preview_total"], 0)
 
         with patch.object(app_module, "compare_docx_layout", return_value=layout) as compare_after_change:
@@ -714,13 +716,11 @@ class JobAssistantTest(unittest.TestCase):
             })
         self.assertEqual(changed.status_code, 200, changed.get_json())
         self.assertFalse(compare_after_change.called)
-        with patch.object(app_module, "compare_docx_layout", return_value=layout) as compare_after_version:
-            with patch.object(app_module, "export_docx_to_pdf", side_effect=fake_export) as export_after_version:
+        with patch.object(app_module, "compare_docx_layout_and_export", side_effect=fake_combined) as combined_after_version:
                 refreshed_preview = self.client.get(f"/api/tailoring/drafts/{draft_id}/preview").get_json()
         self.assertTrue(refreshed_preview["pdf_available"])
         self.assertFalse(refreshed_preview["cached"])
-        self.assertEqual(compare_after_version.call_count, 1)
-        self.assertEqual(export_after_version.call_count, 1)
+        self.assertEqual(combined_after_version.call_count, 1)
 
     def test_tailoring_workspace_reports_missing_description_then_uses_persisted_description(self):
         profile = self.client.post("/api/candidate-profiles", json={"name": "Lakeview QA"}).get_json()
@@ -786,8 +786,7 @@ class JobAssistantTest(unittest.TestCase):
         job = self.client.post("/api/jobs", json={"company": "Example", "title": "Developer", "job_description": "Python and REST APIs"}).get_json()
         workspace = self.client.get(f"/api/tailoring/{job['id']}/workspace?candidate_profile_id={profile['id']}&resume_id={resume['id']}").get_json()
         config = app_module.OllamaConfig(True, "http://ollama", "qwen3:4b", 10, 100, 1000)
-        with patch.object(app_module, "compare_docx_layout", return_value={"available": False, "verified": False, "reason": "Microsoft Word unavailable"}):
-            with patch.object(app_module, "export_docx_to_pdf", return_value={"available": False, "reason": "Microsoft Word unavailable"}):
+        with patch.object(app_module, "compare_docx_layout_and_export", return_value={"available": False, "verified": False, "reason": "Microsoft Word unavailable"}):
                 preview_response = self.client.get(f"/api/tailoring/drafts/{workspace['draft']['id']}/preview")
         self.assertEqual(preview_response.status_code, 200, preview_response.get_json())
         self.assertFalse(preview_response.get_json()["pdf_available"])
@@ -2639,6 +2638,28 @@ class JobAssistantTest(unittest.TestCase):
         self.assertTrue(result["page_mismatch"])
         self.assertTrue(result["line_mismatches"])
 
+    def test_word_layout_measurement_cache_uses_content_fingerprint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "resume.docx"
+            path.write_bytes(f"stable document {time.time_ns()}".encode())
+            measurement = {"available": True, "pages": 1, "paragraphs": [{"index": 0, "lines": 1}]}
+            with patch.object(resume_layout, "_run_word", return_value=(measurement, None)) as run_word:
+                first = resume_layout.measure_docx_layout(path)
+                second = resume_layout.measure_docx_layout(path)
+            self.assertTrue(first["available"])
+            self.assertTrue(second["cached"])
+            self.assertEqual(run_word.call_count, 1)
+            path.write_bytes(f"changed document {time.time_ns()}".encode())
+            with patch.object(resume_layout, "_run_word", return_value=(measurement, None)) as changed_run:
+                resume_layout.measure_docx_layout(path)
+            self.assertEqual(changed_run.call_count, 1)
+
+    def test_application_workspace_header_keeps_existing_queue_as_single_workflow(self):
+        html = self.client.get("/").data.decode("utf-8")
+        self.assertIn('data-tab="shortlist" type="button">Application workspace', html)
+        self.assertIn("Discover in Pipeline, prepare and tailor here", html)
+        self.assertIn('class="application-workflow-rail"', html)
+
     def test_keyword_coverage_deduplicates_aliases_and_warns_on_unsupported_groups(self):
         job = {"title": "Software Engineer", "required_skills": "NodeJS, Node.js, Kubernetes, database design", "preferred_skills": "Postgres, PostgreSQL"}
         profile = {"work_experience": "Built NodeJS services with SQL reporting.", "key_skills": "NodeJS, SQL"}
@@ -3088,6 +3109,98 @@ class JobAssistantTest(unittest.TestCase):
         self.assertTrue(any("Flowtally" in item["original"] for item in artifact["change_log"]["preserved"]))
         self.assertTrue(any("Pinterest" in item["original"] and "Gatekeeper" in item["replacement"] for item in artifact["change_log"]["applied"]))
 
+    def test_cover_letter_ollama_prompt_contains_full_relevant_job_and_template_body(self):
+        job = {
+            "company": "Intuit",
+            "title": "Software Developer 1",
+            "location": "Toronto, Ontario",
+            "job_description": (
+                "Build backend services with Python and REST APIs. Work with product and design partners. "
+                "Salary and benefits are competitive. Equal opportunity employer."
+            ),
+            "responsibilities": "Implement validation, testing, and maintainable data workflows.",
+        }
+        evidence = grounding.build_candidate_evidence({
+            "work_experience": "Built Python services and validation workflows.",
+            "projects": "Flowtally project: implemented REST APIs and 25+ automated backend tests.",
+            "resume_text": "Built Python services and validation workflows. Implemented REST APIs and 25+ automated backend tests.",
+        })
+        prompt = app_module.build_ollama_prompt(
+            "cover_letter",
+            job,
+            evidence,
+            {"original_cover_letter_body": "I am pleased to apply for a software role."},
+        )
+        self.assertIn("Build backend services with Python and REST APIs", prompt)
+        self.assertIn("Implement validation, testing", prompt)
+        self.assertIn("original_cover_letter_body", prompt)
+        self.assertIn("experience_paragraphs", prompt)
+        self.assertNotIn("Salary and benefits are competitive", prompt)
+        self.assertIn("Do not mention salary", prompt)
+
+    def test_structured_ai_sections_reach_plain_docx_template(self):
+        source = Path(self.tmpdir.name) / "plain_structured_ai_template.docx"
+        document = Document()
+        for value in [
+            "Terry Mak", "October 1, 2026", "Hiring Manager", "Old Company", "Toronto, Ontario",
+            "Re: Old Role", "Dear Hiring Manager,", "Old opening paragraph.",
+            "Old experience paragraph one.", "Old experience paragraph two.",
+            "Old employer motivation.", "Thank you for your consideration.", "Sincerely,", "Terry Mak",
+        ]:
+            document.add_paragraph(value)
+        document.save(source)
+        output_path = Path(self.tmpdir.name) / "plain_structured_ai_output.docx"
+        profile = {
+            "name": "Terry Mak",
+            "email": "terry@example.com",
+            "cover_letter_docx_template_path": str(source),
+            "cover_letter_no_dashes": "true",
+        }
+        job = {
+            "company": "Intuit",
+            "title": "Software Developer 1",
+            "location": "Toronto, Ontario",
+            "job_description": "Build Python backend services and automated tests.",
+        }
+        output = {
+            "cover_letter": "fallback",
+            "candidate_evidence": grounding.build_candidate_evidence({"work_experience": "Built Python services."}),
+            "tailoring_plan": {
+                "cover_letter_ai_sections": {
+                    "opening": "I am pleased to apply for the Software Developer 1 position at Intuit.",
+                    "experience_paragraphs": [
+                        "At Flowtally, I built Python services and implemented REST APIs.",
+                        "I added 25+ automated backend tests to validate reporting workflows.",
+                    ],
+                    "motivation": "Intuit's focus on reliable backend services and testing matches this verified experience.",
+                    "closing": "Thank you for considering my application.",
+                }
+            },
+        }
+        artifact = app_module.build_format_preserving_cover_letter(job, profile, output, output_path)
+        self.assertEqual(artifact["status"], "generated", artifact)
+        text = "\n".join(paragraph.text for paragraph in Document(output_path).paragraphs)
+        self.assertIn("Software Developer 1 position at Intuit", text)
+        self.assertIn("25+ automated backend tests", text)
+        self.assertIn("reliable backend services and testing", text)
+        self.assertNotIn("Old experience paragraph", text)
+        self.assertEqual(artifact["change_log"]["generation_source"], "deterministic_fallback")
+
+    def test_structured_ollama_cover_letter_rejects_compensation_and_unsupported_numbers(self):
+        job = {"company": "Intuit", "title": "Software Developer 1", "job_description": "Build Python services."}
+        evidence = grounding.build_candidate_evidence({"projects": "Built Python services and 25+ automated tests across reporting workflows, validation routines, and internal operations tools."})
+        safe = {
+            "opening": "I am pleased to apply for the Software Developer 1 position at Intuit.",
+            "experience_paragraphs": ["I built Python services and 25+ automated tests."],
+            "motivation": "Intuit's focus on reliable Python services matches this verified experience.",
+            "closing": "Thank you for considering my application.",
+        }
+        accepted = app_module.validate_ollama_suggestion("cover_letter", safe, job, evidence)
+        self.assertTrue(accepted["ok"], accepted)
+        unsafe = dict(safe, motivation="The salary and benefits are attractive and I delivered 99 services.")
+        rejected = app_module.validate_ollama_suggestion("cover_letter", unsafe, job, evidence)
+        self.assertFalse(rejected["ok"])
+
     def test_structured_template_replaces_selected_identity_email_hyperlink(self):
         template = Path(self.tmpdir.name) / "structured_hyperlinked_identity.docx"
         document = Document()
@@ -3247,6 +3360,19 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(lakeview_map["motivation"].lower().count("python"), 1)
         self.assertNotIn("Kafka", lakeview_map["motivation"])
         self.assertNotIn("Kubernetes", lakeview_map["motivation"])
+
+    def test_cover_letter_motivation_ignores_compensation_boilerplate(self):
+        job = {
+            "company": "Intuit",
+            "title": "Software Developer 1",
+            "job_description": (
+                "Intuit offers competitive salary and benefits. Intuit builds backend services and maintains reliable data workflows."
+            ),
+        }
+        motivation = app_module.build_job_motivation(job)
+        self.assertNotIn("salary", motivation.lower())
+        self.assertNotIn("benefits", motivation.lower())
+        self.assertIn("backend services", motivation.lower())
 
     def test_cover_letter_validation_uses_body_boundaries_for_contact_details(self):
         evidence = grounding.build_candidate_evidence(self.software_profile())
@@ -5452,5 +5578,76 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("Number(b.relevance_score ?? 0) - Number(a.relevance_score ?? 0)", frontend)
         self.assertIn("Number(item.relevance_score ?? Number.NEGATIVE_INFINITY) > selectedRelevance", frontend)
         self.assertNotIn("const evidenceScore =", frontend)
+
+    def test_application_workspace_updates_status_only_after_explicit_manual_action(self):
+        job = self.client.post("/api/jobs", json={"company": "Workspace Co", "title": "Developer", "status": "Saved"}).get_json()
+        with app_module.app.app_context():
+            cursor = app_module.get_db().execute(
+                "INSERT INTO application_preparation_queue (job_id, status, review_status) VALUES (?, 'approved', 'approved')",
+                [job["id"]],
+            )
+            app_module.get_db().commit()
+            item_id = cursor.lastrowid
+        response = self.client.post(f"/api/preparation/{item_id}/application-status", json={"status": "Applied"})
+        self.assertEqual(response.status_code, 200, response.get_json())
+        refreshed = self.client.get("/api/jobs").get_json()[0]
+        self.assertEqual(refreshed["status"], "Applied")
+        self.assertTrue(refreshed["date_applied"])
+        self.assertEqual(self.client.post(f"/api/preparation/{item_id}/application-status", json={"status": "Nope"}).status_code, 400)
+
+    def test_application_workspace_has_master_detail_contextual_actions(self):
+        frontend = Path(app_module.BASE_DIR, "static", "app.js").read_text(encoding="utf-8")
+        self.assertIn("application-workspace-grid", frontend)
+        self.assertIn("selectPreparationPackage", frontend)
+        self.assertIn("application_id", frontend)
+        self.assertIn("persistSelectedPreparation", frontend)
+        self.assertIn("preparationNextAction", frontend)
+        self.assertIn("/api/preparation/${id}/application-status", frontend)
+        self.assertIn("Open employer application page", frontend)
+
+    def test_application_workspace_next_action_uses_underlying_job_status(self):
+        frontend = Path(app_module.BASE_DIR, "static", "app.js").read_text(encoding="utf-8")
+        for status in ("applied", "interview", "offer", "rejected", "archived"):
+            self.assertIn(f'applicationStatus === "{status}"', frontend)
+        self.assertIn("Application recorded as submitted", frontend)
+        self.assertIn("Interview stage recorded", frontend)
+        self.assertIn("Offer stage recorded", frontend)
+
+    def test_approved_application_keeps_final_preview_and_download_actions(self):
+        frontend = Path(app_module.BASE_DIR, "static", "app.js").read_text(encoding="utf-8")
+        self.assertIn('item.status === "approved"', frontend)
+        self.assertIn('onclick="previewPreparation(${item.id})"', frontend)
+        self.assertIn('/api/preparation/${item.id}/download/resume', frontend)
+        self.assertIn('/api/preparation/${item.id}/download/cover-letter', frontend)
+
+    def test_word_preview_cache_requires_matching_docx_fingerprints_and_invalidates_on_edit(self):
+        original = Path(self.tmpdir.name) / "original.docx"
+        candidate = Path(self.tmpdir.name) / "candidate.docx"
+        output = Path(self.tmpdir.name) / "preview.pdf"
+        original.write_bytes(b"original-docx")
+        candidate.write_bytes(b"candidate-v1")
+        output.write_bytes(b"stale-pdf")
+        output.with_name(f"{output.name}.fingerprints.json").write_text(json.dumps({"original": "old", "candidate": "old"}), encoding="utf-8")
+        calls = []
+
+        def fake_word(_command, environment):
+            calls.append(environment["JOB_TRACKER_PDF_PATH"])
+            Path(environment["JOB_TRACKER_PDF_PATH"]).write_bytes(b"fresh-pdf")
+            measurement = {"available": True, "pages": 1, "paragraphs": [{"index": 0, "lines": 1}]}
+            return {"available": True, "original": measurement, "candidate": measurement, "timings_ms": {"word_layout_validation": 8.0, "pdf_generation": 12.0, "total": 20.0}}, None
+
+        with patch.object(resume_layout, "_run_word", side_effect=fake_word):
+            first = resume_layout.compare_docx_layout_and_export(original, candidate, output)
+            second = resume_layout.compare_docx_layout_and_export(original, candidate, output)
+            candidate.write_bytes(b"candidate-v2")
+            third = resume_layout.compare_docx_layout_and_export(original, candidate, output)
+        self.assertIn("available", first, first)
+        self.assertFalse(first.get("cached", False), first)
+        self.assertTrue(second.get("cached"), second)
+        self.assertFalse(third.get("cached", False), third)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(output.read_bytes(), b"fresh-pdf")
+        self.assertEqual(third["timings_ms"]["word_layout_validation"], 8.0)
+        self.assertEqual(third["timings_ms"]["pdf_generation"], 12.0)
 if __name__ == "__main__":
     unittest.main()
