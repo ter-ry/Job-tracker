@@ -2029,7 +2029,7 @@ def create_app() -> Flask:
                 geocoding_unknown += 1
             clean["remote_eligibility"], clean["remote_eligibility_explanation"] = discovery_remote_eligibility(clean)
             clean = enrich_discovery_job(clean, profile, {"weights": preferences.get("weights", {}), "remote_rule": preferences.get("sort", {}).get("remote_rule")}, evidence_profile=evidence_profile)
-            clean = apply_discovery_search_constraints(clean, search["remote_preference"])
+            clean = apply_discovery_search_constraints(clean, search["remote_preference"], search["discovery_location"])
             clean["discovery_remote_preference"] = search["remote_preference"]
             clean["remote_search_eligible"] = "true" if clean.get("remote_search_eligible") is True else "false" if clean.get("remote_search_eligible") is False else "unknown"
             clean["discovery_result_category"], clean["discovery_result_reason"] = discovery_result_category(clean, search["remote_preference"])
@@ -2703,7 +2703,7 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         clean, _ = geocode_discovery_job(clean, profile, origin, provider, use_cache=True)
         clean["remote_eligibility"], clean["remote_eligibility_explanation"] = discovery_remote_eligibility(clean)
         clean = enrich_discovery_job(clean, profile, {"remote_rule": "remote_after_local"}, evidence_profile=evidence_profile)
-        clean = apply_discovery_search_constraints(clean, search["remote_preference"])
+        clean = apply_discovery_search_constraints(clean, search["remote_preference"], search["discovery_location"])
         clean["discovery_remote_preference"] = search["remote_preference"]
         clean["remote_search_eligible"] = "true" if clean.get("remote_search_eligible") is True else "false" if clean.get("remote_search_eligible") is False else "unknown"
         clean["discovery_result_category"], clean["discovery_result_reason"] = discovery_result_category(clean, search["remote_preference"])
@@ -7530,10 +7530,19 @@ def enrich_discovery_job(job: dict[str, Any], profile: dict[str, str], settings:
     return enriched
 
 
-def apply_discovery_search_constraints(job: dict[str, Any], remote_preference: str) -> dict[str, Any]:
+def apply_discovery_search_constraints(job: dict[str, Any], remote_preference: str, search_location: str = "") -> dict[str, Any]:
     """Keep remote-only searches from presenting onsite/hybrid jobs as eligible."""
     if normalize_space(text(remote_preference)).lower() != "remote":
         return job
+    if province_code_from_text(search_location) == "ON":
+        ontario_status, ontario_reason = discovery_ontario_eligibility(job)
+        job["ontario_eligibility"] = ontario_status
+        job["ontario_eligibility_explanation"] = ontario_reason
+        if ontario_status == "confirmed_ineligible":
+            job["application_priority_score"] = 0
+            job["remote_search_eligible"] = False
+            job.setdefault("application_priority_reasons", []).append("Excluded from the Ontario remote campaign because the posting explicitly excludes Ontario.")
+            return job
     arrangement = normalize_space(text(job.get("work_arrangement") or job.get("remote_type"))).lower()
     if arrangement not in {"remote", "unknown"}:
         job["application_priority_score"] = 0
@@ -7552,7 +7561,7 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
         if text(job.get("posting_availability")).lower() == "confirmed_closed":
             return "excluded", "Posting is confirmed closed."
         return "actionable", "No remote-only restriction applies."
-    if text(job.get("remote_search_eligible")).lower() == "false" or text(job.get("remote_eligibility")).lower() in {"restricted", "confirmed_ineligible"} or text(job.get("posting_availability")).lower() == "confirmed_closed":
+    if text(job.get("remote_search_eligible")).lower() == "false" or text(job.get("remote_eligibility")).lower() in {"restricted", "confirmed_ineligible"} or text(job.get("ontario_eligibility")).lower() == "confirmed_ineligible" or text(job.get("posting_availability")).lower() == "confirmed_closed":
         return "excluded", "Confirmed onsite, hybrid, ineligible, or closed posting."
     if text(job.get("remote_search_eligible")).lower() == "true" and text(job.get("remote_eligibility")).lower() == "canadian_eligible" and "remote" in text(job.get("remote_type")).lower():
         return "actionable", "Remote arrangement and Canadian eligibility are supported by the posting data."
@@ -8443,7 +8452,7 @@ def job_to_dict(row: sqlite3.Row | None, evidence_profile: dict[str, Any] | None
         data["tailoring_changes"] = load_tailoring_changes(job_id)
         data["generation_debug"] = load_generation_debug(job_id)
         data.update(build_qualification_fit(data, evidence_profile))
-        if text(data.get("discovery_remote_preference")).lower() == "remote" and text(data.get("remote_search_eligible")).lower() == "false":
+        if text(data.get("discovery_remote_preference")).lower() == "remote" and (text(data.get("remote_search_eligible")).lower() == "false" or text(data.get("ontario_eligibility")).lower() == "confirmed_ineligible"):
             data["application_priority_score"] = 0
             reasons = list(data.get("application_priority_reasons") or [])
             if not any("remote-only" in text(reason).lower() for reason in reasons):

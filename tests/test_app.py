@@ -294,11 +294,40 @@ class JobAssistantTest(unittest.TestCase):
     def test_discovery_render_actions_use_stable_job_keys_and_new_scores(self):
         source = (Path(__file__).parents[1] / "static" / "app.js").read_text(encoding="utf-8")
         self.assertIn("function discoveryJobKey(job)", source)
+        self.assertIn('const source = String(job.source || job.source_name || "jobspy")', source)
+        self.assertIn("return `${source}|${identity}`", source)
         self.assertIn('data-discovery-action="save"', source)
         self.assertIn('data-discovery-action="hide"', source)
         self.assertIn('Application Priority', source)
         self.assertNotIn("saveDiscoveryJob(${index})", source)
         self.assertNotIn("hideDiscoveryJob(${index})", source)
+
+    def test_ontario_remote_campaign_excludes_explicit_ontario_restriction(self):
+        excluded = {
+            "remote_type": "Remote",
+            "location": "Canada",
+            "job_description": "Remote Canada except Ontario.",
+            "remote_eligibility": "canadian_eligible",
+            "application_priority_score": 82,
+        }
+        app_module.apply_discovery_search_constraints(excluded, "remote", "Ontario")
+        self.assertEqual(excluded["ontario_eligibility"], "confirmed_ineligible")
+        self.assertFalse(excluded["remote_search_eligible"])
+        self.assertEqual(excluded["application_priority_score"], 0)
+        self.assertEqual(app_module.discovery_result_category(excluded, "remote")[0], "excluded")
+
+        eligible = {
+            "remote_type": "Remote",
+            "location": "Ontario",
+            "job_description": "Remote Ontario.",
+            "remote_eligibility": "canadian_eligible",
+            "application_priority_score": 82,
+        }
+        app_module.apply_discovery_search_constraints(eligible, "remote", "Ontario")
+        self.assertEqual(eligible["ontario_eligibility"], "confirmed_eligible")
+        self.assertTrue(eligible["remote_search_eligible"])
+        self.assertEqual(eligible["application_priority_score"], 82)
+        self.assertEqual(app_module.discovery_result_category(eligible, "remote")[0], "actionable")
 
     def test_persisted_remote_only_exclusion_survives_job_reload(self):
         job = self.client.post(

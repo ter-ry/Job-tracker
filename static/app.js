@@ -2659,7 +2659,9 @@ function renderDiscoveryTable(jobs) {
 }
 
 function discoveryJobKey(job) {
-  return String(job.source_job_id || job.application_url || job.url || `${job.source || "jobspy"}|${job.company || ""}|${job.title || ""}|${job.location || ""}`).trim().toLowerCase();
+  const source = String(job.source || job.source_name || "jobspy").trim().toLowerCase();
+  const identity = job.source_job_id || job.application_url || job.url || `${job.company || ""}|${job.title || ""}|${job.location || ""}`;
+  return `${source}|${identity}`.trim().toLowerCase();
 }
 
 function renderDiscoveryRow(job) {
