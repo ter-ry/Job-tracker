@@ -8398,8 +8398,16 @@ def _application_priority(job: dict[str, Any], qualification_score: int | None) 
         return 0, blocking
     recency = discovery_recency_score(job)
     effort = clamp_int(job.get("application_effort_score") or 70, 0, 100)
-    priority = round(qualification_score * 0.65 + recency * 0.15 + effort * 0.10 + 10)
-    return clamp_int(priority, 0, 100), ["Qualification match is weighted first; recency and application effort are secondary."]
+    profile = load_profile()
+    preferred_roles = [part.strip().lower() for part in re.split(r"[,;\n]+", text(profile.get("preferred_roles"))) if part.strip()]
+    title = text(job.get("title")).lower()
+    role_preference = 100 if preferred_roles and any(role in title or title in role for role in preferred_roles) else 60 if preferred_roles else 70
+    preferred_locations = text(profile.get("preferred_locations")).lower()
+    location = text(job.get("location")).lower()
+    location_preference = 100 if preferred_locations and any(part.strip() in location for part in re.split(r"[,;\n]+", preferred_locations) if part.strip()) else 70
+    preference = round((role_preference + location_preference) / 2)
+    priority = round(qualification_score * 0.65 + recency * 0.15 + effort * 0.10 + preference * 0.10)
+    return clamp_int(priority, 0, 100), ["Qualification match is weighted first; recency, effort, and stated role/location preferences are secondary."]
 
 
 def build_qualification_fit(job: dict[str, Any]) -> dict[str, Any]:
