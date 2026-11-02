@@ -281,6 +281,11 @@ def score_seniority_fit(profile: dict[str, Any], analysis: dict[str, Any]) -> di
             score = 82
             explanation.append(f"Detected level {detected} is below or adjacent to selected targets.")
 
+    if detected in {"senior", "lead", "manager", "director"} and not required and analysis.get("description_level") == "unknown":
+        score = min(score, 60)
+        stretch = True
+        explanation.append("The seniority signal comes primarily from the title; the description does not provide enough evidence to treat this as a confident match.")
+
     if required_min is not None:
         if max_required is not None and required_min > max_required:
             over_by = required_min - max_required

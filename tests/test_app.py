@@ -270,6 +270,36 @@ class JobAssistantTest(unittest.TestCase):
         ordered = app_module.sort_discovery_jobs(jobs, "application_priority_score")
         self.assertEqual(ordered[0]["company"], "Preferred")
 
+    def test_canada_wide_discovery_uses_bounded_region_queries(self):
+        self.assertEqual(len(app_module.discovery_query_locations("Canada")), 5)
+        self.assertEqual(app_module.discovery_query_locations("Toronto"), ["Toronto"])
+        calls = []
+
+        def fake_fetch(**kwargs):
+            calls.append(kwargs)
+            return {"jobs": [{"company": "Affirm", "title": "Software Engineer", "location": kwargs["location"], "job_url": "https://affirm.example/role"}], "source_counts": {"linkedin": 1}, "errors": {}, "source_diagnostics": {}, "source_snapshots": {}}
+
+        search = {"keywords": "software engineer", "location": "Canada", "discovery_location": "Canada", "distance": 50, "remote_preference": "remote", "request_per_source_cap": 50, "hours_old": 720, "enabled_sources": ["linkedin"]}
+        with patch.object(app_module, "fetch_jobspy_jobs", side_effect=fake_fetch):
+            result = app_module.fetch_discovery_jobs_for_search(search)
+        self.assertEqual(len(calls), 5)
+        self.assertTrue(all(call["results_wanted"] == 10 for call in calls))
+        self.assertEqual(len(result["jobs"]), 1)
+
+    def test_cross_provider_location_normalization_deduplicates_province_names(self):
+        linkedin = {"company": "Affirm", "title": "Software Engineer II", "location": "Toronto, ON", "url": "https://linkedin.example/affirm"}
+        indeed = {"company": "Affirm", "title": "Software Engineer II", "location": "Toronto, Ontario", "url": "https://indeed.example/affirm"}
+        self.assertEqual(app_module.dedupe_keys(linkedin) & app_module.dedupe_keys(indeed), {"ctl:affirm|software engineer ii|toronto on"})
+
+    def test_discovery_render_actions_use_stable_job_keys_and_new_scores(self):
+        source = (Path(__file__).parents[1] / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("function discoveryJobKey(job)", source)
+        self.assertIn('data-discovery-action="save"', source)
+        self.assertIn('data-discovery-action="hide"', source)
+        self.assertIn('Application Priority', source)
+        self.assertNotIn("saveDiscoveryJob(${index})", source)
+        self.assertNotIn("hideDiscoveryJob(${index})", source)
+
     def test_persisted_remote_only_exclusion_survives_job_reload(self):
         job = self.client.post(
             "/api/jobs",
@@ -2300,6 +2330,12 @@ class JobAssistantTest(unittest.TestCase):
         manager_fit = seniority.score_seniority_fit(stretch_profile, seniority.analyze_job_seniority(manager_job))
         self.assertLess(manager_fit["score"], stretch_fit["score"])
 
+    def test_senior_title_without_description_evidence_is_uncertain(self):
+        profile = {"target_seniority_levels": "junior, intermediate", "willing_to_apply_to_stretch_roles": "true", "management_roles_allowed": "false"}
+        fit = seniority.score_seniority_fit(profile, seniority.analyze_job_seniority({"title": "Senior Software Engineer", "job_description": ""}))
+        self.assertTrue(fit["stretch_role"])
+        self.assertLessEqual(fit["score"], 60)
+
     def test_title_description_disagreement_and_experience_false_positives(self):
         job = {
             "title": "Senior Software Developer",
@@ -3903,7 +3939,8 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("Keywords Score", shortlist)
         self.assertNotIn("Overall Fit</strong>", shortlist)
         self.assertNotIn("miniBreakdown(job)", shortlist)
-        self.assertIn("Job Priority", discovery)
+        self.assertIn("Application Priority", discovery)
+        self.assertNotIn("<strong>Job Priority</strong>", discovery)
         self.assertNotIn("Overall score", discovery)
 
     def test_selected_candidate_profile_isolated_from_legacy_and_other_profiles(self):

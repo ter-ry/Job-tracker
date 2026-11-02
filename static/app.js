@@ -1627,12 +1627,13 @@ function sortJobs(jobs, sortBy) {
 }
 
 function miniBreakdown(job) {
-  return [
+  const details = [
     `skills ${job.skills_match_score || 0}`,
     `role ${job.role_match_score || 0}`,
     `loc ${job.location_score || 0}`,
     `salary ${job.salary_score || 0}`,
   ].join(" | ");
+  return `<details class="score-details"><summary>Legacy Job Priority details</summary><p class="muted">${escapeHtml(details)}</p></details>`;
 }
 
 function riskLabel(job) {
@@ -2463,6 +2464,7 @@ function renderDiscoveryResults(result) {
   const visibleCount = jobs.length;
   const totalCount = Number(result.total || state.discoveryMeta.total || state.discoveryResults.length || 0);
   const evidenceProfileName = jobs[0]?.qualification_evidence_profile_name || state.discoveryResults[0]?.qualification_evidence_profile_name || (value("discovery-profile") ? "Selected candidate profile" : "Active Profile");
+  const categoryCounts = (state.discoveryResults || []).reduce((counts, job) => { const key = job.discovery_result_category || "review_required"; counts[key] = (counts[key] || 0) + 1; return counts; }, {});
   document.getElementById("discovery-active-state").textContent = describeDiscoveryState(prefs, visibleCount, totalCount);
   renderDiscoveryOriginSummary();
   let body = state.discoveryView === "table" ? renderDiscoveryTable(jobs) : renderDiscoveryCards(jobs);
@@ -2500,11 +2502,18 @@ function renderDiscoveryResults(result) {
       </div>
       <p class="muted">${escapeHtml(countText || "No source counts returned")}</p>
       <p class="muted">Qualification résumé: ${escapeHtml(evidenceProfileName)}</p>
+      <p class="muted">Remote result groups: actionable ${Number(categoryCounts.actionable || 0)} · review required ${Number(categoryCounts.review_required || 0)} · excluded ${Number(categoryCounts.excluded || 0)}</p>
       ${errorText}
     </div>
     ${rawSummary}
     ${body}
   `;
+  container.querySelectorAll("[data-discovery-action]").forEach((button) => {
+    button.addEventListener("click", () => {
+      if (button.dataset.discoveryAction === "save") saveDiscoveryJob(button.dataset.jobKey);
+      else hideDiscoveryJob(button.dataset.jobKey);
+    });
+  });
 }
 
 function renderDiscoveryOriginSummary() {
@@ -2615,7 +2624,7 @@ function renderSourceDiagnostics(sourceDiagnostics) {
 
 function renderDiscoveryCards(jobs) {
   if (!jobs.length) return "<p>No live jobs are available from the selected sources.</p>";
-  return jobs.map((job, index) => renderDiscoveryCard(job, index)).join("");
+  return jobs.map((job) => renderDiscoveryCard(job)).join("");
 }
 
 function renderDiscoveryTable(jobs) {
@@ -2628,7 +2637,7 @@ function renderDiscoveryTable(jobs) {
     ["salary", "Salary"],
     ["posted_date", "Posted date"],
     ["work_arrangement", "Work arrangement"],
-    ["overall_score", "Job Priority"],
+    ["application_priority_score", "Application Priority"],
     ["source", "Source"],
   ];
   return `
@@ -2642,15 +2651,20 @@ function renderDiscoveryTable(jobs) {
           </tr>
         </thead>
         <tbody>
-          ${jobs.map((job, index) => renderDiscoveryRow(job, index)).join("")}
+          ${jobs.map((job) => renderDiscoveryRow(job)).join("")}
         </tbody>
       </table>
     </div>
   `;
 }
 
-function renderDiscoveryRow(job, index) {
+function discoveryJobKey(job) {
+  return String(job.source_job_id || job.application_url || job.url || `${job.source || "jobspy"}|${job.company || ""}|${job.title || ""}|${job.location || ""}`).trim().toLowerCase();
+}
+
+function renderDiscoveryRow(job) {
   const applicationUrl = job.application_url && job.application_url !== job.url ? job.application_url : "";
+  const key = escapeAttribute(discoveryJobKey(job));
   return `
     <tr>
       <td>
@@ -2663,14 +2677,14 @@ function renderDiscoveryRow(job, index) {
       <td>${escapeHtml(job.salary || "Salary unavailable")}</td>
       <td>${escapeHtml(job.posted_date || "Unknown")}</td>
       <td>${escapeHtml(job.work_arrangement || job.remote_type || "Unknown")}</td>
-      <td><strong>Job Priority</strong><br>${scorePill(job.overall_score || job.fit_score || 0)}</td>
+      <td><strong>Application Priority</strong><br>${scorePill(job.application_priority_score || 0)}<br><span class="muted">Qualification ${scorePill(job.qualification_match_score ?? job.qualification_fit_score ?? 0)}</span></td>
       <td>${escapeHtml(job.source || "JobSpy")}</td>
     </tr>
     <tr>
       <td colspan="9">
         <div class="row-actions">
-          <button class="button small" type="button" onclick="saveDiscoveryJob(${index})">Save to shortlist</button>
-          <button class="button small ghost" type="button" onclick="hideDiscoveryJob(${index})">Ignore</button>
+          <button class="button small" type="button" data-discovery-action="save" data-job-key="${key}">Save to shortlist</button>
+          <button class="button small ghost" type="button" data-discovery-action="hide" data-job-key="${key}">Ignore</button>
           ${job.url ? `<a class="button small ghost" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open job</a>` : ""}
           ${applicationUrl ? `<a class="button small ghost" href="${escapeAttribute(applicationUrl)}" target="_blank" rel="noreferrer">Application</a>` : ""}
         </div>
@@ -2679,8 +2693,9 @@ function renderDiscoveryRow(job, index) {
   `;
 }
 
-function renderDiscoveryCard(job, index) {
+function renderDiscoveryCard(job) {
   const applicationUrl = job.application_url && job.application_url !== job.url ? job.application_url : "";
+  const key = escapeAttribute(discoveryJobKey(job));
   const warnings = job.warnings?.length
     ? `<div class="warning-list">${job.warnings.map((warning) => `<span>${escapeHtml(warning)}</span>`).join("")}</div>`
     : "";
@@ -2690,7 +2705,7 @@ function renderDiscoveryCard(job, index) {
   const buttonDisabled = alreadySaved && savedStatus === "shortlisted" ? "disabled" : "";
   const saved = alreadySaved ? `<span class="risk low">${escapeHtml(job.saved_job_status || job.status || "Saved")}</span>` : "";
   return `
-    <section class="discovery-card" data-index="${index}">
+    <section class="discovery-card" data-job-key="${key}">
       <div class="discovery-card-main">
         <div>
           <h3>${escapeHtml(job.title || "Untitled role")}</h3>
@@ -2700,21 +2715,21 @@ function renderDiscoveryCard(job, index) {
           <div class="badge-row">
             ${badge("Distance", distanceBadge(job))}
             ${badge("Salary", job.salary || "Unavailable")}
-            ${badge("Job Priority", Number(job.overall_score || job.fit_score || 0))}
-            ${badge("Match", Number(job.match_score || 0))}
+            ${badge("Application Priority", Number(job.application_priority_score || 0))}
+            ${badge("Qualification Match", Number(job.qualification_match_score ?? job.qualification_fit_score ?? 0))}
             ${badge("Source", job.source || "JobSpy")}
             ${badge("Posted", job.posted_date || "Unknown")}
             ${badge("Work", job.work_arrangement || job.remote_type || "Unknown")}
           </div>
         </div>
-        <div><strong>Job Priority</strong><br>${scorePill(job.overall_score || job.fit_score || 0)}${saved}</div>
+        <div><strong>Application Priority</strong><br>${scorePill(job.application_priority_score || 0)}<br><span class="muted">Qualification ${scorePill(job.qualification_match_score ?? job.qualification_fit_score ?? 0)}</span>${saved}</div>
       </div>
       ${warnings}
       <div class="mini-breakdown">${miniBreakdown(job)}</div>
       ${renderDiscoveryWhy(job)}
       <div class="row-actions">
-        <button class="button small" type="button" onclick="saveDiscoveryJob(${index})" ${buttonDisabled}>${buttonLabel}</button>
-        <button class="button small ghost" type="button" onclick="hideDiscoveryJob(${index})">Ignore</button>
+        <button class="button small" type="button" data-discovery-action="save" data-job-key="${key}" ${buttonDisabled}>${buttonLabel}</button>
+        <button class="button small ghost" type="button" data-discovery-action="hide" data-job-key="${key}">Ignore</button>
         ${job.url ? `<a class="button small ghost" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open job</a>` : ""}
         ${applicationUrl ? `<a class="button small ghost" href="${escapeAttribute(applicationUrl)}" target="_blank" rel="noreferrer">Application</a>` : ""}
       </div>
@@ -2883,18 +2898,32 @@ function passesDiscoveryFilters(job, filters = {}) {
 
 function applyDiscoveryClientFiltersAndSort(jobs, preferences = {}) {
   const filtered = (jobs || []).filter((job) => !job.hidden && passesDiscoveryFilters(job, preferences.filters || {}));
-  return filtered.sort((a, b) => compareDiscoveryJobs(a, b, preferences));
+  const categoryRank = { actionable: 0, review_required: 1, excluded: 2 };
+  return filtered.sort((a, b) => (categoryRank[a.discovery_result_category] ?? 1) - (categoryRank[b.discovery_result_category] ?? 1) || compareDiscoveryJobs(a, b, preferences));
 }
 
 function renderDiscoveryWhy(job) {
   const breakdown = job.score_breakdown || {};
   const components = Array.isArray(breakdown.components) ? breakdown.components : [];
   const penalties = Array.isArray(breakdown.penalties) ? breakdown.penalties : [];
-  const total = Number(breakdown.overall_score || job.overall_score || 0);
+  const qualification = Number(job.qualification_match_score ?? job.qualification_fit_score ?? 0);
+  const priority = Number(job.application_priority_score || 0);
+  const matched = (job.qualification_fit_matched_requirements || []).slice(0, 5);
+  const missing = (job.qualification_fit_missing_requirements || []).slice(0, 5);
+  const partial = (job.qualification_fit_partial_requirements || []).slice(0, 5);
+  const evidence = (job.qualification_requirements || []).filter((item) => item.evidence_text).slice(0, 4).map((item) => `${item.requirement}: ${item.evidence_text}`);
   const lines = [
-    ...components.map((item) => `<li>${escapeHtml(item.label || "Component")}: ${Number(item.score || 0)}/${Number(item.max || 0)}</li>`),
-    ...penalties.map((item) => `<li class="risk medium">${escapeHtml(item.label || "Penalty")}: -${Number(item.points || 0)} (${escapeHtml((item.items || []).join(", ") || "")})</li>`),
-    `<li><strong>Total: ${total}/100</strong></li>`,
+    `<li><strong>Qualification Match:</strong> ${qualification}/100</li>`,
+    `<li><strong>Application Priority:</strong> ${priority}/100</li>`,
+    `<li><strong>Matched:</strong> ${escapeHtml(matched.join(", ") || "None identified")}</li>`,
+    `<li><strong>Partial:</strong> ${escapeHtml(partial.join(", ") || "None identified")}</li>`,
+    `<li><strong>Missing mandatory or preferred:</strong> ${escapeHtml(missing.join(", ") || "None identified")}</li>`,
+    `<li><strong>Résumé evidence:</strong> ${escapeHtml(evidence.join(" | ") || "No bounded evidence was found")}</li>`,
+    `<li><strong>Seniority:</strong> ${escapeHtml(job.qualification_fit_seniority?.explanation || job.qualification_fit_label || "Review required")}</li>`,
+    `<li><strong>Eligibility:</strong> ${escapeHtml(job.canadian_eligibility || "unknown")} · ${escapeHtml(job.work_arrangement || job.remote_type || "unknown arrangement")}</li>`,
+    `<li><strong>Evidence source:</strong> ${escapeHtml(job.qualification_evidence_profile_name || "Active Profile")} · ${escapeHtml(job.description_completeness || "description status unknown")}</li>`,
+    ...components.length ? [`<li class="muted">Legacy Job Priority diagnostic: ${components.map((item) => `${item.label} ${Number(item.score || 0)}/${Number(item.max || 0)}`).join(", ")}</li>`] : [],
+    ...penalties.map((item) => `<li class="risk medium">Legacy diagnostic penalty: -${Number(item.points || 0)} (${escapeHtml((item.items || []).join(", ") || "")})</li>`),
   ];
   return `
     <details class="score-details">
@@ -2952,8 +2981,8 @@ function showAllFetchedDiscoveryJobs() {
   handleDiscoveryControlsChanged();
 }
 
-async function saveDiscoveryJob(index) {
-  const job = state.discoveryResults[index];
+async function saveDiscoveryJob(jobKey) {
+  const job = state.discoveryResults.find((item) => discoveryJobKey(item) === String(jobKey));
   if (!job) return;
   if (String(job.saved_job_status || job.status || "").toLowerCase() === "shortlisted") return;
   try {
@@ -3265,9 +3294,10 @@ function showGenerationOutcome(result, requestedKinds) {
   }
 }
 
-function hideDiscoveryJob(index) {
-  if (!state.discoveryResults[index]) return;
-  state.discoveryResults[index].hidden = true;
+function hideDiscoveryJob(jobKey) {
+  const job = state.discoveryResults.find((item) => discoveryJobKey(item) === String(jobKey));
+  if (!job) return;
+  job.hidden = true;
   renderDiscoveryResults({
     jobs: state.discoveryResults,
     total: state.discoveryResults.filter((item) => !item.hidden).length,

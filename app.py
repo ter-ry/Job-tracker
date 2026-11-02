@@ -2001,17 +2001,8 @@ def create_app() -> Flask:
         search["location_resolution_method"] = location_context["resolution_method"]
         search["location_geocode"] = location_context["lookup"]
 
-        fetched = fetch_jobspy_jobs(
-            keywords=keywords,
-            location=search["discovery_location"],
-            distance=search["distance"],
-            remote_preference=search["remote_preference"],
-            job_type=None,
-            results_wanted=search["request_per_source_cap"],
-            hours_old=search["hours_old"],
-            enabled_sources=search["enabled_sources"],
-            country_indeed=text(payload.get("country_indeed")) or "Canada",
-        )
+        search["keywords"] = keywords
+        fetched = fetch_discovery_jobs_for_search(search, country_indeed=text(payload.get("country_indeed")) or "Canada")
 
         raw_jobs = fetched.get("jobs", [])
         existing_keys = existing_job_dedupe_keys()
@@ -2041,6 +2032,7 @@ def create_app() -> Flask:
             clean = apply_discovery_search_constraints(clean, search["remote_preference"])
             clean["discovery_remote_preference"] = search["remote_preference"]
             clean["remote_search_eligible"] = "true" if clean.get("remote_search_eligible") is True else "false" if clean.get("remote_search_eligible") is False else "unknown"
+            clean["discovery_result_category"], clean["discovery_result_reason"] = discovery_result_category(clean, search["remote_preference"])
             clean["source_job_id"] = text(raw_job.get("source_job_id"))
             clean["posted_date"] = text(raw_job.get("posted_date"))
             clean["description_available"] = bool(clean.get("job_description"))
@@ -2074,6 +2066,10 @@ def create_app() -> Flask:
                 if source in source_counts:
                     source_counts[source] += 1
 
+        category_counts = {"actionable": 0, "review_required": 0, "excluded": 0}
+        for item in jobs:
+            category = item.get("discovery_result_category") or "review_required"
+            category_counts[category] = category_counts.get(category, 0) + 1
         capped_count = max(0, len(jobs) - search["total_cap"])
         diagnostics = {
             "bypass_cache": bypass_cache,
@@ -2097,6 +2093,7 @@ def create_app() -> Flask:
             "source_counts": source_counts,
             "source_errors": fetched.get("errors", {}),
             "source_diagnostics": fetched.get("source_diagnostics", {}),
+            "countrywide_region_queries": fetched.get("countrywide_region_queries", []),
             "duplicates_removed": duplicates_in_search,
             "duplicates_in_search": duplicates_in_search,
             "already_saved_matches": already_saved_matches,
@@ -2110,6 +2107,7 @@ def create_app() -> Flask:
             "discovery_location": search["discovery_location"],
             "distance_origin": search["distance_origin"],
             "location_resolution_method": search["location_resolution_method"],
+            "remote_result_groups": category_counts,
         }
         if jobs:
             jobs = sort_discovery_jobs(
@@ -2692,16 +2690,8 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         "location_resolution_method": location_context["resolution_method"],
         "location_geocode": location_context["lookup"],
     })
-    fetched = fetch_jobspy_jobs(
-        keywords=keywords,
-        location=search["discovery_location"],
-        distance=search["distance"],
-        remote_preference=search["remote_preference"],
-        results_wanted=search["request_per_source_cap"],
-        hours_old=search["hours_old"],
-        enabled_sources=search["enabled_sources"],
-        country_indeed="Canada",
-    )
+    search["keywords"] = keywords
+    fetched = fetch_discovery_jobs_for_search(search, country_indeed="Canada")
     existing_keys = existing_job_dedupe_keys()
     seen_keys: set[str] = set()
     jobs: list[dict[str, Any]] = []
@@ -2716,6 +2706,7 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         clean = apply_discovery_search_constraints(clean, search["remote_preference"])
         clean["discovery_remote_preference"] = search["remote_preference"]
         clean["remote_search_eligible"] = "true" if clean.get("remote_search_eligible") is True else "false" if clean.get("remote_search_eligible") is False else "unknown"
+        clean["discovery_result_category"], clean["discovery_result_reason"] = discovery_result_category(clean, search["remote_preference"])
         clean["source_job_id"] = text(raw_job.get("source_job_id"))
         clean["posted_date"] = text(raw_job.get("posted_date"))
         clean["description_available"] = bool(clean.get("job_description"))
@@ -2763,6 +2754,7 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         "source_counts": fetched.get("source_counts", {}),
         "source_errors": fetched.get("errors", {}),
         "source_diagnostics": fetched.get("source_diagnostics", {}),
+        "countrywide_region_queries": fetched.get("countrywide_region_queries", []),
         "duplicates_removed": duplicates_in_search,
         "duplicates_in_search": duplicates_in_search,
         "already_saved_matches": already_saved_matches,
@@ -5994,7 +5986,7 @@ def dedupe_keys(job: dict[str, Any], source_job_id: Any = "") -> set[str]:
         [
             normalize_dedupe_text(job.get("company")),
             normalize_dedupe_text(job.get("title")),
-            normalize_dedupe_text(job.get("location")),
+            normalize_dedupe_location(job.get("location")),
         ]
     )
     if composite.replace("|", ""):
@@ -6018,6 +6010,18 @@ def canonical_url(value: str) -> str:
 
 def normalize_dedupe_text(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", " ", text(value).lower()).strip()
+
+
+def normalize_dedupe_location(value: Any) -> str:
+    normalized = normalize_dedupe_text(value)
+    replacements = {
+        "ontario": "on", "quebec": "qc", "alberta": "ab", "british columbia": "bc",
+        "manitoba": "mb", "saskatchewan": "sk", "nova scotia": "ns", "new brunswick": "nb",
+        "newfoundland and labrador": "nl", "prince edward island": "pe",
+    }
+    for name, code in replacements.items():
+        normalized = normalized.replace(name, code)
+    return normalized
 
 
 def determine_salary(job: dict[str, Any]) -> dict[str, Any]:
@@ -6855,6 +6859,18 @@ def geocode_location_value(
     }
 
 
+def geocode_matches_canadian_location(raw_location: str, geocode: dict[str, Any]) -> bool:
+    display = normalize_space(text(geocode.get("display_name") or geocode.get("normalized_query"))).lower()
+    raw = normalize_space(raw_location).lower()
+    expected_code = province_code_from_text(raw)
+    if expected_code:
+        province_name = next((normalize_space(text(name)).lower() for name, code in PROVINCE_CODE_BY_NAME.items() if code.lower() == expected_code.lower()), "")
+        return province_name in display or re.search(rf"(?:,|\s){re.escape(expected_code.lower())}(?:,|\s|$)", display) is not None
+    if any(token in display for token in ("united states", "usa", "new york", "london, uk", "england")):
+        return False
+    return True
+
+
 def geocode_discovery_job(
     job: dict[str, Any],
     profile: dict[str, str],
@@ -6865,6 +6881,8 @@ def geocode_discovery_job(
     provider = provider or get_geocoding_provider()
     raw_location = text(job.get("location"))
     geocode = geocode_location_value(raw_location, lookup_type="job", profile=profile, provider=provider, use_cache=use_cache)
+    if geocode.get("ok") and not geocode_matches_canadian_location(raw_location, geocode):
+        geocode = {**geocode, "ok": False, "status": "invalid_location", "latitude": "", "longitude": "", "error": "Geocoding result did not match the posting's Canadian province or country."}
     job["location_original"] = raw_location
     job["normalized_location"] = text(geocode.get("normalized_query")) or raw_location
     job["location_provider"] = text(geocode.get("provider"))
@@ -7086,6 +7104,57 @@ def resolve_discovery_location_context(
         "resolution_method": resolution_method,
         "lookup": lookup_result,
     }
+
+
+CANADA_DISCOVERY_REGIONS = ("Toronto, ON", "Montreal, QC", "Vancouver, BC", "Calgary, AB", "Halifax, NS")
+
+
+def discovery_query_locations(location: str) -> list[str]:
+    normalized = normalize_space(location).lower().replace(",", "")
+    if normalized in {"canada", "canadian", "canada wide", "canada-wide", "nationwide"}:
+        return list(CANADA_DISCOVERY_REGIONS)
+    return [normalize_space(location)]
+
+
+def fetch_discovery_jobs_for_search(search: dict[str, Any], *, country_indeed: str = "Canada") -> dict[str, Any]:
+    locations = discovery_query_locations(search.get("discovery_location") or search.get("location"))
+    per_region = max(1, (int(search["request_per_source_cap"]) + len(locations) - 1) // len(locations))
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    combined: dict[str, Any] = {"jobs": [], "errors": {}, "source_counts": {}, "source_diagnostics": {}, "source_snapshots": {}}
+    for location in locations:
+        result = fetch_jobspy_jobs(
+            keywords=search["keywords"], location=location, distance=search["distance"],
+            remote_preference=search["remote_preference"], job_type=None,
+            results_wanted=per_region, hours_old=search["hours_old"],
+            enabled_sources=search["enabled_sources"], country_indeed=country_indeed,
+        )
+        for raw in result.get("jobs", []):
+            key = text(raw.get("source_job_id") or raw.get("job_url") or raw.get("job_url_direct"))
+            if not key:
+                key = "|".join(normalize_space(text(raw.get(field))).lower() for field in ("company", "title", "location"))
+            key = key.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(raw)
+        for source, count in result.get("source_counts", {}).items():
+            combined["source_counts"][source] = int(combined["source_counts"].get(source, 0)) + int(count or 0)
+        combined["errors"].update(result.get("errors", {}))
+        combined["source_snapshots"].update(result.get("source_snapshots", {}))
+        for source, diagnostic in result.get("source_diagnostics", {}).items():
+            if source not in combined["source_diagnostics"]:
+                combined["source_diagnostics"][source] = dict(diagnostic)
+                combined["source_diagnostics"][source]["region_queries"] = locations
+                continue
+            current = combined["source_diagnostics"][source]
+            current["result_count"] = int(current.get("result_count") or 0) + int(diagnostic.get("result_count") or 0)
+            current["raw_records_row_count"] = int(current.get("raw_records_row_count") or 0) + int(diagnostic.get("raw_records_row_count") or 0)
+            current["region_queries"] = locations
+            current["success"] = bool(current.get("success") or diagnostic.get("success"))
+    combined["jobs"] = merged
+    combined["countrywide_region_queries"] = locations if len(locations) > 1 else []
+    return combined
 
 
 def discovery_city_coordinates(location: str) -> tuple[float, float] | None:
@@ -7417,6 +7486,10 @@ def enrich_discovery_job(job: dict[str, Any], profile: dict[str, str], settings:
         "qualification_fit_missing_requirements": qualification.get("qualification_fit_missing_requirements", []),
         "qualification_fit_matched_requirements": qualification.get("qualification_fit_matched_requirements", []),
         "qualification_fit_partial_requirements": qualification.get("qualification_fit_partial_requirements", []),
+        "qualification_requirements": qualification.get("qualification_requirements", []),
+        "qualification_components": qualification.get("qualification_components", {}),
+        "qualification_fit_seniority": qualification.get("qualification_fit_seniority", {}),
+        "application_priority_reasons": qualification.get("application_priority_reasons", []),
         "match_score": scoring["skill_match"],
         "score_breakdown": {
             "overall_score": scoring["overall_score"],
@@ -7472,6 +7545,18 @@ def apply_discovery_search_constraints(job: dict[str, Any], remote_preference: s
             job["application_priority_score"] = min(int(job.get("application_priority_score") or 0), 59)
             job.setdefault("application_priority_reasons", []).append("Work arrangement is unknown and requires review for a remote-only search.")
     return job
+
+
+def discovery_result_category(job: dict[str, Any], remote_preference: str = "") -> tuple[str, str]:
+    if normalize_space(text(remote_preference)).lower() != "remote":
+        if text(job.get("posting_availability")).lower() == "confirmed_closed":
+            return "excluded", "Posting is confirmed closed."
+        return "actionable", "No remote-only restriction applies."
+    if text(job.get("remote_search_eligible")).lower() == "false" or text(job.get("remote_eligibility")).lower() in {"restricted", "confirmed_ineligible"} or text(job.get("posting_availability")).lower() == "confirmed_closed":
+        return "excluded", "Confirmed onsite, hybrid, ineligible, or closed posting."
+    if text(job.get("remote_search_eligible")).lower() == "true" and text(job.get("remote_eligibility")).lower() == "canadian_eligible" and "remote" in text(job.get("remote_type")).lower():
+        return "actionable", "Remote arrangement and Canadian eligibility are supported by the posting data."
+    return "review_required", "Work arrangement or Canadian eligibility requires review."
 
 
 def discovery_sort_value(job: dict[str, Any], field: str, direction: str = "desc", remote_rule: str = "remote_after_local", unknown_salary_position: str = "last") -> tuple[Any, ...]:
@@ -8343,6 +8428,7 @@ def job_to_dict(row: sqlite3.Row | None, evidence_profile: dict[str, Any] | None
         "restricted": "confirmed_ineligible",
     }.get(legacy_eligibility, "unknown")
     data["ontario_eligibility"], data["ontario_eligibility_explanation"] = discovery_ontario_eligibility(data)
+    data["discovery_result_category"], data["discovery_result_reason"] = discovery_result_category(data, text(data.get("discovery_remote_preference")))
     data["score_breakdown"] = parse_json_object(data.get("score_breakdown"))
     if "profile_updated_at" in data and data.get("profile_updated_at"):
         profile_row = query_db("SELECT updated_at FROM profile WHERE id = 1", one=True)
