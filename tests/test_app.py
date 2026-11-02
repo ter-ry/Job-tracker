@@ -251,10 +251,41 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(onsite["application_priority_score"], 0)
         self.assertEqual(hybrid["application_priority_score"], 0)
         self.assertIsNone(unknown["remote_search_eligible"])
+        self.assertEqual(app_module.discovery_ontario_eligibility({"job_description": "Engineers work on our platform."})[0], "unknown")
+        self.assertEqual(app_module.discovery_ontario_eligibility({"job_description": "Remote Canada except Ontario."})[0], "confirmed_ineligible")
+        self.assertEqual(app_module.discovery_ontario_eligibility({"job_description": "Remote Ontario."})[0], "confirmed_eligible")
         normalized = jobspy_source.normalize_jobspy_row({"title": "Developer", "job_url": "https://example.test/job", "description": "Full posting text", "date_posted": "2026-11-01"}, "linkedin")
         self.assertEqual(normalized["posting_availability"], "likely_active")
         url_only = jobspy_source.normalize_jobspy_row({"title": "Developer", "job_url": "https://example.test/job"}, "linkedin")
         self.assertEqual(url_only["posting_availability"], "unverified")
+
+    def test_application_priority_is_the_discovery_best_match_sort(self):
+        preferences = app_module.discovery_preferences_payload({})
+        self.assertEqual(preferences["sort"]["field"], "application_priority_score")
+        jobs = [
+            {"company": "Legacy", "application_priority_score": 20, "overall_score": 95},
+            {"company": "Preferred", "application_priority_score": 80, "overall_score": 40},
+        ]
+        ordered = app_module.sort_discovery_jobs(jobs, "application_priority_score")
+        self.assertEqual(ordered[0]["company"], "Preferred")
+
+    def test_persisted_remote_only_exclusion_survives_job_reload(self):
+        job = self.client.post(
+            "/api/jobs",
+            json={
+                "company": "Hybrid Co",
+                "title": "Software Engineer",
+                "job_description": "Python backend work",
+                "remote_type": "Hybrid",
+                "remote_eligibility": "canadian_eligible",
+                "discovery_remote_preference": "remote",
+                "remote_search_eligible": "false",
+                "application_priority_score": 88,
+            },
+        ).get_json()
+        reloaded = next(item for item in self.client.get("/api/jobs").get_json() if item["id"] == job["id"])
+        self.assertEqual(reloaded["remote_search_eligible"], "false")
+        self.assertEqual(reloaded["application_priority_score"], 0)
 
     def test_missing_mandatory_category_is_unavailable_not_zeroed(self):
         self.client.post("/api/profile", json={"name": "Applicant", "resume_text": "Python and Flask experience."})

@@ -398,6 +398,8 @@ JOB_COLUMNS = {
     "description_source": "TEXT NOT NULL DEFAULT ''",
     "description_fetched_at": "TEXT NOT NULL DEFAULT ''",
     "last_verified_at": "TEXT NOT NULL DEFAULT ''",
+    "discovery_remote_preference": "TEXT NOT NULL DEFAULT ''",
+    "remote_search_eligible": "TEXT NOT NULL DEFAULT ''",
 }
 
 PROFILE_COLUMNS = {
@@ -1713,7 +1715,14 @@ def create_app() -> Flask:
             """SELECT * FROM jobs WHERE discovery_first_seen_at <> '' AND discovery_state <> 'ignored'
                ORDER BY discovery_state = 'new' DESC, discovery_last_seen_at DESC, id DESC LIMIT 500"""
         )
-        return jsonify([job_to_dict(row) for row in rows])
+        evidence_profile = None
+        if request.args.get("candidate_profile_id"):
+            try:
+                selected = resolve_tailoring_resume_profile({"candidate_profile_id": request.args.get("candidate_profile_id"), "resume_id": request.args.get("resume_id")})
+                evidence_profile = selected["profile"]
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
+        return jsonify([job_to_dict(row, evidence_profile) for row in rows])
 
     @app.post("/api/discovery/inbox/<int:job_id>/review")
     def review_discovery_job(job_id: int) -> Response:
@@ -1978,6 +1987,7 @@ def create_app() -> Flask:
         stored_preferences = load_discovery_preferences(search_key)
         preferences = stored_preferences or discovery_preferences_payload({})
         profile = load_profile()
+        evidence_profile = resolve_discovery_evidence_profile(payload)
         provider = get_geocoding_provider()
         origin = profile_home_location(profile)
         try:
@@ -2027,8 +2037,10 @@ def create_app() -> Flask:
             if clean.get("distance_label") == "unknown":
                 geocoding_unknown += 1
             clean["remote_eligibility"], clean["remote_eligibility_explanation"] = discovery_remote_eligibility(clean)
-            clean = enrich_discovery_job(clean, profile, {"weights": preferences.get("weights", {}), "remote_rule": preferences.get("sort", {}).get("remote_rule")})
+            clean = enrich_discovery_job(clean, profile, {"weights": preferences.get("weights", {}), "remote_rule": preferences.get("sort", {}).get("remote_rule")}, evidence_profile=evidence_profile)
             clean = apply_discovery_search_constraints(clean, search["remote_preference"])
+            clean["discovery_remote_preference"] = search["remote_preference"]
+            clean["remote_search_eligible"] = "true" if clean.get("remote_search_eligible") is True else "false" if clean.get("remote_search_eligible") is False else "unknown"
             clean["source_job_id"] = text(raw_job.get("source_job_id"))
             clean["posted_date"] = text(raw_job.get("posted_date"))
             clean["description_available"] = bool(clean.get("job_description"))
@@ -2102,7 +2114,7 @@ def create_app() -> Flask:
         if jobs:
             jobs = sort_discovery_jobs(
                 jobs,
-                preferences.get("sort", {}).get("field") or "overall_score",
+                preferences.get("sort", {}).get("field") or "application_priority_score",
                 preferences.get("sort", {}).get("direction") or "desc",
                 preferences.get("sort", {}).get("secondary_field") or "",
                 preferences.get("sort", {}).get("secondary_direction") or "asc",
@@ -2488,11 +2500,25 @@ def saved_search_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:
 def saved_search_to_discovery_payload(search: dict[str, Any]) -> dict[str, Any]:
     return {
         **search,
+        "candidate_profile_id": search.get("auto_prepare_candidate_profile_id") or "",
         "enabled_sources": search.get("enabled_sources") or ["linkedin", "indeed"],
         "search_depth": search.get("search_depth") or "standard",
         "total_cap": int(search.get("total_cap") or 200),
         "per_source_cap": int(search.get("per_source_cap") or 100),
     }
+
+
+def resolve_discovery_evidence_profile(payload: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the résumé used for discovery scoring, without mixing profiles."""
+    profile_id = payload.get("candidate_profile_id") or payload.get("auto_prepare_candidate_profile_id")
+    if profile_id not in (None, "", 0):
+        selected = resolve_tailoring_resume_profile({"candidate_profile_id": profile_id, "resume_id": payload.get("resume_id") or payload.get("auto_prepare_resume_id")})
+        profile = selected["profile"]
+        profile["_candidate_profile_name"] = text(selected["profile_row"].get("name")) or "Selected candidate profile"
+        return profile
+    profile = load_profile()
+    profile["_candidate_profile_name"] = "Active Profile"
+    return profile
 
 
 def discovery_remote_eligibility(job: dict[str, Any]) -> tuple[str, str]:
@@ -2528,8 +2554,11 @@ def discovery_remote_eligibility(job: dict[str, Any]) -> tuple[str, str]:
 
 def discovery_ontario_eligibility(job: dict[str, Any]) -> tuple[str, str]:
     """Keep Ontario-specific evidence separate from country-level eligibility."""
-    content = " ".join([text(job.get("location")), text(job.get("job_description"))]).lower()
-    if re.search(r"\b(?:ontario|on|toronto|ottawa|hamilton|waterloo|gta)\b", content):
+    location = normalize_space(text(job.get("location"))).lower()
+    description = normalize_space(text(job.get("job_description"))).lower()
+    if re.search(r"(?:except|excluding|outside|not available in|not eligible in|excluding applicants in)\s+(?:the\s+)?ontario\b", description):
+        return "confirmed_ineligible", "Posting explicitly excludes Ontario."
+    if re.search(r"\bremote\s+(?:in\s+)?(?:the\s+)?ontario\b", description) or re.search(r"(?:work|role|position|candidates?|employees?)\s+(?:in|from|within|across|available to)\s+(?:the\s+)?ontario\b", description) or re.search(r"\b(?:toronto|ottawa|hamilton|waterloo|gta),?\s+on(?:tario)?\b", location):
         return "confirmed_eligible", "Posting names Ontario or an Ontario city."
     return "unknown", "The posting confirms Canada, but not Ontario-specific eligibility."
 
@@ -2651,6 +2680,7 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         "auto_prepare_cover_letter_template_id": payload.get("auto_prepare_cover_letter_template_id", 0),
     })
     profile = load_profile()
+    evidence_profile = resolve_discovery_evidence_profile(payload)
     provider = get_geocoding_provider()
     origin = profile_home_location(profile)
     location_context = resolve_discovery_location_context(search["location"], profile, provider, use_cache=True)
@@ -2682,8 +2712,10 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         clean = normalize_job_payload(jobspy_result_to_job_payload(raw_job))
         clean, _ = geocode_discovery_job(clean, profile, origin, provider, use_cache=True)
         clean["remote_eligibility"], clean["remote_eligibility_explanation"] = discovery_remote_eligibility(clean)
-        clean = enrich_discovery_job(clean, profile, {"remote_rule": "remote_after_local"})
+        clean = enrich_discovery_job(clean, profile, {"remote_rule": "remote_after_local"}, evidence_profile=evidence_profile)
         clean = apply_discovery_search_constraints(clean, search["remote_preference"])
+        clean["discovery_remote_preference"] = search["remote_preference"]
+        clean["remote_search_eligible"] = "true" if clean.get("remote_search_eligible") is True else "false" if clean.get("remote_search_eligible") is False else "unknown"
         clean["source_job_id"] = text(raw_job.get("source_job_id"))
         clean["posted_date"] = text(raw_job.get("posted_date"))
         clean["description_available"] = bool(clean.get("job_description"))
@@ -2722,7 +2754,7 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         seen_keys.update(keys)
         jobs.append(clean)
     capped_count = max(0, len(jobs) - search["total_cap"])
-    jobs = sort_discovery_jobs(jobs, "overall_score", "desc", "", "asc", "remote_after_local", "last")[: search["total_cap"]]
+    jobs = sort_discovery_jobs(jobs, "application_priority_score", "desc", "", "asc", "remote_after_local", "last")[: search["total_cap"]]
     persisted = persist_discovery_jobs(jobs, search_id, run_id)
     auto_preparation_queued = enqueue_auto_preparation(search, persisted.get("new_job_ids", [])) if search_id else 0
     search_key = discovery_search_signature(payload)
@@ -6269,6 +6301,8 @@ def discovery_search_signature(payload: dict[str, Any]) -> str:
         "date_window": search["date_window"],
         "per_source_cap": search["per_source_cap"],
         "total_cap": search["total_cap"],
+        "candidate_profile_id": text(payload.get("candidate_profile_id") or payload.get("auto_prepare_candidate_profile_id")),
+        "resume_id": text(payload.get("resume_id") or payload.get("auto_prepare_resume_id")),
     }
     return grounding_hash(dumps_json(relevant, sort_keys=True))
 
@@ -7363,10 +7397,10 @@ def discovery_score_breakdown(job: dict[str, Any], profile: dict[str, str], sett
     }
 
 
-def enrich_discovery_job(job: dict[str, Any], profile: dict[str, str], settings: dict[str, Any] | None = None) -> dict[str, Any]:
+def enrich_discovery_job(job: dict[str, Any], profile: dict[str, str], settings: dict[str, Any] | None = None, evidence_profile: dict[str, Any] | None = None) -> dict[str, Any]:
     salary_snapshot = normalize_salary_snapshot(job)
     scoring = discovery_score_breakdown({**job, **salary_snapshot}, profile, settings)
-    qualification = build_qualification_fit({**job, **salary_snapshot})
+    qualification = build_qualification_fit({**job, **salary_snapshot}, evidence_profile)
     remote_label = discovery_work_arrangement_label(text(job.get("remote_type")))
     enriched = {
         **job,
@@ -7414,6 +7448,7 @@ def enrich_discovery_job(job: dict[str, Any], profile: dict[str, str], settings:
         "ontario_eligibility": discovery_ontario_eligibility(job)[0],
         "ontario_eligibility_explanation": discovery_ontario_eligibility(job)[1],
         "description_completeness": classify_job_description_completeness(job.get("job_description")),
+        "qualification_evidence_profile_name": qualification.get("qualification_evidence_profile_name", "Active Profile"),
         "posted_date_sort": text(job.get("posted_date")) or "9999-12-31",
         "distance_sort": scoring["distance"]["distance_km"],
     }
@@ -7483,8 +7518,8 @@ def discovery_sort_value(job: dict[str, Any], field: str, direction: str = "desc
         return (order.get(remote_label, 3), normalize_space(text(job.get("company"))).lower())
     if field == "seniority":
         return (normalize_space(text(job.get("seniority_level"))).lower(), normalize_space(text(job.get("company"))).lower())
-    if field in {"match_score", "overall_score", "score"}:
-        score_value = clamp_int(job.get("match_score") if field == "match_score" else job.get("overall_score"), 0, 100)
+    if field in {"match_score", "overall_score", "application_priority_score", "score"}:
+        score_value = clamp_int(job.get("match_score") if field == "match_score" else job.get("application_priority_score") if field == "application_priority_score" else job.get("overall_score"), 0, 100)
         return ((-score_value if direction == "desc" else score_value), normalize_space(text(job.get("company"))).lower(), normalize_space(text(job.get("title"))).lower())
     if field == "deadline":
         deadline = text(job.get("deadline")) or "9999-12-31"
@@ -7522,7 +7557,7 @@ def discovery_preferences_payload(payload: dict[str, Any]) -> dict[str, Any]:
     weights_payload = parse_json_object(payload.get("weights")) if isinstance(payload.get("weights"), dict) else parse_json_object(payload.get("weights"))
     preferences = {
         "sort": {
-            "field": normalize_space(text(sort_payload.get("field") or payload.get("sort_field") or payload.get("primary_sort_field") or "overall_score")),
+            "field": normalize_space(text(sort_payload.get("field") or payload.get("sort_field") or payload.get("primary_sort_field") or "application_priority_score")),
             "direction": "asc" if text(sort_payload.get("direction") or payload.get("sort_direction") or payload.get("primary_sort_direction")).lower() == "asc" else "desc",
             "secondary_field": normalize_space(text(secondary_payload.get("field") or payload.get("secondary_sort_field") or "")),
             "secondary_direction": "asc" if text(secondary_payload.get("direction") or payload.get("secondary_sort_direction") or "asc").lower() == "asc" else "desc",
@@ -8321,6 +8356,12 @@ def job_to_dict(row: sqlite3.Row | None, evidence_profile: dict[str, Any] | None
         data["tailoring_changes"] = load_tailoring_changes(job_id)
         data["generation_debug"] = load_generation_debug(job_id)
         data.update(build_qualification_fit(data, evidence_profile))
+        if text(data.get("discovery_remote_preference")).lower() == "remote" and text(data.get("remote_search_eligible")).lower() == "false":
+            data["application_priority_score"] = 0
+            reasons = list(data.get("application_priority_reasons") or [])
+            if not any("remote-only" in text(reason).lower() for reason in reasons):
+                reasons.append("Excluded from remote-only priority because the posting was confirmed onsite or hybrid during discovery.")
+            data["application_priority_reasons"] = reasons
         preparation = query_db(
             "SELECT status FROM application_preparation_queue WHERE job_id = ? ORDER BY updated_at DESC, id DESC LIMIT 1",
             [job_id],
@@ -8531,8 +8572,9 @@ def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any
         "qualification_fit_partial_requirements": [item["requirement"] for item in partial],
         "qualification_requirements": assessed,
         "qualification_components": {"mandatory": mandatory_score, "technical": technical_score, "experience": experience_score, "seniority": seniority.get("score", 0)},
-        "qualification_evidence_profile_id": profile.get("id") or profile.get("_candidate_profile_id") or 1,
-        "qualification_evidence_source": "selected candidate profile résumé DOCX, structured experience, projects, education, and skills",
+        "qualification_evidence_profile_id": profile.get("id") or profile.get("_candidate_profile_id") or "",
+        "qualification_evidence_profile_name": profile.get("_candidate_profile_name") or "Active Profile",
+        "qualification_evidence_source": "selected candidate profile résumé DOCX, structured experience, projects, education, and skills" if profile.get("_candidate_profile_id") else "active Profile résumé text and structured evidence",
         "qualification_fit_seniority": seniority,
         "application_priority_score": priority,
         "application_priority_reasons": priority_reasons,

@@ -229,14 +229,19 @@ function setDiscoverySection(view) {
 
 async function loadAll() {
   try {
-    const [jobs, dashboard, profile, ollamaHealth, systemHealth, evidence, candidateProfiles] = await Promise.all([
-      api.get("/api/jobs"),
+    const candidateProfiles = await api.get("/api/candidate-profiles").catch(() => []);
+    state.candidateProfiles = Array.isArray(candidateProfiles) ? candidateProfiles : [];
+    if (!state.candidateProfiles.some((profile) => String(profile.id) === String(state.selectedCandidateProfileId))) {
+      state.selectedCandidateProfileId = state.candidateProfiles[0] ? String(state.candidateProfiles[0].id) : "";
+    }
+    const profileQuery = state.selectedCandidateProfileId ? `?candidate_profile_id=${encodeURIComponent(state.selectedCandidateProfileId)}` : "";
+    const [jobs, dashboard, profile, ollamaHealth, systemHealth, evidence] = await Promise.all([
+      api.get(`/api/jobs${profileQuery}`),
       api.get("/api/dashboard"),
       api.get("/api/profile"),
       api.get("/api/ollama/health").catch((error) => ({ status: "error", summary: error.message })),
       api.get("/api/health").catch((error) => ({ status: "error", summary: error.message })),
       api.get("/api/evidence").catch(() => []),
-      api.get("/api/candidate-profiles").catch(() => []),
     ]);
     const shortlist = await api.get("/api/shortlist");
     state.jobs = jobs;
@@ -244,11 +249,11 @@ async function loadAll() {
     state.evidence = evidence;
     state.shortlist = shortlist;
     await loadPreparationQueue();
-    state.candidateProfiles = Array.isArray(candidateProfiles) ? candidateProfiles : [];
     await hydrateGenerationSelections();
     state.systemHealth = systemHealth;
     renderDashboard(dashboard);
     renderPipelineDashboard(jobs);
+    await loadDiscoveryInbox();
     renderProfile(profile);
     renderCandidateProfiles();
     await loadKeywordMemory();
@@ -1093,7 +1098,7 @@ function saveCurrentDiscoverySearch() {
   setChecked("saved-search-enabled", false);
   setChecked("saved-search-auto-prepare", false);
   setValue("saved-search-auto-min-priority", 75);
-  setValue("saved-search-auto-profile", "");
+  setValue("saved-search-auto-profile", criteria.candidate_profile_id || "");
   document.querySelectorAll('input[name="saved-search-source"]').forEach((input) => { input.checked = criteria.enabled_sources.includes(input.value); });
 }
 
@@ -1110,7 +1115,8 @@ async function loadDiscoveryInbox() {
   const target = document.getElementById("discovery-inbox");
   if (!target) return;
   try {
-    const jobs = await api.get("/api/discovery/inbox");
+    const profileQuery = state.selectedCandidateProfileId ? `?candidate_profile_id=${encodeURIComponent(state.selectedCandidateProfileId)}` : "";
+    const jobs = await api.get(`/api/discovery/inbox${profileQuery}`);
     target.classList.toggle("empty", !jobs.length);
     target.innerHTML = jobs.length ? jobs.map((job) => `<article class="inbox-row"><div><strong>${escapeHtml(job.title || "Untitled role")}</strong><span>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location unavailable")}</span><span class="muted">${escapeHtml(job.work_arrangement || job.remote_type || "Unknown arrangement")} · Canada: ${escapeHtml(job.canadian_eligibility || "unknown")} · ${escapeHtml(job.salary || "Salary unavailable")} · ${escapeHtml(job.source || "JobSpy")} · ${escapeHtml(job.posted_date || "date unknown")}</span><span class="muted">Description: ${escapeHtml(job.description_completeness || "unknown")} · ${job.discovery_state === "reviewed" ? "Reviewed" : "New"}</span></div><div><strong>Qualification Match ${Number(job.qualification_match_score ?? job.qualification_fit_score ?? 0)}</strong><span class="muted">Application Priority ${Number(job.application_priority_score || 0)} · Job Priority ${Number(job.overall_score || job.fit_score || 0)}</span><span class="muted">Discovered ${escapeHtml(job.discovery_first_seen_at || "")}</span></div><div class="row-actions"><button class="button small" type="button" onclick="reviewInboxJob(${job.id})">Review</button><button class="button ghost small" type="button" onclick="queueDiscoveryJob(${job.id})">Prepare package</button><button class="button ghost small" type="button" onclick="saveInboxJob(${job.id})">Shortlist</button><button class="button ghost small" type="button" onclick="ignoreInboxJob(${job.id})">Ignore</button>${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open</a>` : ""}</div></article>`).join("") : "No discovered opportunities yet.";
   } catch (error) { target.textContent = error.message; }
@@ -1119,7 +1125,7 @@ async function loadDiscoveryInbox() {
 async function reviewInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/review`, "POST", {}); await loadDiscoveryInbox(); } catch (error) { toast(error.message); } }
 async function ignoreInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/ignore`, "POST", {}); await loadDiscoveryInbox(); } catch (error) { toast(error.message); } }
 async function saveInboxJob(id) {
-  try { const jobs = await api.get("/api/jobs"); const job = jobs.find((item) => Number(item.id) === Number(id)); if (!job) throw new Error("Job not found"); await api.send("/api/shortlist", "POST", job); toast("Job shortlisted"); await loadAll(); await loadDiscoveryInbox(); }
+  try { const profileQuery = state.selectedCandidateProfileId ? `?candidate_profile_id=${encodeURIComponent(state.selectedCandidateProfileId)}` : ""; const jobs = await api.get(`/api/jobs${profileQuery}`); const job = jobs.find((item) => Number(item.id) === Number(id)); if (!job) throw new Error("Job not found"); await api.send("/api/shortlist", "POST", job); toast("Job shortlisted"); await loadAll(); await loadDiscoveryInbox(); }
   catch (error) { toast(error.message); }
 }
 
@@ -1245,6 +1251,12 @@ function renderCandidateProfiles() {
   if (!state.selectedCandidateProfileId) state.selectedCandidateProfileId = String(state.candidateProfiles[0].id);
   const autoProfile = document.getElementById("saved-search-auto-profile");
   if (autoProfile) autoProfile.innerHTML = `<option value="">Choose a profile when available</option>${state.candidateProfiles.map((profile) => `<option value="${escapeAttribute(profile.id)}">${escapeHtml(profile.name)}</option>`).join("")}`;
+  const discoveryProfile = document.getElementById("discovery-profile");
+  if (discoveryProfile) {
+    discoveryProfile.innerHTML = `<option value="">Use active Profile</option>${state.candidateProfiles.map((profile) => `<option value="${escapeAttribute(profile.id)}">${escapeHtml(profile.name)}</option>`).join("")}`;
+    discoveryProfile.value = state.selectedCandidateProfileId;
+    discoveryProfile.onchange = async () => { state.selectedCandidateProfileId = discoveryProfile.value; await loadAll(); };
+  }
   list.innerHTML = state.candidateProfiles.map((profile) => `
     <article class="candidate-profile-card ${String(profile.id) === state.selectedCandidateProfileId ? "selected" : ""}">
       <div><h3>${escapeHtml(profile.name)}</h3><p class="muted">${profile.identity_mode === "distinct" ? escapeHtml(profile.applicant_name || "Distinct identity not set") : "Uses active profile identity"}</p></div>
@@ -2192,6 +2204,7 @@ function discoverySearchCriteriaFromControls() {
     per_source_cap: value("discovery-per-source-cap") || 100,
     total_cap: value("discovery-total-cap") || 200,
     bypass_cache: checked("discovery-bypass-cache"),
+    candidate_profile_id: value("discovery-profile"),
   };
 }
 
@@ -2208,7 +2221,7 @@ function setDiscoveryControlsEnabled(enabled) {
 function discoverySortPreferencesFromMode(mode) {
   const sortMode = mode || "best_match";
   const sortMap = {
-    best_match: { field: "overall_score", direction: "desc" },
+    best_match: { field: "application_priority_score", direction: "desc" },
     overall_score: { field: "overall_score", direction: "desc" },
     salary_desc: { field: "salary", direction: "desc", unknown_salary_position: "last" },
     salary_asc: { field: "salary", direction: "asc", unknown_salary_position: "last" },
@@ -2217,7 +2230,7 @@ function discoverySortPreferencesFromMode(mode) {
     company: { field: "company", direction: "asc" },
   };
   return {
-    field: "overall_score",
+    field: "application_priority_score",
     direction: "desc",
     secondary_field: "",
     secondary_direction: "asc",
@@ -2228,13 +2241,14 @@ function discoverySortPreferencesFromMode(mode) {
 }
 
 function discoverySortModeFromPreferences(sort = {}) {
-  const field = sort.field || "overall_score";
+  const field = sort.field || "application_priority_score";
   const direction = sort.direction || "desc";
   if (field === "salary" && direction === "asc") return "salary_asc";
   if (field === "salary" && direction === "desc") return "salary_desc";
   if (field === "distance" && direction === "asc") return "distance";
   if (field === "posted_date" && direction === "desc") return "posted_date";
   if (field === "company" && direction === "asc") return "company";
+  if (field === "application_priority_score" && direction === "desc") return "best_match";
   if (field === "overall_score" && direction === "desc") return "overall_score";
   return "best_match";
 }
@@ -2448,6 +2462,7 @@ function renderDiscoveryResults(result) {
   const jobs = applyDiscoveryClientFiltersAndSort(state.discoveryResults || [], prefs);
   const visibleCount = jobs.length;
   const totalCount = Number(result.total || state.discoveryMeta.total || state.discoveryResults.length || 0);
+  const evidenceProfileName = jobs[0]?.qualification_evidence_profile_name || state.discoveryResults[0]?.qualification_evidence_profile_name || (value("discovery-profile") ? "Selected candidate profile" : "Active Profile");
   document.getElementById("discovery-active-state").textContent = describeDiscoveryState(prefs, visibleCount, totalCount);
   renderDiscoveryOriginSummary();
   let body = state.discoveryView === "table" ? renderDiscoveryTable(jobs) : renderDiscoveryCards(jobs);
@@ -2484,6 +2499,7 @@ function renderDiscoveryResults(result) {
         <div><strong>${visibleCount}</strong><span>Visible</span></div>
       </div>
       <p class="muted">${escapeHtml(countText || "No source counts returned")}</p>
+      <p class="muted">Qualification résumé: ${escapeHtml(evidenceProfileName)}</p>
       ${errorText}
     </div>
     ${rawSummary}
@@ -2747,6 +2763,7 @@ function describeDiscoveryState(preferences, visibleCount, totalCount) {
 function labelDiscoveryField(field) {
   return {
     overall_score: "Overall score",
+    application_priority_score: "Application Priority",
     salary: "Salary",
     distance: "Distance",
     posted_date: "Posted date",
@@ -2792,6 +2809,8 @@ function discoveryFieldValue(job, field, preferences) {
       return [String(job.seniority_level || "").toLowerCase()];
     case "match_score":
       return [Number(job.match_score || job.overall_score || 0)];
+    case "application_priority_score":
+      return [Number(job.application_priority_score || 0)];
     case "deadline":
       return [job.deadline || "9999-12-31"];
     case "overall_score":
