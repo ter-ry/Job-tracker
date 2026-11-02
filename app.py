@@ -54,7 +54,7 @@ from grounding import (
     validate_cover_letter_output,
     validate_generated_content,
 )
-from semantic_matching import MODEL_DOWNLOAD_SIZE, MODEL_NAME, analyze_resume_match
+from semantic_matching import MODEL_DOWNLOAD_SIZE, MODEL_NAME, analyze_resume_match, extract_resume_evidence
 from seniority import DETECTED_LEVELS, SENIORITY_LEVELS, analyze_job_seniority, score_seniority_fit
 from ollama_client import OllamaConfig, build_ollama_health_report, ollama_profile_defaults, request_json_completion
 from sources.jobspy_source import fetch_jobspy_jobs
@@ -392,6 +392,12 @@ JOB_COLUMNS = {
     "remote_eligibility": "TEXT NOT NULL DEFAULT 'unknown'",
     "remote_eligibility_explanation": "TEXT NOT NULL DEFAULT ''",
     "discovery_salary_filter_status": "TEXT NOT NULL DEFAULT ''",
+    "qualification_match_score": "INTEGER NOT NULL DEFAULT 0",
+    "application_priority_score": "INTEGER NOT NULL DEFAULT 0",
+    "posting_availability": "TEXT NOT NULL DEFAULT 'unverified'",
+    "description_source": "TEXT NOT NULL DEFAULT ''",
+    "description_fetched_at": "TEXT NOT NULL DEFAULT ''",
+    "last_verified_at": "TEXT NOT NULL DEFAULT ''",
 }
 
 PROFILE_COLUMNS = {
@@ -2017,6 +2023,9 @@ def create_app() -> Flask:
             clean["source_job_id"] = text(raw_job.get("source_job_id"))
             clean["posted_date"] = text(raw_job.get("posted_date"))
             clean["description_available"] = bool(clean.get("job_description"))
+            clean["description_source"] = "jobspy" if clean.get("job_description") else "missing"
+            clean["description_fetched_at"] = datetime.now().isoformat(timespec="seconds") if clean.get("job_description") else ""
+            clean["posting_availability"] = "likely_active" if clean.get("application_url") or clean.get("url") else "unverified"
             clean["score_breakdown"] = parse_json_object(clean.get("score_breakdown"))
             clean["warnings"] = discovery_warning_reasons(clean, keywords, search["location"])
             clean["already_saved"] = False
@@ -2659,6 +2668,9 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         clean["source_job_id"] = text(raw_job.get("source_job_id"))
         clean["posted_date"] = text(raw_job.get("posted_date"))
         clean["description_available"] = bool(clean.get("job_description"))
+        clean["description_source"] = "jobspy" if clean.get("job_description") else "missing"
+        clean["description_fetched_at"] = datetime.now().isoformat(timespec="seconds") if clean.get("job_description") else ""
+        clean["posting_availability"] = "likely_active" if clean.get("application_url") or clean.get("url") else "unverified"
         clean["score_breakdown"] = parse_json_object(clean.get("score_breakdown"))
         clean["warnings"] = discovery_warning_reasons(clean, keywords, search["location"])
         clean["remote_eligibility"], clean["remote_eligibility_explanation"] = discovery_remote_eligibility(clean)
@@ -7335,6 +7347,7 @@ def discovery_score_breakdown(job: dict[str, Any], profile: dict[str, str], sett
 def enrich_discovery_job(job: dict[str, Any], profile: dict[str, str], settings: dict[str, Any] | None = None) -> dict[str, Any]:
     salary_snapshot = normalize_salary_snapshot(job)
     scoring = discovery_score_breakdown({**job, **salary_snapshot}, profile, settings)
+    qualification = build_qualification_fit({**job, **salary_snapshot})
     remote_label = discovery_work_arrangement_label(text(job.get("remote_type")))
     enriched = {
         **job,
@@ -7343,6 +7356,14 @@ def enrich_discovery_job(job: dict[str, Any], profile: dict[str, str], settings:
         "distance_confidence": scoring["distance"]["confidence"],
         "distance_label": scoring["distance"]["distance_label"],
         "overall_score": scoring["overall_score"],
+        "qualification_fit_score": qualification.get("qualification_fit_score", 0),
+        "qualification_match_score": qualification.get("qualification_match_score", 0),
+        "application_priority_score": qualification.get("application_priority_score", 0),
+        "qualification_fit_label": qualification.get("qualification_fit_label", "Qualification unavailable"),
+        "qualification_fit_reasons": qualification.get("qualification_fit_reasons", []),
+        "qualification_fit_missing_requirements": qualification.get("qualification_fit_missing_requirements", []),
+        "qualification_fit_matched_requirements": qualification.get("qualification_fit_matched_requirements", []),
+        "qualification_fit_partial_requirements": qualification.get("qualification_fit_partial_requirements", []),
         "match_score": scoring["skill_match"],
         "score_breakdown": {
             "overall_score": scoring["overall_score"],
@@ -7369,6 +7390,9 @@ def enrich_discovery_job(job: dict[str, Any], profile: dict[str, str], settings:
             "semantic_scores": scoring["semantic_scores"],
         },
         "work_arrangement": remote_label,
+        "canadian_eligibility": {"canadian_eligible": "confirmed_eligible", "restricted": "confirmed_ineligible"}.get(text(job.get("remote_eligibility")).lower(), "unknown"),
+        "posting_availability": text(job.get("posting_availability")) or ("likely_active" if text(job.get("application_url") or job.get("url")) else "unverified"),
+        "description_completeness": classify_job_description_completeness(job.get("job_description")),
         "posted_date_sort": text(job.get("posted_date")) or "9999-12-31",
         "distance_sort": scoring["distance"]["distance_km"],
     }
@@ -8239,6 +8263,14 @@ def job_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:
         return {}
     data = dict(row)
     data["description_completeness"] = classify_job_description_completeness(data.get("job_description"))
+    data["work_arrangement"] = discovery_work_arrangement_label(text(data.get("remote_type")))
+    legacy_eligibility = text(data.get("remote_eligibility")).lower()
+    data["canadian_eligibility"] = {
+        "canadian_eligible": "confirmed_eligible",
+        "restricted": "confirmed_ineligible",
+    }.get(legacy_eligibility, "unknown")
+    if not text(data.get("posting_availability")):
+        data["posting_availability"] = "likely_active" if text(data.get("application_url") or data.get("url")) else "unverified"
     data["score_breakdown"] = parse_json_object(data.get("score_breakdown"))
     if "profile_updated_at" in data and data.get("profile_updated_at"):
         profile_row = query_db("SELECT updated_at FROM profile WHERE id = 1", one=True)
@@ -8272,53 +8304,172 @@ def classify_job_description_completeness(value: Any) -> str:
     return "complete"
 
 
+QUALIFICATION_ALIASES = {
+    "nodejs": {"nodejs", "node.js"},
+    "node.js": {"nodejs", "node.js"},
+    "java script": {"java script", "javascript"},
+    "javascript": {"java script", "javascript"},
+    "back-end": {"back-end", "backend"},
+    "front-end": {"front-end", "frontend"},
+    "restful apis": {"restful apis", "rest apis", "rest api", "apis"},
+    "rest apis": {"restful apis", "rest apis", "rest api", "apis"},
+    "rest api": {"restful apis", "rest apis", "rest api", "apis"},
+    "postgres": {"postgres", "postgresql"},
+    "postgresql": {"postgres", "postgresql"},
+    "tests": {"test", "tests", "testing"},
+    "testing": {"test", "tests", "testing"},
+}
+
+
+def _qualification_key(value: Any) -> str:
+    clean = normalize_space(text(value)).lower().strip(".,:;()[]")
+    return next((key for key, values in QUALIFICATION_ALIASES.items() if clean in values), clean)
+
+
+def _qualification_terms(job: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build a bounded, explainable inventory from structured fields and JD text."""
+    description = text(job.get("job_description"))
+    content = " ".join(text(job.get(field)) for field in ("title", "required_skills", "preferred_skills", "responsibilities", "job_description"))
+    terms: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(value: str, importance: str, category: str, source: str) -> None:
+        value = normalize_space(value).strip(" -*•")
+        if len(value) < 3 or len(value) > 120:
+            return
+        key = _qualification_key(value)
+        if key in seen:
+            return
+        seen.add(key)
+        terms.append({"requirement": value, "normalized": key, "importance": importance, "category": category, "source": source})
+
+    for field, importance, category in (("required_skills", "required", "technical"), ("preferred_skills", "preferred", "technical"), ("responsibilities", "unclassified", "experience")):
+        for part in re.split(r"[,;\n]+|(?<=[.!?])\s+", text(job.get(field))):
+            add(part, importance, category, field)
+
+    lowered = content.lower()
+    for term in sorted(TECHNICAL_TERMS, key=len, reverse=True):
+        if contains_phrase(lowered, term):
+            importance = "unclassified"
+            if re.search(r"(?:required|must have|qualifications?|requirements?).{0,180}" + re.escape(term), description, re.I | re.S):
+                importance = "required"
+            elif re.search(r"(?:preferred|nice to have|bonus|assets?).{0,180}" + re.escape(term), description, re.I | re.S):
+                importance = "preferred"
+            add(term, importance, "technical", "job description")
+
+    for match in re.finditer(r"\b\d+\+?\s*(?:to\s*\d+\+?\s*)?(?:years?|yrs?)\b[^.\n]{0,80}", content, re.I):
+        add(match.group(0), "required", "experience", "experience requirement")
+    return terms
+
+
+def _evidence_match(requirement: str, evidence: dict[str, Any]) -> tuple[str, str, int]:
+    req = requirement.lower()
+    candidate = text(evidence.get("text")).lower()
+    aliases = QUALIFICATION_ALIASES.get(_qualification_key(requirement), {req})
+    exact = any(alias in candidate for alias in aliases)
+    req_tokens = set(re.findall(r"[a-z0-9+#.]+", req))
+    candidate_tokens = set(re.findall(r"[a-z0-9+#.]+", candidate))
+    stem_overlap = 0
+    for token in req_tokens:
+        forms = {token}
+        if token.endswith("ing"):
+            forms.add(token[:-3])
+        if token.endswith("s"):
+            forms.add(token[:-1])
+        if candidate_tokens & forms:
+            stem_overlap += 1
+    related = ("api" in req or "service" in req) and bool(candidate_tokens & {"api", "apis", "rest", "flask", "backend"})
+    if exact:
+        return "matched", "exact or accepted equivalent wording", 88 if evidence.get("evidence_type") == "professional experience" else 68
+    if related or (req_tokens and stem_overlap / len(req_tokens) >= 0.5):
+        return "partial", "related résumé evidence is present, but the requirement is not stated in full", 58
+    return "missing", "no sufficiently related evidence was found in the selected résumé", 0
+
+
+def _application_priority(job: dict[str, Any], qualification_score: int | None) -> tuple[int, list[str]]:
+    if qualification_score is None:
+        return 0, ["Qualification cannot be ranked until the posting has a usable description."]
+    blocking = []
+    if text(job.get("remote_eligibility")).lower() in {"restricted", "confirmed_ineligible"}:
+        blocking.append("Canadian eligibility is confirmed incompatible.")
+    if text(job.get("posting_availability")).lower() == "confirmed_closed":
+        blocking.append("The posting is confirmed closed.")
+    if blocking:
+        return 0, blocking
+    recency = discovery_recency_score(job)
+    effort = clamp_int(job.get("application_effort_score") or 70, 0, 100)
+    priority = round(qualification_score * 0.65 + recency * 0.15 + effort * 0.10 + 10)
+    return clamp_int(priority, 0, 100), ["Qualification match is weighted first; recency and application effort are secondary."]
+
+
 def build_qualification_fit(job: dict[str, Any]) -> dict[str, Any]:
-    """Expose a transparent qualification view without changing Job Priority."""
+    """Calculate transparent Qualification Match without changing Job Priority."""
     try:
         profile = load_profile()
-        semantic = analyze_resume_match(job, profile, cache_dir=semantic_cache_dir(), use_semantic=False)
+        inventory = _qualification_terms(job)
+        evidence = extract_resume_evidence(profile)
         analysis = analyze_job_seniority(job)
         seniority = score_seniority_fit(profile, analysis)
     except Exception:
-        return {"qualification_fit_score": 0, "qualification_fit_label": "Review required", "qualification_fit_reasons": ["Qualification fit could not be assessed."]}
+        return {"qualification_match_status": "error", "qualification_fit_score": 0, "qualification_fit_label": "Review required", "qualification_fit_reasons": ["Qualification fit could not be assessed."]}
 
-    profile_text = " ".join(text(profile.get(field)) for field in ("resume_text", "work_experience", "projects", "key_skills", "education")).lower()
-    raw_required = [normalize_space(item) for item in re.split(r"[,;\n]+", text(job.get("required_skills"))) if normalize_space(item)]
-    required_terms = raw_required if len(raw_required) > 1 else [item for item in job_keywords(job) if len(item) > 2]
-    required_terms = list(dict.fromkeys(required_terms))
-    matched = [term for term in required_terms if contains_phrase(profile_text, term)]
-    missing = [term for term in required_terms if term not in matched]
-    skill_score = round((len(matched) / len(required_terms)) * 100) if required_terms else clamp_int(semantic.get("scores", {}).get("required_skills"), 0, 100)
-    responsibility_score = clamp_int(semantic.get("scores", {}).get("responsibilities"), 0, 100)
-    score = round(skill_score * 0.5 + seniority.get("score", 0) * 0.35 + responsibility_score * 0.15)
-    required = analysis.get("required_experience") or {}
-    max_profile = None
+    if not normalize_space(text(job.get("job_description"))) and not any(text(job.get(field)) for field in ("required_skills", "preferred_skills", "responsibilities")):
+        return {"qualification_match_status": "unavailable", "qualification_fit_score": 0, "qualification_fit_label": "Qualification unavailable", "qualification_fit_reasons": ["The posting does not contain enough description or structured requirements to assess qualification."]}
+
+    assessed: list[dict[str, Any]] = []
+    for item in inventory:
+        best = {"status": "missing", "reason": "no sufficiently related evidence was found in the selected résumé", "confidence": 0, "evidence": None}
+        for candidate in evidence:
+            status, reason, confidence = _evidence_match(item["requirement"], candidate)
+            if confidence > best["confidence"]:
+                best = {"status": status, "reason": reason, "confidence": confidence, "evidence": candidate}
+        assessed.append({**item, **best, "evidence_text": text((best.get("evidence") or {}).get("text")), "evidence_source": text((best.get("evidence") or {}).get("source_section"))})
+
+    required = [item for item in assessed if item["importance"] == "required"]
+    technical = [item for item in assessed if item["category"] == "technical"]
+    experience = [item for item in assessed if item["category"] == "experience"]
+
+    def coverage(items: list[dict[str, Any]]) -> int:
+        if not items:
+            return 0
+        return round(sum(1 if item["status"] == "matched" else 0.5 if item["status"] == "partial" else 0 for item in items) / len(items) * 100)
+
+    mandatory_score = coverage(required)
+    technical_score = coverage(technical)
+    experience_score = coverage(experience)
+    score = round(mandatory_score * 0.40 + technical_score * 0.25 + experience_score * 0.20 + seniority.get("score", 0) * 0.15)
+    required_experience = analysis.get("required_experience") or {}
     try:
-        max_profile = float(text(profile.get("maximum_required_years")))
+        profile_max_years = float(text(profile.get("maximum_required_years"))) if text(profile.get("maximum_required_years")) else None
     except (TypeError, ValueError):
-        pass
-    if required.get("maximum") and max_profile is not None and float(required["maximum"]) > max_profile:
-        score = min(score, 69)
-        seniority["stretch_role"] = True
-    reasons = []
-    if matched:
-        reasons.append(f"Supported requirements: {', '.join(matched[:5])}.")
+        profile_max_years = None
+    stretch = bool(seniority.get("stretch_role")) or bool(required_experience.get("minimum") and seniority.get("score", 0) < 70)
+    if required_experience.get("maximum") and profile_max_years is not None and float(required_experience["maximum"]) > profile_max_years:
+        stretch = True
+    matched = [item for item in assessed if item["status"] == "matched"]
+    partial = [item for item in assessed if item["status"] == "partial"]
+    missing = [item for item in assessed if item["status"] == "missing"]
+    reasons = [f"Mandatory qualifications: {mandatory_score}% evidence coverage.", f"Technical skills and tools: {technical_score}% evidence coverage.", f"Professional and project experience: {experience_score}% evidence coverage.", f"Seniority assessment: {seniority.get('score', 0)}%."]
     if missing:
-        reasons.append(f"Not demonstrated in the selected profile: {', '.join(missing[:5])}.")
-    if required:
-        reasons.append(f"Posting experience requirement: {required.get('text', 'explicit experience requirement')}.")
-    if seniority.get("explanation"):
-        reasons.append(seniority["explanation"])
-    if seniority.get("stretch_role"):
-        reasons.append("Stretch opportunity: the posting expects more experience or seniority than the selected profile establishes.")
-    label = "Strong qualification match" if score >= 75 and not seniority.get("stretch_role") else "Stretch opportunity" if seniority.get("stretch_role") or score < 60 else "Review qualification fit"
+        reasons.append("Not demonstrated in the selected résumé: " + ", ".join(item["requirement"] for item in missing[:6]) + ".")
+    if stretch:
+        reasons.append("Stretch opportunity: the posting expects experience or seniority not fully established by the selected résumé.")
+    priority, priority_reasons = _application_priority(job, score)
+    label = "Stretch opportunity" if stretch or score < 60 else "Strong qualification match" if score >= 75 else "Review qualification fit"
     return {
+        "qualification_match_status": "assessed",
         "qualification_fit_score": clamp_int(score, 0, 100),
+        "qualification_match_score": clamp_int(score, 0, 100),
         "qualification_fit_label": label,
-        "qualification_fit_reasons": reasons or ["Review the full posting and résumé evidence before applying."],
-        "qualification_fit_matched_requirements": matched,
-        "qualification_fit_missing_requirements": missing,
+        "qualification_fit_reasons": reasons,
+        "qualification_fit_matched_requirements": [item["requirement"] for item in matched],
+        "qualification_fit_missing_requirements": [item["requirement"] for item in missing],
+        "qualification_fit_partial_requirements": [item["requirement"] for item in partial],
+        "qualification_requirements": assessed,
+        "qualification_components": {"mandatory": mandatory_score, "technical": technical_score, "experience": experience_score, "seniority": seniority.get("score", 0)},
         "qualification_fit_seniority": seniority,
+        "application_priority_score": priority,
+        "application_priority_reasons": priority_reasons,
     }
 
 

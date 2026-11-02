@@ -205,6 +205,38 @@ class JobAssistantTest(unittest.TestCase):
         self.assertLess(fit["score"], 75)
         self.assertIn("does not explicitly demonstrate", fit["explanation"])
 
+    def test_qualification_match_uses_resume_evidence_and_aliases(self):
+        self.client.post(
+            "/api/profile",
+            json={
+                "name": "Evidence Applicant",
+                "resume_text": "Built Python and JavaScript applications with NodeJS, Flask, REST APIs, Linux and Git.",
+                "work_experience": "Backend developer who implemented and tested web services.",
+            },
+        )
+        job = self.client.post(
+            "/api/jobs",
+            json={
+                "company": "Evidence Co",
+                "title": "Backend Engineer",
+                "job_description": "Required Qualifications\nPython, Java Script, Node.js, Linux and Git.\nPreferred\nKafka.",
+                "required_skills": "Python, JavaScript, Node.js, Linux, Git",
+                "preferred_skills": "Kafka",
+            },
+        ).get_json()
+        self.assertEqual(job["qualification_match_status"], "assessed")
+        self.assertGreaterEqual(job["qualification_match_score"], 50)
+        self.assertIn("Python", job["qualification_fit_matched_requirements"])
+        self.assertIn("Kafka", job["qualification_fit_missing_requirements"])
+        self.assertIn("mandatory", job["qualification_components"])
+        self.assertIn("application_priority_score", job)
+
+    def test_qualification_match_is_unavailable_without_description(self):
+        self.client.post("/api/profile", json={"name": "Applicant", "resume_text": "Python developer"})
+        job = self.client.post("/api/jobs", json={"company": "Unknown", "title": "Developer"}).get_json()
+        self.assertEqual(job["qualification_match_status"], "unavailable")
+        self.assertIn("enough description", " ".join(job["qualification_fit_reasons"]))
+
     def test_ollama_profile_defaults_and_overrides(self):
         with patch.dict(
             "os.environ",
@@ -1498,6 +1530,24 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("parser error", result["source_diagnostics"]["indeed"]["error"])
         self.assertFalse(result["source_diagnostics"]["google"]["attempted"])
         self.assertEqual(result["source_diagnostics"]["google"]["skipped_reason"], "disabled")
+
+    def test_jobspy_requests_linkedin_descriptions_and_unknown_arrangement_is_explicit(self):
+        captured = []
+
+        def fake_scrape_jobs(**kwargs):
+            captured.append(kwargs)
+            return [{"title": "Developer", "company": "A", "location": "London, UK", "description": ""}]
+
+        result = jobspy_source.fetch_jobspy_jobs(
+            keywords="developer",
+            location="Canada",
+            enabled_sources=["linkedin"],
+            scrape_jobs_func=fake_scrape_jobs,
+        )
+        self.assertTrue(captured[0]["linkedin_fetch_description"])
+        self.assertEqual(result["jobs"][0]["remote_type"], "Unknown")
+        self.assertEqual(jobspy_source.infer_remote_type({"is_remote": False, "location": "Toronto, ON"}), "Unknown")
+        self.assertEqual(jobspy_source.infer_remote_type({"is_remote": True, "location": "London, UK"}), "Remote")
 
     def test_jobspy_discovery_scores_saved_profile_and_handles_missing_fields(self):
         self.client.post(

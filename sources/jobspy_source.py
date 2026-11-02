@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import warnings
+import re
 from importlib import metadata
 import time
 from datetime import datetime, timezone
@@ -171,7 +172,10 @@ def fetch_jobspy_jobs(
                     results_wanted=results_wanted,
                     country_indeed=country_indeed,
                     hours_old=hours_old,
-                    linkedin_fetch_description=False,
+                    # Request the provider description when JobSpy supports it.
+                    # Without this, LinkedIn rows often arrive as title/URL-only
+                    # records and cannot be qualified transparently.
+                    linkedin_fetch_description=True,
                     verbose=0,
                 )
             raw_type = type(frame).__name__ if frame is not None else "NoneType"
@@ -360,14 +364,25 @@ def salary_range_text(min_amount: float | None, max_amount: float | None, interv
 
 
 def infer_remote_type(row: dict[str, Any]) -> str:
-    text = " ".join([clean(row.get("is_remote")), clean(row.get("location")), clean(row.get("title")), clean(row.get("description"))]).lower()
+    explicit = row.get("is_remote")
+    location = clean(row.get("location")).lower()
+    description = clean(row.get("description")).lower()
+    title = clean(row.get("title")).lower()
+    text = " ".join([location, title, description])
+    if re.search(r"\b(?:not|no)\s+remote\b|remote\s+(?:work\s+)?(?:is\s+)?not\s+(?:available|offered)", text):
+        return "On-site"
     if "hybrid" in text:
         return "Hybrid"
-    if "true" in text or "remote" in text:
+    if isinstance(explicit, bool):
+        if explicit:
+            return "Remote"
+    elif clean(explicit).lower() in {"true", "1", "yes"}:
         return "Remote"
     if "on-site" in text or "onsite" in text:
         return "On-site"
-    return ""
+    if re.search(r"\bremote\b", text):
+        return "Remote"
+    return "Unknown"
 
 
 def extract_experience_requirement(description: str) -> str:
