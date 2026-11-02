@@ -237,6 +237,33 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(job["qualification_match_status"], "unavailable")
         self.assertIn("enough description", " ".join(job["qualification_fit_reasons"]))
 
+    def test_qualification_matching_rejects_substring_and_generic_api_false_positives(self):
+        javascript = {"text": "Built JavaScript interfaces.", "evidence_type": "professional experience"}
+        generic_api = {"text": "Used a third party API.", "evidence_type": "professional experience"}
+        self.assertEqual(app_module._evidence_match("Java", javascript)[0], "missing")
+        self.assertEqual(app_module._evidence_match("REST API", generic_api)[0], "missing")
+        self.assertEqual(app_module._evidence_match("Node.js", {"text": "NodeJS services", "evidence_type": "professional experience"})[0], "matched")
+
+    def test_remote_search_constraints_and_unverified_posting_status_are_conservative(self):
+        onsite = app_module.apply_discovery_search_constraints({"remote_type": "On-site", "work_arrangement": "On-site", "application_priority_score": 88}, "remote")
+        hybrid = app_module.apply_discovery_search_constraints({"remote_type": "Hybrid", "work_arrangement": "Hybrid", "application_priority_score": 88}, "remote")
+        unknown = app_module.apply_discovery_search_constraints({"remote_type": "Unknown", "work_arrangement": "Unknown", "application_priority_score": 88}, "remote")
+        self.assertEqual(onsite["application_priority_score"], 0)
+        self.assertEqual(hybrid["application_priority_score"], 0)
+        self.assertIsNone(unknown["remote_search_eligible"])
+        normalized = jobspy_source.normalize_jobspy_row({"title": "Developer", "job_url": "https://example.test/job", "description": "Full posting text", "date_posted": "2026-11-01"}, "linkedin")
+        self.assertEqual(normalized["posting_availability"], "likely_active")
+        url_only = jobspy_source.normalize_jobspy_row({"title": "Developer", "job_url": "https://example.test/job"}, "linkedin")
+        self.assertEqual(url_only["posting_availability"], "unverified")
+
+    def test_missing_mandatory_category_is_unavailable_not_zeroed(self):
+        self.client.post("/api/profile", json={"name": "Applicant", "resume_text": "Python and Flask experience."})
+        job = self.client.post("/api/jobs", json={"company": "Evidence Co", "title": "Developer", "job_description": "Python and Flask experience preferred."}).get_json()
+        self.assertEqual(job["qualification_match_status"], "partial_evidence")
+        self.assertIsNone(job["qualification_components"]["mandatory"])
+        self.assertIn("unavailable", job["qualification_fit_reasons"][0])
+        self.assertIn("qualification_evidence_source", job)
+
     def test_ollama_profile_defaults_and_overrides(self):
         with patch.dict(
             "os.environ",
@@ -3811,6 +3838,31 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(second_response.status_code, 200, second_response.get_data(as_text=True))
         second_score = second_response.get_json()["keywords_score"]
         self.assertGreater(first_score["matched_count"], second_score["matched_count"])
+
+    def test_jobs_api_uses_selected_candidate_resume_for_qualification_evidence(self):
+        self.seed_profile_for_documents()
+        profile_id = self.client.post(
+            "/api/candidate-profiles",
+            json={"name": "Selected Evidence Profile", "identity_mode": "distinct", "applicant_name": "Alex Rivera"},
+        ).get_json()["id"]
+        resume_path = self.build_formatted_resume_fixture()
+        with resume_path.open("rb") as handle:
+            uploaded = self.client.post(
+                f"/api/candidate-profiles/{profile_id}/resumes/upload",
+                data={"file": (handle, "selected.docx"), "name": "Selected résumé", "is_default": "true"},
+                content_type="multipart/form-data",
+            )
+        self.assertEqual(uploaded.status_code, 201, uploaded.get_data(as_text=True))
+        job = self.client.post(
+            "/api/jobs",
+            json={"company": "Evidence API Co", "title": "Python Developer", "job_description": "Python and Flask"},
+        ).get_json()
+        response = self.client.get(f"/api/jobs?candidate_profile_id={profile_id}")
+        self.assertEqual(response.status_code, 200)
+        item = next(row for row in response.get_json() if row["id"] == job["id"])
+        self.assertEqual(str(item["qualification_evidence_profile_id"]), str(profile_id))
+        self.assertIn("selected candidate profile", item["qualification_evidence_source"])
+        self.assertIn("python", [value.lower() for value in item["qualification_fit_matched_requirements"]])
 
     def test_shortlist_uses_keywords_score_as_primary_display_metric(self):
         source = (Path(__file__).parents[1] / "static" / "app.js").read_text(encoding="utf-8")

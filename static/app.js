@@ -1390,8 +1390,9 @@ function renderPipelineDashboard(jobs) {
   }
   cards.innerHTML = sortPipelineJobs(filtered, pipelineSort).map((job) => {
     const score = Number(job.qualification_fit_score ?? job.fit_score ?? 0);
-    const priority = Number(job.application_priority_score || 0);
-    return `<article class="pipeline-card" data-job-id="${job.id}"><div><h3>${escapeHtml(job.title || "Untitled role")}</h3><p>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location not listed")}</p><p class="pipeline-subline">${escapeHtml(job.qualification_fit_label || "Qualification fit")}</p></div><div class="pipeline-score"><strong>${score}%</strong><span>Qualification Match</span><small>Application Priority ${Number(job.application_priority_score || 0)} · Job Priority ${priority}</small><button type="button" data-job-id="${job.id}" class="pipeline-action">View details</button></div></article>`;
+    const applicationPriority = Number(job.application_priority_score || 0);
+    const jobPriority = Number(job.overall_score || job.fit_score || 0);
+    return `<article class="pipeline-card" data-job-id="${job.id}"><div><h3>${escapeHtml(job.title || "Untitled role")}</h3><p>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location not listed")}</p><p class="pipeline-subline">${escapeHtml(job.qualification_fit_label || "Qualification fit")}</p></div><div class="pipeline-score"><strong>${score}%</strong><span>Qualification Match</span><small>Application Priority ${applicationPriority} · Job Priority ${jobPriority}</small><button type="button" data-job-id="${job.id}" class="pipeline-action">View details</button></div></article>`;
   }).join("");
   cards.querySelectorAll(".pipeline-card").forEach((card) => card.addEventListener("click", (event) => {
     if (event.target.closest("button, a")) return;

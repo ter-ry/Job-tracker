@@ -292,6 +292,15 @@ def normalize_jobspy_row(row: dict[str, Any], fallback_source: str = "") -> dict
     city = clean(row.get("city"))
     state = clean(row.get("state") or row.get("state_province"))
     description = clean(row.get("description"))
+    raw_status = clean(row.get("status") or row.get("posting_status")).lower()
+    if row.get("is_closed") is True or raw_status in {"closed", "expired", "removed"}:
+        posting_availability = "confirmed_closed"
+    elif row.get("is_active") is True or raw_status in {"active", "open", "published"}:
+        posting_availability = "verified_active"
+    elif description and clean(row.get("date_posted") or row.get("date")) and job_url:
+        posting_availability = "likely_active"
+    else:
+        posting_availability = "unverified"
 
     return {
         "source_job_id": clean(row.get("id") or row.get("job_id")),
@@ -313,6 +322,7 @@ def normalize_jobspy_row(row: dict[str, Any], fallback_source: str = "") -> dict
         "job_url": job_url,
         "application_url": direct_url,
         "description": description,
+        "posting_availability": posting_availability,
         "posted_date": clean(row.get("date_posted")),
         "company_url": clean(row.get("company_url")),
         "experience_requirement": extract_experience_requirement(description),
