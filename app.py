@@ -55,7 +55,7 @@ from grounding import (
     validate_generated_content,
 )
 from semantic_matching import MODEL_DOWNLOAD_SIZE, MODEL_NAME, analyze_resume_match, extract_resume_evidence
-from seniority import DETECTED_LEVELS, SENIORITY_LEVELS, analyze_job_seniority, score_seniority_fit
+from seniority import DETECTED_LEVELS, SENIORITY_LEVELS, analyze_job_seniority, explicit_professional_years, score_seniority_fit
 from ollama_client import OllamaConfig, build_ollama_health_report, ollama_profile_defaults, request_json_completion
 from sources.jobspy_source import fetch_jobspy_jobs
 from tailoring import generate_tailored_resume_draft
@@ -7637,6 +7637,10 @@ def enrich_discovery_job(job: dict[str, Any], profile: dict[str, str], settings:
         "qualification_fit_matched_requirements": qualification.get("qualification_fit_matched_requirements", []),
         "qualification_fit_partial_requirements": qualification.get("qualification_fit_partial_requirements", []),
         "qualification_requirements": qualification.get("qualification_requirements", []),
+        "experience_requirements": qualification.get("experience_requirements", {}),
+        "qualification_evidence_profile_id": qualification.get("qualification_evidence_profile_id", ""),
+        "qualification_evidence_profile_name": qualification.get("qualification_evidence_profile_name", "Active Profile"),
+        "qualification_evidence_source": qualification.get("qualification_evidence_source", ""),
         "qualification_components": qualification.get("qualification_components", {}),
         "qualification_fit_seniority": qualification.get("qualification_fit_seniority", {}),
         "application_priority_reasons": qualification.get("application_priority_reasons", []),
@@ -8826,6 +8830,15 @@ def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any
         "qualification_fit_missing_requirements": [item["requirement"] for item in missing],
         "qualification_fit_partial_requirements": [item["requirement"] for item in partial],
         "qualification_requirements": assessed,
+        "experience_requirements": {
+            "required": analysis.get("required_experience"),
+            "preferred": analysis.get("preferred_experience"),
+            "ambiguous": analysis.get("ambiguous_experience", []),
+            "candidate_professional_years": explicit_professional_years(profile),
+            "candidate_years_status": "verified from explicit résumé evidence" if explicit_professional_years(profile) is not None else "unverified from selected résumé",
+            "fit_status": "stretch" if stretch else "aligned" if required_experience or analysis.get("detected_level") != "unknown" else "unknown",
+            "source_evidence": analysis.get("required_experience", {}).get("source_evidence", "") if analysis.get("required_experience") else analysis.get("preferred_experience", {}).get("source_evidence", "") if analysis.get("preferred_experience") else "",
+        },
         "qualification_components": {"mandatory": mandatory_score, "technical": technical_score, "experience": experience_score, "seniority": seniority.get("score", 0)},
         "qualification_evidence_profile_id": profile.get("id") or profile.get("_candidate_profile_id") or "",
         "qualification_evidence_profile_name": profile.get("_candidate_profile_name") or "Active Profile",

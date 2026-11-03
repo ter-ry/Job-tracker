@@ -23,7 +23,9 @@
       "qualification_fit_matched_requirements": ["Python", "Flask", "SQL"],
       "qualification_fit_missing_requirements": [],
       "qualification_fit_reasons": ["Mandatory qualifications: 100% evidence coverage.", "Seniority assessment: 90%."],
-      "qualification_evidence_profile_name": "SWE résumé"
+      "qualification_evidence_profile_name": "SWE résumé",
+      "experience_requirements": {"required": {"minimum": 1, "maximum": 2, "text": "1 to 2 years of professional software development experience"}, "preferred": null, "candidate_professional_years": 2, "candidate_years_status": "verified from explicit résumé evidence", "fit_status": "aligned"},
+      "qualification_fit_seniority": {"detected_level": "junior"}
     },
     {
       "id": 2,
@@ -48,7 +50,9 @@
       "qualification_fit_matched_requirements": ["Python"],
       "qualification_fit_missing_requirements": ["Canadian eligibility"],
       "qualification_fit_reasons": ["Canadian eligibility is not confirmed by the posting."],
-      "qualification_evidence_profile_name": "SWE résumé"
+      "qualification_evidence_profile_name": "SWE résumé",
+      "experience_requirements": {"required": null, "preferred": {"minimum": 3, "maximum": null, "text": "3+ years preferred"}, "candidate_professional_years": null, "candidate_years_status": "unverified from selected résumé", "fit_status": "unknown"},
+      "qualification_fit_seniority": {"detected_level": "unknown"}
     },
     {
       "id": 3,
@@ -73,7 +77,9 @@
       "qualification_fit_matched_requirements": [],
       "qualification_fit_missing_requirements": ["Canadian eligibility"],
       "qualification_fit_reasons": ["Canadian eligibility is not confirmed by the posting."],
-      "qualification_evidence_profile_name": "SWE résumé"
+      "qualification_evidence_profile_name": "SWE résumé",
+      "experience_requirements": {"required": null, "preferred": null, "candidate_professional_years": null, "candidate_years_status": "unverified from selected résumé", "fit_status": "unknown"},
+      "qualification_fit_seniority": {"detected_level": "unknown"}
     }
   ],
   "errors": {},

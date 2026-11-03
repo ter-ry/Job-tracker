@@ -2693,6 +2693,7 @@ function renderDiscoveryRow(job) {
     <tr>
       <td>
         <strong>${escapeHtml(job.title || "Untitled role")}</strong>
+        ${renderExperienceSummary(job)}
         ${renderDiscoveryWhy(job)}
       </td>
       <td>${escapeHtml(job.company || "Unknown company")}</td>
@@ -2750,6 +2751,7 @@ function renderDiscoveryCard(job) {
         <div><strong>Application Priority</strong><br>${scorePill(job.application_priority_score || 0)}<br><span class="muted">Qualification ${scorePill(job.qualification_match_score ?? job.qualification_fit_score ?? 0)}</span>${saved}</div>
       </div>
       ${warnings}
+      ${renderExperienceSummary(job)}
       <div class="mini-breakdown">${miniBreakdown(job)}</div>
       ${renderDiscoveryWhy(job)}
       <div class="row-actions">
@@ -2761,6 +2763,23 @@ function renderDiscoveryCard(job) {
       </div>
     </section>
   `;
+}
+
+function formatExperienceRange(range) {
+  if (!range || range.minimum === undefined || range.minimum === null) return "Not specified";
+  const minimum = Number(range.minimum);
+  const maximum = range.maximum === undefined || range.maximum === null ? null : Number(range.maximum);
+  if (maximum !== null && maximum !== minimum) return `${minimum}–${maximum} years`;
+  return `${minimum}+ years`;
+}
+
+function renderExperienceSummary(job) {
+  const experience = job.experience_requirements || {};
+  const candidate = experience.candidate_professional_years;
+  const candidateText = candidate === undefined || candidate === null ? "Unverified" : `${Number(candidate)} years verified`;
+  const fit = experience.fit_status || "unknown";
+  const level = job.qualification_fit_seniority?.detected_level || "unknown";
+  return `<div class="experience-summary"><strong>Experience:</strong> Required ${escapeHtml(formatExperienceRange(experience.required))} · Preferred ${escapeHtml(formatExperienceRange(experience.preferred))} · Candidate ${escapeHtml(candidateText)} · Fit ${escapeHtml(fit)} · Seniority ${escapeHtml(level)}</div>`;
 }
 
 function badge(label, value) {
