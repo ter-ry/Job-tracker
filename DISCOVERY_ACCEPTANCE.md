@@ -4,7 +4,6 @@ Date: 2026-11-03 (America/New_York)
 PR: https://github.com/ter-ry/Job-tracker/pull/12 (draft, unmerged)
 Branch: `codex/discovery-reliability`
 Implementation commit: `0f8482d4de1b224a3035073f5a9a01b61cd83d1d`
-Report commit: `2276cf7`
 Issue: https://github.com/ter-ry/Job-tracker/issues/13
 
 ## Status
