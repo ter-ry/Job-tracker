@@ -1119,7 +1119,7 @@ async function loadDiscoveryInbox() {
     const profileQuery = state.selectedCandidateProfileId ? `?candidate_profile_id=${encodeURIComponent(state.selectedCandidateProfileId)}` : "";
     const separator = profileQuery ? "&" : "?";
     const jobs = await api.get(`/api/discovery/inbox${profileQuery}${separator}include_history=1`);
-    const labels = { new_actionable: "New actionable", review_required: "Review required", excluded: "Excluded", applied: "Applied", skipped: "Skipped" };
+    const labels = { new_actionable: "New actionable", review_required: "Review required", excluded: "Excluded", saved: "Saved for later", applied: "Applied", skipped: "Skipped" };
     const counts = jobs.reduce((result, job) => {
       const category = job.discovery_inbox_category || "review_required";
       result[category] = (result[category] || 0) + 1;
@@ -1135,14 +1135,15 @@ async function loadDiscoveryInbox() {
     }
     const visibleJobs = jobs.filter((job) => (job.discovery_inbox_category || "review_required") === state.discoveryInboxCategory);
     target.classList.toggle("empty", !visibleJobs.length);
-    target.innerHTML = visibleJobs.length ? visibleJobs.map((job) => `<article class="inbox-row"><div><strong>${escapeHtml(job.title || "Untitled role")}</strong><span>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location unavailable")}</span><span class="muted">${escapeHtml(job.work_arrangement || job.remote_type || "Unknown arrangement")} · Canada: ${escapeHtml(job.canadian_eligibility || "unknown")} · ${escapeHtml(job.salary || "Salary unavailable")} · ${escapeHtml(job.source || "JobSpy")} · ${escapeHtml(job.posted_date || "date unknown")}</span><span class="muted">${escapeHtml(labels[job.discovery_inbox_category] || "Review required")} · Description: ${escapeHtml(job.description_completeness || "unknown")}</span></div><div><strong>Qualification Match ${Number(job.qualification_match_score ?? job.qualification_fit_score ?? 0)}</strong><span class="muted">Application Priority ${Number(job.application_priority_score || 0)} · Job Priority ${Number(job.overall_score || job.fit_score || 0)}</span><span class="muted">Discovered ${escapeHtml(job.discovery_first_seen_at || "")}</span></div><div class="row-actions">${job.discovery_inbox_category === "new_actionable" || job.discovery_inbox_category === "review_required" ? `<button class="button small" type="button" onclick="reviewInboxJob(${job.id})">Review</button><button class="button ghost small" type="button" onclick="queueDiscoveryJob(${job.id})">Prepare package</button><button class="button ghost small" type="button" onclick="saveInboxJob(${job.id})">Shortlist</button><button class="button ghost small" type="button" onclick="ignoreInboxJob(${job.id})">Skip</button>` : ""}${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open</a>` : ""}</div></article>`).join("") : `No ${labels[state.discoveryInboxCategory].toLowerCase()} discovery records.`;
+    target.innerHTML = visibleJobs.length ? visibleJobs.map((job) => `<article class="inbox-row"><div><strong>${escapeHtml(job.title || "Untitled role")}</strong><span>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location unavailable")}</span><span class="muted">${escapeHtml(job.work_arrangement || job.remote_type || "Unknown arrangement")} · Canada: ${escapeHtml(job.canadian_eligibility || "unknown")} · ${escapeHtml(job.salary || "Salary unavailable")} · ${escapeHtml(job.source || "JobSpy")} · ${escapeHtml(job.posted_date || "date unknown")}</span><span class="muted">${escapeHtml(labels[job.discovery_inbox_category] || "Review required")} · Description: ${escapeHtml(job.description_completeness || "unknown")}</span></div><div><strong>Qualification Match ${Number(job.qualification_match_score ?? job.qualification_fit_score ?? 0)}</strong><span class="muted">Application Priority ${Number(job.application_priority_score || 0)} · Job Priority ${Number(job.overall_score || job.fit_score || 0)}</span><span class="muted">Discovered ${escapeHtml(job.discovery_first_seen_at || "")}${job.date_applied ? ` · Applied ${escapeHtml(job.date_applied)}` : ""}</span></div><div class="row-actions">${job.discovery_inbox_category === "new_actionable" || job.discovery_inbox_category === "review_required" ? `<button class="button small" type="button" onclick="reviewInboxJob(${job.id})">Review</button><button class="button ghost small" type="button" onclick="saveInboxJob(${job.id})">Save for later</button><button class="button ghost small" type="button" onclick="applyInboxJob(${job.id})">Mark Applied</button><button class="button ghost small" type="button" onclick="ignoreInboxJob(${job.id})">Skip</button>` : ""}${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open original posting</a>` : ""}</div></article>`).join("") : `No ${labels[state.discoveryInboxCategory].toLowerCase()} discovery records.`;
   } catch (error) { target.textContent = error.message; }
 }
 
 async function reviewInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/review`, "POST", {}); await loadDiscoveryInbox(); } catch (error) { toast(error.message); } }
 async function ignoreInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/ignore`, "POST", {}); await loadDiscoveryInbox(); } catch (error) { toast(error.message); } }
+async function applyInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/applied`, "POST", {}); toast("Marked applied; the original posting remains in Applied history."); await Promise.all([loadDiscoveryInbox(), loadAll()]); } catch (error) { toast(error.message); } }
 async function saveInboxJob(id) {
-  try { const profileQuery = state.selectedCandidateProfileId ? `?candidate_profile_id=${encodeURIComponent(state.selectedCandidateProfileId)}` : ""; const jobs = await api.get(`/api/jobs${profileQuery}`); const job = jobs.find((item) => Number(item.id) === Number(id)); if (!job) throw new Error("Job not found"); await api.send("/api/shortlist", "POST", job); toast("Job shortlisted"); await loadAll(); await loadDiscoveryInbox(); }
+  try { await api.send(`/api/discovery/inbox/${id}/save`, "POST", {}); toast("Saved for later"); await Promise.all([loadDiscoveryInbox(), loadAll()]); }
   catch (error) { toast(error.message); }
 }
 
@@ -2528,6 +2529,7 @@ function renderDiscoveryResults(result) {
   container.querySelectorAll("[data-discovery-action]").forEach((button) => {
     button.addEventListener("click", () => {
       if (button.dataset.discoveryAction === "save") saveDiscoveryJob(button.dataset.jobKey);
+      else if (button.dataset.discoveryAction === "applied") applyDiscoveryJob(button.dataset.jobKey);
       else hideDiscoveryJob(button.dataset.jobKey);
     });
   });
@@ -2705,8 +2707,9 @@ function renderDiscoveryRow(job) {
     <tr>
       <td colspan="9">
         <div class="row-actions">
-          <button class="button small" type="button" data-discovery-action="save" data-job-key="${key}">Save to shortlist</button>
-          <button class="button small ghost" type="button" data-discovery-action="hide" data-job-key="${key}">Ignore</button>
+          <button class="button small" type="button" data-discovery-action="save" data-job-key="${key}">Save for later</button>
+          <button class="button small ghost" type="button" data-discovery-action="applied" data-job-key="${key}">Mark Applied</button>
+          <button class="button small ghost" type="button" data-discovery-action="hide" data-job-key="${key}">Skip</button>
           ${job.url ? `<a class="button small ghost" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open job</a>` : ""}
           ${applicationUrl ? `<a class="button small ghost" href="${escapeAttribute(applicationUrl)}" target="_blank" rel="noreferrer">Application</a>` : ""}
         </div>
@@ -2751,7 +2754,8 @@ function renderDiscoveryCard(job) {
       ${renderDiscoveryWhy(job)}
       <div class="row-actions">
         <button class="button small" type="button" data-discovery-action="save" data-job-key="${key}" ${buttonDisabled}>${buttonLabel}</button>
-        <button class="button small ghost" type="button" data-discovery-action="hide" data-job-key="${key}">Ignore</button>
+        <button class="button small ghost" type="button" data-discovery-action="applied" data-job-key="${key}">Mark Applied</button>
+        <button class="button small ghost" type="button" data-discovery-action="hide" data-job-key="${key}">Skip</button>
         ${job.url ? `<a class="button small ghost" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open job</a>` : ""}
         ${applicationUrl ? `<a class="button small ghost" href="${escapeAttribute(applicationUrl)}" target="_blank" rel="noreferrer">Application</a>` : ""}
       </div>
@@ -3006,25 +3010,28 @@ function showAllFetchedDiscoveryJobs() {
 async function saveDiscoveryJob(jobKey) {
   const job = state.discoveryResults.find((item) => discoveryJobKey(item) === String(jobKey));
   if (!job) return;
-  if (String(job.saved_job_status || job.status || "").toLowerCase() === "shortlisted") return;
+  if (!job.id) { toast("This result has no durable discovery identity; run the search again."); return; }
   try {
-    const saved = await api.send("/api/shortlist", "POST", job);
-    job.already_saved = true;
-    job.id = saved.id;
-    job.saved_job_status = saved.status || job.saved_job_status || job.status || "shortlisted";
-    toast(saved.restored ? "Restored to shortlist" : saved.duplicate ? "Already shortlisted" : `${saved.company || "Job"} shortlisted`);
-    await loadAll();
-    document.querySelector('[data-tab="shortlist"]').click();
-    renderDiscoveryResults({
-      jobs: state.discoveryResults,
-      total: state.discoveryResults.filter((item) => !item.hidden).length,
-      duplicates: state.discoveryResults.filter((item) => item.already_saved).length,
-      source_counts: countDiscoverySources(state.discoveryResults),
-      errors: {},
-    });
+    await api.send(`/api/discovery/inbox/${job.id}/save`, "POST", {});
+    job.hidden = true;
+    toast(`${job.company || "Job"} saved for later`);
+    renderDiscoveryResults({ jobs: state.discoveryResults, total: state.discoveryResults.filter((item) => !item.hidden).length, source_counts: countDiscoverySources(state.discoveryResults), errors: {} });
+    await loadDiscoveryInbox();
   } catch (error) {
     toast(error.message);
   }
+}
+
+async function applyDiscoveryJob(jobKey) {
+  const job = state.discoveryResults.find((item) => discoveryJobKey(item) === String(jobKey));
+  if (!job || !job.id) { toast("This result has no durable discovery identity; run the search again."); return; }
+  try {
+    const applied = await api.send(`/api/discovery/inbox/${job.id}/applied`, "POST", {});
+    job.hidden = true;
+    toast(`Marked applied on ${applied.date_applied || "today"}`);
+    renderDiscoveryResults({ jobs: state.discoveryResults, total: state.discoveryResults.filter((item) => !item.hidden).length, source_counts: countDiscoverySources(state.discoveryResults), errors: {} });
+    await loadDiscoveryInbox();
+  } catch (error) { toast(error.message); }
 }
 
 function renderShortlist() {
@@ -3316,17 +3323,16 @@ function showGenerationOutcome(result, requestedKinds) {
   }
 }
 
-function hideDiscoveryJob(jobKey) {
+async function hideDiscoveryJob(jobKey) {
   const job = state.discoveryResults.find((item) => discoveryJobKey(item) === String(jobKey));
-  if (!job) return;
-  job.hidden = true;
-  renderDiscoveryResults({
-    jobs: state.discoveryResults,
-    total: state.discoveryResults.filter((item) => !item.hidden).length,
-    duplicates: state.discoveryResults.filter((item) => item.already_saved).length,
-    source_counts: countDiscoverySources(state.discoveryResults),
-    errors: {},
-  });
+  if (!job || !job.id) { toast("This result has no durable discovery identity; run the search again."); return; }
+  try {
+    await api.send(`/api/discovery/inbox/${job.id}/ignore`, "POST", {});
+    job.hidden = true;
+    toast(`${job.company || "Job"} skipped`);
+    renderDiscoveryResults({ jobs: state.discoveryResults, total: state.discoveryResults.filter((item) => !item.hidden).length, source_counts: countDiscoverySources(state.discoveryResults), errors: {} });
+    await loadDiscoveryInbox();
+  } catch (error) { toast(error.message); }
 }
 
 function countDiscoverySources(jobs) {

@@ -49,12 +49,37 @@
       "qualification_fit_missing_requirements": ["Canadian eligibility"],
       "qualification_fit_reasons": ["Canadian eligibility is not confirmed by the posting."],
       "qualification_evidence_profile_name": "SWE résumé"
+    },
+    {
+      "id": 3,
+      "source_job_id": "cedar-skip-3",
+      "title": "Backend Engineer QA",
+      "company": "Cedar Review Co",
+      "location": "Canada",
+      "url": "https://jobs.example.test/cedar-skip-3",
+      "application_url": "https://careers.example.test/cedar-skip-3",
+      "source": "indeed",
+      "remote_type": "Remote",
+      "job_description": "Backend engineering role with incomplete captured requirements. Canadian eligibility is not stated in the posting.",
+      "description_completeness": "partial",
+      "remote_eligibility": "unknown",
+      "remote_search_eligible": "unknown",
+      "canadian_eligibility": "unknown",
+      "discovery_result_category": "review_required",
+      "discovery_result_reason": "Work arrangement or Canadian eligibility requires review.",
+      "qualification_match_score": 44,
+      "application_priority_score": 42,
+      "qualification_fit_label": "Review qualification fit",
+      "qualification_fit_matched_requirements": [],
+      "qualification_fit_missing_requirements": ["Canadian eligibility"],
+      "qualification_fit_reasons": ["Canadian eligibility is not confirmed by the posting."],
+      "qualification_evidence_profile_name": "SWE résumé"
     }
   ],
   "errors": {},
-  "source_counts": {"linkedin": 1, "indeed": 1, "google": 0, "zip_recruiter": 0},
-  "total": 2,
-  "visible_total": 2,
+  "source_counts": {"linkedin": 1, "indeed": 2, "google": 0, "zip_recruiter": 0},
+  "total": 3,
+  "visible_total": 3,
   "duplicates": 0,
   "already_saved_matches": 0,
   "search_key": "fixture-canada-remote",
@@ -69,7 +94,7 @@
     "jobs_returned_to_frontend": 2,
     "source_diagnostics": {
       "linkedin": {"attempted": true, "success": true, "result_count": 1, "region_queries": ["Toronto, ON", "Montreal, QC", "Vancouver, BC", "Calgary, AB", "Halifax, NS"]},
-      "indeed": {"attempted": true, "success": true, "result_count": 1, "region_queries": ["Toronto, ON", "Montreal, QC", "Vancouver, BC", "Calgary, AB", "Halifax, NS"]}
+      "indeed": {"attempted": true, "success": true, "result_count": 2, "region_queries": ["Toronto, ON", "Montreal, QC", "Vancouver, BC", "Calgary, AB", "Halifax, NS"]}
     }
   },
   "search": {"keywords": "software developer", "location": "Canada", "remote_preference": "remote", "total_cap": 10}

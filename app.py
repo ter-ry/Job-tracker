@@ -1718,7 +1718,7 @@ def create_app() -> Flask:
         include_history = as_bool(request.args.get("include_history"))
         query = "SELECT * FROM jobs WHERE discovery_first_seen_at <> ''"
         if not include_history:
-            query += " AND discovery_state <> 'ignored' AND status <> 'Applied'"
+            query += " AND discovery_state NOT IN ('ignored', 'saved', 'applied') AND status NOT IN ('Applied', 'shortlisted')"
         query += " ORDER BY discovery_state = 'new' DESC, discovery_last_seen_at DESC, id DESC LIMIT 500"
         rows = query_db(
             query
@@ -1737,6 +1737,8 @@ def create_app() -> Flask:
                 category = "applied"
             elif text(item.get("discovery_state")) == "ignored":
                 category = "skipped"
+            elif text(item.get("discovery_state")) == "saved":
+                category = "saved"
             elif text(item.get("discovery_result_category")) == "excluded":
                 category = "excluded"
             elif text(item.get("discovery_result_category")) == "review_required":
@@ -1764,6 +1766,34 @@ def create_app() -> Flask:
         get_db().execute("UPDATE jobs SET discovery_state = 'ignored', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
         get_db().commit()
         return jsonify({"ok": True})
+
+    @app.post("/api/discovery/inbox/<int:job_id>/save")
+    def save_discovery_job(job_id: int) -> Response:
+        row = query_db("SELECT * FROM jobs WHERE id = ? AND discovery_first_seen_at <> ''", [job_id], one=True)
+        if row is None:
+            return jsonify({"error": "Discovered job not found"}), 404
+        get_db().execute(
+            "UPDATE jobs SET status = 'Saved', discovery_state = 'saved', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            [job_id],
+        )
+        get_db().commit()
+        return jsonify(job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)))
+
+    @app.post("/api/discovery/inbox/<int:job_id>/applied")
+    def apply_discovery_job(job_id: int) -> Response:
+        row = query_db("SELECT * FROM jobs WHERE id = ? AND discovery_first_seen_at <> ''", [job_id], one=True)
+        if row is None:
+            return jsonify({"error": "Discovered job not found"}), 404
+        payload = request.get_json(silent=True) or {}
+        applied_date = text(payload.get("date_applied")) or date.today().isoformat()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", applied_date):
+            return jsonify({"error": "date_applied must use YYYY-MM-DD"}), 400
+        get_db().execute(
+            "UPDATE jobs SET status = 'Applied', date_applied = ?, discovery_state = 'applied', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            [applied_date, job_id],
+        )
+        get_db().commit()
+        return jsonify(job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)))
 
     @app.get("/api/preparation/queue")
     def preparation_queue() -> Response:
@@ -2143,6 +2173,23 @@ def create_app() -> Flask:
                 preferences.get("sort", {}).get("unknown_salary_position") or "last",
             )
         jobs = jobs[: search["total_cap"]]
+        manual_run_id = create_discovery_run(None, "manual")
+        persisted = persist_discovery_jobs(jobs, None, manual_run_id)
+        for item in jobs:
+            hydrate_discovery_identity(item)
+        processed_count = sum(1 for item in jobs if item.get("processed_discovery"))
+        jobs = [item for item in jobs if not item.get("processed_discovery")]
+        finish_discovery_run(
+            manual_run_id,
+            status="completed" if not fetched.get("errors") else "completed_with_errors",
+            fetched=len(raw_jobs),
+            new_count=int(persisted.get("new") or 0),
+            duplicate_count=int(persisted.get("duplicate") or 0),
+            errors=len(fetched.get("errors") or {}),
+            outcomes={"source_counts": source_counts, "processed_count": processed_count},
+        )
+        diagnostics["processed_count"] = processed_count
+        diagnostics["persisted"] = persisted
         diagnostics["jobs_returned_to_frontend"] = len(jobs)
         diagnostics["post_processing_row_count"] = len(jobs)
         save_discovery_search_run(search_key, search, diagnostics, raw_jobs)
@@ -2617,6 +2664,24 @@ def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, ru
         counts["new_job_ids"].append(int(db.execute("SELECT last_insert_rowid()").fetchone()[0]))
     db.commit()
     return counts
+
+
+def hydrate_discovery_identity(job: dict[str, Any]) -> dict[str, Any]:
+    """Attach the durable job identity and hide states to a live result."""
+    existing = find_existing_job_match(job)
+    if existing is None:
+        return job
+    job["id"] = int(existing["id"])
+    job["saved_job_id"] = int(existing["id"])
+    job["saved_job_status"] = text(existing["status"])
+    job["discovery_state"] = text(existing["discovery_state"])
+    job["date_applied"] = text(existing["date_applied"])
+    job["already_saved"] = True
+    job["processed_discovery"] = (
+        text(existing["status"]) in {"Applied", "shortlisted"}
+        or text(existing["discovery_state"]) in {"ignored", "saved", "applied"}
+    )
+    return job
 
 
 def create_discovery_run(search_id: int | None, trigger: str) -> int:
@@ -8650,7 +8715,12 @@ def _evidence_match(requirement: str, evidence: dict[str, Any]) -> tuple[str, st
     return "missing", "no sufficiently related evidence was found in the selected résumé", 0
 
 
-def _application_priority(job: dict[str, Any], qualification_score: int | None, profile: dict[str, Any] | None = None) -> tuple[int, list[str]]:
+def _application_priority(
+    job: dict[str, Any],
+    qualification_score: int | None,
+    profile: dict[str, Any] | None = None,
+    seniority: dict[str, Any] | None = None,
+) -> tuple[int, list[str]]:
     if qualification_score is None:
         return 0, ["Qualification cannot be ranked until the posting has a usable description."]
     blocking = []
@@ -8670,8 +8740,12 @@ def _application_priority(job: dict[str, Any], qualification_score: int | None, 
     location = text(job.get("location")).lower()
     location_preference = 100 if preferred_locations and any(part.strip() in location for part in re.split(r"[,;\n]+", preferred_locations) if part.strip()) else 70
     preference = round((role_preference + location_preference) / 2)
-    priority = round(qualification_score * 0.65 + recency * 0.15 + effort * 0.10 + preference * 0.10)
-    reasons = ["Qualification match is weighted first; recency, effort, and stated role/location preferences are secondary."]
+    seniority = seniority or {}
+    seniority_score = clamp_int(seniority.get("score"), 0, 100)
+    priority = round(qualification_score * 0.50 + seniority_score * 0.25 + recency * 0.10 + effort * 0.05 + preference * 0.10)
+    reasons = ["Qualification Match and evidence-backed seniority fit are weighted first; recency, effort, and stated role/location preferences are secondary."]
+    if seniority.get("stretch_role"):
+        reasons.append(text(seniority.get("explanation")) or "The posting expects experience or seniority above the selected target.")
     if text(job.get("remote_eligibility")).lower() in {"", "unknown"}:
         priority = min(priority, 59)
         reasons.append("Canadian eligibility is unverified, so this is not treated as a confirmed eligible recommendation.")
@@ -8740,7 +8814,7 @@ def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any
         reasons.append("Not demonstrated in the selected résumé: " + ", ".join(item["requirement"] for item in missing[:6]) + ".")
     if stretch:
         reasons.append("Stretch opportunity: the posting expects experience or seniority not fully established by the selected résumé.")
-    priority, priority_reasons = _application_priority(job, score, profile)
+    priority, priority_reasons = _application_priority(job, score, profile, seniority)
     label = "Stretch opportunity" if stretch or score < 60 else "Strong qualification match" if score >= 75 else "Review qualification fit"
     return {
         "qualification_match_status": "assessed" if mandatory_score is not None else "partial_evidence",

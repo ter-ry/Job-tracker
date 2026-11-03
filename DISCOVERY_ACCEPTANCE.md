@@ -38,3 +38,13 @@ The visible Windows browser was also exercised against the existing local server
 Because live provider responses were unavailable from the current branch, fresh LinkedIn/Indeed descriptions, top recommendations, and browser persistence actions could not be revalidated against live data in this run. Recorded fixtures cover the browser workflow, résumé matching, eligibility classification, sorting, and Applied/Skipped/Saved persistence. No applications were submitted, no paid APIs were used, production data was not modified, and PR #11, cover-letter generation, and résumé tailoring were not changed.
 
 The application is not being declared fully ready for manual acceptance until the current branch is run where LinkedIn and Indeed DNS/network access is available and the browser can reach that same instance.
+
+## Follow-up fixes — 2026-11-03
+
+- Audited the live Affirm explanation: the role was detected as `lead`, above the selected `entry_level,junior,intermediate` targets, with seniority fit 4/10; the old 65%-qualification formula still yielded Application Priority 79. Priority now combines Qualification Match (50%) with evidence-backed seniority fit (25%), while retaining recency, effort, and preferences as secondary signals.
+- Live discovery results now receive durable database IDs during the search. Save for later, Skip, and Mark Applied call discovery-inbox state endpoints keyed by that ID; Applied preserves the date and original posting URL, and no simple Save action calls legacy shortlist/document generation.
+- Repeat searches omit durable `saved`, `ignored`, `applied`, and legacy shortlisted records from New while retaining them in history.
+- Added API/integration coverage for three distinct live results, repeated searches, durable Save/Skip/Applied state, application-date/link preservation, no shortlist generation, and senior-role ranking.
+- Post-fix Python suite: **208 passed, 1 skipped in 322.16s (0:05:22)**. Python compile, JavaScript syntax, and targeted discovery tests passed.
+
+The disposable browser harness was updated for the lean workflow, but could not run in this environment because the repository has neither the Node nor Python Playwright package (`Cannot find module 'playwright'`). The Windows host server on port 5057 was still serving the pre-fix UI during this run; therefore the post-fix Windows browser smoke test and fresh live ranking after restart remain unverified.

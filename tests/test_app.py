@@ -270,6 +270,33 @@ class JobAssistantTest(unittest.TestCase):
         ordered = app_module.sort_discovery_jobs(jobs, "application_priority_score")
         self.assertEqual(ordered[0]["company"], "Preferred")
 
+    def test_staff_role_with_actual_experience_requirement_cannot_outrank_target_role(self):
+        profile = {
+            "resume_text": "Built React, Python, Flask, Node.js and PostgreSQL applications.",
+            "work_experience": "Software developer with three years of professional software experience.",
+            "target_seniority_levels": "entry_level, junior, intermediate",
+            "maximum_required_years": "3",
+            "willing_to_apply_to_stretch_roles": "true",
+            "management_roles_allowed": "false",
+        }
+        staff = app_module.build_qualification_fit(
+            {
+                "title": "Staff Software Engineer, Fullstack (Card Experiences)",
+                "job_description": "Required qualifications: 8+ years of professional software engineering experience. Lead architecture and mentor engineers across teams. Python, React, SQL and AWS required.",
+            },
+            evidence_profile=profile,
+        )
+        junior = app_module.build_qualification_fit(
+            {
+                "title": "Software Developer I",
+                "job_description": "Required qualifications: 0-2 years of professional software development experience. Python, React, SQL and AWS required.",
+            },
+            evidence_profile=profile,
+        )
+        self.assertLessEqual(staff["qualification_fit_seniority"]["score"], 50)
+        self.assertLess(staff["application_priority_score"], junior["application_priority_score"])
+        self.assertIn("above the saved maximum", staff["qualification_fit_seniority"]["explanation"])
+
     def test_canada_wide_discovery_uses_bounded_region_queries(self):
         self.assertEqual(len(app_module.discovery_query_locations("Canada")), 5)
         self.assertEqual(app_module.discovery_query_locations("Toronto"), ["Toronto"])
@@ -1899,6 +1926,40 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(categories["Backend Developer"], "skipped")
         self.assertEqual(self.client.get("/api/discovery/inbox").get_json(), [])
 
+    def test_live_discovery_persists_save_skip_and_applied_without_generation(self):
+        fake = {
+            "jobs": [
+                {"source_job_id": "persist-save", "title": "Junior React Developer", "company": "Save Co", "location": "Toronto, ON", "source": "linkedin", "job_url": "https://example.test/save", "description": "Required: React, JavaScript, SQL. 0-2 years experience.", "remote_type": "Remote"},
+                {"source_job_id": "persist-skip", "title": "Python Developer", "company": "Skip Co", "location": "Remote Canada", "source": "indeed", "job_url": "https://example.test/skip", "description": "Required: Python, Flask, REST APIs.", "remote_type": "Remote"},
+                {"source_job_id": "persist-apply", "title": "Backend Developer", "company": "Apply Co", "location": "Remote Canada", "source": "indeed", "job_url": "https://example.test/apply", "description": "Required: Python, PostgreSQL, REST APIs.", "remote_type": "Remote"},
+            ],
+            "errors": {}, "source_counts": {"linkedin": 1, "indeed": 2}, "source_diagnostics": {}, "source_snapshots": {},
+        }
+        with patch.object(app_module, "fetch_jobspy_jobs", return_value=fake):
+            first = self.client.post("/api/discovery/jobspy", json={"keywords": "software developer", "enabled_sources": ["linkedin", "indeed"]}).get_json()
+            by_title = {job["title"]: job for job in first["jobs"]}
+            self.assertTrue(all(job.get("id") for job in by_title.values()))
+            save_id = by_title["Junior React Developer"]["id"]
+            skip_id = by_title["Python Developer"]["id"]
+            apply_id = by_title["Backend Developer"]["id"]
+            self.assertEqual(self.client.post(f"/api/discovery/inbox/{save_id}/save", json={}).status_code, 200)
+            self.assertEqual(self.client.post(f"/api/discovery/inbox/{skip_id}/ignore", json={}).status_code, 200)
+            applied = self.client.post(f"/api/discovery/inbox/{apply_id}/applied", json={}).get_json()
+            self.assertEqual(applied["status"], "Applied")
+            self.assertTrue(applied["date_applied"])
+            second = self.client.post("/api/discovery/jobspy", json={"keywords": "software developer", "enabled_sources": ["linkedin", "indeed"]}).get_json()
+
+        self.assertEqual(second["jobs"], [])
+        history = self.client.get("/api/discovery/inbox?include_history=1").get_json()
+        categories = {item["title"]: item["discovery_inbox_category"] for item in history}
+        self.assertEqual(categories["Junior React Developer"], "saved")
+        self.assertEqual(categories["Python Developer"], "skipped")
+        self.assertEqual(categories["Backend Developer"], "applied")
+        self.assertEqual(self.client.get("/api/discovery/inbox").get_json(), [])
+        row = next(item for item in history if item["title"] == "Backend Developer")
+        self.assertEqual(row["url"], "https://example.test/apply")
+        self.assertEqual(row["date_applied"], applied["date_applied"])
+        self.assertEqual(self.client.get("/api/shortlist").get_json(), [])
     def test_saved_discovery_searches_are_named_disabled_by_default_and_editable(self):
         created = self.client.post(
             "/api/discovery/searches",
