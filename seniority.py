@@ -149,8 +149,8 @@ def analyze_job_seniority(job: dict[str, Any]) -> dict[str, Any]:
         "description_level": description_level,
         "title_evidence": title_hits,
         "description_evidence": description_hits,
-        "required_experience": required_range.as_dict() if required_range else None,
-        "preferred_experience": preferred_range.as_dict() if preferred_range else None,
+        "required_experience": experience_range_dict(required_range, description) if required_range else None,
+        "preferred_experience": experience_range_dict(preferred_range, description) if preferred_range else None,
         "ambiguous_experience": [item.as_dict() for item in ambiguous_ranges],
         "management_role": management_flag,
         "leadership_expectations": leadership_flag,
@@ -159,6 +159,18 @@ def analyze_job_seniority(job: dict[str, Any]) -> dict[str, Any]:
         "title_description_disagreement": disagreement,
         "warning": "Title and description seniority signals disagree." if disagreement else "",
     }
+
+
+def experience_range_dict(item: ExperienceRange, content: str) -> dict[str, Any]:
+    result = item.as_dict()
+    start = content.lower().find(item.text.lower())
+    if start >= 0:
+        end_candidates = [position for position in (content.find(".", start), content.find("\n", start)) if position >= 0]
+        end = min(end_candidates) if end_candidates else min(len(content), start + 180)
+        result["source_evidence"] = content[max(0, start - 24):end].strip()
+    else:
+        result["source_evidence"] = item.text
+    return result
 
 
 def detect_level(content: str) -> tuple[str, list[str]]:
@@ -192,7 +204,7 @@ def extract_experience_ranges(content: str) -> tuple[list[ExperienceRange], list
 
     range_pattern = re.compile(
         r"(?P<a>\d{1,2})(?:\s*(?:\+|plus)|\s*(?:-|to|–)\s*(?P<b>\d{1,2})(?:\s*(?:\+|plus))?)?\s*(?:years?|yrs?)"
-        r"(?:\s+of)?\s+(?:professional\s+)?(?:work\s+)?(?:experience|development|engineering|programming)?",
+        r"(?:\s+of)?\s+(?:professional\s+)?(?:work\s+)?(?:experience|development|engineering|programming)?(?:\s+(?:experience|development|engineering|programming))?",
         re.I,
     )
     for match in range_pattern.finditer(content):
@@ -224,7 +236,7 @@ def is_false_experience_match(content: str, start: int, end: int) -> bool:
 
 def classify_experience_context(snippet: str) -> str:
     lowered = snippet.lower()
-    if any(term in lowered for term in ["required", "must have", "minimum", "at least", "need", "requires"]):
+    if any(term in lowered for term in ["required", "requirements", "must have", "minimum", "at least", "need", "requires"]):
         return "required"
     if any(term in lowered for term in ["preferred", "nice to have", "bonus", "asset", "ideally"]):
         return "preferred"

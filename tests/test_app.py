@@ -1899,6 +1899,40 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(categories["Backend Developer"], "skipped")
         self.assertEqual(self.client.get("/api/discovery/inbox").get_json(), [])
 
+    def test_repeated_discovery_omits_applied_and_skipped_requisitions(self):
+        fake = {
+            "jobs": [
+                {"source_job_id": "same-linkedin", "company": "Northstar", "title": "Junior Python Developer", "location": "Remote Canada", "source": "linkedin", "job_url": "https://example.com/northstar", "description": "Required: 1 to 2 years of professional software development experience. Python Flask SQL.", "remote_type": "Remote"},
+                {"source_job_id": "same-indeed", "company": "Maple", "title": "Backend Developer", "location": "Remote Canada", "source": "indeed", "job_url": "https://example.com/maple", "description": "Required: Python SQL backend development.", "remote_type": "Remote"},
+            ],
+            "errors": {}, "source_counts": {"linkedin": 1, "indeed": 1},
+        }
+        with patch.object(app_module, "fetch_jobspy_jobs", return_value=fake):
+            first = self.client.post("/api/discovery/jobspy", json={"keywords": "software developer"}).get_json()
+            first_job = next(item for item in first["jobs"] if item["title"] == "Junior Python Developer")
+            second_job = next(item for item in first["jobs"] if item["title"] == "Backend Developer")
+            applied = self.client.post("/api/shortlist", json={**first_job, "discovery_action": "save_for_later"}).get_json()
+            self.assertTrue(applied["generation"]["skipped"])
+            self.assertEqual(self.client.post(f"/api/shortlist/{applied['id']}/applied", json={}).status_code, 200)
+            self.assertEqual(self.client.post("/api/discovery/skip", json=second_job).status_code, 200)
+            repeated = self.client.post("/api/discovery/jobspy", json={"keywords": "software developer"}).get_json()
+        self.assertEqual(first["visible_total"], 2)
+        self.assertEqual(repeated["visible_total"], 0)
+        self.assertEqual(repeated["previously_processed_count"], 2)
+        self.assertEqual(repeated["jobs"], [])
+
+    def test_discovery_response_exposes_required_and_preferred_experience_evidence(self):
+        fake = {
+            "jobs": [{"source_job_id": "years-1", "company": "Years Co", "title": "Software Developer", "location": "Toronto, ON", "source": "linkedin", "job_url": "https://example.com/years", "description": "Requirements: 3 to 5 years of professional software development experience. Preferred: 6+ years with Python.", "remote_type": "Hybrid"}],
+            "errors": {}, "source_counts": {"linkedin": 1},
+        }
+        with patch.object(app_module, "fetch_jobspy_jobs", return_value=fake):
+            result = self.client.post("/api/discovery/jobspy", json={"keywords": "software developer"}).get_json()
+        experience = result["jobs"][0]["experience_requirements"]
+        self.assertEqual(experience["required"]["minimum"], 3)
+        self.assertEqual(experience["required"]["maximum"], 5)
+        self.assertEqual(experience["preferred"]["minimum"], 6)
+        self.assertIn("professional software development", experience["source_evidence"])
     def test_saved_discovery_searches_are_named_disabled_by_default_and_editable(self):
         created = self.client.post(
             "/api/discovery/searches",
