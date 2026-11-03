@@ -1,62 +1,50 @@
-# Discovery acceptance report
+# Discovery reliability acceptance report
 
-Date: 2026-11-03
-PR: https://github.com/ter-ry/Job-tracker/pull/12 (draft, unmerged)
+Date: 2026-11-03 (America/New_York)
 Branch: `codex/discovery-reliability`
-Issue: https://github.com/ter-ry/Job-tracker/issues/13
+Scope: Issue #13 on draft PR #12
 
-## Status
+## Implemented behavior
 
-Implementation complete for the locally verifiable workflow. Regression tests and recorded-fixture browser acceptance pass. **Live provider acceptance remains blocked** by the managed network and is not claimed as passed.
+- Country-wide Canada searches are resolved before geocoding and expanded into bounded, geographically diverse provider regions. Diagnostics expose exact region queries and per-source outcomes.
+- Discovery results retain distinct actionable, review-required, and excluded outcomes, with Qualification Match and Application Priority shown separately and sorted consistently.
+- The discovery inbox has persistent New actionable, Review required, Excluded, Applied, and Skipped views. Applied and skipped records remain in history and are excluded from New after reloads and reruns.
+- Applied actions persist the application date. Skip actions preserve the record and source URL.
+- The selected candidate profile and résumé remain the evidence source throughout discovery and saved-search views.
+- Cached geocodes are revalidated against the requested Canadian city, province, or postal code before reuse; mismatched coordinates are rejected.
 
-## Defects and fixes
+## Browser and fixture evidence
 
-- Canada-wide searches now resolve country scope before geocoding and use bounded Toronto, Montreal, Vancouver, Calgary, and Halifax provider queries. Diagnostics retain region and provider outcomes.
-- Search results now persist discovery identity when the user chooses Save for later, and the discovery Save action does not generate résumé or cover-letter documents.
-- Applied and Skipped records are excluded from repeated manual and saved-search results while remaining in history. Cross-provider and cross-region identity matching uses canonical URLs plus normalized company/title/location keys.
-- Live result Skip now writes an authoritative SQLite history record. Applied and Skipped records have a Reopen action that explicitly returns them to New.
-- Required and preferred professional experience, candidate years when explicitly evidenced, experience fit, seniority, and source evidence are exposed in the result payload and directly on result rows/cards.
-- The selected résumé profile remains the evidence source through discovery scoring and saved discovery views.
+The browser harness is `scripts/discovery_acceptance_browser.js`. It creates a disposable database and DOCX résumé, seeds recorded Canada results from `tests/fixtures/discovery_canada_acceptance.json`, intercepts only the provider request, and runs the application in Chromium. The successful recorded-fixture run captured:
 
-## Automated verification
+- `01-canada-search.png`: Canada search, ranked results, profile evidence, explanations, and diagnostics.
+- `02-applied-skipped.png`: Applied, Skipped, and separate shortlist history state.
+- `browser-log.json`: profile, seeded IDs, category assignments, and history counts.
 
-- Full Python suite: `Ran 209 tests in 37.275s; OK (skipped=1)`.
-- Targeted regressions: repeated Applied/Skipped searches, experience extraction/display data, inbox history persistence, duplicate handling, and existing seniority false-positive cases all pass.
-- JavaScript syntax: `node --check static/app.js` and `node --check scripts/discovery_acceptance_browser.js`.
-- Diff hygiene: `git diff --check`.
+The QA database and résumé were disposable and did not use production data.
 
-## Browser evidence
+The visible Windows browser was also exercised against the existing local server on `127.0.0.1:5055` with Canada, Remote, LinkedIn and Indeed, the SWE résumé, and prioritized software-development keywords. That server returned no jobs and reported `normalized=Canada; search=Cardston County, AB; method=geocoded_city_region`. It is a stale pre-fix server and is not acceptance evidence for the current branch; it reproduces the original defect.
 
-`scripts/discovery_acceptance_browser.js` creates a disposable SQLite database, a temporary DOCX résumé for the `SWE résumé` profile, and two recorded Canada results. It exercises Canada search entry, résumé selection, ranked results, score explanations, required/preferred experience display, application links, Save for later, Mark Applied, Skip, history counts, reload, and default-inbox exclusion.
+## Validation
 
-Latest successful artifacts:
+- Current full Python regression suite: **205 passed, 1 skipped in 419.31s (0:06:59)** before integrating the remote completion commit.
+- The remote completion commit adds the recorded browser harness and additional discovery coverage; it still needs a fresh post-merge full-suite run before the branch can be called fully accepted.
+- `git diff --check` passed for the documentation change before merge.
 
-- `/tmp/job-tracker-discovery-qa.JSYL4N/artifacts/01-canada-search.png`
-- `/tmp/job-tracker-discovery-qa.JSYL4N/artifacts/02-applied-skipped.png`
-- `/tmp/job-tracker-discovery-qa.JSYL4N/artifacts/browser-log.json`
+## Live acceptance limitation
 
-The QA database and résumé were disposable. No production records or personal documents were used.
+**LIVE ACCEPTANCE BLOCKED.** The current-branch provider run planned the five Canadian region queries, then JobSpy failed DNS resolution for `www.linkedin.com` (`NameResolutionError`, `[Errno 11001]`) before returning jobs. The visible Windows browser and restricted execution environment are on separate local-network surfaces: the browser can reach the stale 5055 server, while it cannot reach an isolated current-branch server on 5057 (`ERR_CONNECTION_REFUSED`).
 
-## Acceptance matrix
+Because live provider responses were unavailable from the current branch, fresh LinkedIn/Indeed descriptions, top recommendations, and browser persistence actions could not be revalidated against live data in this run. Recorded fixtures cover the browser workflow, résumé matching, eligibility classification, sorting, and Applied/Skipped/Saved persistence. No applications were submitted, no paid APIs were used, production data was not modified, and PR #11, cover-letter generation, and résumé tailoring were not changed.
 
-| Area | Result | Evidence |
-|---|---|---|
-| Canada scope and geocoding safeguards | Pass locally | Existing unit coverage plus regional diagnostics and Canada fixture |
-| Qualification Match and Application Priority | Pass locally | Existing scoring tests and browser explanations |
-| Required/preferred years extraction | Pass locally | Seniority tests and new response/UI regression |
-| SWE résumé evidence isolation | Pass locally | Candidate-profile browser fixture and profile-scoped API calls |
-| Provider/cross-region deduplication | Pass locally | Canonical URL and company/title/location tests |
-| Save for later | Pass locally | Discovery action persists identity without document generation |
-| Applied and Skip persistence | Pass locally | Repeated-search regression and browser reload evidence |
-| Accidental decision correction | Pass locally | Reopen endpoint and history action |
-| Live provider search | Blocked | Network proxy/DNS failures |
+The application is not being declared fully ready for manual acceptance until the current branch is run where LinkedIn and Indeed DNS/network access is available and the browser can reach that same instance.
 
-## Live limitation
+## Follow-up fixes — 2026-11-03
 
-**LIVE ACCEPTANCE BLOCKED.** The bounded public-source check attempted LinkedIn, Indeed, Google Jobs, and ZipRecruiter. LinkedIn, Indeed, and Google returned proxy tunnel `403 Forbidden`; ZipRecruiter returned DNS failure. Do not treat recorded fixtures as live acceptance.
+- Audited the live Affirm explanation: the role was detected as `lead`, above the selected `entry_level,junior,intermediate` targets, with seniority fit 4/10; the old 65%-qualification formula still yielded Application Priority 79. Priority now combines Qualification Match (50%) with evidence-backed seniority fit (25%), while retaining recency, effort, and preferences as secondary signals.
+- Live discovery results now receive durable database IDs during the search. Save for later, Skip, and Mark Applied call discovery-inbox state endpoints keyed by that ID; Applied preserves the date and original posting URL, and no simple Save action calls legacy shortlist/document generation.
+- Repeat searches omit durable `saved`, `ignored`, `applied`, and legacy shortlisted records from New while retaining them in history.
+- Added API/integration coverage for three distinct live results, repeated searches, durable Save/Skip/Applied state, application-date/link preservation, no shortlist generation, and senior-role ranking.
+- Post-fix Python suite: **208 passed, 1 skipped in 322.16s (0:05:22)**. Python compile, JavaScript syntax, and targeted discovery tests passed.
 
-## Windows follow-up
-
-After network access is available on the host, run the browser harness against an isolated data directory and perform one Canada remote SWE search. Confirm the first ten provider results include source URLs, required-years evidence, and the selected résumé name; mark one Applied, one Skip, and one Save for later; reload and repeat the search. The code and report already preserve the required local evidence, so this is the remaining live check rather than a database repair.
-
-No paid AI API, application submission, automatic Applied action against production data, résumé rewrite, cover-letter generation, or PR merge was performed. PR #11 was not modified.
+The disposable browser harness was updated for the lean workflow, but could not run in this environment because the repository has neither the Node nor Python Playwright package (`Cannot find module 'playwright'`). The Windows host server on port 5057 was still serving the pre-fix UI during this run; therefore the post-fix Windows browser smoke test and fresh live ranking after restart remain unverified.

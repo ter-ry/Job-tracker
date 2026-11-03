@@ -78,12 +78,8 @@ async function main() {
   }
 
   await page.locator('[data-discovery-action="save"]').first().click();
-  await page.getByRole("button", { name: "Shortlist", exact: true }).click();
-  await page.getByRole("button", { name: "Mark applied" }).first().click();
-  await page.getByRole("button", { name: "Discovery" }).click();
-  await page.getByRole("button", { name: "Saved searches" }).click();
-  await page.getByRole("button", { name: /Review required/ }).click();
-  await page.evaluate(() => ignoreInboxJob(2));
+  await page.locator('[data-discovery-action="applied"]').first().click();
+  await page.locator('[data-discovery-action="hide"]').first().click();
   await page.screenshot({ path: path.join(artifactDir, "02-applied-skipped.png"), fullPage: true });
 
   await page.reload({ waitUntil: "networkidle" });
@@ -91,7 +87,8 @@ async function main() {
   await page.getByRole("button", { name: "Saved searches" }).click();
   const appliedCount = await page.getByRole("button", { name: /Applied/ }).innerText();
   const skippedCount = await page.getByRole("button", { name: /Skipped/ }).innerText();
-  if (!/1/.test(appliedCount) || !/1/.test(skippedCount)) throw new Error(`History counts wrong: ${appliedCount}; ${skippedCount}`);
+  const savedCount = await page.getByRole("button", { name: /Saved for later/ }).innerText();
+  if (!/1/.test(appliedCount) || !/1/.test(skippedCount) || !/1/.test(savedCount)) throw new Error(`History counts wrong: ${appliedCount}; ${skippedCount}; ${savedCount}`);
 
   const inbox = await page.evaluate(async () => ({
     current: await fetch("/api/discovery/inbox").then((response) => response.json()),
@@ -99,9 +96,9 @@ async function main() {
   }));
   if (inbox.current.length !== 0) throw new Error(`Processed records returned to New inbox: ${inbox.current.length}`);
   const categories = Object.fromEntries(inbox.history.map((item) => [item.title, item.discovery_inbox_category]));
-  if (categories["Junior Python Developer"] !== "applied" || categories["Backend Engineer"] !== "skipped") throw new Error(`Unexpected categories: ${JSON.stringify(categories)}`);
+  if (categories["Junior Python Developer"] !== "saved" || categories["Backend Engineer"] !== "applied" || categories["Backend Engineer QA"] !== "skipped") throw new Error(`Unexpected categories: ${JSON.stringify(categories)}`);
 
-  fs.writeFileSync(path.join(artifactDir, "browser-log.json"), JSON.stringify({ profileId: profile.id, seededJobIds: seeded.map((job) => job.id), categories, appliedCount, skippedCount }, null, 2));
+  fs.writeFileSync(path.join(artifactDir, "browser-log.json"), JSON.stringify({ profileId: profile.id, seededJobIds: seeded.map((job) => job.id), categories, appliedCount, skippedCount, savedCount }, null, 2));
   await browser.close();
 }
 

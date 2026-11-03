@@ -55,7 +55,7 @@ from grounding import (
     validate_generated_content,
 )
 from semantic_matching import MODEL_DOWNLOAD_SIZE, MODEL_NAME, analyze_resume_match, extract_resume_evidence
-from seniority import DETECTED_LEVELS, SENIORITY_LEVELS, analyze_job_seniority, explicit_professional_years, score_seniority_fit
+from seniority import DETECTED_LEVELS, SENIORITY_LEVELS, analyze_job_seniority, score_seniority_fit
 from ollama_client import OllamaConfig, build_ollama_health_report, ollama_profile_defaults, request_json_completion
 from sources.jobspy_source import fetch_jobspy_jobs
 from tailoring import generate_tailored_resume_draft
@@ -1391,7 +1391,6 @@ def create_app() -> Flask:
     @app.post("/api/shortlist")
     def create_shortlist_item() -> Response:
         payload = request.get_json(force=True)
-        discovery_save = text(payload.get("discovery_action")) == "save_for_later"
         try:
             generation_profile = resolve_generation_profile(payload)
         except ValueError as exc:
@@ -1417,12 +1416,6 @@ def create_app() -> Flask:
         clean["cover_letter_generation_error"] = ""
         clean["cover_letter_generation_warning"] = ""
         clean["generation_error"] = ""
-        if discovery_save:
-            now = datetime.now().isoformat(timespec="seconds")
-            clean["discovery_first_seen_at"] = text(clean.get("discovery_first_seen_at")) or now
-            clean["discovery_last_seen_at"] = now
-            clean["discovery_seen_count"] = int(clean.get("discovery_seen_count") or 1)
-            clean["discovery_state"] = text(clean.get("discovery_state")) or "new"
         db = get_db()
         cursor = db.execute(
             f"""
@@ -1433,35 +1426,9 @@ def create_app() -> Flask:
         )
         db.commit()
         job_id = int(cursor.lastrowid)
-        generation = {"skipped": True, "reason": "Discovery Save for later does not generate application documents."} if discovery_save else generate_and_store_shortlist_documents(job_id, profile_override=generation_profile)
+        generation = generate_and_store_shortlist_documents(job_id, profile_override=generation_profile)
         job = query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)
         return jsonify({**job_to_dict(job), "generation": generation, "duplicate": False, "restored": False}), 201
-
-    @app.post("/api/discovery/skip")
-    def skip_discovery_result() -> Response:
-        payload = request.get_json(force=True) or {}
-        clean = normalize_job_payload(payload)
-        existing = find_existing_job_match(clean)
-        now = datetime.now().isoformat(timespec="seconds")
-        if existing is not None:
-            get_db().execute(
-                "UPDATE jobs SET discovery_state = 'ignored', discovery_last_seen_at = ?, discovery_seen_count = discovery_seen_count + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                [now, int(existing["id"])],
-            )
-            get_db().commit()
-            return jsonify(job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [int(existing["id"])], one=True)))
-        clean["status"] = "Saved"
-        clean["discovery_first_seen_at"] = now
-        clean["discovery_last_seen_at"] = now
-        clean["discovery_seen_count"] = 1
-        clean["discovery_state"] = "ignored"
-        clean["date_added"] = text(clean.get("date_added")) or date.today().isoformat()
-        cursor = get_db().execute(
-            f"INSERT INTO jobs ({', '.join(JOB_COLUMNS.keys())}) VALUES ({', '.join(['?'] * len(JOB_COLUMNS))})",
-            tuple(clean[column] for column in JOB_COLUMNS),
-        )
-        get_db().commit()
-        return jsonify(job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [cursor.lastrowid], one=True)))
 
     @app.post("/api/shortlist/<int:job_id>/regenerate")
     def regenerate_shortlist_documents(job_id: int) -> Response:
@@ -1751,7 +1718,7 @@ def create_app() -> Flask:
         include_history = as_bool(request.args.get("include_history"))
         query = "SELECT * FROM jobs WHERE discovery_first_seen_at <> ''"
         if not include_history:
-            query += " AND discovery_state <> 'ignored' AND status <> 'Applied'"
+            query += " AND discovery_state NOT IN ('ignored', 'saved', 'applied') AND status NOT IN ('Applied', 'shortlisted')"
         query += " ORDER BY discovery_state = 'new' DESC, discovery_last_seen_at DESC, id DESC LIMIT 500"
         rows = query_db(
             query
@@ -1770,6 +1737,8 @@ def create_app() -> Flask:
                 category = "applied"
             elif text(item.get("discovery_state")) == "ignored":
                 category = "skipped"
+            elif text(item.get("discovery_state")) == "saved":
+                category = "saved"
             elif text(item.get("discovery_result_category")) == "excluded":
                 category = "excluded"
             elif text(item.get("discovery_result_category")) == "review_required":
@@ -1798,14 +1767,30 @@ def create_app() -> Flask:
         get_db().commit()
         return jsonify({"ok": True})
 
-    @app.post("/api/discovery/inbox/<int:job_id>/reopen")
-    def reopen_discovery_job(job_id: int) -> Response:
+    @app.post("/api/discovery/inbox/<int:job_id>/save")
+    def save_discovery_job(job_id: int) -> Response:
         row = query_db("SELECT * FROM jobs WHERE id = ? AND discovery_first_seen_at <> ''", [job_id], one=True)
         if row is None:
             return jsonify({"error": "Discovered job not found"}), 404
         get_db().execute(
-            "UPDATE jobs SET status = CASE WHEN status = 'Applied' THEN 'Saved' ELSE status END, date_applied = CASE WHEN status = 'Applied' THEN '' ELSE date_applied END, discovery_state = 'new', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE jobs SET status = 'Saved', discovery_state = 'saved', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             [job_id],
+        )
+        get_db().commit()
+        return jsonify(job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)))
+
+    @app.post("/api/discovery/inbox/<int:job_id>/applied")
+    def apply_discovery_job(job_id: int) -> Response:
+        row = query_db("SELECT * FROM jobs WHERE id = ? AND discovery_first_seen_at <> ''", [job_id], one=True)
+        if row is None:
+            return jsonify({"error": "Discovered job not found"}), 404
+        payload = request.get_json(silent=True) or {}
+        applied_date = text(payload.get("date_applied")) or date.today().isoformat()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", applied_date):
+            return jsonify({"error": "date_applied must use YYYY-MM-DD"}), 400
+        get_db().execute(
+            "UPDATE jobs SET status = 'Applied', date_applied = ?, discovery_state = 'applied', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            [applied_date, job_id],
         )
         get_db().commit()
         return jsonify(job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)))
@@ -2078,7 +2063,6 @@ def create_app() -> Flask:
         jobs: list[dict[str, Any]] = []
         duplicates_in_search = 0
         already_saved_matches = 0
-        previously_processed_count = 0
         excluded_count = 0
         geocoding_success = 0
         geocoding_cached = 0
@@ -2122,15 +2106,6 @@ def create_app() -> Flask:
                 already_saved_matches += 1
                 existing_match = find_existing_job_match(clean)
                 if existing_match is not None:
-                    existing_status = text(existing_match["status"]).lower()
-                    existing_state = text(existing_match["discovery_state"]).lower()
-                    if existing_status == "applied" or existing_state == "ignored":
-                        previously_processed_count += 1
-                        get_db().execute(
-                            "UPDATE jobs SET discovery_last_seen_at = ?, discovery_seen_count = discovery_seen_count + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                            [datetime.now().isoformat(timespec="seconds"), int(existing_match["id"])],
-                        )
-                        continue
                     clean["saved_job_id"] = int(existing_match["id"])
                     clean["saved_job_status"] = text(existing_match["status"])
             seen_keys.update(keys)
@@ -2175,7 +2150,6 @@ def create_app() -> Flask:
             "duplicates_removed": duplicates_in_search,
             "duplicates_in_search": duplicates_in_search,
             "already_saved_matches": already_saved_matches,
-            "previously_processed_count": previously_processed_count,
             "excluded_count": excluded_count,
             "capped_count": capped_count,
             "visible_count": min(len(jobs), search["total_cap"]),
@@ -2199,6 +2173,23 @@ def create_app() -> Flask:
                 preferences.get("sort", {}).get("unknown_salary_position") or "last",
             )
         jobs = jobs[: search["total_cap"]]
+        manual_run_id = create_discovery_run(None, "manual")
+        persisted = persist_discovery_jobs(jobs, None, manual_run_id)
+        for item in jobs:
+            hydrate_discovery_identity(item)
+        processed_count = sum(1 for item in jobs if item.get("processed_discovery"))
+        jobs = [item for item in jobs if not item.get("processed_discovery")]
+        finish_discovery_run(
+            manual_run_id,
+            status="completed" if not fetched.get("errors") else "completed_with_errors",
+            fetched=len(raw_jobs),
+            new_count=int(persisted.get("new") or 0),
+            duplicate_count=int(persisted.get("duplicate") or 0),
+            errors=len(fetched.get("errors") or {}),
+            outcomes={"source_counts": source_counts, "processed_count": processed_count},
+        )
+        diagnostics["processed_count"] = processed_count
+        diagnostics["persisted"] = persisted
         diagnostics["jobs_returned_to_frontend"] = len(jobs)
         diagnostics["post_processing_row_count"] = len(jobs)
         save_discovery_search_run(search_key, search, diagnostics, raw_jobs)
@@ -2218,7 +2209,6 @@ def create_app() -> Flask:
                 "duplicates": duplicates_in_search,
                 "duplicates_in_search": duplicates_in_search,
                 "already_saved_matches": already_saved_matches,
-            "previously_processed_count": previously_processed_count,
                 "excluded_count": excluded_count,
                 "capped_count": capped_count,
                 "search_key": search_key,
@@ -2676,6 +2666,24 @@ def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, ru
     return counts
 
 
+def hydrate_discovery_identity(job: dict[str, Any]) -> dict[str, Any]:
+    """Attach the durable job identity and hide states to a live result."""
+    existing = find_existing_job_match(job)
+    if existing is None:
+        return job
+    job["id"] = int(existing["id"])
+    job["saved_job_id"] = int(existing["id"])
+    job["saved_job_status"] = text(existing["status"])
+    job["discovery_state"] = text(existing["discovery_state"])
+    job["date_applied"] = text(existing["date_applied"])
+    job["already_saved"] = True
+    job["processed_discovery"] = (
+        text(existing["status"]) in {"Applied", "shortlisted"}
+        or text(existing["discovery_state"]) in {"ignored", "saved", "applied"}
+    )
+    return job
+
+
 def create_discovery_run(search_id: int | None, trigger: str) -> int:
     cursor = get_db().execute("INSERT INTO discovery_run_history (search_id, trigger) VALUES (?, ?)", [search_id, trigger])
     get_db().commit()
@@ -2777,7 +2785,6 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
     jobs: list[dict[str, Any]] = []
     duplicates_in_search = 0
     already_saved_matches = 0
-    previously_processed_count = 0
     filtered = 0
     for raw_job in fetched.get("jobs", []):
         clean = normalize_job_payload(jobspy_result_to_job_payload(raw_job))
@@ -2821,15 +2828,6 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         if clean["already_saved"]:
             existing_match = find_existing_job_match(clean)
             if existing_match is not None:
-                existing_status = text(existing_match["status"]).lower()
-                existing_state = text(existing_match["discovery_state"]).lower()
-                if existing_status == "applied" or existing_state == "ignored":
-                    previously_processed_count += 1
-                    get_db().execute(
-                        "UPDATE jobs SET discovery_last_seen_at = ?, discovery_seen_count = discovery_seen_count + 1, discovery_last_search_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                        [datetime.now().isoformat(timespec="seconds"), int(search_id or 0), int(existing_match["id"])],
-                    )
-                    continue
                 clean["saved_job_id"] = int(existing_match["id"])
                 clean["saved_job_status"] = text(existing_match["status"])
         seen_keys.update(keys)
@@ -2848,7 +2846,6 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         "duplicates_removed": duplicates_in_search,
         "duplicates_in_search": duplicates_in_search,
         "already_saved_matches": already_saved_matches,
-        "previously_processed_count": previously_processed_count,
         "excluded_count": filtered,
         "capped_count": capped_count,
         "visible_count": len(jobs),
@@ -2871,7 +2868,6 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         "duplicates": duplicates_in_search,
         "duplicates_in_search": duplicates_in_search,
         "already_saved_matches": already_saved_matches,
-        "previously_processed_count": previously_processed_count,
         "excluded_count": filtered,
         "capped_count": capped_count,
         "persisted": persisted,
@@ -7641,10 +7637,6 @@ def enrich_discovery_job(job: dict[str, Any], profile: dict[str, str], settings:
         "qualification_fit_matched_requirements": qualification.get("qualification_fit_matched_requirements", []),
         "qualification_fit_partial_requirements": qualification.get("qualification_fit_partial_requirements", []),
         "qualification_requirements": qualification.get("qualification_requirements", []),
-        "experience_requirements": qualification.get("experience_requirements", {}),
-        "qualification_evidence_profile_id": qualification.get("qualification_evidence_profile_id", ""),
-        "qualification_evidence_profile_name": qualification.get("qualification_evidence_profile_name", "Active Profile"),
-        "qualification_evidence_source": qualification.get("qualification_evidence_source", ""),
         "qualification_components": qualification.get("qualification_components", {}),
         "qualification_fit_seniority": qualification.get("qualification_fit_seniority", {}),
         "application_priority_reasons": qualification.get("application_priority_reasons", []),
@@ -8723,7 +8715,12 @@ def _evidence_match(requirement: str, evidence: dict[str, Any]) -> tuple[str, st
     return "missing", "no sufficiently related evidence was found in the selected résumé", 0
 
 
-def _application_priority(job: dict[str, Any], qualification_score: int | None, profile: dict[str, Any] | None = None) -> tuple[int, list[str]]:
+def _application_priority(
+    job: dict[str, Any],
+    qualification_score: int | None,
+    profile: dict[str, Any] | None = None,
+    seniority: dict[str, Any] | None = None,
+) -> tuple[int, list[str]]:
     if qualification_score is None:
         return 0, ["Qualification cannot be ranked until the posting has a usable description."]
     blocking = []
@@ -8743,8 +8740,12 @@ def _application_priority(job: dict[str, Any], qualification_score: int | None, 
     location = text(job.get("location")).lower()
     location_preference = 100 if preferred_locations and any(part.strip() in location for part in re.split(r"[,;\n]+", preferred_locations) if part.strip()) else 70
     preference = round((role_preference + location_preference) / 2)
-    priority = round(qualification_score * 0.65 + recency * 0.15 + effort * 0.10 + preference * 0.10)
-    reasons = ["Qualification match is weighted first; recency, effort, and stated role/location preferences are secondary."]
+    seniority = seniority or {}
+    seniority_score = clamp_int(seniority.get("score"), 0, 100)
+    priority = round(qualification_score * 0.50 + seniority_score * 0.25 + recency * 0.10 + effort * 0.05 + preference * 0.10)
+    reasons = ["Qualification Match and evidence-backed seniority fit are weighted first; recency, effort, and stated role/location preferences are secondary."]
+    if seniority.get("stretch_role"):
+        reasons.append(text(seniority.get("explanation")) or "The posting expects experience or seniority above the selected target.")
     if text(job.get("remote_eligibility")).lower() in {"", "unknown"}:
         priority = min(priority, 59)
         reasons.append("Canadian eligibility is unverified, so this is not treated as a confirmed eligible recommendation.")
@@ -8813,7 +8814,7 @@ def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any
         reasons.append("Not demonstrated in the selected résumé: " + ", ".join(item["requirement"] for item in missing[:6]) + ".")
     if stretch:
         reasons.append("Stretch opportunity: the posting expects experience or seniority not fully established by the selected résumé.")
-    priority, priority_reasons = _application_priority(job, score, profile)
+    priority, priority_reasons = _application_priority(job, score, profile, seniority)
     label = "Stretch opportunity" if stretch or score < 60 else "Strong qualification match" if score >= 75 else "Review qualification fit"
     return {
         "qualification_match_status": "assessed" if mandatory_score is not None else "partial_evidence",
@@ -8825,15 +8826,6 @@ def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any
         "qualification_fit_missing_requirements": [item["requirement"] for item in missing],
         "qualification_fit_partial_requirements": [item["requirement"] for item in partial],
         "qualification_requirements": assessed,
-        "experience_requirements": {
-            "required": analysis.get("required_experience"),
-            "preferred": analysis.get("preferred_experience"),
-            "ambiguous": analysis.get("ambiguous_experience", []),
-            "candidate_professional_years": explicit_professional_years(profile),
-            "candidate_years_status": "verified from explicit résumé evidence" if explicit_professional_years(profile) is not None else "unverified from selected résumé",
-            "fit_status": "stretch" if stretch else "aligned" if required_experience or analysis.get("detected_level") != "unknown" else "unknown",
-            "source_evidence": analysis.get("required_experience", {}).get("source_evidence", "") if analysis.get("required_experience") else analysis.get("preferred_experience", {}).get("source_evidence", "") if analysis.get("preferred_experience") else "",
-        },
         "qualification_components": {"mandatory": mandatory_score, "technical": technical_score, "experience": experience_score, "seniority": seniority.get("score", 0)},
         "qualification_evidence_profile_id": profile.get("id") or profile.get("_candidate_profile_id") or "",
         "qualification_evidence_profile_name": profile.get("_candidate_profile_name") or "Active Profile",
