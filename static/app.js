@@ -22,6 +22,7 @@ const state = {
   generationSelections: {},
   shortlistRegenerations: {},
   selectedCandidateProfileId: "",
+  discoveryInboxCategory: "new_actionable",
   tailoring: { draftId: null, jobId: null, profileId: null, resumeId: null, data: null, selectedParagraph: null, selectedKeyword: null, aiImproveJobId: null },
 };
 
@@ -1116,9 +1117,25 @@ async function loadDiscoveryInbox() {
   if (!target) return;
   try {
     const profileQuery = state.selectedCandidateProfileId ? `?candidate_profile_id=${encodeURIComponent(state.selectedCandidateProfileId)}` : "";
-    const jobs = await api.get(`/api/discovery/inbox${profileQuery}`);
-    target.classList.toggle("empty", !jobs.length);
-    target.innerHTML = jobs.length ? jobs.map((job) => `<article class="inbox-row"><div><strong>${escapeHtml(job.title || "Untitled role")}</strong><span>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location unavailable")}</span><span class="muted">${escapeHtml(job.work_arrangement || job.remote_type || "Unknown arrangement")} · Canada: ${escapeHtml(job.canadian_eligibility || "unknown")} · ${escapeHtml(job.salary || "Salary unavailable")} · ${escapeHtml(job.source || "JobSpy")} · ${escapeHtml(job.posted_date || "date unknown")}</span><span class="muted">Description: ${escapeHtml(job.description_completeness || "unknown")} · ${job.discovery_state === "reviewed" ? "Reviewed" : "New"}</span></div><div><strong>Qualification Match ${Number(job.qualification_match_score ?? job.qualification_fit_score ?? 0)}</strong><span class="muted">Application Priority ${Number(job.application_priority_score || 0)} · Job Priority ${Number(job.overall_score || job.fit_score || 0)}</span><span class="muted">Discovered ${escapeHtml(job.discovery_first_seen_at || "")}</span></div><div class="row-actions"><button class="button small" type="button" onclick="reviewInboxJob(${job.id})">Review</button><button class="button ghost small" type="button" onclick="queueDiscoveryJob(${job.id})">Prepare package</button><button class="button ghost small" type="button" onclick="saveInboxJob(${job.id})">Shortlist</button><button class="button ghost small" type="button" onclick="ignoreInboxJob(${job.id})">Ignore</button>${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open</a>` : ""}</div></article>`).join("") : "No discovered opportunities yet.";
+    const separator = profileQuery ? "&" : "?";
+    const jobs = await api.get(`/api/discovery/inbox${profileQuery}${separator}include_history=1`);
+    const labels = { new_actionable: "New actionable", review_required: "Review required", excluded: "Excluded", applied: "Applied", skipped: "Skipped" };
+    const counts = jobs.reduce((result, job) => {
+      const category = job.discovery_inbox_category || "review_required";
+      result[category] = (result[category] || 0) + 1;
+      return result;
+    }, {});
+    const filters = document.getElementById("discovery-inbox-filters");
+    if (filters) {
+      filters.innerHTML = Object.entries(labels).map(([category, label]) => `<button class="button ghost small ${state.discoveryInboxCategory === category ? "active" : ""}" type="button" data-inbox-category="${category}">${label} <span class="muted">${Number(counts[category] || 0)}</span></button>`).join("");
+      filters.querySelectorAll("[data-inbox-category]").forEach((button) => button.addEventListener("click", () => {
+        state.discoveryInboxCategory = button.dataset.inboxCategory || "new_actionable";
+        loadDiscoveryInbox();
+      }));
+    }
+    const visibleJobs = jobs.filter((job) => (job.discovery_inbox_category || "review_required") === state.discoveryInboxCategory);
+    target.classList.toggle("empty", !visibleJobs.length);
+    target.innerHTML = visibleJobs.length ? visibleJobs.map((job) => `<article class="inbox-row"><div><strong>${escapeHtml(job.title || "Untitled role")}</strong><span>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location unavailable")}</span><span class="muted">${escapeHtml(job.work_arrangement || job.remote_type || "Unknown arrangement")} · Canada: ${escapeHtml(job.canadian_eligibility || "unknown")} · ${escapeHtml(job.salary || "Salary unavailable")} · ${escapeHtml(job.source || "JobSpy")} · ${escapeHtml(job.posted_date || "date unknown")}</span><span class="muted">${escapeHtml(labels[job.discovery_inbox_category] || "Review required")} · Description: ${escapeHtml(job.description_completeness || "unknown")}</span></div><div><strong>Qualification Match ${Number(job.qualification_match_score ?? job.qualification_fit_score ?? 0)}</strong><span class="muted">Application Priority ${Number(job.application_priority_score || 0)} · Job Priority ${Number(job.overall_score || job.fit_score || 0)}</span><span class="muted">Discovered ${escapeHtml(job.discovery_first_seen_at || "")}</span></div><div class="row-actions">${job.discovery_inbox_category === "new_actionable" || job.discovery_inbox_category === "review_required" ? `<button class="button small" type="button" onclick="reviewInboxJob(${job.id})">Review</button><button class="button ghost small" type="button" onclick="queueDiscoveryJob(${job.id})">Prepare package</button><button class="button ghost small" type="button" onclick="saveInboxJob(${job.id})">Shortlist</button><button class="button ghost small" type="button" onclick="ignoreInboxJob(${job.id})">Skip</button>` : ""}${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open</a>` : ""}</div></article>`).join("") : `No ${labels[state.discoveryInboxCategory].toLowerCase()} discovery records.`;
   } catch (error) { target.textContent = error.message; }
 }
 
@@ -2562,6 +2579,9 @@ function renderDiscoveryDiagnostics(diagnostics, visibleCount, totalCount) {
     diagnostics.distance_origin ? `origin=${diagnostics.distance_origin}` : "",
     diagnostics.location_resolution_method ? `method=${diagnostics.location_resolution_method}` : "",
   ].filter(Boolean).join("; ") || "not configured")}</li>`);
+  if (Array.isArray(diagnostics.countrywide_region_queries) && diagnostics.countrywide_region_queries.length) {
+    details.push(`<li><strong>Country-wide provider regions:</strong> ${escapeHtml(diagnostics.countrywide_region_queries.join(" | "))}</li>`);
+  }
   details.push(`<li><strong>Origin:</strong> ${escapeHtml([
     diagnostics.origin_geocode_status ? `status=${diagnostics.origin_geocode_status}` : "",
     diagnostics.origin_precision ? `precision=${diagnostics.origin_precision}` : "",

@@ -1531,7 +1531,11 @@ def create_app() -> Flask:
         if existing is None:
             return jsonify({"error": "Job not found"}), 404
         get_db().execute(
-            "UPDATE jobs SET status = 'Applied', date_applied = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            """UPDATE jobs
+               SET status = 'Applied', date_applied = ?,
+                   discovery_state = CASE WHEN discovery_first_seen_at <> '' THEN 'applied' ELSE discovery_state END,
+                   updated_at = CURRENT_TIMESTAMP
+               WHERE id = ?""",
             [date.today().isoformat(), job_id],
         )
         get_db().commit()
@@ -1711,9 +1715,13 @@ def create_app() -> Flask:
 
     @app.get("/api/discovery/inbox")
     def discovery_inbox() -> Response:
+        include_history = as_bool(request.args.get("include_history"))
+        query = "SELECT * FROM jobs WHERE discovery_first_seen_at <> ''"
+        if not include_history:
+            query += " AND discovery_state <> 'ignored' AND status <> 'Applied'"
+        query += " ORDER BY discovery_state = 'new' DESC, discovery_last_seen_at DESC, id DESC LIMIT 500"
         rows = query_db(
-            """SELECT * FROM jobs WHERE discovery_first_seen_at <> '' AND discovery_state <> 'ignored'
-               ORDER BY discovery_state = 'new' DESC, discovery_last_seen_at DESC, id DESC LIMIT 500"""
+            query
         )
         evidence_profile = None
         if request.args.get("candidate_profile_id"):
@@ -1722,7 +1730,22 @@ def create_app() -> Flask:
                 evidence_profile = selected["profile"]
             except ValueError as exc:
                 return jsonify({"error": str(exc)}), 400
-        return jsonify([job_to_dict(row, evidence_profile) for row in rows])
+        jobs = []
+        for row in rows:
+            item = job_to_dict(row, evidence_profile)
+            if text(item.get("status")) == "Applied":
+                category = "applied"
+            elif text(item.get("discovery_state")) == "ignored":
+                category = "skipped"
+            elif text(item.get("discovery_result_category")) == "excluded":
+                category = "excluded"
+            elif text(item.get("discovery_result_category")) == "review_required":
+                category = "review_required"
+            else:
+                category = "new_actionable"
+            item["discovery_inbox_category"] = category
+            jobs.append(item)
+        return jsonify(jobs)
 
     @app.post("/api/discovery/inbox/<int:job_id>/review")
     def review_discovery_job(job_id: int) -> Response:

@@ -1882,6 +1882,23 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(second["duplicates"], 0)
         self.assertEqual(second["diagnostics"]["already_saved_matches"], 1)
 
+    def test_discovery_inbox_applied_and_skipped_records_stay_out_of_new_view(self):
+        jobs = [
+            {"company": "Northstar", "title": "Junior Python Developer", "location": "Remote Canada", "url": "https://example.com/northstar/1", "source": "linkedin", "job_description": "Python Flask REST APIs", "remote_type": "Remote", "discovery_state": "new", "discovery_first_seen_at": "2026-11-03T00:00:00", "discovery_last_seen_at": "2026-11-03T00:00:00", "discovery_remote_preference": "remote", "remote_eligibility": "canadian_eligible", "remote_search_eligible": "true"},
+            {"company": "Maple", "title": "Backend Developer", "location": "Remote Canada", "url": "https://example.com/maple/2", "source": "indeed", "job_description": "Python SQL backend", "remote_type": "Remote", "discovery_state": "new", "discovery_first_seen_at": "2026-11-03T00:00:00", "discovery_last_seen_at": "2026-11-03T00:00:00", "discovery_remote_preference": "remote", "remote_eligibility": "canadian_eligible", "remote_search_eligible": "true"},
+        ]
+        created = [self.client.post("/api/jobs", json=job).get_json() for job in jobs]
+        applied = self.client.post("/api/shortlist", json=created[0]).get_json()
+        self.assertEqual(self.client.post(f"/api/shortlist/{applied['id']}/applied", json={}).status_code, 200)
+        self.assertEqual(self.client.post(f"/api/discovery/inbox/{created[1]['id']}/ignore", json={}).status_code, 200)
+
+        self.assertEqual(self.client.get("/api/discovery/inbox").get_json(), [])
+        history = self.client.get("/api/discovery/inbox?include_history=1").get_json()
+        categories = {item["title"]: item["discovery_inbox_category"] for item in history}
+        self.assertEqual(categories["Junior Python Developer"], "applied")
+        self.assertEqual(categories["Backend Developer"], "skipped")
+        self.assertEqual(self.client.get("/api/discovery/inbox").get_json(), [])
+
     def test_saved_discovery_searches_are_named_disabled_by_default_and_editable(self):
         created = self.client.post(
             "/api/discovery/searches",
