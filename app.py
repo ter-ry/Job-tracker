@@ -6616,8 +6616,21 @@ def build_location_lookup_candidates(raw_value: str, profile: dict[str, str] | N
 
 
 def geocoding_cache_key(lookup_type: str, query_text: str, normalized_query: str) -> str:
-    payload = {"lookup_type": lookup_type, "query_text": normalize_space(query_text).lower(), "normalized_query": normalize_space(normalized_query).lower()}
+    payload = {"lookup_type": lookup_type, "query_text": canonical_location_cache_value(query_text), "normalized_query": canonical_location_cache_value(normalized_query)}
     return grounding_hash(dumps_json(payload, sort_keys=True))
+
+
+def canonical_location_cache_value(value: str) -> str:
+    raw = normalize_space(value)
+    postal = extract_canadian_postal_code(raw)
+    if postal:
+        return postal.replace(" ", "").lower()
+    parts = [part.strip() for part in raw.split(",") if part.strip()]
+    city = normalize_space(parts[0]) if parts else raw
+    province_code = province_code_from_text(raw)
+    if city and province_code:
+        return f"{city.lower()}|{province_code.lower()}"
+    return raw.lower()
 
 
 def load_geocoding_cache(cache_key: str) -> dict[str, Any] | None:
@@ -6776,12 +6789,15 @@ def geocode_location_value(
                     "cached": True,
                 }
             )
-            if cached_result.get("ok"):
+            if cached_result.get("ok") and geocoding_result_matches_query(raw, candidate["normalized_query"], cached_result):
                 return cached_result
+            if cached_result.get("ok"):
+                cached_result = {**cached_result, "ok": False, "status": "invalid_cached_result", "error": "Cached geocoding coordinates did not match the requested location."}
             errors.append(text(cached_result.get("error")) or "Cached geocoding failure.")
             if cached_result.get("status") == "rate_limited":
                 break
-            continue
+            if not cached.get("success"):
+                continue
         try:
             lookup = provider.geocode(candidate["query"], country="Canada")
             latitude = lookup.get("latitude")
@@ -6804,6 +6820,8 @@ def geocode_location_value(
                 "display_name": text(lookup.get("display_name")),
                 "cached": False,
             }
+            if not geocoding_result_matches_query(raw, candidate["normalized_query"], result):
+                raise ValueError("Geocoding result did not match the requested Canadian location.")
             if use_cache:
                 save_geocoding_cache(cache_key, lookup_type, candidate["query"], candidate["normalized_query"], provider.name, result, True)
             return result
@@ -6863,12 +6881,30 @@ def geocode_matches_canadian_location(raw_location: str, geocode: dict[str, Any]
     display = normalize_space(text(geocode.get("display_name") or geocode.get("normalized_query"))).lower()
     raw = normalize_space(raw_location).lower()
     expected_code = province_code_from_text(raw)
+    postal = extract_canadian_postal_code(raw)
+    if postal and postal[0] == "M":
+        expected_code = "ON"
     if expected_code:
         province_name = next((normalize_space(text(name)).lower() for name, code in PROVINCE_CODE_BY_NAME.items() if code.lower() == expected_code.lower()), "")
         return province_name in display or re.search(rf"(?:,|\s){re.escape(expected_code.lower())}(?:,|\s|$)", display) is not None
     if any(token in display for token in ("united states", "usa", "new york", "london, uk", "england")):
         return False
     return True
+
+
+def geocoding_result_matches_query(raw_value: str, normalized_query: str, geocode: dict[str, Any]) -> bool:
+    if not geocode_matches_canadian_location(raw_value, geocode):
+        return False
+    raw = normalize_space(raw_value).lower()
+    if extract_canadian_postal_code(raw):
+        return True
+    if province_code_from_text(raw):
+        return True
+    city = normalize_space(raw.split(",", 1)[0]).lower()
+    display = normalize_space(text(geocode.get("display_name") or geocode.get("normalized_query"))).lower()
+    if city in {"", "canada", "canadian", "nationwide", "canada-wide"}:
+        return True
+    return city in display or city in normalize_space(normalized_query).lower()
 
 
 def geocode_discovery_job(
@@ -7041,6 +7077,28 @@ def resolve_discovery_location_context(
     normalized_postal = normalize_canadian_postal_code(postal) if postal else ""
     distance_origin = normalized_postal or normalized_input
     lookup_input = normalized_postal or normalized_input
+    if is_countrywide_search_location(normalized_input):
+        return {
+            "original_input": original_input,
+            "normalized_input": "Canada",
+            "distance_origin": "Canada",
+            "discovery_location": "Canada",
+            "resolution_method": "countrywide_scope",
+            "lookup": {
+                "ok": False,
+                "status": "countrywide_scope",
+                "original_input": original_input,
+                "normalized_query": "Canada",
+                "latitude": "",
+                "longitude": "",
+                "provider": provider.name,
+                "confidence": 0,
+                "precision": "country",
+                "geocoded_at": "",
+                "error": "Country-wide search does not require a single distance origin.",
+                "cached": False,
+            },
+        }
     lookup_result: dict[str, Any]
     postal_fallback_location = ""
     if postal:
@@ -7110,10 +7168,14 @@ CANADA_DISCOVERY_REGIONS = ("Toronto, ON", "Montreal, QC", "Vancouver, BC", "Cal
 
 
 def discovery_query_locations(location: str) -> list[str]:
-    normalized = normalize_space(location).lower().replace(",", "")
-    if normalized in {"canada", "canadian", "canada wide", "canada-wide", "nationwide"}:
+    if is_countrywide_search_location(location):
         return list(CANADA_DISCOVERY_REGIONS)
     return [normalize_space(location)]
+
+
+def is_countrywide_search_location(location: str) -> bool:
+    normalized = normalize_space(location).lower().replace(",", "")
+    return normalized in {"canada", "canadian", "canada wide", "canada-wide", "nationwide", "nation wide"}
 
 
 def fetch_discovery_jobs_for_search(search: dict[str, Any], *, country_indeed: str = "Canada") -> dict[str, Any]:

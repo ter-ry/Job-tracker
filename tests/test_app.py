@@ -1217,6 +1217,64 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(postal["discovery_location"], "Toronto, ON")
         self.assertEqual(postal["resolution_method"], "postal_code_prefix_fallback")
 
+    def test_countrywide_resolution_skips_unrelated_geocoder_result(self):
+        provider = FakeGeocodingProvider({
+            "Canada, Canada": {
+                "latitude": 49.0,
+                "longitude": -112.7,
+                "display_name": "Cardston County, Alberta, Canada",
+            }
+        })
+        resolved = app_module.resolve_discovery_location_context("Canada", {}, provider)
+        self.assertEqual(resolved["discovery_location"], "Canada")
+        self.assertEqual(resolved["resolution_method"], "countrywide_scope")
+        self.assertEqual(provider.calls, [])
+        self.assertEqual(app_module.discovery_query_locations(resolved["discovery_location"]), [
+            "Toronto, ON", "Montreal, QC", "Vancouver, BC", "Calgary, AB", "Halifax, NS",
+        ])
+
+    def test_invalid_postal_coordinates_are_rejected_and_cached_values_revalidated(self):
+        bad = {
+            "latitude": 49.0004149,
+            "longitude": -112.7880266,
+            "display_name": "Cardston County, Alberta, Canada",
+        }
+        bad_provider = FakeGeocodingProvider({"M2J 0B6, Canada": bad})
+        result = app_module.geocode_location_value("M2J 0B6", lookup_type="profile", provider=bad_provider, use_cache=False)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["latitude"], "")
+
+        good = {
+            "latitude": 43.787,
+            "longitude": -79.353,
+            "display_name": "Toronto, Ontario, Canada",
+        }
+        provider = FakeGeocodingProvider({"M2J 0B6, Canada": good})
+        with app_module.app.app_context():
+            app_module.init_db()
+            cache_key = app_module.geocoding_cache_key("profile", "M2J 0B6, Canada", "M2J 0B6, Canada")
+            app_module.save_geocoding_cache(cache_key, "profile", "M2J 0B6, Canada", "M2J 0B6, Canada", "fake", {**bad, "ok": True}, True)
+            refreshed = app_module.geocode_location_value("M2J 0B6", lookup_type="profile", provider=provider, use_cache=True)
+        self.assertTrue(refreshed["ok"])
+        self.assertEqual(refreshed["display_name"], "Toronto, Ontario, Canada")
+        self.assertEqual(len(provider.calls), 1)
+
+    def test_equivalent_city_inputs_reuse_geocoding_cache(self):
+        provider = FakeGeocodingProvider({
+            "Toronto, Ontario, Canada": {
+                "latitude": 43.6532,
+                "longitude": -79.3832,
+                "display_name": "Toronto, Ontario, Canada",
+            }
+        })
+        with app_module.app.app_context():
+            app_module.init_db()
+            first = app_module.geocode_location_value("Toronto", lookup_type="search", provider=provider)
+            second = app_module.geocode_location_value("Toronto, ON", lookup_type="search", provider=provider)
+        self.assertTrue(first["ok"])
+        self.assertTrue(second["ok"])
+        self.assertEqual(len(provider.calls), 1)
+
     def test_canadian_postal_code_normalization_and_cached_profile_geocoding(self):
         self.assertEqual(app_module.normalize_canadian_postal_code("m5v2t6"), "M5V 2T6")
         self.assertEqual(app_module.extract_canadian_postal_code("Suite 400, M5V 2T6"), "M5V 2T6")
@@ -1227,6 +1285,7 @@ class JobAssistantTest(unittest.TestCase):
                     "status": "saved",
                     "latitude": 43.6426,
                     "longitude": -79.3871,
+                    "display_name": "Toronto, Ontario, Canada",
                     "provider": "fake",
                     "confidence": 95,
                     "precision": "postal code",
@@ -1428,7 +1487,7 @@ class JobAssistantTest(unittest.TestCase):
                 "M5V 2T6, Canada": {
                     "latitude": 43.6426,
                     "longitude": -79.3871,
-                    "display_name": "M5V 2T6, Canada",
+                    "display_name": "Toronto, Ontario, Canada",
                     "ok": True,
                     "status": "saved",
                     "provider": "fake",
