@@ -329,6 +329,17 @@ class JobAssistantTest(unittest.TestCase):
         self.assertNotIn("saveDiscoveryJob(${index})", source)
         self.assertNotIn("hideDiscoveryJob(${index})", source)
 
+    def test_discovery_inbox_uses_local_rows_and_persists_selected_profile(self):
+        source = (Path(__file__).parents[1] / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn('localStorage.getItem("jobTracker.selectedCandidateProfileId")', source)
+        self.assertIn('localStorage.setItem("jobTracker.selectedCandidateProfileId"', source)
+        self.assertIn("renderDiscoveryInbox(state.discoveryInboxJobs)", source)
+        self.assertIn("updateInboxLocalJob", source)
+        self.assertNotIn("Promise.all([loadDiscoveryInbox(), loadAll()])", source)
+        self.assertIn('let pipelineSort = "priority"', source)
+        self.assertIn("Source evidence:", source)
+        self.assertIn("Technical qualification strength is separate from Canadian eligibility.", source)
+
     def test_ontario_remote_campaign_excludes_explicit_ontario_restriction(self):
         excluded = {
             "remote_type": "Remote",

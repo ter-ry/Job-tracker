@@ -21,7 +21,8 @@ const state = {
   candidateProfiles: [],
   generationSelections: {},
   shortlistRegenerations: {},
-  selectedCandidateProfileId: "",
+  selectedCandidateProfileId: (() => { try { return localStorage.getItem("jobTracker.selectedCandidateProfileId") || ""; } catch (_) { return ""; } })(),
+  discoveryInboxJobs: [],
   discoveryInboxCategory: "new_actionable",
   tailoring: { draftId: null, jobId: null, profileId: null, resumeId: null, data: null, selectedParagraph: null, selectedKeyword: null, aiImproveJobId: null },
 };
@@ -131,7 +132,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("new-saved-search").addEventListener("click", () => toggleSavedSearchForm(true));
   document.getElementById("cancel-saved-search").addEventListener("click", () => toggleSavedSearchForm(false));
   document.getElementById("refresh-saved-searches").addEventListener("click", loadSavedSearches);
-  document.getElementById("refresh-discovery-inbox").addEventListener("click", loadDiscoveryInbox);
+  document.getElementById("refresh-discovery-inbox").addEventListener("click", () => loadDiscoveryInbox(true));
   document.getElementById("toggle-discovery-scheduler").addEventListener("click", toggleDiscoveryScheduler);
   document.getElementById("refresh-discovery-task-status")?.addEventListener("click", loadDiscoveryTaskStatus);
   document.getElementById("csv-import-form").addEventListener("submit", importCsv);
@@ -210,7 +211,6 @@ document.addEventListener("DOMContentLoaded", () => {
   setDiscoveryControlsEnabled(false);
   loadAll();
   loadSavedSearches();
-  loadDiscoveryInbox();
   loadDiscoveryScheduler();
   loadDiscoveryTaskStatus();
 });
@@ -229,41 +229,47 @@ function setDiscoverySection(view) {
 }
 
 async function loadAll() {
+  const loadStart = performance.now();
+  performance.mark("job-tracker-loadAll-start");
   try {
     const candidateProfiles = await api.get("/api/candidate-profiles").catch(() => []);
     state.candidateProfiles = Array.isArray(candidateProfiles) ? candidateProfiles : [];
     if (!state.candidateProfiles.some((profile) => String(profile.id) === String(state.selectedCandidateProfileId))) {
       state.selectedCandidateProfileId = state.candidateProfiles[0] ? String(state.candidateProfiles[0].id) : "";
+      try { localStorage.setItem("jobTracker.selectedCandidateProfileId", state.selectedCandidateProfileId); } catch (_) { /* storage may be disabled */ }
     }
     const profileQuery = state.selectedCandidateProfileId ? `?candidate_profile_id=${encodeURIComponent(state.selectedCandidateProfileId)}` : "";
-    const [jobs, dashboard, profile, ollamaHealth, systemHealth, evidence] = await Promise.all([
+    const [jobs, dashboard, profile, systemHealth, evidence] = await Promise.all([
       api.get(`/api/jobs${profileQuery}`),
       api.get("/api/dashboard"),
       api.get("/api/profile"),
-      api.get("/api/ollama/health").catch((error) => ({ status: "error", summary: error.message })),
       api.get("/api/health").catch((error) => ({ status: "error", summary: error.message })),
       api.get("/api/evidence").catch(() => []),
     ]);
     const shortlist = await api.get("/api/shortlist");
     state.jobs = jobs;
+    state.discoveryInboxJobs = jobs.filter((job) => job.discovery_first_seen_at);
     state.profile = profile;
     state.evidence = evidence;
     state.shortlist = shortlist;
-    await loadPreparationQueue();
-    await hydrateGenerationSelections();
     state.systemHealth = systemHealth;
     renderDashboard(dashboard);
     renderPipelineDashboard(jobs);
-    await loadDiscoveryInbox();
+    renderDiscoveryInbox(state.discoveryInboxJobs);
     renderProfile(profile);
     renderCandidateProfiles();
-    await loadKeywordMemory();
     renderTemplateStatus(profile);
-    renderOllamaHealth(ollamaHealth);
+    renderOllamaHealth({ status: "loading", summary: "Checking local AI status…" });
     renderEvidenceLibrary(evidence);
     renderJobs();
     renderShortlist();
-    await refreshShortlistKeywordScores();
+    // These package/memory surfaces are unrelated to the initial Discovery view.
+    // Load them after the useful page is painted instead of blocking category access.
+    void Promise.all([loadPreparationQueue(), hydrateGenerationSelections(), loadKeywordMemory()]);
+    void api.get("/api/ollama/health").then(renderOllamaHealth).catch((error) => renderOllamaHealth({ status: "error", summary: error.message }));
+    state.lastLoadAllMs = Math.round(performance.now() - loadStart);
+    performance.mark("job-tracker-loadAll-end");
+    performance.measure("job-tracker-loadAll", { start: "job-tracker-loadAll-start", end: "job-tracker-loadAll-end" });
   } catch (error) {
     toast(error.message);
   }
@@ -1112,38 +1118,64 @@ async function runSavedSearch(id) {
   catch (error) { toast(error.message); }
 }
 
-async function loadDiscoveryInbox() {
+function discoveryInboxCategory(job) {
+  if (String(job.status || "") === "Applied") return "applied";
+  if (String(job.discovery_state || "") === "ignored") return "skipped";
+  if (String(job.discovery_state || "") === "saved") return "saved";
+  if (String(job.discovery_result_category || "") === "excluded") return "excluded";
+  if (String(job.discovery_result_category || "") === "review_required") return "review_required";
+  return "new_actionable";
+}
+
+function renderDiscoveryInbox(jobs) {
   const target = document.getElementById("discovery-inbox");
   if (!target) return;
+  const labels = { new_actionable: "New actionable", review_required: "Review required", excluded: "Excluded", saved: "Saved for later", applied: "Applied", skipped: "Skipped" };
+  const counts = jobs.reduce((result, job) => {
+    const category = job.discovery_inbox_category || discoveryInboxCategory(job);
+    result[category] = (result[category] || 0) + 1;
+    return result;
+  }, {});
+  const filters = document.getElementById("discovery-inbox-filters");
+  if (filters) {
+    filters.innerHTML = Object.entries(labels).map(([category, label]) => `<button class="button ghost small ${state.discoveryInboxCategory === category ? "active" : ""}" type="button" data-inbox-category="${category}">${label} <span class="muted">${Number(counts[category] || 0)}</span></button>`).join("");
+    filters.querySelectorAll("[data-inbox-category]").forEach((button) => button.addEventListener("click", () => {
+      state.discoveryInboxCategory = button.dataset.inboxCategory || "new_actionable";
+      renderDiscoveryInbox(state.discoveryInboxJobs);
+    }));
+  }
+  const visibleJobs = jobs.filter((job) => (job.discovery_inbox_category || discoveryInboxCategory(job)) === state.discoveryInboxCategory);
+  target.classList.toggle("empty", !visibleJobs.length);
+  target.innerHTML = visibleJobs.length ? visibleJobs.map((job) => `<article class="inbox-row"><div><strong>${escapeHtml(job.title || "Untitled role")}</strong><span>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location unavailable")}</span><span class="muted">${escapeHtml(job.work_arrangement || job.remote_type || "Unknown arrangement")} · Canada: ${escapeHtml(job.canadian_eligibility || "unknown")} · ${escapeHtml(job.salary || "Salary unavailable")} · ${escapeHtml(job.source || "JobSpy")} · ${escapeHtml(job.posted_date || "date unknown")}</span><span class="muted">${escapeHtml(labels[job.discovery_inbox_category || discoveryInboxCategory(job)] || "Review required")} · Description: ${escapeHtml(job.description_completeness || "unknown")}</span>${renderExperienceSummary(job)}<span class="muted">Source evidence: ${escapeHtml(job.qualification_evidence_source || "Not available")}</span></div><div><strong>Qualification Match ${Number(job.qualification_match_score ?? job.qualification_fit_score ?? 0)}</strong><span class="muted">Application Priority ${Number(job.application_priority_score || 0)} · Canada eligibility ${escapeHtml(job.canadian_eligibility || "unknown")}</span><span class="muted">Discovered ${escapeHtml(job.discovery_first_seen_at || "")}${job.date_applied ? ` · Applied ${escapeHtml(job.date_applied)}` : ""}</span></div><div class="row-actions">${(job.discovery_inbox_category || discoveryInboxCategory(job)) === "new_actionable" || (job.discovery_inbox_category || discoveryInboxCategory(job)) === "review_required" ? `<button class="button small" type="button" onclick="reviewInboxJob(${job.id})">Review</button><button class="button ghost small" type="button" onclick="saveInboxJob(${job.id})">Save for later</button><button class="button ghost small" type="button" onclick="applyInboxJob(${job.id})">Mark Applied</button><button class="button ghost small" type="button" onclick="ignoreInboxJob(${job.id})">Skip</button>` : ""}${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open original posting</a>` : ""}</div></article>`).join("") : `No ${labels[state.discoveryInboxCategory].toLowerCase()} discovery records.`;
+}
+
+async function loadDiscoveryInbox(force = false) {
+  const target = document.getElementById("discovery-inbox");
+  if (!target) return;
+  if (!force && state.discoveryInboxJobs.length) {
+    renderDiscoveryInbox(state.discoveryInboxJobs);
+    return;
+  }
   try {
     const profileQuery = state.selectedCandidateProfileId ? `?candidate_profile_id=${encodeURIComponent(state.selectedCandidateProfileId)}` : "";
     const separator = profileQuery ? "&" : "?";
     const jobs = await api.get(`/api/discovery/inbox${profileQuery}${separator}include_history=1`);
-    const labels = { new_actionable: "New actionable", review_required: "Review required", excluded: "Excluded", saved: "Saved for later", applied: "Applied", skipped: "Skipped" };
-    const counts = jobs.reduce((result, job) => {
-      const category = job.discovery_inbox_category || "review_required";
-      result[category] = (result[category] || 0) + 1;
-      return result;
-    }, {});
-    const filters = document.getElementById("discovery-inbox-filters");
-    if (filters) {
-      filters.innerHTML = Object.entries(labels).map(([category, label]) => `<button class="button ghost small ${state.discoveryInboxCategory === category ? "active" : ""}" type="button" data-inbox-category="${category}">${label} <span class="muted">${Number(counts[category] || 0)}</span></button>`).join("");
-      filters.querySelectorAll("[data-inbox-category]").forEach((button) => button.addEventListener("click", () => {
-        state.discoveryInboxCategory = button.dataset.inboxCategory || "new_actionable";
-        loadDiscoveryInbox();
-      }));
-    }
-    const visibleJobs = jobs.filter((job) => (job.discovery_inbox_category || "review_required") === state.discoveryInboxCategory);
-    target.classList.toggle("empty", !visibleJobs.length);
-    target.innerHTML = visibleJobs.length ? visibleJobs.map((job) => `<article class="inbox-row"><div><strong>${escapeHtml(job.title || "Untitled role")}</strong><span>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location unavailable")}</span><span class="muted">${escapeHtml(job.work_arrangement || job.remote_type || "Unknown arrangement")} · Canada: ${escapeHtml(job.canadian_eligibility || "unknown")} · ${escapeHtml(job.salary || "Salary unavailable")} · ${escapeHtml(job.source || "JobSpy")} · ${escapeHtml(job.posted_date || "date unknown")}</span><span class="muted">${escapeHtml(labels[job.discovery_inbox_category] || "Review required")} · Description: ${escapeHtml(job.description_completeness || "unknown")}</span></div><div><strong>Qualification Match ${Number(job.qualification_match_score ?? job.qualification_fit_score ?? 0)}</strong><span class="muted">Application Priority ${Number(job.application_priority_score || 0)} · Job Priority ${Number(job.overall_score || job.fit_score || 0)}</span><span class="muted">Discovered ${escapeHtml(job.discovery_first_seen_at || "")}${job.date_applied ? ` · Applied ${escapeHtml(job.date_applied)}` : ""}</span></div><div class="row-actions">${job.discovery_inbox_category === "new_actionable" || job.discovery_inbox_category === "review_required" ? `<button class="button small" type="button" onclick="reviewInboxJob(${job.id})">Review</button><button class="button ghost small" type="button" onclick="saveInboxJob(${job.id})">Save for later</button><button class="button ghost small" type="button" onclick="applyInboxJob(${job.id})">Mark Applied</button><button class="button ghost small" type="button" onclick="ignoreInboxJob(${job.id})">Skip</button>` : ""}${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open original posting</a>` : ""}</div></article>`).join("") : `No ${labels[state.discoveryInboxCategory].toLowerCase()} discovery records.`;
+    state.discoveryInboxJobs = Array.isArray(jobs) ? jobs : [];
+    renderDiscoveryInbox(state.discoveryInboxJobs);
   } catch (error) { target.textContent = error.message; }
 }
 
-async function reviewInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/review`, "POST", {}); await loadDiscoveryInbox(); } catch (error) { toast(error.message); } }
-async function ignoreInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/ignore`, "POST", {}); await loadDiscoveryInbox(); } catch (error) { toast(error.message); } }
-async function applyInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/applied`, "POST", {}); toast("Marked applied; the original posting remains in Applied history."); await Promise.all([loadDiscoveryInbox(), loadAll()]); } catch (error) { toast(error.message); } }
+function updateInboxLocalJob(id, updates) {
+  const job = state.discoveryInboxJobs.find((item) => Number(item.id) === Number(id)) || state.jobs.find((item) => Number(item.id) === Number(id));
+  if (job) Object.assign(job, updates, { discovery_inbox_category: discoveryInboxCategory({ ...job, ...updates }) });
+  state.discoveryInboxJobs = state.jobs.filter((item) => item.discovery_first_seen_at);
+  renderDiscoveryInbox(state.discoveryInboxJobs);
+}
+async function reviewInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/review`, "POST", {}); updateInboxLocalJob(id, { discovery_state: "reviewed" }); } catch (error) { toast(error.message); } }
+async function ignoreInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/ignore`, "POST", {}); updateInboxLocalJob(id, { discovery_state: "ignored" }); } catch (error) { toast(error.message); } }
+async function applyInboxJob(id) { try { const applied = await api.send(`/api/discovery/inbox/${id}/applied`, "POST", {}); toast("Marked applied; the original posting remains in Applied history."); updateInboxLocalJob(id, { status: "Applied", date_applied: applied.date_applied, discovery_state: "applied" }); } catch (error) { toast(error.message); } }
 async function saveInboxJob(id) {
-  try { await api.send(`/api/discovery/inbox/${id}/save`, "POST", {}); toast("Saved for later"); await Promise.all([loadDiscoveryInbox(), loadAll()]); }
+  try { await api.send(`/api/discovery/inbox/${id}/save`, "POST", {}); toast("Saved for later"); updateInboxLocalJob(id, { status: "Saved", discovery_state: "saved" }); }
   catch (error) { toast(error.message); }
 }
 
@@ -1266,14 +1298,17 @@ function renderCandidateProfiles() {
     document.getElementById("candidate-profile-documents").textContent = "Create a profile to add role-specific documents.";
     return;
   }
-  if (!state.selectedCandidateProfileId) state.selectedCandidateProfileId = String(state.candidateProfiles[0].id);
+  if (!state.selectedCandidateProfileId) {
+    state.selectedCandidateProfileId = String(state.candidateProfiles[0].id);
+    try { localStorage.setItem("jobTracker.selectedCandidateProfileId", state.selectedCandidateProfileId); } catch (_) { /* storage may be disabled */ }
+  }
   const autoProfile = document.getElementById("saved-search-auto-profile");
   if (autoProfile) autoProfile.innerHTML = `<option value="">Choose a profile when available</option>${state.candidateProfiles.map((profile) => `<option value="${escapeAttribute(profile.id)}">${escapeHtml(profile.name)}</option>`).join("")}`;
   const discoveryProfile = document.getElementById("discovery-profile");
   if (discoveryProfile) {
     discoveryProfile.innerHTML = `<option value="">Use active Profile</option>${state.candidateProfiles.map((profile) => `<option value="${escapeAttribute(profile.id)}">${escapeHtml(profile.name)}</option>`).join("")}`;
     discoveryProfile.value = state.selectedCandidateProfileId;
-    discoveryProfile.onchange = async () => { state.selectedCandidateProfileId = discoveryProfile.value; await loadAll(); };
+    discoveryProfile.onchange = async () => { state.selectedCandidateProfileId = discoveryProfile.value; try { localStorage.setItem("jobTracker.selectedCandidateProfileId", state.selectedCandidateProfileId); } catch (_) { /* storage may be disabled */ } await loadAll(); };
   }
   list.innerHTML = state.candidateProfiles.map((profile) => `
     <article class="candidate-profile-card ${String(profile.id) === state.selectedCandidateProfileId ? "selected" : ""}">
@@ -1285,6 +1320,7 @@ function renderCandidateProfiles() {
 
 async function selectCandidateProfile(profileId) {
   state.selectedCandidateProfileId = String(profileId);
+  try { localStorage.setItem("jobTracker.selectedCandidateProfileId", state.selectedCandidateProfileId); } catch (_) { /* storage may be disabled */ }
   renderCandidateProfiles();
   await renderCandidateProfileDocuments();
 }
@@ -1360,7 +1396,7 @@ function renderDashboard(dashboard) {
 }
 
 let pipelineCategory = "All";
-let pipelineSort = "qualification";
+let pipelineSort = "priority";
 let pipelineDetailScrollY = 0;
 
 function normalizedPipelineSalary(job) {
@@ -1440,7 +1476,7 @@ function openPipelineJobDetails(id) {
   if (panel.hidden) pipelineDetailScrollY = window.scrollY;
   const requirements = [job.required_skills, job.preferred_skills, job.responsibilities].filter(Boolean).join("\n\n");
   const reasons = (job.qualification_fit_reasons || []).map((reason) => `<li>${escapeHtml(reason)}</li>`).join("") || "<li>Review the full posting and résumé evidence before applying.</li>";
-  panel.innerHTML = `<div class="pipeline-detail-header"><div><span class="eyebrow">Job details</span><h3 id="pipeline-detail-title">${escapeHtml(job.title || "Untitled role")}</h3><p>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location not listed")}</p></div><button class="button ghost small" type="button" data-close-job-details>Close</button></div><div class="pipeline-detail-grid"><div><strong>Qualification Match</strong><p class="pipeline-detail-score">${Number(job.qualification_fit_score ?? job.fit_score ?? 0)}% · ${escapeHtml(job.qualification_fit_label || "Review required")}</p><ul>${reasons}</ul></div><div><strong>Application Priority</strong><p>${Number(job.application_priority_score || 0)}</p><strong>Job Priority</strong><p>${Number(job.overall_score || 0)}</p><strong>Canada eligibility</strong><p>${escapeHtml(job.canadian_eligibility || "unknown")}</p><strong>Posting status</strong><p>${escapeHtml(job.posting_availability || "unverified")}</p><strong>Salary</strong><p>${escapeHtml(job.salary || "Not listed")}</p><strong>Posting date</strong><p>${escapeHtml(job.posted_date || "Not listed")}</p><strong>Deadline</strong><p>${escapeHtml(job.deadline || "Not listed")}</p></div></div><details open><summary>Requirements and responsibilities</summary><pre>${escapeHtml(requirements || "No structured requirements were stored.")}</pre></details><details><summary>Full job description</summary><pre>${escapeHtml(job.job_description || "No job description was stored.")}</pre></details><p class="pipeline-detail-links">${job.url ? `<a href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Original posting</a>` : "Original posting unavailable"}${job.application_url && job.application_url !== job.url ? ` · <a href="${escapeAttribute(job.application_url)}" target="_blank" rel="noreferrer">Application page</a>` : ""}</p><div class="actions"><button class="button" type="button" data-prepare-job="${job.id}">Prepare application</button><button class="button ghost" type="button" data-edit-job="${job.id}">Edit job</button></div>`;
+  panel.innerHTML = `<div class="pipeline-detail-header"><div><span class="eyebrow">Job details</span><h3 id="pipeline-detail-title">${escapeHtml(job.title || "Untitled role")}</h3><p>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location not listed")}</p></div><button class="button ghost small" type="button" data-close-job-details>Close</button></div><div class="pipeline-detail-grid"><div><strong>Qualification Match</strong><p class="pipeline-detail-score">${Number(job.qualification_fit_score ?? job.fit_score ?? 0)}% · ${escapeHtml(job.qualification_fit_label || "Review required")}</p><p class="muted">Technical qualification strength is separate from Canadian eligibility.</p><ul>${reasons}</ul><div class="experience-summary">${renderExperienceSummary(job)}</div><p class="muted">Source evidence: ${escapeHtml(job.qualification_evidence_source || "Not available")}</p></div><div><strong>Application Priority</strong><p>${Number(job.application_priority_score || 0)}</p><strong>Canada eligibility</strong><p>${escapeHtml(job.canadian_eligibility || "unknown")}</p><strong>Posting status</strong><p>${escapeHtml(job.posting_availability || "unverified")}</p><strong>Job Priority (legacy)</strong><p>${Number(job.overall_score || 0)}</p><strong>Salary</strong><p>${escapeHtml(job.salary || "Not listed")}</p><strong>Posting date</strong><p>${escapeHtml(job.posted_date || "Not listed")}</p><strong>Deadline</strong><p>${escapeHtml(job.deadline || "Not listed")}</p></div></div><details open><summary>Requirements and responsibilities</summary><pre>${escapeHtml(requirements || "No structured requirements were stored.")}</pre></details><details><summary>Full job description</summary><pre>${escapeHtml(job.job_description || "No job description was stored.")}</pre></details><p class="pipeline-detail-links">${job.url ? `<a href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Original posting</a>` : "Original posting unavailable"}${job.application_url && job.application_url !== job.url ? ` · <a href="${escapeAttribute(job.application_url)}" target="_blank" rel="noreferrer">Application page</a>` : ""}</p><div class="actions"><button class="button" type="button" data-prepare-job="${job.id}">Prepare application</button><button class="button ghost" type="button" data-edit-job="${job.id}">Edit job</button></div>`;
   panel.setAttribute("role", "dialog");
   panel.setAttribute("aria-modal", "true");
   panel.setAttribute("aria-labelledby", "pipeline-detail-title");
@@ -3160,7 +3196,7 @@ async function removeShortlist(id) {
 
 function generationSelection(jobId) {
   if (!state.generationSelections[jobId]) {
-    const first = state.candidateProfiles[0];
+    const first = state.candidateProfiles.find((profile) => String(profile.id) === String(state.selectedCandidateProfileId)) || state.candidateProfiles[0];
     state.generationSelections[jobId] = { profileId: first ? String(first.id) : "", resumeId: "", coverLetterTemplateId: "", documents: { resumes: [], cover_letter_templates: [] }, keywordScore: null, keywordScoreError: "", keywordScoreLoading: false };
   }
   return state.generationSelections[jobId];

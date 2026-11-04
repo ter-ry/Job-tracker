@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import copy
 from collections import Counter
 import difflib
 import hashlib
@@ -91,6 +92,17 @@ TAILORING_AI_JOBS: dict[str, dict[str, Any]] = {}
 TAILORING_AI_JOBS_LOCK = threading.Lock()
 TAILORING_AI_INFERENCE_SLOT = threading.BoundedSemaphore(1)
 TAILORING_AI_JOB_RETENTION_SECONDS = 600
+
+# Discovery list endpoints are read far more often than individual job details.
+# Keep derived résumé matching in a bounded process-local cache.  The key includes
+# all job/profile inputs that affect the result, so edits or profile changes cannot
+# reuse stale qualification evidence after a restart or within a running process.
+QUALIFICATION_CACHE_VERSION = "discovery-qualification-v2"
+QUALIFICATION_CACHE_LIMIT = 512
+_QUALIFICATION_CACHE: dict[str, dict[str, Any]] = {}
+_RESUME_EVIDENCE_CACHE: dict[str, list[dict[str, Any]]] = {}
+_QUALIFICATION_TERMS_CACHE: dict[str, list[dict[str, Any]]] = {}
+_EVIDENCE_MATCH_CACHE: dict[str, tuple[str, str, int]] = {}
 
 DISCOVERY_SCORE_WEIGHTS = {
     "skill_match": 35,
@@ -1335,7 +1347,11 @@ def create_app() -> Flask:
                 evidence_profile = selected["profile"]
             except ValueError as exc:
                 return jsonify({"error": str(exc)}), 400
-        return jsonify([job_to_dict(row, evidence_profile) for row in rows])
+        statuses = _preparation_statuses([int(row["id"]) for row in rows])
+        return jsonify([
+            job_to_dict(row, evidence_profile, include_legacy_details=False, preparation_status=statuses.get(int(row["id"])))
+            for row in rows
+        ])
 
     @app.post("/api/jobs")
     def create_job() -> Response:
@@ -1730,9 +1746,10 @@ def create_app() -> Flask:
                 evidence_profile = selected["profile"]
             except ValueError as exc:
                 return jsonify({"error": str(exc)}), 400
+        statuses = _preparation_statuses([int(row["id"]) for row in rows])
         jobs = []
         for row in rows:
-            item = job_to_dict(row, evidence_profile)
+            item = job_to_dict(row, evidence_profile, include_legacy_details=False, preparation_status=statuses.get(int(row["id"])))
             if text(item.get("status")) == "Applied":
                 category = "applied"
             elif text(item.get("discovery_state")) == "ignored":
@@ -2403,7 +2420,12 @@ def create_app() -> Flask:
 
     @app.get("/api/dashboard")
     def dashboard() -> Response:
-        jobs = [job_to_dict(row) for row in query_db("SELECT * FROM jobs")]
+        rows = query_db("SELECT * FROM jobs")
+        statuses = _preparation_statuses([int(row["id"]) for row in rows])
+        jobs = [
+            job_to_dict(row, include_qualification=False, include_legacy_details=False, preparation_status=statuses.get(int(row["id"])))
+            for row in rows
+        ]
         return jsonify(build_dashboard(jobs))
 
     @app.get("/export.csv")
@@ -8579,7 +8601,95 @@ def normalize_job_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return clean
 
 
-def job_to_dict(row: sqlite3.Row | None, evidence_profile: dict[str, Any] | None = None) -> dict[str, Any]:
+def _qualification_profile_key(profile: dict[str, Any] | None) -> str:
+    if not profile:
+        return "active-profile"
+    relevant = {
+        key: profile.get(key)
+        for key in (
+            "id", "_candidate_profile_id", "updated_at", "resume_text", "work_experience",
+            "projects", "education", "key_skills", "target_seniority_levels", "maximum_required_years",
+            "willing_to_apply_to_stretch_roles", "management_roles_allowed",
+        )
+    }
+    return hashlib.sha256(json.dumps(relevant, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def _qualification_job_key(job: dict[str, Any], profile: dict[str, Any] | None) -> str:
+    relevant = {
+        "version": QUALIFICATION_CACHE_VERSION,
+        "profile": _qualification_profile_key(profile),
+        "job": {key: job.get(key) for key in (
+            "id", "updated_at", "title", "job_description", "required_skills", "preferred_skills",
+            "responsibilities", "required_experience", "preferred_experience", "remote_eligibility",
+            "posting_availability", "application_effort_score", "location", "remote_type",
+        )},
+    }
+    return hashlib.sha256(json.dumps(relevant, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def _cached_resume_evidence(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    key = _qualification_profile_key(profile)
+    evidence = _RESUME_EVIDENCE_CACHE.get(key)
+    if evidence is None:
+        evidence = extract_resume_evidence(profile)
+        for item in evidence:
+            lowered = text(item.get("text")).lower()
+            item["_token_sequence"] = re.findall(r"[a-z0-9+#.]+", lowered)
+            item["_tokens"] = set(item["_token_sequence"])
+        if len(_RESUME_EVIDENCE_CACHE) >= QUALIFICATION_CACHE_LIMIT:
+            _RESUME_EVIDENCE_CACHE.pop(next(iter(_RESUME_EVIDENCE_CACHE)))
+        _RESUME_EVIDENCE_CACHE[key] = evidence
+    return evidence
+
+
+def _cached_qualification_terms(job: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = {key: job.get(key) for key in ("title", "required_skills", "preferred_skills", "responsibilities", "job_description")}
+    key = hashlib.sha256(json.dumps(raw, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    terms = _QUALIFICATION_TERMS_CACHE.get(key)
+    if terms is None:
+        terms = _qualification_terms(job)
+        if len(_QUALIFICATION_TERMS_CACHE) >= QUALIFICATION_CACHE_LIMIT:
+            _QUALIFICATION_TERMS_CACHE.pop(next(iter(_QUALIFICATION_TERMS_CACHE)))
+        _QUALIFICATION_TERMS_CACHE[key] = terms
+    return terms
+
+
+def _cached_qualification_fit(job: dict[str, Any], profile: dict[str, Any] | None) -> dict[str, Any]:
+    key = _qualification_job_key(job, profile)
+    cached = _QUALIFICATION_CACHE.get(key)
+    if cached is not None:
+        return copy.deepcopy(cached)
+    result = build_qualification_fit(job, profile)
+    if len(_QUALIFICATION_CACHE) >= QUALIFICATION_CACHE_LIMIT:
+        _QUALIFICATION_CACHE.pop(next(iter(_QUALIFICATION_CACHE)))
+    _QUALIFICATION_CACHE[key] = copy.deepcopy(result)
+    return result
+
+
+def _preparation_statuses(job_ids: list[int]) -> dict[int, str]:
+    if not job_ids:
+        return {}
+    placeholders = ",".join("?" for _ in job_ids)
+    rows = query_db(
+        f"SELECT job_id, status FROM application_preparation_queue WHERE job_id IN ({placeholders}) ORDER BY updated_at DESC, id DESC",
+        job_ids,
+    )
+    statuses: dict[int, str] = {}
+    for row in rows:
+        job_id = int(row["job_id"])
+        statuses.setdefault(job_id, text(row["status"]))
+    return statuses
+
+
+def job_to_dict(
+    row: sqlite3.Row | None,
+    evidence_profile: dict[str, Any] | None = None,
+    *,
+    include_qualification: bool = True,
+    include_legacy_details: bool = True,
+    preparation_status: str | None = None,
+) -> dict[str, Any]:
     if row is None:
         return {}
     data = dict(row)
@@ -8603,21 +8713,25 @@ def job_to_dict(row: sqlite3.Row | None, evidence_profile: dict[str, Any] | None
                 data["cover_letter_generation_status"] = "Outdated — regenerate using current profile"
     job_id = clamp_int(data.get("id"), 0, 10**9)
     if job_id:
-        data["tailoring_changes"] = load_tailoring_changes(job_id)
-        data["generation_debug"] = load_generation_debug(job_id)
-        data.update(build_qualification_fit(data, evidence_profile))
+        if include_legacy_details:
+            data["tailoring_changes"] = load_tailoring_changes(job_id)
+            data["generation_debug"] = load_generation_debug(job_id)
+        if include_qualification:
+            data.update(_cached_qualification_fit(data, evidence_profile))
         if text(data.get("discovery_remote_preference")).lower() == "remote" and (text(data.get("remote_search_eligible")).lower() == "false" or text(data.get("ontario_eligibility")).lower() == "confirmed_ineligible"):
             data["application_priority_score"] = 0
             reasons = list(data.get("application_priority_reasons") or [])
             if not any("remote-only" in text(reason).lower() for reason in reasons):
                 reasons.append("Excluded from remote-only priority because the posting was confirmed onsite or hybrid during discovery.")
             data["application_priority_reasons"] = reasons
-        preparation = query_db(
-            "SELECT status FROM application_preparation_queue WHERE job_id = ? ORDER BY updated_at DESC, id DESC LIMIT 1",
-            [job_id],
-            one=True,
-        )
-        data["preparation_status"] = text(preparation["status"]) if preparation else ""
+        if preparation_status is None and include_legacy_details:
+            preparation = query_db(
+                "SELECT status FROM application_preparation_queue WHERE job_id = ? ORDER BY updated_at DESC, id DESC LIMIT 1",
+                [job_id],
+                one=True,
+            )
+            preparation_status = text(preparation["status"]) if preparation else ""
+        data["preparation_status"] = preparation_status or ""
     return data
 
 
@@ -8696,12 +8810,24 @@ def _qualification_terms(job: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _evidence_match(requirement: str, evidence: dict[str, Any]) -> tuple[str, str, int]:
+    cache_key = hashlib.sha256((requirement + "\0" + text(evidence.get("evidence_type")) + "\0" + text(evidence.get("text"))).encode("utf-8")).hexdigest()
+    cached = _EVIDENCE_MATCH_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     req = requirement.lower()
     candidate = text(evidence.get("text")).lower()
     aliases = QUALIFICATION_ALIASES.get(_qualification_key(requirement), {req})
-    exact = any(re.search(r"(?<![a-z0-9])" + re.escape(alias) + r"(?![a-z0-9])", candidate) for alias in aliases)
+    candidate_sequence = evidence.get("_token_sequence") or re.findall(r"[a-z0-9+#.]+", candidate)
+    candidate_tokens = evidence.get("_tokens") or set(candidate_sequence)
+    alias_sequences = [re.findall(r"[a-z0-9+#.]+", alias.lower()) for alias in aliases]
+    exact = any(
+        sequence and any(
+            candidate_sequence[index:index + len(sequence)] == sequence
+            for index in range(max(0, len(candidate_sequence) - len(sequence) + 1))
+        )
+        for sequence in alias_sequences
+    )
     req_tokens = set(re.findall(r"[a-z0-9+#.]+", req))
-    candidate_tokens = set(re.findall(r"[a-z0-9+#.]+", candidate))
     stem_overlap = 0
     for token in req_tokens:
         forms = {token}
@@ -8713,10 +8839,22 @@ def _evidence_match(requirement: str, evidence: dict[str, Any]) -> tuple[str, st
             stem_overlap += 1
     related = ("api" in req or "service" in req) and bool(candidate_tokens & {"rest", "flask", "backend"})
     if exact:
-        return "matched", "exact or accepted equivalent wording", 88 if evidence.get("evidence_type") == "professional experience" else 68
+        result = ("matched", "exact or accepted equivalent wording", 88 if evidence.get("evidence_type") == "professional experience" else 68)
+        if len(_EVIDENCE_MATCH_CACHE) >= QUALIFICATION_CACHE_LIMIT * 8:
+            _EVIDENCE_MATCH_CACHE.pop(next(iter(_EVIDENCE_MATCH_CACHE)))
+        _EVIDENCE_MATCH_CACHE[cache_key] = result
+        return result
     if related or (len(req_tokens) >= 2 and stem_overlap / len(req_tokens) >= 0.6):
-        return "partial", "related résumé evidence is present, but the requirement is not stated in full", 58
-    return "missing", "no sufficiently related evidence was found in the selected résumé", 0
+        result = ("partial", "related résumé evidence is present, but the requirement is not stated in full", 58)
+        if len(_EVIDENCE_MATCH_CACHE) >= QUALIFICATION_CACHE_LIMIT * 8:
+            _EVIDENCE_MATCH_CACHE.pop(next(iter(_EVIDENCE_MATCH_CACHE)))
+        _EVIDENCE_MATCH_CACHE[cache_key] = result
+        return result
+    result = ("missing", "no sufficiently related evidence was found in the selected résumé", 0)
+    if len(_EVIDENCE_MATCH_CACHE) >= QUALIFICATION_CACHE_LIMIT * 8:
+        _EVIDENCE_MATCH_CACHE.pop(next(iter(_EVIDENCE_MATCH_CACHE)))
+    _EVIDENCE_MATCH_CACHE[cache_key] = result
+    return result
 
 
 def _application_priority(
@@ -8763,8 +8901,8 @@ def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any
     """Calculate transparent Qualification Match without changing Job Priority."""
     try:
         profile = evidence_profile or load_profile()
-        inventory = _qualification_terms(job)
-        evidence = extract_resume_evidence(profile)
+        inventory = _cached_qualification_terms(job)
+        evidence = _cached_resume_evidence(profile)
         analysis = analyze_job_seniority(job)
         seniority = score_seniority_fit(profile, analysis)
     except Exception:
@@ -8780,7 +8918,12 @@ def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any
             status, reason, confidence = _evidence_match(item["requirement"], candidate)
             if confidence > best["confidence"]:
                 best = {"status": status, "reason": reason, "confidence": confidence, "evidence": candidate}
-        assessed.append({**item, **best, "evidence_text": text((best.get("evidence") or {}).get("text")), "evidence_source": text((best.get("evidence") or {}).get("source_section"))})
+        assessed.append({
+            **item,
+            **{key: value for key, value in best.items() if key != "evidence"},
+            "evidence_text": text((best.get("evidence") or {}).get("text")),
+            "evidence_source": text((best.get("evidence") or {}).get("source_section")),
+        })
 
     required = [item for item in assessed if item["importance"] == "required"]
     technical = [item for item in assessed if item["category"] == "technical"]

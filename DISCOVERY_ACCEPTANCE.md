@@ -57,3 +57,31 @@ No production database, user document, application submission, or paid API was u
 **LIVE ACCEPTANCE BLOCKED.** The bounded provider check attempted LinkedIn, Indeed, Google Jobs, and ZipRecruiter. LinkedIn, Indeed, and Google returned proxy tunnel `403 Forbidden`; ZipRecruiter returned DNS failure. The earlier Windows-visible server was stale pre-fix code, so it is not current-branch evidence.
 
 When provider access is available on Windows, run one isolated Canada remote SWE search against the current branch, inspect the first ten results for source/application links, experience evidence, eligibility, and the SWE profile name, then mark one Saved, one Applied, and one Skipped and repeat the search after reload. This is the only remaining live check; no database repair or manual code change should be needed.
+
+## Performance/usability pass — 2026-11-04
+
+The November 4 Windows report confirmed that Saved, Applied, and Skipped history survives refresh, and measured approximately ten-second loads with 108 discovered jobs. The confirmed code path was repeated qualification extraction/matching, tailoring and generation metadata file reads, one preparation-status query per row, a second full inbox request during `loadAll()`, and blocking shortlist keyword/document work.
+
+The focused pass now:
+
+- caches résumé evidence, extracted qualification terms, evidence matches, and complete qualification results with keys that include job content/version, selected résumé/profile content, and an algorithm version;
+- replaces per-job preparation-status queries with one batched query and keeps dashboard summaries qualification-free;
+- renders Discovery inbox categories from the already-loaded job rows, so category changes and Save/Applied/Skip update the local durable row without reloading all jobs or invoking document generation/keyword scoring;
+- displays required/preferred years, candidate verified years, fit, seniority and résumé source evidence in inbox and Pipeline details;
+- persists the selected candidate profile ID in browser local storage and uses it for generation defaults instead of silently choosing the first profile;
+- makes Pipeline default to Application Priority and labels Canadian eligibility separately from technical Qualification Match.
+
+### Measured QA benchmark
+
+The benchmark used the disposable `.tmpqa/discovery-reliability-review-20261102/data/jobs.sqlite` with 108 jobs (104 discovered), without production data.
+
+| Endpoint | Before | After |
+|---|---:|---:|
+| `/api/jobs?candidate_profile_id=2` | 4.8–5.1s cold | 3.04s cold |
+| `/api/discovery/inbox?include_history=1` | 5.7s when recomputing the same rows | 0.39s after the job-list derivation cache |
+| `/api/dashboard` | 6.05s | 0.26s |
+| `/api/shortlist` | 0.21s | 0.12s |
+
+The cold job-list target is narrowly above the practical three-second goal on this host; qualification data was retained rather than hidden to force the target. Category changes no longer make a network request after initial load and are expected to remain well below two seconds.
+
+Validation: **209 tests passed, 1 skipped**; Python compilation, JavaScript syntax, and `git diff --check` passed. The recorded browser fixture still cannot run in this environment because the repository has no Playwright package (`Cannot find module 'playwright'`). A fresh post-change Windows browser timing and live-provider audit therefore remain host-side limitations.
