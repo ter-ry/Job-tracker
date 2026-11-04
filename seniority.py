@@ -151,7 +151,7 @@ def analyze_job_seniority(job: dict[str, Any]) -> dict[str, Any]:
         "description_evidence": description_hits,
         "required_experience": experience_range_dict(required_range, description) if required_range else None,
         "preferred_experience": experience_range_dict(preferred_range, description) if preferred_range else None,
-        "ambiguous_experience": [item.as_dict() for item in ambiguous_ranges],
+        "ambiguous_experience": [experience_range_dict(item, description) for item in ambiguous_ranges],
         "management_role": management_flag,
         "leadership_expectations": leadership_flag,
         "budget_or_hiring_responsibility": budget_or_hiring,
@@ -211,7 +211,7 @@ def extract_experience_ranges(content: str) -> tuple[list[ExperienceRange], list
         if is_false_experience_match(content, match.start(), match.end()):
             continue
         snippet = content[max(0, match.start() - 80) : min(len(content), match.end() + 80)]
-        kind = classify_experience_context(snippet)
+        kind = classify_experience_section(content, match.start()) or classify_experience_context(snippet)
         a = float(match.group("a"))
         b = float(match.group("b")) if match.group("b") else (None if "+" in match.group(0) or "plus" in match.group(0).lower() else a)
         item = ExperienceRange(a, b, kind, match.group(0).strip())
@@ -222,6 +222,18 @@ def extract_experience_ranges(content: str) -> tuple[list[ExperienceRange], list
         else:
             ambiguous.append(item)
     return required, preferred, ambiguous
+
+
+def classify_experience_section(content: str, position: int) -> str:
+    """Use the nearest explicit qualifications heading as context for a bullet."""
+    headings = list(re.finditer(
+        r"(?im)^\s*(?P<heading>(?:minimum|basic|required)\s+qualifications?|requirements?|preferred\s+qualifications?|preferred|nice\s+to\s+have|bonus|assets?)\s*:?[ \t]*$",
+        content[:position],
+    ))
+    if not headings:
+        return ""
+    heading = headings[-1].group("heading").lower()
+    return "preferred" if any(term in heading for term in ("preferred", "nice", "bonus", "asset")) else "required"
 
 
 def is_false_experience_match(content: str, start: int, end: int) -> bool:
@@ -330,11 +342,25 @@ def score_seniority_fit(profile: dict[str, Any], analysis: dict[str, Any]) -> di
 
     return {
         "score": max(0, min(100, round(score))),
+        "detected_level": detected,
+        "detected_level_source": seniority_signal_source(analysis, detected),
         "explanation": " ".join(explanation),
         "stretch_role": bool(stretch),
         "management_role": management,
         "confidence": analysis.get("confidence", 0),
     }
+
+
+def seniority_signal_source(analysis: dict[str, Any], detected: str) -> str:
+    if detected == "unknown":
+        return "unknown"
+    if analysis.get("title_level") == detected:
+        return "title"
+    if analysis.get("description_level") == detected:
+        return "description"
+    if analysis.get("required_experience") or analysis.get("preferred_experience"):
+        return "experience requirement"
+    return "combined evidence"
 
 
 def parse_optional_float(value: Any) -> float | None:

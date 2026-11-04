@@ -85,3 +85,13 @@ The benchmark used the disposable `.tmpqa/discovery-reliability-review-20261102/
 The cold job-list target is narrowly above the practical three-second goal on this host; qualification data was retained rather than hidden to force the target. Category changes no longer make a network request after initial load and are expected to remain well below two seconds.
 
 Validation: **209 tests passed, 1 skipped**; Python compilation, JavaScript syntax, and `git diff --check` passed. The recorded browser fixture still cannot run in this environment because the repository has no Playwright package (`Cannot find module 'playwright'`). A fresh post-change Windows browser timing and live-provider audit therefore remain host-side limitations.
+
+## Evidence-accuracy pass — 2026-11-04
+
+- The stored Apple TV and Sports description contains the Minimum Qualifications bullet `4+ years of professional software development experience in full-stack engineering.` The nearest-heading classifier now records it as required and preserves the posting phrase in `source_evidence`; no description was invented or repaired.
+- Java and Spring/Spring Boot in that Apple minimum-qualification section are required technical terms. A selected SWE résumé containing JavaScript but no Java or Spring evidence is reported missing for Java and Spring; JavaScript is not accepted as Java.
+- Seniority scoring now returns `detected_level` and its evidence source. The frontend uses that contract, so explicit Junior/Senior title signals are shown even when a legacy response lacks a separate level field.
+- Experience fit is `aligned` only when the selected résumé has explicit professional-years evidence. Otherwise it remains `unverified`, including when the job has a detected seniority or required-years signal.
+- Cached home coordinates are checked against the saved Canadian postal/city/province region before distance calculations. A Toronto FSA (`M`) with Alberta coordinates is rejected as `invalid_cached`, leaving distance unknown rather than reporting a fabricated Toronto distance. Regression coverage exercises Toronto, Calgary, Vancouver, and same-city distance calculations.
+
+Validation for this pass: **213 tests passed, 1 skipped** in 180.644 seconds; targeted evidence/geocoding tests passed; Python compilation, JavaScript syntax, and `git diff --check` passed. The Playwright browser fixture remains unavailable because the repository environment has no `playwright` package, and provider access remains blocked as documented above.

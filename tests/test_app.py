@@ -205,6 +205,71 @@ class JobAssistantTest(unittest.TestCase):
         self.assertLess(fit["score"], 75)
         self.assertIn("does not explicitly demonstrate", fit["explanation"])
 
+    def test_apple_minimum_qualification_years_and_java_spring_are_source_grounded(self):
+        job = {
+            "title": "Full Stack Engineer - Apple TV and Sports",
+            "job_description": (
+                "Minimum Qualifications\n"
+                "* BS in Computer Science or related field.\n"
+                "* 4+ years of professional software development experience in full-stack engineering.\n"
+                "* Strong proficiency in Java and modern backend frameworks (such as Spring / Spring Boot).\n"
+                "* Strong proficiency in JavaScript / TypeScript."
+            ),
+        }
+        analysis = seniority.analyze_job_seniority(job)
+        self.assertEqual(analysis["required_experience"]["minimum"], 4)
+        self.assertIn("4+ years of professional", analysis["required_experience"]["source_evidence"])
+        profile = {
+            "resume_text": "Built JavaScript, React and Python applications.",
+            "work_experience": "Software developer with three years of professional software development experience.",
+            "target_seniority_levels": "entry_level, junior, intermediate",
+            "maximum_required_years": "3",
+        }
+        fit = app_module.build_qualification_fit(job, evidence_profile=profile)
+        requirements = {item["requirement"].lower(): item for item in fit["qualification_requirements"]}
+        self.assertEqual(requirements["java"]["status"], "missing")
+        self.assertEqual(requirements["spring"]["status"], "missing")
+        self.assertEqual(requirements["java"]["importance"], "required")
+        self.assertEqual(requirements["spring"]["importance"], "required")
+        self.assertEqual(fit["experience_requirements"]["required"]["minimum"], 4)
+        self.assertNotEqual(fit["qualification_fit_label"], "Strong qualification match")
+
+    def test_seniority_contract_and_unverified_experience_status(self):
+        analysis = seniority.analyze_job_seniority({"title": "Senior Software Engineer", "job_description": "Build software."})
+        fit = seniority.score_seniority_fit({"target_seniority_levels": "senior"}, analysis)
+        self.assertEqual(fit["detected_level"], "senior")
+        self.assertEqual(fit["detected_level_source"], "title")
+        unverified = app_module.build_qualification_fit(
+            {"title": "Software Engineer", "job_description": "Required: 3+ years of professional software development experience."},
+            evidence_profile={"target_seniority_levels": "junior, intermediate", "resume_text": "Built Python projects."},
+        )
+        self.assertEqual(unverified["experience_requirements"]["candidate_years_status"], "unverified from selected résumé")
+        self.assertEqual(unverified["experience_requirements"]["fit_status"], "unverified")
+
+    def test_cached_home_coordinates_are_rejected_by_canadian_region(self):
+        stale_toronto = {
+            "location": "M2J 0B6", "home_location_normalized": "M2J 0B6, Canada",
+            "home_location_latitude": "49.0004", "home_location_longitude": "-112.7880",
+            "home_location_status": "cached", "home_location_precision": "postal code",
+        }
+        origin = app_module.profile_home_location(stale_toronto)
+        self.assertIsNone(origin["latitude"])
+        self.assertEqual(origin["status"], "invalid_cached")
+        self.assertEqual(app_module.home_coordinates_match_location({"location": "Toronto, ON"}, 43.65, -79.38), True)
+        self.assertEqual(app_module.home_coordinates_match_location({"location": "Calgary, AB"}, 51.05, -114.07), True)
+        self.assertEqual(app_module.home_coordinates_match_location({"location": "Vancouver, BC"}, 49.28, -123.12), True)
+        self.assertEqual(app_module.home_coordinates_match_location({"location": "Toronto, ON"}, 51.05, -114.07), False)
+        toronto = {"normalized": "Toronto, ON", "latitude": 43.65, "longitude": -79.38, "precision": "city", "confidence": 90}
+        toronto_job = {"latitude": 43.65, "longitude": -79.38, "precision": "city", "confidence": 90}
+        calgary_job = {"latitude": 51.05, "longitude": -114.07, "precision": "city", "confidence": 90}
+        vancouver_job = {"latitude": 49.28, "longitude": -123.12, "precision": "city", "confidence": 90}
+        toronto_distance = app_module.location_distance_snapshot(toronto, "Toronto, ON", "", "remote_after_local", toronto_job)
+        calgary_distance = app_module.location_distance_snapshot(toronto, "Calgary, AB", "", "remote_after_local", calgary_job)
+        vancouver_distance = app_module.location_distance_snapshot(toronto, "Vancouver, BC", "", "remote_after_local", vancouver_job)
+        self.assertEqual(toronto_distance["distance_km"], 0)
+        self.assertGreater(calgary_distance["distance_km"], 2000)
+        self.assertGreater(vancouver_distance["distance_km"], 3000)
+
     def test_qualification_match_uses_resume_evidence_and_aliases(self):
         self.client.post(
             "/api/profile",

@@ -2814,8 +2814,10 @@ function renderExperienceSummary(job) {
   const candidate = experience.candidate_professional_years;
   const candidateText = candidate === undefined || candidate === null ? "Unverified" : `${Number(candidate)} years verified`;
   const fit = experience.fit_status || "unknown";
-  const level = job.qualification_fit_seniority?.detected_level || "unknown";
-  return `<div class="experience-summary"><strong>Experience:</strong> Required ${escapeHtml(formatExperienceRange(experience.required))} · Preferred ${escapeHtml(formatExperienceRange(experience.preferred))} · Candidate ${escapeHtml(candidateText)} · Fit ${escapeHtml(fit)} · Seniority ${escapeHtml(level)}</div>`;
+  const level = job.qualification_fit_seniority?.detected_level || job.seniority_level || "unknown";
+  const ambiguous = experience.ambiguous || [];
+  const requiredLabel = formatExperienceRange(experience.required) || (ambiguous.length ? `Ambiguous (${formatExperienceRange(ambiguous[0])})` : "Not specified");
+  return `<div class="experience-summary"><strong>Experience:</strong> Required ${escapeHtml(requiredLabel)} · Preferred ${escapeHtml(formatExperienceRange(experience.preferred) || "Not specified")} · Candidate ${escapeHtml(candidateText)} · Fit ${escapeHtml(fit)} · Seniority ${escapeHtml(level)}</div>`;
 }
 
 function badge(label, value) {

@@ -7055,18 +7055,55 @@ def profile_home_location(profile: dict[str, str]) -> dict[str, Any]:
     lat = profile.get("home_location_latitude")
     lon = profile.get("home_location_longitude")
     status = text(profile.get("home_location_status"))
+    try:
+        latitude = float(lat) if text(lat) else None
+        longitude = float(lon) if text(lon) else None
+    except (TypeError, ValueError):
+        latitude = longitude = None
+    error = text(profile.get("home_location_error"))
+    if latitude is not None and longitude is not None and not home_coordinates_match_location(profile, latitude, longitude):
+        latitude = longitude = None
+        status = "invalid_cached"
+        error = "Cached home coordinates do not match the saved Canadian location; distance remains unknown."
     return {
         "input": text(profile.get("home_location_original") or profile.get("location")),
         "normalized": normalized,
-        "latitude": float(lat) if text(lat) else None,
-        "longitude": float(lon) if text(lon) else None,
+        "latitude": latitude,
+        "longitude": longitude,
         "provider": text(profile.get("home_location_provider")),
         "confidence": clamp_int(profile.get("home_location_confidence"), 0, 100),
         "precision": text(profile.get("home_location_precision")),
         "geocoded_at": text(profile.get("home_location_geocoded_at")),
         "status": status or ("saved" if normalized else "missing"),
-        "error": text(profile.get("home_location_error")),
+        "error": error,
     }
+
+
+CANADIAN_PROVINCE_COORDINATE_BOUNDS = {
+    "ON": (41.6, 56.9, -95.2, -74.3), "AB": (48.9, 60.0, -120.0, -109.0),
+    "BC": (48.2, 60.0, -139.1, -114.0), "QC": (45.0, 62.6, -79.8, -57.0),
+    "MB": (49.0, 60.1, -102.1, -88.9), "SK": (49.0, 60.1, -110.1, -101.9),
+    "NS": (43.3, 47.1, -66.5, -59.5), "NB": (44.5, 48.1, -69.1, -63.7),
+    "NL": (46.5, 60.5, -67.8, -52.5), "PE": (46.0, 47.1, -64.6, -61.9),
+    "YT": (59.0, 69.7, -141.1, -123.8), "NT": (60.0, 78.5, -136.5, -102.0),
+    "NU": (51.0, 83.2, -120.0, -61.0),
+}
+
+
+def home_coordinates_match_location(profile: dict[str, Any], latitude: float, longitude: float) -> bool:
+    raw = " ".join(text(profile.get(field)) for field in ("location", "home_location_original", "home_location_normalized"))
+    postal = extract_canadian_postal_code(raw)
+    province = "ON" if postal and postal[0] == "M" else province_code_from_text(raw)
+    lowered = raw.lower()
+    if not province:
+        province = {"toronto": "ON", "calgary": "AB", "vancouver": "BC"}.get(
+            next((city for city in ("toronto", "calgary", "vancouver") if city in lowered), ""), ""
+        )
+    bounds = CANADIAN_PROVINCE_COORDINATE_BOUNDS.get(province)
+    if not bounds:
+        return True
+    min_lat, max_lat, min_lon, max_lon = bounds
+    return min_lat <= latitude <= max_lat and min_lon <= longitude <= max_lon
 
 
 def discovery_origin_available(profile: dict[str, str]) -> bool:
@@ -8772,6 +8809,27 @@ def _qualification_phrase_present(content: str, phrase: str) -> bool:
     return bool(re.search(pattern, content.lower()))
 
 
+def _description_requirement_importance(description: str, term: str) -> str:
+    """Classify a term using its nearest explicit qualifications section."""
+    lowered = description.lower()
+    index = lowered.find(term.lower())
+    if index < 0:
+        return "unclassified"
+    headings = list(re.finditer(
+        r"(?im)^\s*(?P<heading>(?:minimum|basic|required)\s+qualifications?|requirements?|preferred\s+qualifications?|preferred|nice\s+to\s+have|bonus|assets?)\s*:?[ \t]*$",
+        description[:index],
+    ))
+    if headings:
+        heading = headings[-1].group("heading").lower()
+        return "preferred" if any(value in heading for value in ("preferred", "nice", "bonus", "asset")) else "required"
+    context = lowered[max(0, index - 260):index + len(term)]
+    if re.search(r"\b(required|requirements|must have|minimum qualifications|qualifications)\b", context):
+        return "required"
+    if re.search(r"\b(preferred|nice to have|bonus|asset)\b", context):
+        return "preferred"
+    return "unclassified"
+
+
 def _qualification_terms(job: dict[str, Any]) -> list[dict[str, Any]]:
     """Build a bounded, explainable inventory from structured fields and JD text."""
     description = text(job.get("job_description"))
@@ -8797,11 +8855,7 @@ def _qualification_terms(job: dict[str, Any]) -> list[dict[str, Any]]:
     lowered = content.lower()
     for term in sorted(TECHNICAL_TERMS, key=len, reverse=True):
         if _qualification_phrase_present(lowered, term):
-            importance = "unclassified"
-            if re.search(r"(?:required|must have|qualifications?|requirements?).{0,180}" + re.escape(term), description, re.I | re.S):
-                importance = "required"
-            elif re.search(r"(?:preferred|nice to have|bonus|assets?).{0,180}" + re.escape(term), description, re.I | re.S):
-                importance = "preferred"
+            importance = _description_requirement_importance(description, term)
             add(term, importance, "technical", "job description")
 
     for match in re.finditer(r"\b\d+\+?\s*(?:to\s*\d+\+?\s*)?(?:years?|yrs?)\b[^.\n]{0,80}", content, re.I):
@@ -8979,7 +9033,12 @@ def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any
             "ambiguous": analysis.get("ambiguous_experience", []),
             "candidate_professional_years": explicit_professional_years(profile),
             "candidate_years_status": "verified from explicit résumé evidence" if explicit_professional_years(profile) is not None else "unverified from selected résumé",
-            "fit_status": "stretch" if stretch else "aligned" if required_experience or analysis.get("detected_level") != "unknown" else "unknown",
+            "fit_status": (
+                "unverified" if explicit_professional_years(profile) is None and (required_experience or analysis.get("detected_level") != "unknown") else
+                "stretch" if stretch else
+                "aligned" if explicit_professional_years(profile) is not None and (required_experience or analysis.get("detected_level") != "unknown") else
+                "unknown"
+            ),
             "source_evidence": analysis.get("required_experience", {}).get("source_evidence", "") if analysis.get("required_experience") else analysis.get("preferred_experience", {}).get("source_evidence", "") if analysis.get("preferred_experience") else "",
         },
         "qualification_components": {"mandatory": mandatory_score, "technical": technical_score, "experience": experience_score, "seniority": seniority.get("score", 0)},
