@@ -409,6 +409,67 @@ class JobAssistantTest(unittest.TestCase):
         url_only = jobspy_source.normalize_jobspy_row({"title": "Developer", "job_url": "https://example.test/job"}, "linkedin")
         self.assertEqual(url_only["posting_availability"], "unverified")
 
+    def test_jobspy_experience_extraction_ignores_company_history(self):
+        description = (
+            "For 30 years, we've been on a mission to change banking for good.\n"
+            "Basic Qualifications:\n"
+            "* At least 6 years of hands-on development experience.\n"
+            "Preferred Qualifications:\n"
+            "* 8+ years leading the full life-cycle of software development."
+        )
+        normalized = jobspy_source.normalize_jobspy_row(
+            {"title": "Staff Software Engineer", "job_url": "https://example.test/capital-one", "description": description},
+            "indeed",
+        )
+        self.assertEqual(normalized["experience_requirement"], "6 years of")
+        analysis = seniority.analyze_job_seniority({"title": "Staff Software Engineer", "job_description": description})
+        self.assertEqual(analysis["required_experience"]["minimum"], 6)
+        self.assertNotIn("30", analysis["required_experience"]["source_evidence"])
+
+    def test_role_family_does_not_leak_from_body_into_security_or_quality_titles(self):
+        security = self.client.post(
+            "/api/jobs",
+            json={
+                "company": "Super.com",
+                "title": "Head of Security",
+                "job_description": "Head of Security. Lead software engineering security programs and manage the security function.",
+            },
+        ).get_json()
+        quality = self.client.post(
+            "/api/jobs",
+            json={
+                "company": "Method Integration",
+                "title": "Junior Quality Engineer",
+                "job_description": "Quality engineering role validating software releases and test automation.",
+            },
+        ).get_json()
+        self.assertEqual(security["role_type"], "other")
+        self.assertEqual(quality["role_type"], "other")
+        self.assertEqual(seniority.analyze_job_seniority({"title": "Head of Security", "job_description": "Manage security engineers."})["detected_level"], "director")
+        staff_analysis = seniority.analyze_job_seniority({"title": "Staff Software Engineer", "job_description": "This role does not have direct reports."})
+        self.assertEqual(staff_analysis["detected_level"], "lead")
+        self.assertFalse(staff_analysis["management_role"])
+
+    def test_jobspy_employment_type_does_not_override_role_family(self):
+        self.assertEqual(app_module.map_jobspy_role_type("fulltime"), "")
+        affirm = app_module.jobspy_result_to_job_payload(
+            {
+                "title": "Software Engineer I, Fullstack",
+                "job_type": "volunteer",
+                "description": "Full-time salaried engineering role building software systems.",
+            }
+        )
+        security = app_module.jobspy_result_to_job_payload(
+            {
+                "title": "Head of Security",
+                "job_type": "fulltime",
+                "description": "Lead security and software engineering programs.",
+            }
+        )
+        self.assertEqual(affirm["role_type"], "software developer")
+        self.assertIn("Full-time salaried", affirm["job_description"])
+        self.assertEqual(security["role_type"], "other")
+
     def test_application_priority_is_the_discovery_best_match_sort(self):
         preferences = app_module.discovery_preferences_payload({})
         self.assertEqual(preferences["sort"]["field"], "application_priority_score")

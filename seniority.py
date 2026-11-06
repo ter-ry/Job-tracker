@@ -176,9 +176,9 @@ def experience_range_dict(item: ExperienceRange, content: str) -> dict[str, Any]
 def detect_level(content: str) -> tuple[str, list[str]]:
     lowered = content.lower()
     checks = [
-        ("director", ["director", "head of engineering", "vp engineering"]),
+        ("director", ["director", "head of", "vp engineering"]),
         ("manager", ["engineering manager", "development manager", "manager, software", "people manager"]),
-        ("lead", ["lead ", "tech lead", "technical lead", "principal", "staff engineer"]),
+        ("lead", ["lead ", "tech lead", "technical lead", "principal", "staff engineer", "staff software engineer"]),
         ("senior", ["senior", "sr.", "sr "]),
         ("intermediate", ["intermediate", "mid-level", "mid level", "level 2"]),
         ("junior", ["junior", "jr.", "jr ", "early career"]),
@@ -216,11 +216,16 @@ def detect_description_level(content: str) -> tuple[str, list[str]]:
 def role_has_management_scope(title: str, description: str) -> bool:
     if detect_level(title)[0] in {"manager", "director"}:
         return True
-    return bool(re.search(
+    pattern = re.compile(
         r"\b(?:manage(?:s|d)?\s+(?:a|an|the)?\s*team|direct reports|people management|performance reviews|responsible for hiring|hire engineers|headcount responsibility|budget responsibility)\b",
-        description,
         re.I,
-    ))
+    )
+    for match in pattern.finditer(description):
+        context = description[max(0, match.start() - 35):match.start()].lower()
+        if re.search(r"(?:does not|doesn't|do not|without|no)\s+(?:have\s+)?(?:any\s+)?$", context):
+            continue
+        return True
+    return False
 
 
 def role_has_leadership_scope(description: str) -> bool:
@@ -280,7 +285,7 @@ def classify_experience_section(content: str, position: int) -> str:
 
 def is_false_experience_match(content: str, start: int, end: int) -> bool:
     snippet = content[max(0, start - 30) : min(len(content), end + 30)].lower()
-    if re.search(r"\$\s*\d", snippet) or any(term in snippet for term in ["salary", "per year", "annually", "version", "python 3", "team of", "people on"]):
+    if re.search(r"\$\s*\d", snippet) or re.search(r"\bfor\s+\d{1,2}\s*(?:\+|\\\+)?\s*years?\s*,?\s*(?:we|our|the company)\b", snippet) or any(term in snippet for term in ["salary", "per year", "annually", "version", "python 3", "team of", "people on"]):
         return True
     number = int(re.search(r"\d{1,4}", content[start:end]).group(0))
     if 1900 <= number <= 2100:

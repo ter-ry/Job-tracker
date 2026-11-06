@@ -158,3 +158,29 @@ Set-Location 'C:\Users\ter23\Documents\Job tracker'
 ```
 
 Copy the resulting `*.json` and `*.md` files back with the same names or attach them to Issue #13. The audit remains **INCONCLUSIVE**: no live sample reached the 40-posting independent-adjudication threshold, so top-20 precision, years accuracy, mandatory-skill accuracy, eligibility error rate, false-positive/negative rates, and coverage cannot be calculated honestly.
+
+## Captured Windows pipeline replay — 2026-11-06
+
+The original live audit’s `missing_description_count=20` was an audit-only field mismatch: JobSpy-normalized records store the provider text under `description`, while the raw assessor checked `job_description`. More importantly, that assessor never invoked the application’s `jobspy_result_to_job_payload`, `normalize_job_payload`, geocoding/eligibility, qualification, or persistence path.
+
+`scripts/quality_audit.py --captured ...` now delegates to `scripts/replay_quality_audit.py`. Replay copies the isolated QA SQLite database to a disposable temporary database, replays each captured scenario through the real `/api/discovery/jobspy` endpoint, and reads back the persisted rows with the selected SWE résumé (candidate profile 2, résumé 2). The exact replay command was:
+
+```powershell
+& .venv\Scripts\python.exe scripts\quality_audit.py `
+  --captured .tmpqa/quality-audit-live-windows.json `
+  --db-path .tmpqa/discovery-reliability-review-20261102/data/jobs.sqlite `
+  --candidate-profile-id 2 `
+  --resume-id 2 `
+  --output-prefix .tmpqa/quality-audit-pipeline-replay-verified
+```
+
+Replay results: 25 captured records, 20 raw canonical postings, 20 persisted unique jobs, 0 persisted missing descriptions, and 5 cross-scenario/source duplicates removed. The actual application priority ranking produced 9 actionable, 6 review-required, and 5 excluded jobs. The top 20 are selected after persistence and scoring by `application_priority_score`, not raw provider order. The detailed replay report is retained in `.tmpqa/quality-audit-pipeline-replay-final2.md` and the compact committed summary is `audit/quality-audit-pipeline-replay-2026-11-06.md`.
+
+### Confirmed defects and behavior
+
+- Capital One’s `For 30 years, we've...` company-history sentence was being extracted by the provider adapter as `30 years`. The evidence-aware parser now ignores that contextual phrase and extracts the actual Basic Qualifications requirement: 6 years. Source evidence remains preserved.
+- `fulltime` and `volunteer` JobSpy employment metadata no longer determines the application role family. Salaried Affirm engineering records now classify as `software developer` from the advertised title/description; `Head of Security` and `Junior Quality Engineer` classify as `other`.
+- `Staff Software Engineer` now detects as `lead`, and negated wording such as `does not have direct reports` no longer marks it as a management role. In the Canada remote replay, hybrid Staff/Quality roles have priority 0 and category `excluded`; Head of Security is `director`/`other` with low review priority, not an actionable junior SWE recommendation.
+- The supplied Windows capture contains no Montreal record. The same remote-only constraint already covered by regression tests excludes any hybrid/on-site Montreal posting from remote priority; it remains visible only as excluded/review data when appropriate.
+
+The replay remains **INCONCLUSIVE** for independent quality metrics: captured provider descriptions and URLs were not independently adjudicated against original postings. Top-20 precision, years accuracy, mandatory-skill accuracy, eligibility errors, and false-positive/negative rates therefore remain unavailable.

@@ -2945,13 +2945,15 @@ def normalize_bool_text(value: Any, default: bool) -> str:
 def jobspy_result_to_job_payload(job: dict[str, Any]) -> dict[str, Any]:
     source = text(job.get("source"))
     description = text(job.get("description"))
+    title = text(job.get("title"))
     role_type = text(job.get("job_type"))
+    mapped_role_type = map_jobspy_role_type(role_type) or guess_role_type_for_job(title, description)
     salary_text = text(job.get("salary_text") or job.get("salary"))
     salary = determine_salary(
         {
-            "title": text(job.get("title")),
+            "title": title,
             "location": text(job.get("location")),
-            "role_type": map_jobspy_role_type(role_type),
+            "role_type": mapped_role_type,
             "seniority_level": text(job.get("experience_requirement")),
             "job_type": role_type,
             "salary_min": job.get("salary_min"),
@@ -2965,7 +2967,7 @@ def jobspy_result_to_job_payload(job: dict[str, Any]) -> dict[str, Any]:
     salary_listed = salary["salary_source"] not in {"estimated", "missing"}
     return {
         "company": text(job.get("company")) or "Unknown company",
-        "title": text(job.get("title")) or "Untitled role",
+        "title": title or "Untitled role",
         "location": text(job.get("location")),
         "url": text(job.get("job_url")),
         "application_url": text(job.get("application_url")) or text(job.get("job_url")),
@@ -2981,7 +2983,7 @@ def jobspy_result_to_job_payload(job: dict[str, Any]) -> dict[str, Any]:
         "salary_confidence": salary["salary_confidence"],
         "salary_listed": int(salary_listed),
         "remote_type": text(job.get("remote_type")),
-        "role_type": map_jobspy_role_type(role_type),
+        "role_type": mapped_role_type,
         "seniority_level": text(job.get("experience_requirement")),
         "required_skills": text(job.get("required_skills")),
         "preferred_skills": text(job.get("preferred_skills")),
@@ -3002,7 +3004,7 @@ def map_jobspy_role_type(value: str) -> str:
         return "other"
     if "part" in lowered:
         return "other"
-    if "full" in lowered:
+    if re.search(r"\bfull[- ]?stack\b", lowered) or "software developer" in lowered or "software engineer" in lowered:
         return "software developer"
     return ""
 
@@ -9192,7 +9194,7 @@ def extract_job_details(content: str, source: str = "", existing: dict[str, Any]
     location = text(existing.get("location")) or guess_location(compact)
     salary = text(existing.get("salary")) or guess_salary(compact)
     remote_type = text(existing.get("remote_type")) or guess_remote_type(compact)
-    role_type = text(existing.get("role_type")) or guess_role_type(f"{title} {compact}")
+    role_type = text(existing.get("role_type")) or guess_role_type_for_job(title, compact)
     seniority = text(existing.get("seniority_level")) or guess_seniority(f"{title} {compact}")
     skills = keyword_hits(compact, REWARD_KEYWORDS)
     required = extract_section(content, ["requirements", "required qualifications", "what you bring"])
@@ -9278,6 +9280,22 @@ def guess_role_type(content: str) -> str:
     if "support" in lowered and "cloud" in lowered:
         return "cloud support"
     return "other"
+
+
+def guess_role_type_for_job(title: str, description: str) -> str:
+    """Prefer the advertised title and avoid body-only role-family leakage."""
+    lowered_title = normalize_space(title).lower()
+    if re.search(r"\b(?:software|full[- ]?stack|fullstack|backend|front[- ]?end)\s+(?:engineer|developer)\b", lowered_title) or re.search(r"\bfull[- ]?stack\b", lowered_title):
+        return "software developer"
+    title_role = guess_role_type(title)
+    if title_role != "other":
+        return title_role
+    # A description can mention software engineering while advertising a
+    # different job family. Keep security, quality, and executive roles out of
+    # the software-developer bucket unless the title itself says so.
+    if re.search(r"\b(?:head|chief|director|manager)\b|\bsecurity\b|\bquality\b", lowered_title):
+        return "other"
+    return guess_role_type(f"{title} {description}")
 
 
 def guess_seniority(content: str) -> str:

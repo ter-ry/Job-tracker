@@ -1,8 +1,9 @@
 """Bounded, reproducible discovery quality audit.
 
-Offline mode reads a SQLite database read-only.  Live mode makes exactly two
-bounded JobSpy attempts per enabled provider: Canada remote and Toronto hybrid.
-It records source URLs but never treats a URL as independently verified.
+Offline mode reads a SQLite database read-only. Live mode makes one bounded
+JobSpy attempt per enabled provider in each of Canada remote and Toronto hybrid.
+Captured mode replays records through the actual application pipeline in a
+temporary database. It records source URLs but never treats them as verified.
 """
 
 from __future__ import annotations
@@ -140,14 +141,31 @@ def run_live(enabled_sources: list[str]) -> tuple[list[dict[str, Any]], dict[str
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db-path", type=Path, help="Read-only SQLite database to audit")
+    parser.add_argument("--captured", type=Path, help="Captured live-audit JSON to replay through the application pipeline")
     parser.add_argument("--live", action="store_true", help="Run two bounded live scenarios")
     parser.add_argument(
         "--enabled-sources",
         default="linkedin,indeed",
         help="Comma-separated JobSpy providers for live mode (default: linkedin,indeed)",
     )
-    parser.add_argument("--output-prefix", type=Path, default=Path(".tmpqa/quality-audit"))
+    parser.add_argument(
+        "--output-prefix",
+        type=Path,
+        help="Output file prefix; defaults to a dated .tmpqa audit run directory",
+    )
+    parser.add_argument("--candidate-profile-id", type=int, default=2)
+    parser.add_argument("--resume-id", type=int, default=2)
     args = parser.parse_args()
+    if args.output_prefix is None:
+        args.output_prefix = Path(".tmpqa") / f"quality-audit-{datetime.now(timezone.utc):%Y%m%d}" / "quality-audit"
+    if args.captured:
+        if not args.db_path:
+            parser.error("--db-path is required with --captured")
+        from replay_quality_audit import replay
+
+        report = replay(args.captured, args.db_path, args.output_prefix.with_suffix(".json"), args.candidate_profile_id, args.resume_id)
+        print(json.dumps({key: report[key] for key in ("audit_status", "raw_job_count", "raw_unique_count", "persisted_job_count", "persisted_unique_count", "raw_missing_description_count", "persisted_missing_description_count", "duplicate_count_raw", "duplicate_count_persisted")}, indent=2))
+        return 0
     enabled_sources = [source.strip() for source in args.enabled_sources.split(",") if source.strip()]
     if args.live:
         jobs, diagnostics = run_live(enabled_sources)

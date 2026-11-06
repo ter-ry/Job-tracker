@@ -396,10 +396,18 @@ def infer_remote_type(row: dict[str, Any]) -> str:
 
 
 def extract_experience_requirement(description: str) -> str:
-    import re
+    # Reuse the evidence-aware parser so company-history prose such as
+    # "For 30 years, we've..." cannot become a job requirement. Prefer a
+    # classified required range, then preferred, then explicitly ambiguous
+    # wording while preserving the original matched phrase.
+    from seniority import extract_experience_ranges
 
-    match = re.search(r"(\d+)\+?\s*(?:-\s*\d+\s*)?(?:years|yrs)", description or "", re.I)
-    return match.group(0) if match else ""
+    required, preferred, ambiguous = extract_experience_ranges(description or "")
+    candidates = required or preferred or ambiguous
+    if not candidates:
+        return ""
+    strongest = max(candidates, key=lambda item: (item.minimum or 0, item.maximum or item.minimum or 0))
+    return strongest.text
 
 
 def extract_keyword_text(description: str) -> str:

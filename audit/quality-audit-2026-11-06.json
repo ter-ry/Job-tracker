@@ -28,6 +28,26 @@
     "linkedin_posting_markers": "1/3",
     "indeed_http_401": "2/2"
   },
+  "pipeline_replay": {
+    "captured_records": 25,
+    "raw_unique_postings": 20,
+    "persisted_unique_postings": 20,
+    "raw_missing_descriptions": 0,
+    "persisted_missing_descriptions": 0,
+    "duplicates_removed": 5,
+    "categories": {
+      "actionable": 9,
+      "review_required": 6,
+      "excluded": 5
+    },
+    "top20_rank_field": "application_priority_score",
+    "independent_source_verification": 0
+  },
+  "confirmed_corrections": [
+    "Company-history 'For 30 years' no longer becomes Capital One's experience requirement; the actual 6-year Basic Qualification is retained.",
+    "fulltime/volunteer provider employment metadata no longer leaks into role-family classification.",
+    "Staff Software Engineer detects as lead, negated direct-report wording is not management evidence, and Head of Security is director/other."
+  ],
   "limitations": [
     "No live provider result was available for independent source adjudication.",
     "URL reachability and page titles do not prove an active original posting or description accuracy.",
