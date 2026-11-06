@@ -2805,7 +2805,7 @@ function formatExperienceRange(range) {
   if (!range || range.minimum === undefined || range.minimum === null) return "Not specified";
   const minimum = Number(range.minimum);
   const maximum = range.maximum === undefined || range.maximum === null ? null : Number(range.maximum);
-  if (maximum !== null && maximum !== minimum) return `${minimum}–${maximum} years`;
+  if (maximum !== null && maximum !== minimum) return `${minimum}–${maximum}${/(?:\+|\\\+)/.test(String(range.text || "")) ? "+" : ""} years`;
   return `${minimum}+ years`;
 }
 
