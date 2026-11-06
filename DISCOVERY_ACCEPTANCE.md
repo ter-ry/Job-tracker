@@ -124,3 +124,21 @@ The exact reported test `test_tailoring_apply_defers_word_validation_and_preview
 | Unchanged `origin/master` | `d8b78cd` | Failed identically: `compare_mock.call_count` was 2, expected 1 |
 
 The PR diff contains no changes to `preview_tailoring_draft`, `validate_tailoring_draft_layout`, or `compare_docx_layout` call sites. This is therefore a pre-existing base-branch failure, not a PR #12 regression. No tailoring functionality was modified.
+
+## Independent quality audit — 2026-11-06
+
+The reusable bounded audit is `scripts/quality_audit.py`. It reads SQLite in read-only mode and writes a JSON/Markdown report. The offline command used for this review was:
+
+```powershell
+& .venv/Scripts/python.exe scripts/quality_audit.py `
+  --db-path .tmpqa/discovery-reliability-review-20261102/data/jobs.sqlite `
+  --output-prefix .tmpqa/quality-audit-offline
+```
+
+The disposable QA database contained 104 discovered and 104 unique canonical postings. There were no duplicate canonical identities, 104 source URLs, no missing descriptions, 10 unknown eligibility values, and 13 zero-priority records. The stored descriptions yielded 26 required-year, 1 preferred-year, and 36 ambiguous-year classifications. No original posting was independently adjudicated, so top-20 precision, required-years accuracy, mandatory-skill accuracy, eligibility errors, and seniority confusion are deliberately `null`; URL presence is not source verification.
+
+The bounded live check used exactly two scenarios with the required composite terms (`Full Stack Developer`, `Software Developer`, `Python Developer`, `React Developer`, and `Junior Software Engineer`): Canada remote and Toronto hybrid. Each scenario attempted the enabled LinkedIn and Indeed sources once. Both LinkedIn attempts ended without results after DNS resolution failure; both Indeed attempts failed immediately because `apis.indeed.com` could not resolve. No provider retry was made. The resulting live report is `.tmpqa/quality-audit-live.json` and `.tmpqa/quality-audit-live.md`.
+
+### Audit conclusion
+
+**INCONCLUSIVE — not a live quality-gate pass.** The audit found no automated completeness suspect in the offline top 20, but it did not obtain the independent source sample required to judge whether the ranked jobs are genuinely suitable, whether mandatory skills and years are accurate, or whether eligibility is correct. No production data or ranking behavior was changed based on this blocked audit. A Windows/network environment with source access must run the same command and independently inspect the returned original postings before treating this as evidence for production rollout.
