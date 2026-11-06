@@ -2816,7 +2816,7 @@ function renderExperienceSummary(job) {
   const fit = experience.fit_status || "unknown";
   const level = job.qualification_fit_seniority?.detected_level || job.seniority_level || "unknown";
   const ambiguous = experience.ambiguous || [];
-  const requiredLabel = formatExperienceRange(experience.required) || (ambiguous.length ? `Ambiguous (${formatExperienceRange(ambiguous[0])})` : "Not specified");
+  const requiredLabel = experience.required ? formatExperienceRange(experience.required) : ambiguous.length ? `Experience mentioned (unclassified): ${formatExperienceRange(ambiguous[0])}` : "Not specified";
   return `<div class="experience-summary"><strong>Experience:</strong> Required ${escapeHtml(requiredLabel)} · Preferred ${escapeHtml(formatExperienceRange(experience.preferred) || "Not specified")} · Candidate ${escapeHtml(candidateText)} · Fit ${escapeHtml(fit)} · Seniority ${escapeHtml(level)}</div>`;
 }
 

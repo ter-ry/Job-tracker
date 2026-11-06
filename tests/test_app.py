@@ -292,6 +292,33 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(reloaded["experience_requirements"]["required"]["minimum"], 4)
         self.assertIn("4\\+ years of professional", reloaded["experience_requirements"]["source_evidence"])
 
+    def test_persisted_atb_composite_heading_reaches_api_with_required_years(self):
+        created = self.client.post(
+            "/api/jobs",
+            json={
+                "company": "ATB Financial",
+                "title": "Intermediate Software Developer",
+                "url": "https://ca.indeed.com/viewjob?jk=01863eaea11eca75",
+                "job_description": (
+                    "Skills, Experience & Requirements\n"
+                    "* Bachelor degree in Computer Science.\n"
+                    "* 2\\-3\\+ years of professional full\\-stack software development experience with strong proficiency in Python and modern web programming frameworks."
+                ),
+            },
+        ).get_json()
+        self.assertEqual(created["experience_requirements"]["required"]["minimum"], 2)
+        self.assertEqual(created["experience_requirements"]["required"]["maximum"], 3)
+        self.assertIn("2\\-3\\+ years of professional", created["experience_requirements"]["source_evidence"])
+        reloaded = next(item for item in self.client.get("/api/jobs").get_json() if item["id"] == created["id"])
+        self.assertEqual(reloaded["experience_requirements"]["required"]["maximum"], 3)
+
+    def test_unclassified_experience_is_visible_as_uncertain(self):
+        analysis = seniority.analyze_job_seniority({"title": "Software Developer", "job_description": "Experience: 2-3+ years of professional full-stack development."})
+        self.assertIsNone(analysis["required_experience"])
+        self.assertEqual(analysis["ambiguous_experience"][0]["minimum"], 2)
+        source = (Path(__file__).parents[1] / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("Experience mentioned (unclassified):", source)
+
     def test_seniority_ignores_other_roles_and_preserves_conflict(self):
         junior = seniority.analyze_job_seniority({
             "title": "Junior Software Developer",

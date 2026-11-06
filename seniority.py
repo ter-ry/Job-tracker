@@ -262,15 +262,20 @@ def extract_experience_ranges(content: str) -> tuple[list[ExperienceRange], list
 
 
 def classify_experience_section(content: str, position: int) -> str:
-    """Use the nearest explicit qualifications heading as context for a bullet."""
-    headings = list(re.finditer(
-        r"(?im)^\s*(?P<heading>(?:minimum|basic|required)\s+qualifications?|requirements?|preferred\s+qualifications?|preferred|nice\s+to\s+have|bonus|assets?)\s*:?[ \t]*$",
-        content[:position],
-    ))
+    """Use the nearest Markdown/plain qualifications heading as context."""
+    headings: list[str] = []
+    for raw_line in content[:position].splitlines():
+        heading = re.sub(r"[*_`#]", "", raw_line).replace(r"\&", "&").replace(r"\-", "-").strip(" -:").lower()
+        if len(heading) <= 120 and not re.search(r"[.!?]", heading) and re.search(r"\b(?:requirements?|qualifications?|experience)\b", heading):
+            headings.append(heading)
     if not headings:
         return ""
-    heading = headings[-1].group("heading").lower()
-    return "preferred" if any(term in heading for term in ("preferred", "nice", "bonus", "asset")) else "required"
+    heading = headings[-1]
+    if any(term in heading for term in ("preferred", "nice to have", "bonus", "asset")):
+        return "preferred"
+    if re.search(r"\b(?:requirements?|minimum qualifications?|basic qualifications?|required qualifications?)\b", heading):
+        return "required"
+    return ""
 
 
 def is_false_experience_match(content: str, start: int, end: int) -> bool:
