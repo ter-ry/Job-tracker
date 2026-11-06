@@ -8994,6 +8994,11 @@ def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any
     available_components = [(mandatory_score, 40), (technical_score, 25), (experience_score, 20), (seniority.get("score", 0), 15)]
     available_components = [(value, weight) for value, weight in available_components if value is not None]
     score = round(sum(value * weight for value, weight in available_components) / sum(weight for _, weight in available_components)) if available_components else 0
+    insufficient_mandatory_evidence = mandatory_score is None
+    if insufficient_mandatory_evidence:
+        # A high keyword/seniority average is not evidence of qualification when
+        # the posting never supplied a clearly mandatory requirement set.
+        score = min(score, 59)
     required_experience = analysis.get("required_experience") or {}
     try:
         profile_max_years = float(text(profile.get("maximum_required_years"))) if text(profile.get("maximum_required_years")) else None
@@ -9011,17 +9016,20 @@ def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any
         f"Professional and project experience: {experience_score}% evidence coverage." if experience_score is not None else "Professional and project experience: unavailable from the stored posting.",
         f"Seniority assessment: {seniority.get('score', 0)}%.",
     ]
+    if insufficient_mandatory_evidence:
+        reasons.append("Qualification confidence is limited because the stored posting has no clearly classified mandatory requirements.")
     if missing:
         reasons.append("Not demonstrated in the selected résumé: " + ", ".join(item["requirement"] for item in missing[:6]) + ".")
     if stretch:
         reasons.append("Stretch opportunity: the posting expects experience or seniority not fully established by the selected résumé.")
     priority, priority_reasons = _application_priority(job, score, profile, seniority)
-    label = "Stretch opportunity" if stretch or score < 60 else "Strong qualification match" if score >= 75 else "Review qualification fit"
+    label = "Insufficient requirement evidence" if insufficient_mandatory_evidence else "Stretch opportunity" if stretch or score < 60 else "Strong qualification match" if score >= 75 else "Review qualification fit"
     return {
         "qualification_match_status": "assessed" if mandatory_score is not None else "partial_evidence",
         "qualification_fit_score": clamp_int(score, 0, 100),
         "qualification_match_score": clamp_int(score, 0, 100),
-        "qualification_fit_label": "Insufficient requirement evidence" if mandatory_score is None and not experience else label,
+        "qualification_fit_label": label,
+        "qualification_evidence_confidence": "low" if insufficient_mandatory_evidence else "standard",
         "qualification_fit_reasons": reasons,
         "qualification_fit_matched_requirements": [item["requirement"] for item in matched],
         "qualification_fit_missing_requirements": [item["requirement"] for item in missing],

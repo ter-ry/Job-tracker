@@ -90,7 +90,7 @@ def analyze_job_seniority(job: dict[str, Any]) -> dict[str, Any]:
         for field in ["required_skills", "preferred_skills", "responsibilities", "job_description", "notes"]
     )
     title_level, title_hits = detect_level(title)
-    description_level, description_hits = detect_level(description)
+    description_level, description_hits = detect_description_level(description)
     required_ranges, preferred_ranges, ambiguous_ranges = extract_experience_ranges(description)
     required_field = str(job.get("required_skills") or "").lower()
     preferred_field = str(job.get("preferred_skills") or "").lower()
@@ -107,29 +107,29 @@ def analyze_job_seniority(job: dict[str, Any]) -> dict[str, Any]:
         ambiguous_ranges = still_ambiguous
     required_range = strongest_range(required_ranges)
     preferred_range = strongest_range(preferred_ranges)
-    management_flag = contains_any(description, MANAGEMENT_TERMS) or contains_any(title, ["manager", "director"])
-    leadership_flag = contains_any(description, LEADERSHIP_TERMS)
-    budget_or_hiring = contains_any(description, ["budget", "hiring", "hire engineers", "recruit", "headcount"])
+    management_flag = role_has_management_scope(title, description)
+    leadership_flag = role_has_leadership_scope(description)
+    budget_or_hiring = role_has_budget_or_hiring_scope(description)
 
-    evidence_levels = [level for level in [title_level, description_level] if level != "unknown"]
+    inferred_levels: list[str] = []
     if required_range and (required_range.minimum or 0) >= 10:
-        evidence_levels.append("director" if management_flag or budget_or_hiring else "lead")
+        inferred_levels.append("director" if management_flag or budget_or_hiring else "lead")
     elif required_range and (required_range.minimum or 0) >= 7:
-        evidence_levels.append("lead" if leadership_flag else "senior")
+        inferred_levels.append("lead" if leadership_flag else "senior")
     elif required_range and (required_range.minimum or 0) >= 5:
-        evidence_levels.append("senior")
+        inferred_levels.append("senior")
     elif required_range and (required_range.minimum or 0) >= 3:
-        evidence_levels.append("intermediate")
+        inferred_levels.append("intermediate")
     elif required_range and (required_range.maximum or required_range.minimum or 0) <= 2:
-        evidence_levels.append("junior")
-    if management_flag:
-        evidence_levels.append("manager" if "director" not in title.lower() else "director")
+        inferred_levels.append("junior")
 
-    detected = combine_levels(evidence_levels)
+    detected = title_level if title_level != "unknown" else description_level
+    if detected == "unknown":
+        detected = combine_levels(inferred_levels)
     disagreement = (
         title_level != "unknown"
         and description_level != "unknown"
-        and abs(LEVEL_RANK.get(title_level, 0) - LEVEL_RANK.get(description_level, 0)) >= 2
+        and title_level != description_level
     )
     confidence = 35
     if detected != "unknown":
@@ -187,11 +187,48 @@ def detect_level(content: str) -> tuple[str, list[str]]:
     ]
     hits: list[str] = []
     for level, terms in checks:
-        found = [term.strip() for term in terms if term in lowered]
+        found = [term.strip() for term in terms if re.search(rf"(?<![a-z]){re.escape(term)}(?![a-z])", lowered)]
         if found:
             hits.extend(found)
             return level, list(dict.fromkeys(hits))
     return "unknown", []
+
+
+def detect_description_level(content: str) -> tuple[str, list[str]]:
+    """Detect seniority in role-scoped JD statements, not background prose."""
+    candidates: list[tuple[str, list[str]]] = []
+    chunks = [chunk.strip() for chunk in re.split(r"(?:\r?\n+|(?<=[.!?])\s+)", content) if chunk.strip()]
+    role_context = re.compile(r"\b(?:seeking|looking for|hiring|candidate|role|position|job|level|qualification|requirement|required|experience as|responsible for|you will)\b", re.I)
+    unrelated_reference = re.compile(r"\b(?:with|alongside|among|our|other|team of|reports to|work(?:s)? with)\s+(?:the\s+)?(?:technical\s+)?(?:senior|lead|principal|staff|manager|director|intern|co-?op)\b", re.I)
+    for chunk in chunks:
+        level, hits = detect_level(chunk)
+        if level == "unknown" or not role_context.search(chunk) or unrelated_reference.search(chunk):
+            continue
+        candidates.append((level, hits))
+    if not candidates:
+        return "unknown", []
+    first_level, _ = candidates[0]
+    if all(level == first_level for level, _ in candidates):
+        return first_level, list(dict.fromkeys(hit for _, hits in candidates for hit in hits))
+    return "unknown", list(dict.fromkeys(hit for _, hits in candidates for hit in hits))
+
+
+def role_has_management_scope(title: str, description: str) -> bool:
+    if detect_level(title)[0] in {"manager", "director"}:
+        return True
+    return bool(re.search(
+        r"\b(?:manage(?:s|d)?\s+(?:a|an|the)?\s*team|direct reports|people management|performance reviews|responsible for hiring|hire engineers|headcount responsibility|budget responsibility)\b",
+        description,
+        re.I,
+    ))
+
+
+def role_has_leadership_scope(description: str) -> bool:
+    return bool(re.search(r"\b(?:technical lead|lead technical direction|own(?:s)? the roadmap|architectural ownership|mentor(?:s|ing)? engineers)\b", description, re.I))
+
+
+def role_has_budget_or_hiring_scope(description: str) -> bool:
+    return bool(re.search(r"\b(?:responsible for hiring|hire engineers|headcount responsibility|budget responsibility|own(?:s)? the budget)\b", description, re.I))
 
 
 def extract_experience_ranges(content: str) -> tuple[list[ExperienceRange], list[ExperienceRange], list[ExperienceRange]]:
@@ -203,7 +240,7 @@ def extract_experience_ranges(content: str) -> tuple[list[ExperienceRange], list
         required.append(ExperienceRange(0, 0, "required", "no experience required"))
 
     range_pattern = re.compile(
-        r"(?P<a>\d{1,2})(?:\s*(?:\+|plus)|\s*(?:-|to|–)\s*(?P<b>\d{1,2})(?:\s*(?:\+|plus))?)?\s*(?:years?|yrs?)"
+        r"(?P<a>\d{1,2})(?:\s*(?:\+|\\\+|plus)|\s*(?:-|\\-|to|–)\s*(?P<b>\d{1,2})(?:\s*(?:\+|\\\+|plus))?)?\s*(?:years?|yrs?)"
         r"(?:\s+of)?\s+(?:professional\s+)?(?:work\s+)?(?:experience|development|engineering|programming)?(?:\s+(?:experience|development|engineering|programming))?",
         re.I,
     )
@@ -213,7 +250,7 @@ def extract_experience_ranges(content: str) -> tuple[list[ExperienceRange], list
         snippet = content[max(0, match.start() - 80) : min(len(content), match.end() + 80)]
         kind = classify_experience_section(content, match.start()) or classify_experience_context(snippet)
         a = float(match.group("a"))
-        b = float(match.group("b")) if match.group("b") else (None if "+" in match.group(0) or "plus" in match.group(0).lower() else a)
+        b = float(match.group("b")) if match.group("b") else (None if "+" in match.group(0) or r"\+" in match.group(0) or "plus" in match.group(0).lower() else a)
         item = ExperienceRange(a, b, kind, match.group(0).strip())
         if kind == "required":
             required.append(item)

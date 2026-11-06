@@ -270,6 +270,63 @@ class JobAssistantTest(unittest.TestCase):
         self.assertGreater(calgary_distance["distance_km"], 2000)
         self.assertGreater(vancouver_distance["distance_km"], 3000)
 
+    def test_persisted_apple_markdown_record_reaches_api_with_required_years(self):
+        created = self.client.post(
+            "/api/jobs",
+            json={
+                "company": "Apple",
+                "title": "Full Stack Engineer - Apple TV and Sports",
+                "url": "https://ca.indeed.com/viewjob?jk=69e2657d94ea1cfa",
+                "job_description": (
+                    "Minimum Qualifications\n\n"
+                    "* BS in Computer Science or related field.\n"
+                    "* 4\\+ years of professional software development experience in full\\-stack engineering.\n"
+                    "* Strong proficiency in Java and modern backend frameworks (such as Spring / Spring Boot)."
+                ),
+                "required_skills": "javascript, react, sql, api",
+            },
+        ).get_json()
+        self.assertEqual(created["experience_requirements"]["required"]["minimum"], 4)
+        self.assertIn("4\\+ years of professional", created["experience_requirements"]["source_evidence"])
+        reloaded = next(item for item in self.client.get("/api/jobs").get_json() if item["id"] == created["id"])
+        self.assertEqual(reloaded["experience_requirements"]["required"]["minimum"], 4)
+        self.assertIn("4\\+ years of professional", reloaded["experience_requirements"]["source_evidence"])
+
+    def test_seniority_ignores_other_roles_and_preserves_conflict(self):
+        junior = seniority.analyze_job_seniority({
+            "title": "Junior Software Developer",
+            "job_description": "Work with senior engineers and engineering managers; interns may assist with testing.",
+        })
+        self.assertEqual(junior["detected_level"], "junior")
+        self.assertEqual(junior["description_level"], "unknown")
+        self.assertFalse(junior["management_role"])
+        senior = seniority.analyze_job_seniority({
+            "title": "Senior Full Stack Engineer",
+            "job_description": "Our technical lead describes architecture while this role builds production features.",
+        })
+        self.assertEqual(senior["detected_level"], "senior")
+        self.assertEqual(senior["title_level"], "senior")
+        self.assertEqual(senior["description_level"], "unknown")
+
+    def test_missing_mandatory_evidence_caps_qualification_confidence(self):
+        fit = app_module.build_qualification_fit(
+            {
+                "company": "Beehivr Technology",
+                "title": "Full Stack Developer",
+                "job_description": "We build AI products with Next.js, Rails, FastAPI, AWS and client-facing delivery. Flexible hours and remote-friendly.",
+                "required_skills": "python, react, sql, aws, cloud, api, automation",
+            },
+            evidence_profile={
+                "resume_text": "Built Python, React, SQL and AWS applications.",
+                "work_experience": "Software developer with three years of professional software development experience.",
+                "target_seniority_levels": "junior, intermediate",
+            },
+        )
+        self.assertIsNone(fit["qualification_components"]["mandatory"])
+        self.assertLessEqual(fit["qualification_fit_score"], 59)
+        self.assertEqual(fit["qualification_fit_label"], "Insufficient requirement evidence")
+        self.assertEqual(fit["qualification_evidence_confidence"], "low")
+
     def test_qualification_match_uses_resume_evidence_and_aliases(self):
         self.client.post(
             "/api/profile",
@@ -403,6 +460,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertNotIn("Promise.all([loadDiscoveryInbox(), loadAll()])", source)
         self.assertIn('let pipelineSort = "priority"', source)
         self.assertIn("Source evidence:", source)
+        self.assertIn("Evidence confidence:", source)
         self.assertIn("Technical qualification strength is separate from Canadian eligibility.", source)
 
     def test_ontario_remote_campaign_excludes_explicit_ontario_restriction(self):
