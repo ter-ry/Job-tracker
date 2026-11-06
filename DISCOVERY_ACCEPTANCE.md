@@ -113,3 +113,14 @@ Read-only inspection of `.tmpqa/discovery-reliability-review-20261102/data/jobs.
 Composite headings containing Requirements/Qualifications are now classified from normalized Markdown lines, while genuinely unclassified ranges remain ambiguous and display `Experience mentioned (unclassified): 2–3 years` rather than `Not specified`. The persisted ATB job regression verifies SQLite-shaped data through `/api/jobs`, including 2–3 bounds and original source evidence. The existing persisted Apple 4+ regression remains passing.
 
 Targeted ATB/Apple/parser/UI tests, compilation, JavaScript syntax, and `git diff --check` pass. The latest full run reached 218 tests with one unrelated pre-existing tailoring preview-cache failure (`compare_docx_layout` call count 2 vs expected 1), reproducible in isolation; no tailoring code was changed. Browser/provider limitations remain as documented above.
+
+## Release-readiness comparison — 2026-11-06
+
+The exact reported test `test_tailoring_apply_defers_word_validation_and_preview_cache_tracks_draft_version` was run in both checkouts with the same virtual environment and isolated temporary test data:
+
+| Checkout | Commit | Result |
+|---|---|---|
+| PR #12 | `1fc6b61` | Failed: `compare_mock.call_count` was 2, expected 1 |
+| Unchanged `origin/master` | `d8b78cd` | Failed identically: `compare_mock.call_count` was 2, expected 1 |
+
+The PR diff contains no changes to `preview_tailoring_draft`, `validate_tailoring_draft_layout`, or `compare_docx_layout` call sites. This is therefore a pre-existing base-branch failure, not a PR #12 regression. No tailoring functionality was modified.
