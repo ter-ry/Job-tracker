@@ -142,3 +142,19 @@ The bounded live check used exactly two scenarios with the required composite te
 ### Audit conclusion
 
 **INCONCLUSIVE — not a live quality-gate pass.** The audit found no automated completeness suspect in the offline top 20, but it did not obtain the independent source sample required to judge whether the ranked jobs are genuinely suitable, whether mandatory skills and years are accurate, or whether eligibility is correct. No production data or ranking behavior was changed based on this blocked audit. A Windows/network environment with source access must run the same command and independently inspect the returned original postings before treating this as evidence for production rollout.
+
+## Bounded provider retry and URL audit — 2026-11-06
+
+After the initial failure, read-only DNS probes resolved `apis.indeed.com`, `www.linkedin.com`, `www.google.com`, `www.ziprecruiter.com`, and `github.com`. A fresh two-scenario retry nevertheless reproduced provider-path failures: LinkedIn raised `NameResolutionError` for both searches and returned no rows. A separate one-attempt fallback run using Google Jobs and ZipRecruiter also returned no rows; Google raised `NameResolutionError` for `www.google.com`, and ZipRecruiter raised a TLS client DNS error for `api.ziprecruiter.com`. The application passed the same bounded search parameters into JobSpy and recorded the provider exceptions; no application defect was exposed and no further retry was made.
+
+The existing QA top 20 was checked once at the stored URLs. 15/20 returned HTTP 200; the five sampled content responses were not sufficient for source adjudication: LinkedIn returned recognizable job-page titles for 3/3 sampled LinkedIn URLs, but only 1/3 contained simple posting-content markers, while Indeed returned HTTP 401 for 2/2 sampled Indeed URLs. Reachability and page titles are not proof that the original posting is active or that the stored description is accurate. The URL and content probe reports are retained under `.tmpqa/quality-audit-url-check.json` and `.tmpqa/quality-audit-content-check.json`.
+
+The updated reusable commands for a Windows network environment are:
+
+```powershell
+Set-Location 'C:\Users\ter23\Documents\Job tracker'
+& .venv\Scripts\python.exe scripts\quality_audit.py --live --enabled-sources linkedin,indeed --output-prefix .tmpqa\quality-audit-live-windows
+& .venv\Scripts\python.exe scripts\quality_audit.py --live --enabled-sources google,zip_recruiter --output-prefix .tmpqa\quality-audit-live-fallback-windows
+```
+
+Copy the resulting `*.json` and `*.md` files back with the same names or attach them to Issue #13. The audit remains **INCONCLUSIVE**: no live sample reached the 40-posting independent-adjudication threshold, so top-20 precision, years accuracy, mandatory-skill accuracy, eligibility error rate, false-positive/negative rates, and coverage cannot be calculated honestly.

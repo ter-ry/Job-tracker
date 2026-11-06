@@ -117,8 +117,8 @@ def assess_jobs(jobs: list[dict[str, Any]], *, live: bool) -> dict[str, Any]:
     }
 
 
-def run_live() -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    # Exactly two attempts per provider, one per required scenario.
+def run_live(enabled_sources: list[str]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    # One bounded attempt per enabled provider in each required scenario.
     scenarios = [
         {"name": "canada_remote", "keywords": "Full Stack Developer Software Developer Python Developer React Developer Junior Software Engineer", "location": "Canada", "remote_preference": "remote"},
         {"name": "toronto_hybrid", "keywords": "Full Stack Developer Software Developer Python Developer React Developer Junior Software Engineer", "location": "Toronto, Ontario", "remote_preference": "hybrid"},
@@ -129,7 +129,7 @@ def run_live() -> tuple[list[dict[str, Any]], dict[str, Any]]:
         result = fetch_jobspy_jobs(
             keywords=scenario["keywords"], location=scenario["location"], distance=50,
             remote_preference=scenario["remote_preference"], results_wanted=10,
-            hours_old=720, enabled_sources=["linkedin", "indeed"],
+            hours_old=720, enabled_sources=enabled_sources,
         )
         diagnostics[scenario["name"]] = result.get("source_diagnostics", {})
         for job in result.get("jobs", []):
@@ -141,10 +141,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db-path", type=Path, help="Read-only SQLite database to audit")
     parser.add_argument("--live", action="store_true", help="Run two bounded live scenarios")
+    parser.add_argument(
+        "--enabled-sources",
+        default="linkedin,indeed",
+        help="Comma-separated JobSpy providers for live mode (default: linkedin,indeed)",
+    )
     parser.add_argument("--output-prefix", type=Path, default=Path(".tmpqa/quality-audit"))
     args = parser.parse_args()
+    enabled_sources = [source.strip() for source in args.enabled_sources.split(",") if source.strip()]
     if args.live:
-        jobs, diagnostics = run_live()
+        jobs, diagnostics = run_live(enabled_sources)
     else:
         db_path = args.db_path or Path(__file__).resolve().parents[1] / "data" / "jobs.sqlite"
         jobs, diagnostics = read_jobs(db_path), {"mode": "offline", "db_path": str(db_path)}
@@ -154,6 +160,7 @@ def main() -> int:
         "live": bool(args.live),
         "search_terms": TERMS,
         "scenarios": ["Canada remote", "Toronto hybrid"],
+        "enabled_sources": enabled_sources if args.live else [],
         "provider_diagnostics": diagnostics,
         "assessment": assess_jobs(jobs, live=args.live),
         "jobs": [{"canonical_key": canonical_key(job), **job} for job in jobs],
