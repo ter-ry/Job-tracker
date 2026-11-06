@@ -35,4 +35,8 @@ The records were replayed through `jobspy_result_to_job_payload`, `normalize_job
 | 15 | Super.com | Head of Security | 39 | 39 | review_required | — |
 | 16–20 | AlayaCare, Capital One, Intuit, Method Integration | Mixed roles | 0 | 37–59 | excluded | Capital One: 6 years |
 
-No original posting was independently fetched and adjudicated. Consequently precision, experience accuracy, mandatory-skill accuracy, eligibility error rate, and false-positive/negative rates remain unavailable.
+## Latest Windows replay correction
+
+The final Windows artifacts contain 27 raw records, 21 unique canonical postings, 21 persisted unique jobs, and 6 duplicate records removed before persistence. The current ranking is 9 actionable, 6 review-required, and 5 excluded; no persisted description is missing. This replay exercises the real persistence, qualification, eligibility, résumé matching, and application-priority pipeline.
+
+An independent source review matched 18 of the captured top 20 to authoritative employer/ATS or exact LinkedIn/Indeed pages; Joblet-AI and Kablamo remain unresolved. Because those checks were not recorded as the required structured annotations, `independently_verified_count` remains 0 in the JSON audit and the 40-posting acceptance sample was not met. Precision, required-years accuracy, mandatory-skill accuracy, eligibility error rate, and false-positive/negative rates remain unavailable. Final status: **INCONCLUSIVE**.

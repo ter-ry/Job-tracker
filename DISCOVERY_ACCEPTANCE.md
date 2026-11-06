@@ -184,3 +184,25 @@ Replay results: 25 captured records, 20 raw canonical postings, 20 persisted uni
 - The supplied Windows capture contains no Montreal record. The same remote-only constraint already covered by regression tests excludes any hybrid/on-site Montreal posting from remote priority; it remains visible only as excluded/review data when appropriate.
 
 The replay remains **INCONCLUSIVE** for independent quality metrics: captured provider descriptions and URLs were not independently adjudicated against original postings. Top-20 precision, years accuracy, mandatory-skill accuracy, eligibility errors, and false-positive/negative rates therefore remain unavailable.
+
+## Final Windows evidence review — 2026-11-06
+
+The latest Windows artifacts are `.tmpqa/quality-audit-live-windows-final.json/.md` and `.tmpqa/quality-audit-pipeline-replay-windows-final.json/.md`. They contain 27 captured records, 21 unique canonical postings, 21 persisted unique jobs, and 6 duplicate records removed before persistence. The replay uses the real `/api/discovery/jobspy` path and therefore exercises payload conversion, normalization, geocoding/eligibility, qualification extraction, selected SWE résumé matching, application-priority scoring, deduplication, and SQLite persistence. The persisted ranking is 9 actionable, 6 review-required, and 5 excluded jobs; no persisted description was missing.
+
+I independently checked the captured top-20 postings against employer career pages, employer ATS pages, or exact LinkedIn/Indeed job pages where available. Source checks confirmed the advertised role/location and material seniority or eligibility signals for 18 of 20 rows. Examples include PRI's in-office junior role in Mississauga, Affirm's Software Engineer I fullstack role as Remote Canada, DoorDash's Toronto entry-level role with its graduation/internship constraints, Quora's US/Canada remote new-grad role, Didero's Toronto hybrid new-graduate role, Thomson Reuters' Toronto hybrid role, Super.com's remote Head of Security requiring 10+ years, Capital One's Toronto Staff role, and Method's Toronto hybrid Junior Quality Engineer. The Joblet-AI and Kablamo rows could not be matched to the exact captured posting from an authoritative source; they remain unverified rather than being counted as confirmed.
+
+This manual source review is not a replacement for the structured acceptance sample: the audit JSON still reports `independently_verified_count=0` because no source annotations were captured in the required machine-readable schema. The required sample is at least 40 unique postings with at least 20 independently adjudicated top-ranked originals. Therefore the measurable gate metrics remain unavailable, not zero:
+
+| Criterion | Denominator/evidence | Result |
+|---|---:|---|
+| Pipeline replay integrity | 27 raw / 21 unique / 21 persisted; 0 persisted missing descriptions | Pass for replay scope |
+| Duplicate handling | 6 raw duplicates; 0 persisted duplicates | Pass for replay scope |
+| Independent source sample | 18 manually source-confirmed top-20 rows; structured audit count 0; required 40 total and 20 top-ranked annotations | **Insufficient evidence** |
+| Top-20 precision | No adjudication dataset with required fields | N/A |
+| Required-years accuracy | No structured original-vs-captured years annotations | N/A |
+| Mandatory-skill accuracy | No structured original-vs-captured skill annotations | N/A |
+| Eligibility error rate | No structured work-authorization/location adjudications | N/A |
+| False-positive / false-negative rate | No labeled candidate set or unused holdout | N/A |
+| Title-term coverage | Latest capture does not provide the required separate per-term denominators | N/A |
+
+The independent review found no basis to change the targeted pipeline fixes already in PR #12, and it did not modify production data, the production database, or unrelated files. The pre-existing tailoring preview-cache failure remains separate and reproduces on unchanged `origin/master`. Final decision: **INCONCLUSIVE — PR #12 is not ready to merge**. A merge decision requires one structured Windows adjudication pass covering at least 40 unique postings, including at least 20 top-ranked originals, with source URL, active-state, location/authorization, seniority, required/preferred years, mandatory/preferred skills, and candidate-fit labels.

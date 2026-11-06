@@ -27,3 +27,9 @@ The top 20 URLs in the isolated QA ranking were checked once: 15/20 returned HTT
 | Seniority confusion | N/A |
 
 The 104-job offline QA integrity report remains available under `.tmpqa`; it found 104 unique canonical postings and no duplicate canonical identities, but it is not independent source ground truth.
+
+## Latest Windows source review
+
+The final Windows capture contained 27 raw records and 21 unique canonical postings. A deterministic replay through the real application endpoint persisted all 21 unique jobs, removed 6 raw duplicates, and produced 9 actionable, 6 review-required, and 5 excluded rows. No persisted description was missing.
+
+An independent review of the captured top 20 matched 18 rows to employer career/ATS pages or exact LinkedIn/Indeed pages. The two unresolved exact matches were Joblet-AI and Kablamo. This is supporting evidence only: the machine-readable audit contains no structured source annotations (`independently_verified_count=0`), so the required 40-posting sample and all accuracy/error metrics remain unavailable. The final quality-gate decision remains **INCONCLUSIVE**; no merge is authorized.
