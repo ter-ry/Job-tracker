@@ -67,6 +67,15 @@ def source_counts(jobs: list[dict[str, Any]]) -> dict[str, int]:
     return dict(Counter(str(job.get("source") or "").lower() for job in jobs))
 
 
+def category_counts(jobs: list[dict[str, Any]]) -> dict[str, int]:
+    """Count categories over the complete persisted set, not only top-N rows."""
+    counts = {"actionable": 0, "review_required": 0, "excluded": 0}
+    for job in jobs:
+        category = str(job.get("discovery_result_category") or "review_required")
+        counts[category] = counts.get(category, 0) + 1
+    return counts
+
+
 def compact_job(job: dict[str, Any], scenarios: list[str]) -> dict[str, Any]:
     experience = job.get("experience_requirements") or {}
     qualification_requirements = job.get("qualification_requirements") or []
@@ -103,6 +112,25 @@ def compact_job(job: dict[str, Any], scenarios: list[str]) -> dict[str, Any]:
         "score_breakdown": job.get("score_breakdown"),
         "warnings": job.get("warnings", []),
     }
+
+
+def merge_scenario_results(job: dict[str, Any], scenario_results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Use the best valid scenario result when one posting appears in multiple searches."""
+    if not scenario_results:
+        return job
+    ranked = sorted(scenario_results, key=lambda item: int(item.get("application_priority_score") or 0), reverse=True)
+    best = ranked[0]
+    job["scenario_results"] = scenario_results
+    job["scenario_application_priority_scores"] = {
+        str(item.get("scenario") or "unknown"): int(item.get("application_priority_score") or 0)
+        for item in scenario_results
+    }
+    job["application_priority_score"] = best.get("application_priority_score")
+    job["discovery_result_category"] = best.get("discovery_result_category") or job.get("discovery_result_category")
+    job["discovery_result_reason"] = best.get("discovery_result_reason") or job.get("discovery_result_reason")
+    job["discovery_remote_preference"] = best.get("discovery_remote_preference") or job.get("discovery_remote_preference")
+    job["remote_search_eligible"] = best.get("remote_search_eligible") or job.get("remote_search_eligible")
+    return job
 
 
 def replay(captured_path: Path, database_path: Path, output_path: Path, profile_id: int, resume_id: int) -> dict[str, Any]:
@@ -187,6 +215,7 @@ def replay(captured_path: Path, database_path: Path, output_path: Path, profile_
             "bypass_cache": True,
         }
         responses: list[dict[str, Any]] = []
+        scenario_results: dict[str, list[dict[str, Any]]] = defaultdict(list)
         with patch.object(app_module, "fetch_discovery_jobs_for_search", side_effect=replay_fetch), patch.object(app_module, "get_geocoding_provider", return_value=ReplayGeocoder()):
             with app_module.app.test_client() as client:
                 for scenario, _jobs in scenario_jobs.items():
@@ -200,13 +229,28 @@ def replay(captured_path: Path, database_path: Path, output_path: Path, profile_
                     if response.status_code != 200:
                         raise RuntimeError(f"Replay failed for {scenario}: {response.status_code} {body}")
                     responses.append({"scenario": scenario, "diagnostics": body.get("diagnostics", {}), "returned_count": len(body.get("jobs", []))})
+                    for result in body.get("jobs", []):
+                        source_id = str(result.get("source_job_id") or "")
+                        if source_id:
+                            scenario_results[source_id].append({
+                                "scenario": scenario,
+                                "application_priority_score": result.get("application_priority_score"),
+                                "discovery_result_category": result.get("discovery_result_category"),
+                                "discovery_result_reason": result.get("discovery_result_reason"),
+                                "discovery_remote_preference": result.get("discovery_remote_preference"),
+                                "remote_search_eligible": result.get("remote_search_eligible"),
+                            })
                 rows = client.get(f"/api/jobs?candidate_profile_id={profile_id}&resume_id={resume_id}").get_json()
 
         source_ids = set(source_scenarios)
         persisted = [row for row in rows if str(row.get("source_job_id") or "") in source_ids]
         persisted.sort(key=lambda row: (-int(row.get("application_priority_score") or 0), int(row.get("id") or 0)))
         scenario_map = {source_id: sorted(values) for source_id, values in source_scenarios.items()}
-        compact = [compact_job(row, scenario_map.get(str(row.get("source_job_id") or ""), [])) for row in persisted]
+        compact = []
+        for row in persisted:
+            source_id = str(row.get("source_job_id") or "")
+            merged = merge_scenario_results(row, scenario_results.get(source_id, []))
+            compact.append(compact_job(merged, scenario_map.get(source_id, [])))
         raw_unique = {canonical_key(job) for job in captured_jobs}
         persisted_unique = {canonical_key(job) for job in persisted}
         report = {
@@ -234,9 +278,13 @@ def replay(captured_path: Path, database_path: Path, output_path: Path, profile_
             "responses": responses,
             "top20": compact[:20],
             "all_persisted": compact,
+            "persisted_category_counts": category_counts(compact),
+            "top20_category_counts": category_counts(compact[:20]),
+            "persisted_outside_top20": compact[20:],
             "limitations": [
                 "Captured provider records were replayed but original postings were not independently adjudicated.",
                 "URL presence and stored descriptions are not source verification.",
+                "Duplicate postings returned by multiple search scenarios are ranked using their best scenario-specific application priority; persisted rows remain one durable job.",
             ],
         }
     output_path.write_text(json.dumps(report, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
