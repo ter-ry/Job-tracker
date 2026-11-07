@@ -1,0 +1,56 @@
+{
+  "status": "INCONCLUSIVE",
+  "sample_size": 0,
+  "unique_postings": 0,
+  "independently_verified_count": 0,
+  "top20_precision": null,
+  "required_year_accuracy": null,
+  "mandatory_skill_accuracy": null,
+  "eligibility_error_count": null,
+  "seniority_confusion_count": null,
+  "bounded_live_attempts": {
+    "linkedin_indeed": {
+      "scenarios": 2,
+      "result_count": 0,
+      "failure": "LinkedIn NameResolutionError; Indeed apis.indeed.com NameResolutionError"
+    },
+    "google_zip_recruiter": {
+      "scenarios": 2,
+      "result_count": 0,
+      "failure": "Google www.google.com NameResolutionError; ZipRecruiter api.ziprecruiter.com DNS/TLS failure"
+    }
+  },
+  "stored_url_probe": {
+    "top20_checked": 20,
+    "http_200_or_redirect": 15,
+    "content_sample_checked": 5,
+    "linkedin_job_titles": "3/3",
+    "linkedin_posting_markers": "1/3",
+    "indeed_http_401": "2/2"
+  },
+  "pipeline_replay": {
+    "captured_records": 25,
+    "raw_unique_postings": 20,
+    "persisted_unique_postings": 20,
+    "raw_missing_descriptions": 0,
+    "persisted_missing_descriptions": 0,
+    "duplicates_removed": 5,
+    "categories": {
+      "actionable": 9,
+      "review_required": 6,
+      "excluded": 5
+    },
+    "top20_rank_field": "application_priority_score",
+    "independent_source_verification": 0
+  },
+  "confirmed_corrections": [
+    "Company-history 'For 30 years' no longer becomes Capital One's experience requirement; the actual 6-year Basic Qualification is retained.",
+    "fulltime/volunteer provider employment metadata no longer leaks into role-family classification.",
+    "Staff Software Engineer detects as lead, negated direct-report wording is not management evidence, and Head of Security is director/other."
+  ],
+  "limitations": [
+    "No live provider result was available for independent source adjudication.",
+    "URL reachability and page titles do not prove an active original posting or description accuracy.",
+    "The existing tailoring preview-cache failure is unrelated and unchanged."
+  ]
+}

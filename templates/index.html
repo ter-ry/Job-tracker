@@ -44,8 +44,8 @@
           <div id="pipeline-filters" class="pipeline-filters" role="tablist" aria-label="Pipeline categories"></div>
           <label class="pipeline-sort">Sort pipeline
             <select id="pipeline-sort" aria-label="Sort pipeline">
+              <option value="priority">Application Priority</option>
               <option value="qualification">Qualification fit</option>
-              <option value="priority">Job Priority</option>
               <option value="salary">Salary</option>
               <option value="distance">Distance</option>
               <option value="posted">Date posted</option>
@@ -83,7 +83,7 @@
               <label class="checkline"><input id="saved-search-auto-prepare" type="checkbox"> Automatically prepare qualifying packages</label>
               <p class="muted helper">Automatic preparation applies only to new discovery results. Unknown Canadian eligibility always requires manual confirmation; it is never bypassed by a saved-search setting.</p>
               <label>Minimum Job Priority<input id="saved-search-auto-min-priority" type="number" min="0" max="100" step="1" value="75"></label>
-              <label>Preparation candidate profile<select id="saved-search-auto-profile"><option value="">Choose a profile when available</option></select></label>
+              <label>Résumé profile for scoring and preparation<select id="saved-search-auto-profile"><option value="">Use active Profile</option></select></label>
               <fieldset class="source-picker"><legend>Sources</legend><label><input type="checkbox" name="saved-search-source" value="linkedin" checked> LinkedIn</label><label><input type="checkbox" name="saved-search-source" value="indeed" checked> Indeed</label><label><input type="checkbox" name="saved-search-source" value="google"> Google Jobs</label><label><input type="checkbox" name="saved-search-source" value="zip_recruiter"> ZipRecruiter</label></fieldset>
               <div class="actions"><button class="button" type="submit">Save search</button><button class="button ghost" type="button" id="cancel-saved-search">Cancel</button></div>
             </form>
@@ -110,6 +110,7 @@
                 </select>
               </label>
               <label>Fetch limit<input id="discovery-total-cap" type="number" min="1" step="1" value="200"></label>
+              <label>Résumé profile<select id="discovery-profile"><option value="">Use active Profile</option></select></label>
             </div>
             <fieldset class="source-picker">
               <legend>Sources</legend>
@@ -220,6 +221,7 @@
 
           <section class="panel discovery-inbox-panel discovery-view-saved">
             <div class="panel-header"><div><h2>Discovery inbox</h2><p class="muted helper">New opportunities remain saved, but are never shortlisted automatically.</p></div><button class="button ghost small" type="button" id="refresh-discovery-inbox">Refresh</button></div>
+            <div id="discovery-inbox-filters" class="actions compact" role="tablist" aria-label="Discovery inbox status"></div>
             <div id="discovery-inbox" class="generated-output empty">No discovered opportunities yet.</div>
           </section>
 

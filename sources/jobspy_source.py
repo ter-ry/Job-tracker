@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import warnings
+import re
 from importlib import metadata
 import time
 from datetime import datetime, timezone
@@ -171,7 +172,10 @@ def fetch_jobspy_jobs(
                     results_wanted=results_wanted,
                     country_indeed=country_indeed,
                     hours_old=hours_old,
-                    linkedin_fetch_description=False,
+                    # Request the provider description when JobSpy supports it.
+                    # Without this, LinkedIn rows often arrive as title/URL-only
+                    # records and cannot be qualified transparently.
+                    linkedin_fetch_description=True,
                     verbose=0,
                 )
             raw_type = type(frame).__name__ if frame is not None else "NoneType"
@@ -288,6 +292,15 @@ def normalize_jobspy_row(row: dict[str, Any], fallback_source: str = "") -> dict
     city = clean(row.get("city"))
     state = clean(row.get("state") or row.get("state_province"))
     description = clean(row.get("description"))
+    raw_status = clean(row.get("status") or row.get("posting_status")).lower()
+    if row.get("is_closed") is True or raw_status in {"closed", "expired", "removed"}:
+        posting_availability = "confirmed_closed"
+    elif row.get("is_active") is True or raw_status in {"active", "open", "published"}:
+        posting_availability = "verified_active"
+    elif description and clean(row.get("date_posted") or row.get("date")) and job_url:
+        posting_availability = "likely_active"
+    else:
+        posting_availability = "unverified"
 
     return {
         "source_job_id": clean(row.get("id") or row.get("job_id")),
@@ -309,6 +322,7 @@ def normalize_jobspy_row(row: dict[str, Any], fallback_source: str = "") -> dict
         "job_url": job_url,
         "application_url": direct_url,
         "description": description,
+        "posting_availability": posting_availability,
         "posted_date": clean(row.get("date_posted")),
         "company_url": clean(row.get("company_url")),
         "experience_requirement": extract_experience_requirement(description),
@@ -360,21 +374,40 @@ def salary_range_text(min_amount: float | None, max_amount: float | None, interv
 
 
 def infer_remote_type(row: dict[str, Any]) -> str:
-    text = " ".join([clean(row.get("is_remote")), clean(row.get("location")), clean(row.get("title")), clean(row.get("description"))]).lower()
+    explicit = row.get("is_remote")
+    location = clean(row.get("location")).lower()
+    description = clean(row.get("description")).lower()
+    title = clean(row.get("title")).lower()
+    text = " ".join([location, title, description])
+    if re.search(r"\b(?:not|no)\s+remote\b|remote\s+(?:work\s+)?(?:is\s+)?not\s+(?:available|offered)", text):
+        return "On-site"
     if "hybrid" in text:
         return "Hybrid"
-    if "true" in text or "remote" in text:
+    if isinstance(explicit, bool):
+        if explicit:
+            return "Remote"
+    elif clean(explicit).lower() in {"true", "1", "yes"}:
         return "Remote"
     if "on-site" in text or "onsite" in text:
         return "On-site"
-    return ""
+    if re.search(r"\bremote\b", text):
+        return "Remote"
+    return "Unknown"
 
 
 def extract_experience_requirement(description: str) -> str:
-    import re
+    # Reuse the evidence-aware parser so company-history prose such as
+    # "For 30 years, we've..." cannot become a job requirement. Prefer a
+    # classified required range, then preferred, then explicitly ambiguous
+    # wording while preserving the original matched phrase.
+    from seniority import extract_experience_ranges
 
-    match = re.search(r"(\d+)\+?\s*(?:-\s*\d+\s*)?(?:years|yrs)", description or "", re.I)
-    return match.group(0) if match else ""
+    required, preferred, ambiguous = extract_experience_ranges(description or "")
+    candidates = required or preferred or ambiguous
+    if not candidates:
+        return ""
+    strongest = max(candidates, key=lambda item: (item.minimum or 0, item.maximum or item.minimum or 0))
+    return strongest.text
 
 
 def extract_keyword_text(description: str) -> str:
