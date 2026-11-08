@@ -2793,6 +2793,45 @@ class JobAssistantTest(unittest.TestCase):
         fit = app_module.build_qualification_fit(job, evidence_profile=profile)
         self.assertLessEqual(fit["application_priority_score"], 49)
 
+    def test_hybrid_location_scope_excludes_confirmed_out_of_area_postings(self):
+        job = {
+            "title": "Associate Software Developer",
+            "role_type": "software developer",
+            "location": "Charlottetown, PE",
+            "remote_type": "Unknown",
+            "remote_eligibility": "canadian_eligible",
+            "application_priority_score": 70,
+        }
+        app_module.apply_discovery_search_constraints(job, "hybrid", "Toronto, ON")
+        self.assertFalse(job["location_search_eligible"])
+        self.assertEqual(app_module.discovery_result_category(job, "hybrid")[0], "excluded")
+
+    def test_recommendation_eligibility_is_distinct_from_review_inventory(self):
+        review = {
+            "title": "Junior Quality Engineer",
+            "role_type": "other",
+            "remote_type": "Hybrid",
+            "remote_eligibility": "canadian_eligible",
+            "application_priority_score": 49,
+        }
+        category, _ = app_module.discovery_result_category(review, "hybrid")
+        self.assertEqual(category, "review_required")
+        self.assertFalse(category == "actionable")
+
+    def test_adjacent_technical_support_role_stays_in_review_inventory(self):
+        job = {
+            "title": "Junior Technical Support Engineer",
+            "role_type": "technical support engineer",
+            "location": "Remote Canada",
+            "remote_type": "Remote",
+            "remote_eligibility": "canadian_eligible",
+            "remote_search_eligible": True,
+            "application_priority_score": 69,
+        }
+        category, reason = app_module.discovery_result_category(job, "remote")
+        self.assertEqual(category, "review_required")
+        self.assertIn("role family", reason)
+
     def test_direct_skill_match_semantic_transferable_and_unrelated_low(self):
         profile = {
             "key_skills": "Python, Flask, SQL",

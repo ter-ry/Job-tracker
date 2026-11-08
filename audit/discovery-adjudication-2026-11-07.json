@@ -55,6 +55,25 @@
       {"job": "DoorDash Software Engineer, Entry-Level", "before": {"required_experience": null, "category": "actionable", "priority": 58}, "after": {"required_experience": "0-2 years upper-bound evidence", "category": "actionable", "priority": 58}}
     ]
   },
+  "latest_recommendation_quality_evaluation": {
+    "date": "2026-11-08",
+    "holdout_file": "audit/discovery-independent-holdout-2026-11-08.json",
+    "holdout_records": 20,
+    "suitable_holdout_records": 7,
+    "actionable_holdout_recommendations": 7,
+    "holdout_true_positives": 7,
+    "holdout_false_positives": 0,
+    "holdout_false_negatives": 0,
+    "actionable_precision": {"numerator": 7, "denominator": 7, "value": 1.0, "decision": "PASS"},
+    "false_positive_rate": {"numerator": 0, "denominator": 7, "value": 0.0, "decision": "PASS"},
+    "false_negative_rate": {"numerator": 0, "denominator": 7, "value": 0.0, "decision": "PASS"},
+    "recommendation_coverage": {"numerator": 7, "denominator": 20, "value": 0.35, "decision": "DIAGNOSTIC"},
+    "mandatory_skill_accuracy": {"numerator": null, "denominator": null, "value": null, "decision": "INCONCLUSIVE"},
+    "full_replay_category_counts": {"actionable": 10, "review_required": 9, "excluded": 2},
+    "top20_category_counts": {"actionable": 9, "review_required": 9, "excluded": 2},
+    "legacy_top20_diagnostic": {"precision": {"numerator": 12, "denominator": 18, "value": 0.6667, "decision": "FAIL"}, "false_positive_rate": {"numerator": 6, "denominator": 18, "value": 0.3333, "decision": "FAIL"}},
+    "decision_note": "The actionable recommendation metric passes on the independent holdout. The frozen legacy top-20 metric includes review inventory and remains a separate FAIL diagnostic; no threshold was reduced."
+  },
   "records": [
     {"record_id":"top20-01","scope":"top20","rank":1,"persisted_id":123,"company":"PRI Engineering","title":"Junior Software Developer","source_url":"https://www.linkedin.com/jobs/view/4485786623","authoritative_source_url":"https://priengineering.com/career-opportunities/","verification_status":"verified","verified_at":"2026-11-07T15:00:00-05:00","active_status":"active","source_evidence":{"location":"Mississauga, ON; in office","work_authorization":"Canada role; no sponsorship restriction stated","seniority":"entry level / junior","required_experience":"recent graduate or completing by start date; no numeric years","mandatory_skills":["web applications","REST APIs","relational databases","Git"],"preferred_skills":["Azure","React or similar","Node/TypeScript","C#/.NET"]},"job_tracker":{"category":"actionable","application_priority":72,"required_experience":null,"remote_eligibility":"canadian_eligible"},"ground_truth":{"target_recommendable":true,"location_eligible":true,"seniority_compatible":true,"candidate_suitability":"conditional"}},
     {"record_id":"top20-02","scope":"top20","rank":2,"persisted_id":124,"company":"Rose Rocket","title":"Junior Software Engineer","source_url":"https://www.linkedin.com/jobs/view/4488058684","authoritative_source_url":"https://ca.linkedin.com/jobs/view/junior-software-engineer-at-rose-rocket-4488058684","verification_status":"verified","verified_at":"2026-11-07T15:00:00-05:00","active_status":"active","source_evidence":{"location":"Toronto, ON; hybrid, office Monday/Tuesday/Thursday","work_authorization":"Canadian equal-opportunity statement; no restriction stated","seniority":"junior","required_experience":"no numeric years","mandatory_skills":["Git","NodeJS/NestJS/TypeScript","React","PostgreSQL"],"preferred_skills":["AWS","Docker","Kubernetes"]},"job_tracker":{"category":"actionable","application_priority":69,"required_experience":null,"remote_eligibility":"canadian_eligible"},"ground_truth":{"target_recommendable":true,"location_eligible":true,"seniority_compatible":true,"candidate_suitability":"conditional"}},

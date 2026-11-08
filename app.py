@@ -411,6 +411,7 @@ JOB_COLUMNS = {
     "description_fetched_at": "TEXT NOT NULL DEFAULT ''",
     "last_verified_at": "TEXT NOT NULL DEFAULT ''",
     "discovery_remote_preference": "TEXT NOT NULL DEFAULT ''",
+    "discovery_location_scope": "TEXT NOT NULL DEFAULT ''",
     "remote_search_eligible": "TEXT NOT NULL DEFAULT ''",
 }
 
@@ -2101,8 +2102,10 @@ def create_app() -> Flask:
             clean = enrich_discovery_job(clean, profile, {"weights": preferences.get("weights", {}), "remote_rule": preferences.get("sort", {}).get("remote_rule")}, evidence_profile=evidence_profile)
             clean = apply_discovery_search_constraints(clean, search["remote_preference"], search["discovery_location"])
             clean["discovery_remote_preference"] = search["remote_preference"]
+            clean["discovery_location_scope"] = search["discovery_location"]
             clean["remote_search_eligible"] = "true" if clean.get("remote_search_eligible") is True else "false" if clean.get("remote_search_eligible") is False else "unknown"
             clean["discovery_result_category"], clean["discovery_result_reason"] = discovery_result_category(clean, search["remote_preference"])
+            clean["recommendation_eligible"] = clean["discovery_result_category"] == "actionable"
             clean["source_job_id"] = text(raw_job.get("source_job_id"))
             clean["posted_date"] = text(raw_job.get("posted_date"))
             clean["description_available"] = bool(clean.get("job_description"))
@@ -2815,8 +2818,10 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         clean = enrich_discovery_job(clean, profile, {"remote_rule": "remote_after_local"}, evidence_profile=evidence_profile)
         clean = apply_discovery_search_constraints(clean, search["remote_preference"], search["discovery_location"])
         clean["discovery_remote_preference"] = search["remote_preference"]
+        clean["discovery_location_scope"] = search["discovery_location"]
         clean["remote_search_eligible"] = "true" if clean.get("remote_search_eligible") is True else "false" if clean.get("remote_search_eligible") is False else "unknown"
         clean["discovery_result_category"], clean["discovery_result_reason"] = discovery_result_category(clean, search["remote_preference"])
+        clean["recommendation_eligible"] = clean["discovery_result_category"] == "actionable"
         clean["source_job_id"] = text(raw_job.get("source_job_id"))
         clean["posted_date"] = text(raw_job.get("posted_date"))
         clean["description_available"] = bool(clean.get("job_description"))
@@ -7746,9 +7751,17 @@ def enrich_discovery_job(job: dict[str, Any], profile: dict[str, str], settings:
 
 
 def apply_discovery_search_constraints(job: dict[str, Any], remote_preference: str, search_location: str = "") -> dict[str, Any]:
-    """Keep remote-only searches from presenting onsite/hybrid jobs as eligible."""
-    if normalize_space(text(remote_preference)).lower() != "remote":
+    """Apply work-arrangement and requested-location constraints before ranking."""
+    preference = normalize_space(text(remote_preference)).lower()
+    if preference != "remote":
+        if search_location and outside_requested_location(job, search_location):
+            job["location_search_eligible"] = False
+            job["application_priority_score"] = 0
+            job.setdefault("application_priority_reasons", []).append("Excluded because the confirmed job location is outside the requested hybrid/on-site search area.")
+        else:
+            job["location_search_eligible"] = True if search_location else None
         return job
+    job["location_search_eligible"] = True
     if province_code_from_text(search_location) == "ON":
         ontario_status, ontario_reason = discovery_ontario_eligibility(job)
         job["ontario_eligibility"] = ontario_status
@@ -7772,10 +7785,14 @@ def apply_discovery_search_constraints(job: dict[str, Any], remote_preference: s
 
 
 def discovery_result_category(job: dict[str, Any], remote_preference: str = "") -> tuple[str, str]:
+    target_role_families = {"software developer", "full-stack developer", "intern", "new grad"}
     if normalize_space(text(remote_preference)).lower() != "remote":
         if text(job.get("posting_availability")).lower() == "confirmed_closed":
             return "excluded", "Posting is confirmed closed."
-        if text(job.get("role_type")).lower() == "other":
+        if job.get("location_search_eligible") is False or text(job.get("location_search_eligible")).lower() == "false":
+            return "excluded", "Confirmed job location is outside the requested search area."
+        role_type = text(job.get("role_type")).lower()
+        if role_type and role_type not in target_role_families:
             return "review_required", "The stored role family is outside the selected software-developer target family."
         seniority = job.get("qualification_fit_seniority") or {}
         if seniority.get("stretch_role") or (text(job.get("application_priority_score")).isdigit() and int(job.get("application_priority_score")) < 50):
@@ -7784,7 +7801,8 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
     if text(job.get("remote_search_eligible")).lower() == "false" or text(job.get("remote_eligibility")).lower() in {"restricted", "confirmed_ineligible"} or text(job.get("ontario_eligibility")).lower() == "confirmed_ineligible" or text(job.get("posting_availability")).lower() == "confirmed_closed":
         return "excluded", "Confirmed onsite, hybrid, ineligible, or closed posting."
     if text(job.get("remote_search_eligible")).lower() == "true" and text(job.get("remote_eligibility")).lower() == "canadian_eligible" and "remote" in text(job.get("remote_type")).lower():
-        if text(job.get("role_type")).lower() == "other":
+        role_type = text(job.get("role_type")).lower()
+        if role_type and role_type not in target_role_families:
             return "review_required", "The stored role family is outside the selected software-developer target family."
         seniority = job.get("qualification_fit_seniority") or {}
         if seniority.get("stretch_role") or (text(job.get("application_priority_score")).isdigit() and int(job.get("application_priority_score")) < 50):
@@ -8750,7 +8768,10 @@ def job_to_dict(
         "restricted": "confirmed_ineligible",
     }.get(legacy_eligibility, "unknown")
     data["ontario_eligibility"], data["ontario_eligibility_explanation"] = discovery_ontario_eligibility(data)
+    if text(data.get("discovery_location_scope")) and normalize_space(text(data.get("discovery_remote_preference"))).lower() != "remote":
+        data["location_search_eligible"] = not outside_requested_location(data, text(data.get("discovery_location_scope")))
     data["discovery_result_category"], data["discovery_result_reason"] = discovery_result_category(data, text(data.get("discovery_remote_preference")))
+    data["recommendation_eligible"] = data["discovery_result_category"] == "actionable"
     data["score_breakdown"] = parse_json_object(data.get("score_breakdown"))
     if "profile_updated_at" in data and data.get("profile_updated_at"):
         profile_row = query_db("SELECT updated_at FROM profile WHERE id = 1", one=True)

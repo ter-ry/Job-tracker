@@ -240,3 +240,33 @@ Using the existing captured Windows records and a disposable copy of the preserv
 | Verified sample | 40 unique / 20 top adjudicated | ≥40 / ≥20 | 20 verified top rows, 20 historical unverified | PASS |
 
 The detailed structured evidence and before/after records are in `audit/discovery-adjudication-2026-11-07.json` and `.tmpqa/quality-audit-pipeline-replay-after-fix.json` (the latter is intentionally Git-ignored). The gate remains **FAIL**: improving experience extraction and conservative classification did not yet raise relevance precision or false-positive performance to the frozen thresholds. PR #12 must remain draft and unmerged.
+
+## Recommendation-quality correction — 2026-11-08
+
+The six previously adjudicated false positives were handled by general rules, not employer exceptions:
+
+| Posting | Defect | Correction |
+|---|---|---|
+| Joblet-AI Fullstack | Canada eligibility was not established by the authoritative listing | Keep as review-required when Canadian eligibility is unknown |
+| Kablamo FullStack Engineer | 3–5 years and mid-level scope are a stretch for the selected junior target | Keep as review-required |
+| Genesys PEI | Confirmed location is outside the Toronto hybrid search scope | Exclude in the hybrid scenario; retain only as review data if another scenario is ambiguous |
+| Super.com Head of Security | Executive/security role and 10+ years | Keep outside actionable recommendations |
+| Capital One Staff Software Engineer | Staff scope and 6 years | Keep as review-required |
+| Method Junior Quality Engineer | Adjacent quality role, not the selected SWE family | Keep as review-required |
+
+The application now distinguishes retrieved rows, actionable recommendations, review inventory, and excluded rows. Non-target role families (including technical support, cloud support, quality, and implementation) are review-required even when they contain programming keywords. Hybrid/on-site searches persist their requested location scope and exclude confirmed out-of-area postings. `recommendation_eligible` is true only for the actionable category.
+
+The independent holdout is `audit/discovery-independent-holdout-2026-11-08.json`: 20 authoritative employer ATS records, labeled before replay, with 7 suitable target postings, 7 unsuitable/ambiguous postings, and 6 explicit geographic/seniority mismatches. It is evaluated through the real persistence, qualification, matching, eligibility, and priority pipeline by `scripts/evaluate_independent_holdout.py`; the generated result remains in `.tmpqa`.
+
+| Criterion | Measured result | Required threshold | Sample / denominator | Decision |
+|---|---:|---:|---:|---|
+| Actionable recommendation precision | 7/7 = 100.00% | ≥85% | 7 actionable holdout rows | PASS |
+| Holdout false-positive rate | 0/7 = 0.00% | ≤15% | 20 independently labeled holdout rows; 7 recommendations | PASS |
+| Holdout false-negative rate | 0/7 = 0.00% | ≤10% | 7 independently suitable holdout rows | PASS |
+| Hard eligibility violations among actionable | 0/7 = 0.00% | 0 | 7 actionable holdout rows | PASS |
+| Recommendation coverage | 7/20 = 35.00% | Report; no minimum threshold | 20 holdout rows | Diagnostic |
+| Mandatory-skill accuracy | Not calculable | ≥90% | Holdout evidence is sufficient for future extraction review, but no exact comparable application labels are yet emitted | INCONCLUSIVE |
+
+The frozen legacy top-20 metric remains reported separately: 12/18 = 66.67% and 6/18 = 33.33% false-positive rate, because that denominator includes review inventory. It is not silently relabeled as a pass. The product recommendation metric now measures only actionable rows, while uncertain/borderline rows remain visible for manual review. The current 21-row replay has 10 actionable, 9 review-required, and 2 excluded rows overall; its top 20 has 9 actionable, 9 review-required, and 2 excluded.
+
+The independent holdout’s authoritative URLs, evidence, timestamps, and labels are committed in the audit record. The corrected adjacent-role regression and location-scope regressions are in `tests/test_app.py`. The pre-existing tailoring preview-cache failure remains separate and unchanged.
