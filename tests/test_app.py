@@ -2735,6 +2735,64 @@ class JobAssistantTest(unittest.TestCase):
         self.assertFalse(any(item["minimum"] == 6 for item in analysis["ambiguous_experience"]))
         self.assertFalse(any(item["minimum"] == 2024 for item in analysis["ambiguous_experience"]))
 
+    def test_experience_headings_and_company_history_are_classified_conservatively(self):
+        description = (
+            "Our company has been in business for 20 years.\n"
+            "What you bring:\n"
+            "3-5 years of professional software development experience.\n"
+            "Preferred qualifications:\n"
+            "7+ years leading engineering teams."
+        )
+        analysis = seniority.analyze_job_seniority({"title": "Software Engineer", "job_description": description})
+        self.assertEqual(analysis["required_experience"]["minimum"], 3)
+        self.assertEqual(analysis["required_experience"]["maximum"], 5)
+        self.assertEqual(analysis["preferred_experience"]["minimum"], 7)
+        self.assertNotIn("20", analysis["required_experience"]["source_evidence"])
+
+    def test_qualification_inventory_does_not_promote_company_technology_to_mandatory(self):
+        job = {
+            "title": "Software Developer",
+            "job_description": (
+                "Our platform uses Kubernetes and Redis.\n"
+                "What you bring:\n"
+                "Python and REST APIs.\n"
+                "Nice to have:\n"
+                "Docker."
+            ),
+        }
+        terms = app_module._qualification_terms(job)
+        by_name = {item["requirement"].lower(): item for item in terms}
+        self.assertEqual(by_name["python"]["importance"], "required")
+        self.assertEqual(by_name["rest apis"]["importance"], "required")
+        if "docker" in by_name:
+            self.assertEqual(by_name["docker"]["importance"], "preferred")
+        if "kubernetes" in by_name:
+            self.assertNotEqual(by_name["kubernetes"]["importance"], "required")
+
+    def test_non_target_role_family_requires_review_in_hybrid_discovery(self):
+        job = {
+            "title": "Junior Quality Engineer",
+            "role_type": "other",
+            "remote_type": "Hybrid",
+            "location": "Toronto, ON",
+            "remote_eligibility": "canadian_eligible",
+            "job_description": "What you bring:\nPython and testing.",
+            "posting_availability": "likely_active",
+        }
+        category, reason = app_module.discovery_result_category(job, "hybrid")
+        self.assertEqual(category, "review_required")
+        self.assertIn("role family", reason)
+        profile = {
+            "resume_text": "Python developer with testing experience.",
+            "work_experience": "Built Python services and automated tests.",
+            "target_seniority_levels": "entry_level, junior, intermediate",
+            "maximum_required_years": "3",
+            "willing_to_apply_to_stretch_roles": "true",
+            "management_roles_allowed": "false",
+        }
+        fit = app_module.build_qualification_fit(job, evidence_profile=profile)
+        self.assertLessEqual(fit["application_priority_score"], 49)
+
     def test_direct_skill_match_semantic_transferable_and_unrelated_low(self):
         profile = {
             "key_skills": "Python, Flask, SQL",

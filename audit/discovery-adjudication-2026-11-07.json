@@ -24,7 +24,36 @@
   "acceptance_thresholds": {
     "unique_audit_records": {"required": 40, "result": "PASS"},
     "top20_adjudicated": {"required": 20, "result": "PASS"},
-    "metric_thresholds": "No numeric precision, accuracy, or error-rate thresholds are stated in DISCOVERY_ACCEPTANCE.md; those criteria remain INCONCLUSIVE rather than being invented."
+    "metric_thresholds": {
+      "top20_precision": {"required": ">=0.85", "minimum_evaluable_denominator": 20},
+      "required_experience_accuracy": {"required": ">=0.90", "minimum_evaluable_denominator": 5},
+      "mandatory_skill_accuracy": {"required": ">=0.90", "minimum_evaluable_denominator": 5},
+      "hard_eligibility_violations_actionable": {"required": "0", "minimum_evaluable_denominator": 1},
+      "false_positive_rate": {"required": "<=0.15", "minimum_evaluable_denominator": 20},
+      "false_negative_rate": {"required": "<=0.10", "minimum_evaluable_denominator": 20}
+    }
+  },
+  "post_fix_evaluation": {
+    "captured_replay_report": ".tmpqa/quality-audit-pipeline-replay-after-fix.json",
+    "persisted_unique_jobs": 21,
+    "top20_adjudicated": 20,
+    "category_counts_all_persisted": {"actionable": 10, "review_required": 9, "excluded": 2},
+    "metrics": {
+      "top20_precision": {"numerator": 12, "denominator": 18, "value": 0.6667, "decision": "FAIL"},
+      "required_experience_accuracy": {"numerator": 6, "denominator": 6, "value": 1.0, "decision": "PASS"},
+      "mandatory_skill_accuracy": {"numerator": null, "denominator": null, "value": null, "decision": "INCONCLUSIVE", "reason": "The existing authoritative sample still lacks a complete comparable mandatory-skill denominator."},
+      "hard_eligibility_violations_actionable": {"numerator": 0, "denominator": 10, "value": 0.0, "decision": "PASS"},
+      "eligibility_error_rate_all_top20": {"numerator": 1, "denominator": 20, "value": 0.05, "decision": "FAIL"},
+      "false_positive_rate": {"numerator": 6, "denominator": 18, "value": 0.3333, "decision": "FAIL"},
+      "false_negative_rate": {"numerator": 0, "denominator": 12, "value": 0.0, "decision": "PASS", "evidence_note": "This remains a discovered-source reference sample, not a fresh independent holdout; it is reported but not sufficient to close the gate."}
+    },
+    "before_after": [
+      {"job": "Kablamo FullStack Engineer", "before": {"required_experience": null, "category": "review_required", "priority": 57}, "after": {"required_experience": "3-5 years", "category": "review_required", "priority": 74}},
+      {"job": "Super.com Head of Security", "before": {"required_experience": null, "category": "review_required", "priority": 39}, "after": {"required_experience": "10+ years", "category": "review_required", "priority": 39}},
+      {"job": "Capital One Staff Software Engineer", "before": {"required_experience": "6 years", "category": "review_required", "priority": 40}, "after": {"required_experience": "6 years", "category": "review_required", "priority": 40}},
+      {"job": "Method Integration Junior Quality Engineer", "before": {"required_experience": null, "category": "actionable", "priority": 70}, "after": {"required_experience": "1+ years", "category": "review_required", "priority": 49}},
+      {"job": "DoorDash Software Engineer, Entry-Level", "before": {"required_experience": null, "category": "actionable", "priority": 58}, "after": {"required_experience": "0-2 years upper-bound evidence", "category": "actionable", "priority": 58}}
+    ]
   },
   "records": [
     {"record_id":"top20-01","scope":"top20","rank":1,"persisted_id":123,"company":"PRI Engineering","title":"Junior Software Developer","source_url":"https://www.linkedin.com/jobs/view/4485786623","authoritative_source_url":"https://priengineering.com/career-opportunities/","verification_status":"verified","verified_at":"2026-11-07T15:00:00-05:00","active_status":"active","source_evidence":{"location":"Mississauga, ON; in office","work_authorization":"Canada role; no sponsorship restriction stated","seniority":"entry level / junior","required_experience":"recent graduate or completing by start date; no numeric years","mandatory_skills":["web applications","REST APIs","relational databases","Git"],"preferred_skills":["Azure","React or similar","Node/TypeScript","C#/.NET"]},"job_tracker":{"category":"actionable","application_priority":72,"required_experience":null,"remote_eligibility":"canadian_eligible"},"ground_truth":{"target_recommendable":true,"location_eligible":true,"seniority_compatible":true,"candidate_suitability":"conditional"}},

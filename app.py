@@ -7775,10 +7775,20 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
     if normalize_space(text(remote_preference)).lower() != "remote":
         if text(job.get("posting_availability")).lower() == "confirmed_closed":
             return "excluded", "Posting is confirmed closed."
+        if text(job.get("role_type")).lower() == "other":
+            return "review_required", "The stored role family is outside the selected software-developer target family."
+        seniority = job.get("qualification_fit_seniority") or {}
+        if seniority.get("stretch_role") or (text(job.get("application_priority_score")).isdigit() and int(job.get("application_priority_score")) < 50):
+            return "review_required", "The posting expects experience or seniority that is not confirmed as aligned with the selected target."
         return "actionable", "No remote-only restriction applies."
     if text(job.get("remote_search_eligible")).lower() == "false" or text(job.get("remote_eligibility")).lower() in {"restricted", "confirmed_ineligible"} or text(job.get("ontario_eligibility")).lower() == "confirmed_ineligible" or text(job.get("posting_availability")).lower() == "confirmed_closed":
         return "excluded", "Confirmed onsite, hybrid, ineligible, or closed posting."
     if text(job.get("remote_search_eligible")).lower() == "true" and text(job.get("remote_eligibility")).lower() == "canadian_eligible" and "remote" in text(job.get("remote_type")).lower():
+        if text(job.get("role_type")).lower() == "other":
+            return "review_required", "The stored role family is outside the selected software-developer target family."
+        seniority = job.get("qualification_fit_seniority") or {}
+        if seniority.get("stretch_role") or (text(job.get("application_priority_score")).isdigit() and int(job.get("application_priority_score")) < 50):
+            return "review_required", "The posting expects experience or seniority that is not confirmed as aligned with the selected target."
         return "actionable", "Remote arrangement and Canadian eligibility are supported by the posting data."
     return "review_required", "Work arrangement or Canadian eligibility requires review."
 
@@ -8661,7 +8671,7 @@ def _qualification_job_key(job: dict[str, Any], profile: dict[str, Any] | None) 
         "job": {key: job.get(key) for key in (
             "id", "updated_at", "title", "job_description", "required_skills", "preferred_skills",
             "responsibilities", "required_experience", "preferred_experience", "remote_eligibility",
-            "posting_availability", "application_effort_score", "location", "remote_type",
+            "posting_availability", "application_effort_score", "location", "remote_type", "role_type",
         )},
     }
     return hashlib.sha256(json.dumps(relevant, sort_keys=True, default=str).encode("utf-8")).hexdigest()
@@ -8818,14 +8828,14 @@ def _description_requirement_importance(description: str, term: str) -> str:
     if index < 0:
         return "unclassified"
     headings = list(re.finditer(
-        r"(?im)^\s*(?P<heading>(?:minimum|basic|required)\s+qualifications?|requirements?|preferred\s+qualifications?|preferred|nice\s+to\s+have|bonus|assets?)\s*:?[ \t]*$",
+        r"(?im)^\s*[*_`#=~\\ -]*(?P<heading>(?:minimum|basic|required)\s+qualifications?|requirements?|preferred\s+qualifications?|preferred|nice\s+to\s+have|bonus|assets?|what\s+you\s+bring|what\s+we(?:'re|\s+are|’re)\s+looking\s+for|who\s+you\s+are|your\s+background|core\s+skills(?:\s+and\s+experience)?|education\s+and\s+experience)[*_`#=~\\ -]*\s*:?[ \t]*$",
         description[:index],
     ))
     if headings:
         heading = headings[-1].group("heading").lower()
         return "preferred" if any(value in heading for value in ("preferred", "nice", "bonus", "asset")) else "required"
     context = lowered[max(0, index - 260):index + len(term)]
-    if re.search(r"\b(required|requirements|must have|minimum qualifications|qualifications)\b", context):
+    if re.search(r"\b(required|requirements|must have|minimum qualifications|qualifications|what you bring|what we're looking for|what we are looking for|what you’re looking for|who you are|your background|core skills)\b", context):
         return "required"
     if re.search(r"\b(preferred|nice to have|bonus|asset)\b", context):
         return "preferred"
@@ -8849,7 +8859,7 @@ def _qualification_terms(job: dict[str, Any]) -> list[dict[str, Any]]:
         seen.add(key)
         terms.append({"requirement": value, "normalized": key, "importance": importance, "category": category, "source": source})
 
-    has_required_section = bool(re.search(r"(?:^|\n)\s*(?:required(?: qualifications?)?|requirements?|minimum qualifications?|must have)\s*(?::|$)", description, re.I | re.M))
+    has_required_section = bool(re.search(r"(?:^|\n)\s*(?:required(?: qualifications?)?|requirements?|minimum qualifications?|must have|what you bring|what we're looking for|what we are looking for|what you’re looking for|who you are|your background|core skills(?: and experience)?|education and experience)\s*(?::|$)", description, re.I | re.M))
     for field, importance, category in (("required_skills", "required" if (not description or has_required_section) else "unclassified", "technical"), ("preferred_skills", "preferred", "technical"), ("responsibilities", "unclassified", "experience")):
         for part in re.split(r"[,;\n]+|(?<=[.!?])\s+", text(job.get(field))):
             add(part, importance, category, field)
@@ -8942,6 +8952,9 @@ def _application_priority(
     seniority_score = clamp_int(seniority.get("score"), 0, 100)
     priority = round(qualification_score * 0.50 + seniority_score * 0.25 + recency * 0.10 + effort * 0.05 + preference * 0.10)
     reasons = ["Qualification Match and evidence-backed seniority fit are weighted first; recency, effort, and stated role/location preferences are secondary."]
+    if text(job.get("role_type")).lower() == "other":
+        priority = min(priority, 49)
+        reasons.append("The stored role family is outside the selected software-developer target family, so it requires review before applying.")
     if seniority.get("stretch_role"):
         reasons.append(text(seniority.get("explanation")) or "The posting expects experience or seniority above the selected target.")
     if text(job.get("remote_eligibility")).lower() in {"", "unknown"}:

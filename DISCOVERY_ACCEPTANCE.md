@@ -207,4 +207,36 @@ This manual source review is not a replacement for the structured acceptance sam
 
 The independent review found no basis to change the targeted product fixes already in PR #12, and it did not modify production data, the production database, or unrelated files. The pre-existing tailoring preview-cache failure remains separate and reproduces on unchanged `origin/master`. The structured adjudication is now recorded in `audit/discovery-adjudication-2026-11-07.json/.md`: 40 unique records and 20/20 top-ranked rows are adjudicated, while 20 historical records remain explicitly unverified. The scenario-aware replay correction shows 13 actionable, 6 review-required, and 2 excluded among all 21 persisted rows; the 21st row outside the top 20 is Verismo Health, now actionable under its Toronto-hybrid result.
 
-Final decision: **INCONCLUSIVE — PR #12 is not ready to merge**. Top-20 precision is 12/18 (66.67%), required-experience accuracy is 1/5 (20%), eligibility error rate is 1/20 (5%), and mandatory-skill accuracy is not calculable honestly. `DISCOVERY_ACCEPTANCE.md` specifies the 40/20 sample requirements but does not specify numeric pass thresholds for these quality metrics, so no PASS/FAIL claim is fabricated. The remaining acceptance blocker is a documented quality result, not missing sample construction.
+Final decision for the pre-fix snapshot: **INCONCLUSIVE — superseded by the frozen-gate evaluation below**.
+
+## Frozen quality gate — 2026-11-07
+
+The following thresholds were frozen before evaluating the current-branch fixes. They must not be reduced to obtain a pass:
+
+| Criterion | Required threshold | Denominator / minimum evaluable sample | Ambiguous and unverified handling |
+|---|---:|---|---|
+| Top-ranked precision | ≥85% | target-recommendable top-ranked rows / all actionable or review-required top-ranked rows; at least 20 adjudicated top rows | ambiguous suitability is not positive; unverified sources do not count as verified positives |
+| Required-experience extraction accuracy | ≥90% | exact comparable required-year/range extractions / independently adjudicated comparable rows; minimum 5 | preferred years, upper bounds, graduation restrictions, company history, employee tenure, and unrelated numbers are distinct; ambiguous extraction is not correct until adjudicated |
+| Mandatory-skill extraction accuracy | ≥90% | correctly classified mandatory skills / independently adjudicated mandatory-skill labels; minimum 5 comparable postings | preferred, optional, example, and company-technology mentions are not mandatory; missing or ambiguous evidence is unverified |
+| Hard eligibility violations among actionable jobs | 0 | confirmed location/work-authorization violations / actionable jobs; minimum 1 actionable job | unknown eligibility is review-required, never an eligible positive; unverified records cannot prove eligibility |
+| False-positive rate | ≤15% | irrelevant or ineligible predictions / all actionable or review-required predictions; minimum 20 | ambiguous rows remain in the denominator and are not silently relabeled |
+| False-negative rate | ≤10% | relevant reference postings missed or wrongly excluded / independently sampled relevant/irrelevant holdout; minimum 20 labeled postings | the discovered set is not an independent holdout; discovered-source counts are diagnostic only |
+
+The verified sample requires at least 40 unique records and 20 independently adjudicated top-ranked postings. A verified record must include an authoritative employer/ATS or exact original-posting URL, source evidence, verification timestamp, active status, location, work authorization, seniority, required experience, mandatory and preferred skills, and candidate suitability. Historical records may be retained for regression context but remain `unverified` and cannot increase verified denominators.
+
+## Post-fix quality result — 2026-11-07
+
+Using the existing captured Windows records and a disposable copy of the preserved QA database, the real `/api/discovery/jobspy` path now persists 21 unique jobs and classifies the complete set as 10 actionable, 9 review-required, and 2 excluded. The application changes recognize composite/Markdown requirement headings, preserve upper-bound experience semantics, ignore company-history numbers, and require review for non-target role families and stretch/low-priority postings.
+
+| Criterion | Measured result | Threshold | Sample | Decision |
+|---|---:|---:|---:|---|
+| Top-ranked precision | 12/18 = 66.67% | ≥85% | 18 predicted actionable/review rows; 20 top rows adjudicated | FAIL |
+| Required-experience accuracy | 6/6 = 100% | ≥90% | 6 unique authoritative comparable rows | PASS |
+| Mandatory-skill accuracy | Not calculable | ≥90% | no complete denominator of at least 5 comparable postings | INCONCLUSIVE |
+| Hard eligibility violations among actionable | 0/10 = 0% | 0 | 10 actionable rows | PASS |
+| Overall top-20 eligibility conflicts | 1/20 = 5% | diagnostic; actionable criterion is controlling | 20 | FAIL diagnostic |
+| False-positive rate | 6/18 = 33.33% | ≤15% | 18 predicted actionable/review rows | FAIL |
+| False-negative rate | 0/12 = 0% | ≤10% | discovered-source reference only, not independent holdout | INCONCLUSIVE |
+| Verified sample | 40 unique / 20 top adjudicated | ≥40 / ≥20 | 20 verified top rows, 20 historical unverified | PASS |
+
+The detailed structured evidence and before/after records are in `audit/discovery-adjudication-2026-11-07.json` and `.tmpqa/quality-audit-pipeline-replay-after-fix.json` (the latter is intentionally Git-ignored). The gate remains **FAIL**: improving experience extraction and conservative classification did not yet raise relevance precision or false-positive performance to the frozen thresholds. PR #12 must remain draft and unmerged.

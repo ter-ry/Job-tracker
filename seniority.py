@@ -256,6 +256,8 @@ def extract_experience_ranges(content: str) -> tuple[list[ExperienceRange], list
         kind = classify_experience_section(content, match.start()) or classify_experience_context(snippet)
         a = float(match.group("a"))
         b = float(match.group("b")) if match.group("b") else (None if "+" in match.group(0) or r"\+" in match.group(0) or "plus" in match.group(0).lower() else a)
+        if re.search(r"\b(?:no more than|up to|at most|maximum of)\b", snippet, re.I):
+            a, b = 0.0, a
         item = ExperienceRange(a, b, kind, match.group(0).strip())
         if kind == "required":
             required.append(item)
@@ -271,21 +273,21 @@ def classify_experience_section(content: str, position: int) -> str:
     headings: list[str] = []
     for raw_line in content[:position].splitlines():
         heading = re.sub(r"[*_`#]", "", raw_line).replace(r"\&", "&").replace(r"\-", "-").strip(" -:").lower()
-        if len(heading) <= 120 and not re.search(r"[.!?]", heading) and re.search(r"\b(?:requirements?|qualifications?|experience)\b", heading):
+        if len(heading) <= 120 and not re.search(r"[.!?]", heading) and re.search(r"\b(?:requirements?|qualifications?|experience|what you bring|what we're looking for|what we are looking for|what you’re looking for|what we’re looking for|what you are looking for|who you are|your background|core skills|education and experience|basic qualifications?|minimum qualifications?)\b", heading):
             headings.append(heading)
     if not headings:
         return ""
     heading = headings[-1]
     if any(term in heading for term in ("preferred", "nice to have", "bonus", "asset")):
         return "preferred"
-    if re.search(r"\b(?:requirements?|minimum qualifications?|basic qualifications?|required qualifications?)\b", heading):
+    if re.search(r"\b(?:requirements?|minimum qualifications?|basic qualifications?|required qualifications?|what you bring|what we're looking for|what we are looking for|what you’re looking for|what we’re looking for|what you are looking for|who you are|your background|core skills|education and experience)\b", heading):
         return "required"
     return ""
 
 
 def is_false_experience_match(content: str, start: int, end: int) -> bool:
     snippet = content[max(0, start - 30) : min(len(content), end + 30)].lower()
-    if re.search(r"\$\s*\d", snippet) or re.search(r"\bfor\s+\d{1,2}\s*(?:\+|\\\+)?\s*years?\s*,?\s*(?:we|our|the company)\b", snippet) or any(term in snippet for term in ["salary", "per year", "annually", "version", "python 3", "team of", "people on"]):
+    if re.search(r"\$\s*\d", snippet) or re.search(r"\bfor\s+\d{1,2}\s*(?:\+|\\\+)?\s*years?\s*,?\s*(?:we|our|the company)\b", snippet) or re.search(r"\b(?:founded|operating|in business|history|mission)\b[^.\n]{0,45}\b\d{1,2}\s*years?\b", snippet) or re.search(r"\b\d{1,2}\s*years?\b[^.\n]{0,45}\b(?:founded|in business|history|company)\b", snippet) or any(term in snippet for term in ["salary", "per year", "annually", "version", "python 3", "team of", "people on", "joined us", "joined the team"]):
         return True
     number = int(re.search(r"\d{1,4}", content[start:end]).group(0))
     if 1900 <= number <= 2100:
@@ -295,7 +297,7 @@ def is_false_experience_match(content: str, start: int, end: int) -> bool:
 
 def classify_experience_context(snippet: str) -> str:
     lowered = snippet.lower()
-    if any(term in lowered for term in ["required", "requirements", "must have", "minimum", "at least", "need", "requires"]):
+    if any(term in lowered for term in ["required", "requirements", "must have", "minimum", "at least", "need", "requires", "no more than", "up to", "at most", "maximum of"]):
         return "required"
     if any(term in lowered for term in ["preferred", "nice to have", "bonus", "asset", "ideally"]):
         return "preferred"
