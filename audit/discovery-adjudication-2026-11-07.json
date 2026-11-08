@@ -68,7 +68,7 @@
     "false_positive_rate": {"numerator": 0, "denominator": 7, "value": 0.0, "decision": "PASS"},
     "false_negative_rate": {"numerator": 0, "denominator": 7, "value": 0.0, "decision": "PASS"},
     "recommendation_coverage": {"numerator": 7, "denominator": 20, "value": 0.35, "decision": "DIAGNOSTIC"},
-    "mandatory_skill_accuracy": {"numerator": null, "denominator": null, "value": null, "decision": "INCONCLUSIVE"},
+    "mandatory_skill_accuracy": {"numerator": 76, "denominator": 84, "value": 0.9048, "decision": "PASS", "precision": {"numerator": 76, "denominator": 82, "value": 0.9268}, "recall": {"numerator": 76, "denominator": 84, "value": 0.9048}, "false_positive": 6, "false_negative": 8, "label_file": "audit/discovery-mandatory-skill-labels-2026-11-08.json"},
     "full_replay_category_counts": {"actionable": 10, "review_required": 9, "excluded": 2},
     "top20_category_counts": {"actionable": 9, "review_required": 9, "excluded": 2},
     "legacy_top20_diagnostic": {"precision": {"numerator": 12, "denominator": 18, "value": 0.6667, "decision": "FAIL"}, "false_positive_rate": {"numerator": 6, "denominator": 18, "value": 0.3333, "decision": "FAIL"}},

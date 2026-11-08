@@ -78,4 +78,16 @@ The six false positives were individually resolved with general rules: unknown C
 
 The independent authoritative holdout is `audit/discovery-independent-holdout-2026-11-08.json` (20 records), selected and labeled before application scoring. `scripts/evaluate_independent_holdout.py` replays those records through the real disposable-database `/api/discovery/jobspy` path. Result: 7 suitable postings, 7 actionable recommendations, 0 false positives, and 0 false negatives. Thus actionable precision is 7/7 = 100%, holdout false-positive rate is 0/7 = 0%, and holdout false-negative rate is 0/7 = 0%. Recommendation coverage is 7/20 = 35% and is reported diagnostically; uncertainty is preserved in review-required rows.
 
-The frozen legacy top-20 diagnostic is still 12/18 = 66.67% precision and 6/18 = 33.33% false-positive rate because its denominator includes review inventory. It remains FAIL rather than being weakened. Mandatory-skill accuracy remains INCONCLUSIVE because the application does not yet emit a complete comparable mandatory-label denominator. The current replay inventory is 10 actionable, 9 review-required, and 2 excluded across 21 persisted jobs; top 20 is 9/9/2.
+The frozen legacy top-20 diagnostic is still 12/18 = 66.67% precision and 6/18 = 33.33% false-positive rate because its denominator includes review inventory. It remains FAIL rather than being weakened. The current replay inventory is 10 actionable, 9 review-required, and 2 excluded across 21 persisted jobs; top 20 is 9/9/2.
+
+The required-skill labels are in `audit/discovery-mandatory-skill-labels-2026-11-08.json`. They contain 84 explicitly required technical labels across the 20 independently sourced holdout postings. Preferred/optional technologies and non-skill requirements are excluded. The replay compares persisted application requirements marked both `required` and `technical`.
+
+| Metric | Numerator / denominator | Result | Threshold | Decision |
+|---|---:|---:|---:|---|
+| Precision | 76/82 | 92.68% | Reported | PASS |
+| Recall | 76/84 | 90.48% | Reported | PASS |
+| Accuracy | 76/84 | 90.48% | ≥90% | PASS |
+
+Six extracted labels were false positives and eight authoritative labels were missed. The detailed per-posting comparison is in `.tmpqa/quality-audit-mandatory-skills-20261108.json`; no labels were fabricated or converted from preferred evidence.
+
+The 20-record holdout was selected and labeled before scoring, outside the current 21-row audit pool. Seven records are independently suitable; all seven were recommended, so recall is 7/7 = 100% and false negatives are 0/7. Recommendation coverage is 7/20 = 35%, not recall. Actionable precision is 7/7 = 100% and actionable false-positive rate is 0/7 = 0%. Mandatory-skill accuracy and the actionable holdout metrics now pass. The known tailoring preview-cache failure remains separate; PR #12 remains draft and unmerged pending final human review.

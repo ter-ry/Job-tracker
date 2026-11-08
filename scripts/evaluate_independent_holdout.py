@@ -23,16 +23,16 @@ def scenario_for(record: dict[str, Any]) -> str:
 
 def fixture_description(record: dict[str, Any]) -> str:
     evidence = record["source_evidence"]
-    skills = ", ".join(evidence.get("mandatory_skills") or []) or "not stated"
-    return "\n".join(
-        [
-            f"Location: {evidence.get('location', '')}",
-            f"Seniority: {evidence.get('seniority', '')}",
-            f"Required experience: {evidence.get('required_experience', '')}",
-            f"Required qualifications: {skills}",
-            f"Work authorization: {evidence.get('work_authorization', '')}",
-        ]
-    )
+    skills = evidence.get("mandatory_skills") or []
+    lines = [
+        f"Location: {evidence.get('location', '')}",
+        f"Seniority: {evidence.get('seniority', '')}",
+        f"Required experience: {evidence.get('required_experience', '')}",
+        "Required Qualifications",
+    ]
+    lines.extend(f"- {skill}" for skill in skills)
+    lines.append(f"Work authorization: {evidence.get('work_authorization', '')}")
+    return "\n".join(lines)
 
 
 def build_capture(holdout: dict[str, Any]) -> dict[str, Any]:

@@ -2832,6 +2832,17 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(category, "review_required")
         self.assertIn("role family", reason)
 
+    def test_required_skill_inventory_preserves_explicit_bullets(self):
+        terms = app_module._qualification_terms({
+            "title": "Junior Platform Engineer",
+            "job_description": "Required Qualifications\n- Python\n- Django\n- Kubernetes\n- Full-stack development\nPreferred\n- AWS",
+        })
+        required = {item["normalized"] for item in terms if item["importance"] == "required"}
+        preferred = {item["normalized"] for item in terms if item["importance"] == "preferred"}
+        self.assertTrue({"python", "django", "kubernetes"}.issubset(required))
+        self.assertIn("aws", preferred)
+        self.assertNotIn("aws", required)
+
     def test_direct_skill_match_semantic_transferable_and_unrelated_low(self):
         profile = {
             "key_skills": "Python, Flask, SQL",

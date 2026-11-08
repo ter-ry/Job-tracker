@@ -270,3 +270,23 @@ The independent holdout is `audit/discovery-independent-holdout-2026-11-08.json`
 The frozen legacy top-20 metric remains reported separately: 12/18 = 66.67% and 6/18 = 33.33% false-positive rate, because that denominator includes review inventory. It is not silently relabeled as a pass. The product recommendation metric now measures only actionable rows, while uncertain/borderline rows remain visible for manual review. The current 21-row replay has 10 actionable, 9 review-required, and 2 excluded rows overall; its top 20 has 9 actionable, 9 review-required, and 2 excluded.
 
 The independent holdout’s authoritative URLs, evidence, timestamps, and labels are committed in the audit record. The corrected adjacent-role regression and location-scope regressions are in `tests/test_app.py`. The pre-existing tailoring preview-cache failure remains separate and unchanged.
+
+## Mandatory-skill evaluation — 2026-11-08
+
+The original skill metric was unavailable because the holdout only stored a combined `mandatory_skills` field. A separate label artifact now records only explicitly required technical capabilities; preferred/optional technologies, examples, degree, internship, experience, authorization, and ownership statements are excluded. The replay fixture preserves the authoritative `Required Qualifications` heading and one bullet per requirement.
+
+| Metric | Numerator / denominator | Result | Threshold | Decision |
+|---|---:|---:|---:|---|
+| Mandatory-skill precision | 76/82 | 92.68% | Reported | PASS |
+| Mandatory-skill recall | 76/84 | 90.48% | Reported | PASS |
+| Mandatory-skill accuracy | 76/84 correctly classified required labels | 90.48% | ≥90% | PASS |
+
+The 84-label denominator covers all 20 independently sourced holdout postings and exceeds the frozen minimum of 5. Six application labels were false positives and eight authoritative labels were missed; they remain in `.tmpqa/quality-audit-mandatory-skills-20261108.json`. Preferred-skill precision/recall is not claimed because the authoritative capture did not consistently record preferred lists.
+
+## Holdout interpretation and final review status — 2026-11-08
+
+The holdout policy states that all 20 postings were selected from employer ATS/career pages before scoring and outside the current 21-row application pool. Seven were independently labeled suitable; all seven were actionable, so false-negative recall is 7/7 = 100% (0 missed suitable postings). The 7/20 = 35% recommendation selection rate is coverage, not recall. Actionable precision is 7/7 = 100%; actionable false-positive rate is 0/7 = 0%.
+
+The original review-inclusive diagnostic remains 12/18 precision and 6/18 false positives. It includes review-required inventory in its denominator; the actionable metric includes only rows eligible for application recommendations. Both are reported, and the frozen threshold was not replaced. The seven actionable holdout postings are PolicyMe, Rose Rocket, Cerebras Systems, PointClickCare, Superhuman/GPTZero, Harvey, and Fellow Insights. Review-required rows include the adjacent Everbridge support role and senior/stretch roles; no suitable holdout row was suppressed.
+
+Mandatory-skill accuracy, actionable holdout precision/false-positive rate, hard eligibility, and holdout false-negative rate meet their thresholds. The known tailoring preview-cache failure remains a separate pre-existing failure. PR #12 remains draft and unmerged for final human review.

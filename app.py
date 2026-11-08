@@ -8831,6 +8831,16 @@ QUALIFICATION_ALIASES = {
     "testing": {"test", "tests", "testing"},
 }
 
+QUALIFICATION_TECHNICAL_TERMS = [
+    *TECHNICAL_TERMS,
+    "c++", "c#", "go", "golang", "django", "graphql", "grpc", "websocket", "nestjs",
+    "docker", "kubernetes", "linux", "systems", "systems programming", "system design",
+    "architecture", "programming", "scripting", "observability", "troubleshooting",
+    "networking", "integrations", "frameworks", "web applications", "databases",
+    "data processing", "rbac", "cloud infrastructure", "multithreaded", "full-stack", "full stack",
+    "full-stack development", "full-stack software development", "full-stack engineering", "software development",
+]
+
 
 def _qualification_key(value: Any) -> str:
     clean = normalize_space(text(value)).lower().strip(".,:;()[]")
@@ -8886,7 +8896,7 @@ def _qualification_terms(job: dict[str, Any]) -> list[dict[str, Any]]:
             add(part, importance, category, field)
 
     lowered = content.lower()
-    for term in sorted(TECHNICAL_TERMS, key=len, reverse=True):
+    for term in sorted(QUALIFICATION_TECHNICAL_TERMS, key=len, reverse=True):
         if _qualification_phrase_present(lowered, term):
             importance = _description_requirement_importance(description, term)
             add(term, importance, "technical", "job description")
