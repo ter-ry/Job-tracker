@@ -265,6 +265,28 @@ def extract_experience_ranges(content: str) -> tuple[list[ExperienceRange], list
             preferred.append(item)
         else:
             ambiguous.append(item)
+
+    word_values = {"zero": 0.0, "one": 1.0, "two": 2.0, "three": 3.0, "four": 4.0, "five": 5.0, "six": 6.0, "seven": 7.0, "eight": 8.0, "nine": 9.0, "ten": 10.0}
+    word_pattern = re.compile(
+        r"(?P<a>zero|one|two|three|four|five|six|seven|eight|nine|ten)\s*(?:to|[-–])\s*"
+        r"(?P<b>zero|one|two|three|four|five|six|seven|eight|nine|ten)\s+years?\b|"
+        r"(?:more than|over)\s+(?P<c>zero|one|two|three|four|five|six|seven|eight|nine|ten)\s+years?\b",
+        re.I,
+    )
+    for match in word_pattern.finditer(content):
+        if is_false_experience_match(content, match.start(), match.end()):
+            continue
+        snippet = content[max(0, match.start() - 80) : min(len(content), match.end() + 80)]
+        kind = classify_experience_section(content, match.start()) or classify_experience_context(snippet)
+        minimum = word_values[(match.group("a") or match.group("c")).lower()]
+        maximum = word_values[match.group("b").lower()] if match.group("b") else None
+        item = ExperienceRange(minimum, maximum, kind, match.group(0).strip())
+        if kind == "required":
+            required.append(item)
+        elif kind == "preferred":
+            preferred.append(item)
+        else:
+            ambiguous.append(item)
     return required, preferred, ambiguous
 
 
@@ -289,7 +311,10 @@ def is_false_experience_match(content: str, start: int, end: int) -> bool:
     snippet = content[max(0, start - 30) : min(len(content), end + 30)].lower()
     if re.search(r"\$\s*\d", snippet) or re.search(r"\bfor\s+\d{1,2}\s*(?:\+|\\\+)?\s*years?\s*,?\s*(?:we|our|the company)\b", snippet) or re.search(r"\b(?:founded|operating|in business|history|mission)\b[^.\n]{0,45}\b\d{1,2}\s*years?\b", snippet) or re.search(r"\b\d{1,2}\s*years?\b[^.\n]{0,45}\b(?:founded|in business|history|company)\b", snippet) or any(term in snippet for term in ["salary", "per year", "annually", "version", "python 3", "team of", "people on", "joined us", "joined the team"]):
         return True
-    number = int(re.search(r"\d{1,4}", content[start:end]).group(0))
+    number_match = re.search(r"\d{1,4}", content[start:end])
+    if not number_match:
+        return False
+    number = int(number_match.group(0))
     if 1900 <= number <= 2100:
         return True
     return False

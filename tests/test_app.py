@@ -409,6 +409,27 @@ class JobAssistantTest(unittest.TestCase):
         url_only = jobspy_source.normalize_jobspy_row({"title": "Developer", "job_url": "https://example.test/job"}, "linkedin")
         self.assertEqual(url_only["posting_availability"], "unverified")
 
+    def test_remote_canada_wording_without_structured_location_is_eligible(self):
+        eligibility, reason = app_module.discovery_remote_eligibility({
+            "remote_type": "Remote",
+            "location": "",
+            "job_description": "This position can be performed remotely from anywhere in the US or Canada.",
+        })
+        self.assertEqual(eligibility, "canadian_eligible")
+        self.assertIn("Canadian", reason)
+
+    def test_remote_canada_mentions_without_affirmative_scope_remain_unknown(self):
+        for description in (
+            "This is a remote role based in the UK. Our customers span Canada and Europe.",
+            "Remote role; applicants must reside outside Canada.",
+        ):
+            eligibility, _reason = app_module.discovery_remote_eligibility({
+                "remote_type": "Remote",
+                "location": "London, UK",
+                "job_description": description,
+            })
+            self.assertEqual(eligibility, "unknown")
+
     def test_jobspy_experience_extraction_ignores_company_history(self):
         description = (
             "For 30 years, we've been on a mission to change banking for good.\n"
@@ -425,6 +446,14 @@ class JobAssistantTest(unittest.TestCase):
         analysis = seniority.analyze_job_seniority({"title": "Staff Software Engineer", "job_description": description})
         self.assertEqual(analysis["required_experience"]["minimum"], 6)
         self.assertNotIn("30", analysis["required_experience"]["source_evidence"])
+
+    def test_experience_extraction_parses_spelled_out_ranges(self):
+        required, preferred, ambiguous = seniority.extract_experience_ranges(
+            "This role requires one to five years of relevant software experience."
+        )
+        self.assertEqual((required[0].minimum, required[0].maximum), (1.0, 5.0))
+        self.assertFalse(preferred)
+        self.assertFalse(ambiguous)
 
     def test_role_family_does_not_leak_from_body_into_security_or_quality_titles(self):
         security = self.client.post(
