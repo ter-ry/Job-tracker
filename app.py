@@ -6408,7 +6408,8 @@ def split_salary_contexts(content: str) -> list[str]:
 
 
 def salary_numbers(context: str) -> list[float]:
-    pattern = r"(?:CAD\s*)?\$?\s*(\d{2,3}k|\d{2,3}(?:,\d{3})?|\d{2,3})(?:\s*(?:-|to|–|—)\s*(?:CAD\s*)?\$?\s*(\d{2,3}k|\d{2,3}(?:,\d{3})?|\d{2,3}))?"
+    number = r"(?:\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)(?:k)?"
+    pattern = rf"(?:CAD|USD|CA)?\s*\$?\s*({number})(?:\s*(?:-|to|–|—)\s*(?:CAD|USD|CA)?\s*\$?\s*({number}))?"
     match = re.search(pattern, context, re.I)
     if not match:
         return []
@@ -6480,7 +6481,7 @@ def plausible_base_salary(minimum: float, maximum: float, interval: str) -> bool
         return 400 <= high <= 7000
     if interval == "monthly":
         return 1500 <= high <= 30000
-    return 25000 <= high <= 350000
+    return 25000 <= high <= 1_000_000
 
 
 def false_salary_context(context: str) -> bool:

@@ -246,7 +246,7 @@ def extract_experience_ranges(content: str) -> tuple[list[ExperienceRange], list
 
     range_pattern = re.compile(
         r"(?P<a>\d{1,2})(?:\s*(?:\+|\\\+|plus)|\s*(?:-|\\-|to|–)\s*(?P<b>\d{1,2})(?:\s*(?:\+|\\\+|plus))?)?\s*(?:years?|yrs?)"
-        r"(?:\s+of)?\s+(?:professional\s+)?(?:work\s+)?(?:experience|development|engineering|programming)?(?:\s+(?:experience|development|engineering|programming))?",
+        r"(?:\s+of)?\s+(?:professional\s+)?(?:work\s+)?(?:experience|development|engineering|programming|building|shipping|working|with\s+(?:children|families|software))?(?:\s+(?:experience|development|engineering|programming|building|shipping|working))?",
         re.I,
     )
     for match in range_pattern.finditer(content):

@@ -2751,6 +2751,16 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(hourly["salary_interval"], "hourly")
         self.assertEqual(hourly["salary_min"], 62400)
 
+    def test_salary_parser_preserves_decimal_and_currency_prefixed_range_endpoints(self):
+        hourly = app_module.parse_salary_text("Salary: $18.00-$21.00 per hour")
+        self.assertEqual((hourly["salary_min"], hourly["salary_max"], hourly["salary_interval"], hourly["salary_currency"]), (37440, 43680, "hourly", "CAD"))
+        annual = app_module.parse_salary_text("Base salary: CA$90,000–CA$130,000 CAD per year")
+        self.assertEqual((annual["salary_min"], annual["salary_max"], annual["salary_interval"], annual["salary_currency"]), (90000, 130000, "yearly", "CAD"))
+
+    def test_salary_parser_accepts_legitimate_high_compensation_ranges(self):
+        parsed = app_module.parse_salary_text("Base salary CA$157K-$367K")
+        self.assertEqual((parsed["salary_min"], parsed["salary_max"], parsed["salary_currency"]), (157000, 367000, "CAD"))
+
     def test_salary_parser_avoids_false_bonus_matches_and_keeps_missing_unestimated(self):
         false_match = app_module.parse_salary_text("Includes a $5,000 signing bonus and wellness benefits.")
         estimate = app_module.determine_salary(
