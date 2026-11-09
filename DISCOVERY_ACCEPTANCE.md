@@ -296,3 +296,11 @@ Mandatory-skill accuracy, actionable holdout precision/false-positive rate, hard
 The preview-cache regression was reproduced deterministically on PR #12 and passed 3/3 on `origin/master` with the same `.venv` and exact test command. A temporary-worktree bisect identified `f33c8df` as the first bad PR commit; the relevant issue was an indirect shared path/cache interaction, not a material tailoring-route change. The layout validator normalized `draft_path` before using it in the SQLite update predicate, so an equivalent stored path could make the cache write a no-op. The fix keeps the draft-ID and path race guard but compares against the original stored SQLite path representation.
 
 Validation after the fix: the failing test passed 3/3; the tailoring group passed 25/25; discovery/audit regressions passed 38/38; and the full suite passed **229 tests, 1 skipped**. No assertion was weakened and no production database or user data was used.
+
+## Flexible occupation search and post-merge replay — 2026-11-09
+
+The default discovery mode is now `Job Title Search`, with configurable strict or related-title matching and occupation synonym vocabularies. `Explore Opportunities` is explicit and retains adjacent roles as review-only opportunities without applying the software-target global cap. Search records persist the mode and title-match classification so results remain explainable after persistence.
+
+Salary extraction no longer creates market estimates. Missing or ambiguous compensation remains unavailable, while explicit source text retains its interval, currency, confidence, and evidence. Commute display distinguishes straight-line distance from unavailable road/transit routing.
+
+The fresh Windows capture contained 26 unique provider records. An isolated replay normalized all 26, recognized explicit compensation on 16, left 10 unpriced, and created zero estimates. This is operational replay evidence, not independent authoritative ground truth. Independent authoritative salary, skills, freshness, and completeness metrics therefore remain **INCONCLUSIVE** until the required labeled sample is collected; see `docs/occupation-search-acceptance-20261109.md`. Frozen quality thresholds were not changed.

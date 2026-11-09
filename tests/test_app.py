@@ -2751,7 +2751,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(hourly["salary_interval"], "hourly")
         self.assertEqual(hourly["salary_min"], 62400)
 
-    def test_salary_parser_avoids_false_bonus_matches_and_estimates_missing(self):
+    def test_salary_parser_avoids_false_bonus_matches_and_keeps_missing_unestimated(self):
         false_match = app_module.parse_salary_text("Includes a $5,000 signing bonus and wellness benefits.")
         estimate = app_module.determine_salary(
             {
@@ -2763,8 +2763,17 @@ class JobAssistantTest(unittest.TestCase):
             }
         )
         self.assertEqual(false_match["salary_source"], "missing")
-        self.assertEqual(estimate["salary_source"], "estimated")
-        self.assertIn("Estimated market range", estimate["salary_text"])
+        self.assertEqual(estimate["salary_source"], "missing")
+        self.assertEqual(estimate["salary_text"], "")
+        self.assertEqual(estimate["salary_ambiguity"], "not stated")
+
+    def test_title_search_uses_advertised_title_not_description_keywords(self):
+        self.assertEqual(app_module.classify_title_match("Frontend Developer", "software developer", "related"), ("exact", 100))
+        self.assertEqual(app_module.classify_title_match("Strategy Analyst", "software developer", "related")[0], "uncertain")
+
+    def test_explore_mode_retains_adjacent_roles_without_global_non_target_cap(self):
+        job = {"role_type": "analyst", "discovery_search_mode": "explore", "occupation_match_type": "adjacent_opportunity", "location_search_eligible": True, "remote_type": "Hybrid", "application_priority_score": 80}
+        self.assertEqual(app_module.discovery_result_category(job, "hybrid")[0], "adjacent_opportunity")
 
     def test_revised_scoring_salary_location_dominate_and_missing_not_zero(self):
         profile = {

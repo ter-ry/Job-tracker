@@ -99,6 +99,18 @@
           <form id="discovery-form" class="panel discovery-search-panel discovery-view-find">
             <div class="panel-header"><h2>Live job discovery</h2></div>
             <div class="grid two">
+              <label>Search mode
+                <select id="discovery-search-mode">
+                  <option value="title" selected>Job Title Search</option>
+                  <option value="explore">Explore Opportunities</option>
+                </select>
+              </label>
+              <label>Title matching
+                <select id="discovery-title-match-mode">
+                  <option value="related" selected>Exact and related titles</option>
+                  <option value="strict">Exact titles only</option>
+                </select>
+              </label>
               <label>Keywords<input id="discovery-keywords" required placeholder="software developer"></label>
               <label>Search area<input id="discovery-location" placeholder="Toronto, Ontario"></label>
               <label>Distance<input id="discovery-distance" type="number" min="0" step="1" placeholder="50 km"></label>
@@ -113,6 +125,7 @@
               <label>Fetch limit<input id="discovery-total-cap" type="number" min="1" step="1" value="200"></label>
               <label>Résumé profile<select id="discovery-profile"><option value="">Use active Profile</option></select></label>
             </div>
+            <p class="muted helper">Job Title Search uses the advertised title and recognized occupation synonyms. Explore Opportunities may retain adjacent roles for manual review and does not require a résumé profile.</p>
             <fieldset class="source-picker">
               <legend>Sources</legend>
               <label><input type="checkbox" name="discovery-source" value="linkedin" checked> LinkedIn</label>

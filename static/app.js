@@ -2329,6 +2329,8 @@ async function saveEditedVersion(kind, elementId) {
 }
 
 function applyDiscoverySearchDefaults() {
+  setValue("discovery-search-mode", "title");
+  setValue("discovery-title-match-mode", "related");
   setValue("discovery-search-depth", "standard");
   setValue("discovery-date-window", "14d");
   setValue("discovery-sort-mode", "best_match");
@@ -2352,6 +2354,8 @@ function syncDiscoveryDepthDefaults() {
 
 function discoverySearchCriteriaFromControls() {
   return {
+    search_mode: value("discovery-search-mode") || "title",
+    title_match_mode: value("discovery-title-match-mode") || "related",
     keywords: value("discovery-keywords"),
     location: value("discovery-location"),
     enabled_sources: selectedDiscoverySources(),
@@ -2891,11 +2895,11 @@ function renderDiscoveryCard(job) {
         <div>
           <h3>${escapeHtml(job.title || "Untitled role")}</h3>
           <p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(job.location || "Location unavailable")}</p>
-          <p class="muted">${escapeHtml(job.source || "JobSpy")} · ${escapeHtml(job.work_arrangement || job.remote_type || "Remote unspecified")} · ${escapeHtml(job.salary || "Salary unavailable")} · Posted ${escapeHtml(job.posted_date || "unknown")}</p>
+          <p class="muted">${escapeHtml(job.source || "JobSpy")} · ${escapeHtml(job.work_arrangement || job.remote_type || "Remote unspecified")} · ${escapeHtml(displaySalary(job))} · Posted ${escapeHtml(job.posted_date || "unknown")}</p>
           <p class="muted">Normalized location: ${escapeHtml(job.normalized_location || "Unavailable")} · ${escapeHtml(distanceBadge(job))}</p>
           <div class="badge-row">
             ${badge("Distance", distanceBadge(job))}
-            ${badge("Salary", job.salary || "Unavailable")}
+            ${badge("Salary", displaySalary(job))}
             ${badge("Application Priority", Number(job.application_priority_score || 0))}
             ${badge("Qualification Match", Number(job.qualification_match_score ?? job.qualification_fit_score ?? 0))}
             ${badge("Source", job.source || "JobSpy")}
@@ -2944,11 +2948,15 @@ function badge(label, value) {
   return `<span class="badge"><strong>${escapeHtml(label)}:</strong> ${escapeHtml(rendered)}</span>`;
 }
 
+function displaySalary(job) {
+  return job?.salary_source === "estimated" ? "Unspecified" : (job?.salary || "Salary unavailable");
+}
+
 function distanceBadge(job) {
   if (job.distance_label === "remote") return "Remote";
   if (job.distance_km === undefined || job.distance_km === null) return "Unknown";
   if (Number(job.distance_km) >= 9999) return "Unknown";
-  return job.distance_note ? `${job.distance_note} · ${Number(job.distance_km)} km` : `${Number(job.distance_km)} km`;
+  return job.distance_note ? `${job.distance_note} · ${Number(job.distance_km)} km (straight-line)` : `${Number(job.distance_km)} km (straight-line)`;
 }
 
 function describeDiscoveryState(preferences, visibleCount, totalCount) {
@@ -3411,7 +3419,7 @@ function renderShortlistCard(job) {
       : selection.keywordScore
         ? renderKeywordCoverage({ keywords_score: selection.keywordScore, eligibility_concerns: [] })
         : `<section class="keywords-score-panel"><h3>Keywords Score</h3><p class="muted">Select a candidate profile and base résumé to inspect keyword coverage. This does not generate documents.</p></section>`;
-  const salaryLabel = job.salary_source === "estimated" ? `${job.salary} (estimated)` : job.salary || "Salary unavailable";
+  const salaryLabel = displaySalary(job);
   return `
     <section class="discovery-card shortlist-card">
       <div class="discovery-card-main">
