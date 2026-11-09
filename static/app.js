@@ -2404,7 +2404,15 @@ async function searchDiscovery(event) {
   const status = document.getElementById("discovery-status");
   const criteria = discoverySearchCriteriaFromControls();
   button.disabled = true;
-  status.textContent = `Searching jobs from ${criteria.enabled_sources.map(sourceLabel).join(", ")}...`;
+  const startedAt = Date.now();
+  const sourceText = criteria.enabled_sources.map(sourceLabel).join(", ");
+  status.textContent = `Fetching jobs from ${sourceText}...`;
+  const progressTimer = window.setInterval(() => {
+    const elapsedSeconds = Math.floor((Date.now() - startedAt) / 1000);
+    status.textContent = elapsedSeconds >= 30
+      ? `Still fetching from ${sourceText} (${elapsedSeconds}s); processing starts after provider responses return...`
+      : `Fetching jobs from ${sourceText} (${elapsedSeconds}s)...`;
+  }, 1000);
   try {
     const result = await api.send("/api/discovery/jobspy", "POST", criteria);
     state.discoveryResults = result.jobs || [];
@@ -2426,15 +2434,17 @@ async function searchDiscovery(event) {
       document.getElementById("discovery-results").scrollIntoView({ behavior: "smooth", block: "start" });
     }
     setDiscoveryControlsEnabled(Boolean(state.discoveryResults.length));
+    const partialFailure = Object.keys(result.errors || {}).length > 0;
     status.textContent = result.visible_total
-      ? `Fetched ${result.total || 0} jobs and showing ${result.visible_total}.`
+      ? `${partialFailure ? "Completed with provider errors" : "Search completed"}: fetched ${result.total || 0} jobs and showing ${result.visible_total}.`
       : result.total
-        ? `Fetched ${result.total} jobs; local filters are hiding all of them.`
-        : "No jobs were fetched from the selected sources.";
+        ? `${partialFailure ? "Completed with provider errors" : "Processing completed"}: fetched ${result.total} jobs; local filters are hiding all of them.`
+        : partialFailure ? "Search completed with provider errors; no jobs were returned." : "Search completed; no jobs were fetched from the selected sources.";
   } catch (error) {
     toast(error.message);
     status.textContent = error.message;
   } finally {
+    window.clearInterval(progressTimer);
     button.disabled = false;
   }
 }
@@ -2538,6 +2548,12 @@ function renderDiscoveryResults(result) {
     body = "<p>Distance filter unavailable - save a postal code or location in Profile.</p>" + body;
   }
   const rawSummary = renderDiscoveryDiagnostics(diagnostics, visibleCount, totalCount);
+  const aggregateFetchLimit = Number(
+    diagnostics.search_criteria?.total_cap
+      || state.discoverySearchCriteria?.total_cap
+      || value("discovery-total-cap")
+      || 200
+  );
   const fetchedCount = Number(diagnostics.raw_jobs_returned ?? totalCount ?? 0);
   const duplicateCount = Number(diagnostics.duplicates_in_search ?? diagnostics.duplicates_removed ?? result.duplicates ?? 0);
   const savedCount = Number(diagnostics.already_saved_matches ?? result.already_saved_matches ?? 0);
@@ -2545,7 +2561,7 @@ function renderDiscoveryResults(result) {
   const cappedCount = Number(diagnostics.capped_count ?? 0);
   container.innerHTML = `
     <div class="discovery-summary">
-      <p>Results are limited by your aggregate fetch limit of <strong>${escapeHtml(String(diagnostics.search_criteria?.total_cap || totalCount))}</strong>.</p>
+      <p>Results are limited by your aggregate fetch limit of <strong>${escapeHtml(String(aggregateFetchLimit))}</strong>.</p>
       <div class="discovery-counts" aria-label="Discovery result counts">
         <div><strong>${fetchedCount}</strong><span>Fetched</span></div>
         <div><strong>${duplicateCount}</strong><span>Duplicate in search</span></div>

@@ -4,6 +4,8 @@ import io
 import re
 import tempfile
 import time
+import sqlite3
+import threading
 import unittest
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -1451,6 +1453,35 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("Keywords are required", response.get_json()["error"])
 
+    def test_database_bootstrap_runs_once_for_repeated_requests(self):
+        with patch.object(app_module, "init_db", wraps=app_module.init_db) as initialize:
+            self.assertEqual(self.client.get("/api/profile").status_code, 200)
+            self.assertEqual(self.client.get("/api/profile").status_code, 200)
+        self.assertEqual(initialize.call_count, 1)
+
+    def test_refresh_during_active_sqlite_write_waits_without_initialization_lock_error(self):
+        with self.client.application.app_context():
+            app_module.init_db()
+        app_module._INITIALIZED_DATABASE_PATH = None
+        holder = sqlite3.connect(app_module.DB_PATH, timeout=app_module.SQLITE_BUSY_TIMEOUT_MS / 1000)
+        holder.execute(f"PRAGMA busy_timeout = {app_module.SQLITE_BUSY_TIMEOUT_MS}")
+        holder.execute("BEGIN IMMEDIATE")
+        holder.execute("UPDATE app_settings SET value = value WHERE key = 'missing-key'")
+        result: list[object] = []
+
+        def refresh() -> None:
+            result.append(self.client.get("/api/profile"))
+
+        thread = threading.Thread(target=refresh)
+        thread.start()
+        time.sleep(0.05)
+        holder.commit()
+        holder.close()
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].status_code, 200)
+
     def test_discovery_location_resolution_normalizes_city_and_postal_inputs(self):
         provider = FakeGeocodingProvider(
             {
@@ -1985,6 +2016,23 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("parser error", result["source_diagnostics"]["indeed"]["error"])
         self.assertFalse(result["source_diagnostics"]["google"]["attempted"])
         self.assertEqual(result["source_diagnostics"]["google"]["skipped_reason"], "disabled")
+
+    def test_jobspy_provider_timeout_is_reported_as_partial_failure(self):
+        def stalled_provider(**_kwargs):
+            time.sleep(0.2)
+            return []
+
+        result = jobspy_source.fetch_jobspy_jobs(
+            keywords="software developer",
+            location="Toronto, ON",
+            enabled_sources=["linkedin"],
+            provider_timeout_seconds=0.05,
+            scrape_jobs_func=stalled_provider,
+        )
+        self.assertEqual(result["jobs"], [])
+        self.assertIn("linkedin", result["errors"])
+        self.assertIn("timed out", result["errors"]["linkedin"])
+        self.assertEqual(result["source_diagnostics"]["linkedin"]["error_type"], "TimeoutError")
 
     def test_jobspy_requests_linkedin_descriptions_and_unknown_arrangement_is_explicit(self):
         captured = []
