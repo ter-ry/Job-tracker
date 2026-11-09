@@ -4,6 +4,7 @@ import warnings
 import re
 from importlib import metadata
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
 from typing import Any
 
@@ -76,6 +77,7 @@ def fetch_jobspy_jobs(
     enabled_sources: list[str] | None = None,
     country_indeed: str = "Canada",
     scrape_jobs_func: Any | None = None,
+    provider_timeout_seconds: int | None = 45,
 ) -> dict[str, Any]:
     scrape_jobs = scrape_jobs_func or _load_scrape_jobs()
     sources = [source for source in (enabled_sources or ["linkedin", "indeed"]) if source in JOBSPY_SOURCE_NAMES]
@@ -161,23 +163,37 @@ def fetch_jobspy_jobs(
         try:
             with warnings.catch_warnings(record=True) as caught_warnings:
                 warnings.simplefilter("always")
-                frame = scrape_jobs(
-                    site_name=JOBSPY_SOURCE_NAMES[source],
-                    search_term=keywords,
-                    google_search_term=f"{keywords} jobs near {location}",
-                    location=location,
-                    distance=distance,
-                    is_remote=(remote_preference or "").lower() == "remote",
-                    job_type=job_type or None,
-                    results_wanted=results_wanted,
-                    country_indeed=country_indeed,
-                    hours_old=hours_old,
+                scrape_kwargs = {
+                    "site_name": JOBSPY_SOURCE_NAMES[source],
+                    "search_term": keywords,
+                    "google_search_term": f"{keywords} jobs near {location}",
+                    "location": location,
+                    "distance": distance,
+                    "is_remote": (remote_preference or "").lower() == "remote",
+                    "job_type": job_type or None,
+                    "results_wanted": results_wanted,
+                    "country_indeed": country_indeed,
+                    "hours_old": hours_old,
                     # Request the provider description when JobSpy supports it.
                     # Without this, LinkedIn rows often arrive as title/URL-only
                     # records and cannot be qualified transparently.
-                    linkedin_fetch_description=True,
-                    verbose=0,
-                )
+                    "linkedin_fetch_description": True,
+                    "verbose": 0,
+                }
+                # JobSpy has no portable provider timeout parameter.  Run each
+                # provider call behind a bounded future so one stalled source
+                # becomes a partial failure instead of holding the HTTP request
+                # forever.  The underlying provider cannot be force-killed, so
+                # cancellation is best-effort and diagnostics retain the timeout.
+                executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"jobspy-{source}")
+                future = executor.submit(scrape_jobs, **scrape_kwargs)
+                try:
+                    frame = future.result(timeout=provider_timeout_seconds)
+                except FutureTimeoutError as exc:
+                    future.cancel()
+                    raise TimeoutError(f"{source} provider timed out after {provider_timeout_seconds}s") from exc
+                finally:
+                    executor.shutdown(wait=False, cancel_futures=True)
             raw_type = type(frame).__name__ if frame is not None else "NoneType"
             raw_rows = frame_to_records(frame)
             normalized_rows: list[dict[str, Any]] = []
