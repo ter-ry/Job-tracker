@@ -1,0 +1,27 @@
+{
+  "schema_version": "1.0",
+  "label_policy": "Only explicitly required technical capabilities from the authoritative evidence are labeled required_skills. Preferred, example, degree, internship, experience, authorization, and ownership statements are excluded from this skill denominator.",
+  "preferred_skills_recorded": false,
+  "records": [
+    {"id":"holdout-01","required_skills":["python","react","postgresql","aws","full-stack development"],"preferred_skills":[]},
+    {"id":"holdout-02","required_skills":["git","nodejs","nestjs","typescript","react","postgresql"],"preferred_skills":[]},
+    {"id":"holdout-03","required_skills":["c/c++","systems","networking"],"preferred_skills":[]},
+    {"id":"holdout-04","required_skills":["programming","scripting","automation","observability"],"preferred_skills":[]},
+    {"id":"holdout-05","required_skills":["full-stack software development","web frameworks"],"preferred_skills":[]},
+    {"id":"holdout-06","required_skills":["python","typescript","javascript","java","go"],"preferred_skills":[]},
+    {"id":"holdout-07","required_skills":["react","typescript","django","python","graphql"],"preferred_skills":[]},
+    {"id":"holdout-08","required_skills":["technical troubleshooting","web applications","networking","apis","integrations"],"preferred_skills":[]},
+    {"id":"holdout-09","required_skills":["cloud applications","web apis","databases"],"preferred_skills":[]},
+    {"id":"holdout-10","required_skills":["c++","python","systems programming","linux"],"preferred_skills":[]},
+    {"id":"holdout-11","required_skills":["full-stack engineering","llm apis","streaming protocols"],"preferred_skills":[]},
+    {"id":"holdout-12","required_skills":["systems design","apis","architecture","product engineering"],"preferred_skills":[]},
+    {"id":"holdout-13","required_skills":["golang","rest","grpc","graphql","websocket apis","docker","kubernetes","cloud"],"preferred_skills":[]},
+    {"id":"holdout-14","required_skills":["backend development","apis","databases","system architecture"],"preferred_skills":[]},
+    {"id":"holdout-15","required_skills":["backend platforms","rbac","integrations","programming fundamentals"],"preferred_skills":[]},
+    {"id":"holdout-16","required_skills":["python","django","typescript","react","software architecture"],"preferred_skills":[]},
+    {"id":"holdout-17","required_skills":["typescript","javascript","frameworks","web application development"],"preferred_skills":[]},
+    {"id":"holdout-18","required_skills":["cloud infrastructure","kubernetes","postgres","systems"],"preferred_skills":[]},
+    {"id":"holdout-19","required_skills":["c++","c#","multithreaded server-client applications"],"preferred_skills":[]},
+    {"id":"holdout-20","required_skills":["java","python","data processing"],"preferred_skills":[]}
+  ]
+}

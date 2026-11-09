@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import copy
 from collections import Counter
 import difflib
 import hashlib
@@ -54,8 +55,8 @@ from grounding import (
     validate_cover_letter_output,
     validate_generated_content,
 )
-from semantic_matching import MODEL_DOWNLOAD_SIZE, MODEL_NAME, analyze_resume_match
-from seniority import DETECTED_LEVELS, SENIORITY_LEVELS, analyze_job_seniority, score_seniority_fit
+from semantic_matching import MODEL_DOWNLOAD_SIZE, MODEL_NAME, analyze_resume_match, extract_resume_evidence
+from seniority import DETECTED_LEVELS, SENIORITY_LEVELS, analyze_job_seniority, explicit_professional_years, score_seniority_fit
 from ollama_client import OllamaConfig, build_ollama_health_report, ollama_profile_defaults, request_json_completion
 from sources.jobspy_source import fetch_jobspy_jobs
 from tailoring import generate_tailored_resume_draft
@@ -91,6 +92,17 @@ TAILORING_AI_JOBS: dict[str, dict[str, Any]] = {}
 TAILORING_AI_JOBS_LOCK = threading.Lock()
 TAILORING_AI_INFERENCE_SLOT = threading.BoundedSemaphore(1)
 TAILORING_AI_JOB_RETENTION_SECONDS = 600
+
+# Discovery list endpoints are read far more often than individual job details.
+# Keep derived résumé matching in a bounded process-local cache.  The key includes
+# all job/profile inputs that affect the result, so edits or profile changes cannot
+# reuse stale qualification evidence after a restart or within a running process.
+QUALIFICATION_CACHE_VERSION = "discovery-qualification-v2"
+QUALIFICATION_CACHE_LIMIT = 512
+_QUALIFICATION_CACHE: dict[str, dict[str, Any]] = {}
+_RESUME_EVIDENCE_CACHE: dict[str, list[dict[str, Any]]] = {}
+_QUALIFICATION_TERMS_CACHE: dict[str, list[dict[str, Any]]] = {}
+_EVIDENCE_MATCH_CACHE: dict[str, tuple[str, str, int]] = {}
 
 DISCOVERY_SCORE_WEIGHTS = {
     "skill_match": 35,
@@ -392,6 +404,15 @@ JOB_COLUMNS = {
     "remote_eligibility": "TEXT NOT NULL DEFAULT 'unknown'",
     "remote_eligibility_explanation": "TEXT NOT NULL DEFAULT ''",
     "discovery_salary_filter_status": "TEXT NOT NULL DEFAULT ''",
+    "qualification_match_score": "INTEGER NOT NULL DEFAULT 0",
+    "application_priority_score": "INTEGER NOT NULL DEFAULT 0",
+    "posting_availability": "TEXT NOT NULL DEFAULT 'unverified'",
+    "description_source": "TEXT NOT NULL DEFAULT ''",
+    "description_fetched_at": "TEXT NOT NULL DEFAULT ''",
+    "last_verified_at": "TEXT NOT NULL DEFAULT ''",
+    "discovery_remote_preference": "TEXT NOT NULL DEFAULT ''",
+    "discovery_location_scope": "TEXT NOT NULL DEFAULT ''",
+    "remote_search_eligible": "TEXT NOT NULL DEFAULT ''",
 }
 
 PROFILE_COLUMNS = {
@@ -1320,7 +1341,18 @@ def create_app() -> Flask:
     @app.get("/api/jobs")
     def list_jobs() -> Response:
         rows = query_db("SELECT * FROM jobs ORDER BY date_added DESC, id DESC")
-        return jsonify([job_to_dict(row) for row in rows])
+        evidence_profile = None
+        if request.args.get("candidate_profile_id"):
+            try:
+                selected = resolve_tailoring_resume_profile({"candidate_profile_id": request.args.get("candidate_profile_id"), "resume_id": request.args.get("resume_id")})
+                evidence_profile = selected["profile"]
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
+        statuses = _preparation_statuses([int(row["id"]) for row in rows])
+        return jsonify([
+            job_to_dict(row, evidence_profile, include_legacy_details=False, preparation_status=statuses.get(int(row["id"])))
+            for row in rows
+        ])
 
     @app.post("/api/jobs")
     def create_job() -> Response:
@@ -1516,7 +1548,11 @@ def create_app() -> Flask:
         if existing is None:
             return jsonify({"error": "Job not found"}), 404
         get_db().execute(
-            "UPDATE jobs SET status = 'Applied', date_applied = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            """UPDATE jobs
+               SET status = 'Applied', date_applied = ?,
+                   discovery_state = CASE WHEN discovery_first_seen_at <> '' THEN 'applied' ELSE discovery_state END,
+                   updated_at = CURRENT_TIMESTAMP
+               WHERE id = ?""",
             [date.today().isoformat(), job_id],
         )
         get_db().commit()
@@ -1696,11 +1732,40 @@ def create_app() -> Flask:
 
     @app.get("/api/discovery/inbox")
     def discovery_inbox() -> Response:
+        include_history = as_bool(request.args.get("include_history"))
+        query = "SELECT * FROM jobs WHERE discovery_first_seen_at <> ''"
+        if not include_history:
+            query += " AND discovery_state NOT IN ('ignored', 'saved', 'applied') AND status NOT IN ('Applied', 'shortlisted')"
+        query += " ORDER BY discovery_state = 'new' DESC, discovery_last_seen_at DESC, id DESC LIMIT 500"
         rows = query_db(
-            """SELECT * FROM jobs WHERE discovery_first_seen_at <> '' AND discovery_state <> 'ignored'
-               ORDER BY discovery_state = 'new' DESC, discovery_last_seen_at DESC, id DESC LIMIT 500"""
+            query
         )
-        return jsonify([job_to_dict(row) for row in rows])
+        evidence_profile = None
+        if request.args.get("candidate_profile_id"):
+            try:
+                selected = resolve_tailoring_resume_profile({"candidate_profile_id": request.args.get("candidate_profile_id"), "resume_id": request.args.get("resume_id")})
+                evidence_profile = selected["profile"]
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
+        statuses = _preparation_statuses([int(row["id"]) for row in rows])
+        jobs = []
+        for row in rows:
+            item = job_to_dict(row, evidence_profile, include_legacy_details=False, preparation_status=statuses.get(int(row["id"])))
+            if text(item.get("status")) == "Applied":
+                category = "applied"
+            elif text(item.get("discovery_state")) == "ignored":
+                category = "skipped"
+            elif text(item.get("discovery_state")) == "saved":
+                category = "saved"
+            elif text(item.get("discovery_result_category")) == "excluded":
+                category = "excluded"
+            elif text(item.get("discovery_result_category")) == "review_required":
+                category = "review_required"
+            else:
+                category = "new_actionable"
+            item["discovery_inbox_category"] = category
+            jobs.append(item)
+        return jsonify(jobs)
 
     @app.post("/api/discovery/inbox/<int:job_id>/review")
     def review_discovery_job(job_id: int) -> Response:
@@ -1719,6 +1784,34 @@ def create_app() -> Flask:
         get_db().execute("UPDATE jobs SET discovery_state = 'ignored', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
         get_db().commit()
         return jsonify({"ok": True})
+
+    @app.post("/api/discovery/inbox/<int:job_id>/save")
+    def save_discovery_job(job_id: int) -> Response:
+        row = query_db("SELECT * FROM jobs WHERE id = ? AND discovery_first_seen_at <> ''", [job_id], one=True)
+        if row is None:
+            return jsonify({"error": "Discovered job not found"}), 404
+        get_db().execute(
+            "UPDATE jobs SET status = 'Saved', discovery_state = 'saved', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            [job_id],
+        )
+        get_db().commit()
+        return jsonify(job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)))
+
+    @app.post("/api/discovery/inbox/<int:job_id>/applied")
+    def apply_discovery_job(job_id: int) -> Response:
+        row = query_db("SELECT * FROM jobs WHERE id = ? AND discovery_first_seen_at <> ''", [job_id], one=True)
+        if row is None:
+            return jsonify({"error": "Discovered job not found"}), 404
+        payload = request.get_json(silent=True) or {}
+        applied_date = text(payload.get("date_applied")) or date.today().isoformat()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", applied_date):
+            return jsonify({"error": "date_applied must use YYYY-MM-DD"}), 400
+        get_db().execute(
+            "UPDATE jobs SET status = 'Applied', date_applied = ?, discovery_state = 'applied', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            [applied_date, job_id],
+        )
+        get_db().commit()
+        return jsonify(job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)))
 
     @app.get("/api/preparation/queue")
     def preparation_queue() -> Response:
@@ -1965,6 +2058,7 @@ def create_app() -> Flask:
         stored_preferences = load_discovery_preferences(search_key)
         preferences = stored_preferences or discovery_preferences_payload({})
         profile = load_profile()
+        evidence_profile = resolve_discovery_evidence_profile(payload)
         provider = get_geocoding_provider()
         origin = profile_home_location(profile)
         try:
@@ -1978,17 +2072,8 @@ def create_app() -> Flask:
         search["location_resolution_method"] = location_context["resolution_method"]
         search["location_geocode"] = location_context["lookup"]
 
-        fetched = fetch_jobspy_jobs(
-            keywords=keywords,
-            location=search["discovery_location"],
-            distance=search["distance"],
-            remote_preference=search["remote_preference"],
-            job_type=None,
-            results_wanted=search["request_per_source_cap"],
-            hours_old=search["hours_old"],
-            enabled_sources=search["enabled_sources"],
-            country_indeed=text(payload.get("country_indeed")) or "Canada",
-        )
+        search["keywords"] = keywords
+        fetched = fetch_discovery_jobs_for_search(search, country_indeed=text(payload.get("country_indeed")) or "Canada")
 
         raw_jobs = fetched.get("jobs", [])
         existing_keys = existing_job_dedupe_keys()
@@ -2013,10 +2098,20 @@ def create_app() -> Flask:
                 geocoding_errors.append(text(geocode_result.get("error")))
             if clean.get("distance_label") == "unknown":
                 geocoding_unknown += 1
-            clean = enrich_discovery_job(clean, profile, {"weights": preferences.get("weights", {}), "remote_rule": preferences.get("sort", {}).get("remote_rule")})
+            clean["remote_eligibility"], clean["remote_eligibility_explanation"] = discovery_remote_eligibility(clean)
+            clean = enrich_discovery_job(clean, profile, {"weights": preferences.get("weights", {}), "remote_rule": preferences.get("sort", {}).get("remote_rule")}, evidence_profile=evidence_profile)
+            clean = apply_discovery_search_constraints(clean, search["remote_preference"], search["discovery_location"])
+            clean["discovery_remote_preference"] = search["remote_preference"]
+            clean["discovery_location_scope"] = search["discovery_location"]
+            clean["remote_search_eligible"] = "true" if clean.get("remote_search_eligible") is True else "false" if clean.get("remote_search_eligible") is False else "unknown"
+            clean["discovery_result_category"], clean["discovery_result_reason"] = discovery_result_category(clean, search["remote_preference"])
+            clean["recommendation_eligible"] = clean["discovery_result_category"] == "actionable"
             clean["source_job_id"] = text(raw_job.get("source_job_id"))
             clean["posted_date"] = text(raw_job.get("posted_date"))
             clean["description_available"] = bool(clean.get("job_description"))
+            clean["description_source"] = "jobspy" if clean.get("job_description") else "missing"
+            clean["description_fetched_at"] = datetime.now().isoformat(timespec="seconds") if clean.get("job_description") else ""
+            clean["posting_availability"] = text(clean.get("posting_availability")) or "unverified"
             clean["score_breakdown"] = parse_json_object(clean.get("score_breakdown"))
             clean["warnings"] = discovery_warning_reasons(clean, keywords, search["location"])
             clean["already_saved"] = False
@@ -2044,6 +2139,10 @@ def create_app() -> Flask:
                 if source in source_counts:
                     source_counts[source] += 1
 
+        category_counts = {"actionable": 0, "review_required": 0, "excluded": 0}
+        for item in jobs:
+            category = item.get("discovery_result_category") or "review_required"
+            category_counts[category] = category_counts.get(category, 0) + 1
         capped_count = max(0, len(jobs) - search["total_cap"])
         diagnostics = {
             "bypass_cache": bypass_cache,
@@ -2067,6 +2166,7 @@ def create_app() -> Flask:
             "source_counts": source_counts,
             "source_errors": fetched.get("errors", {}),
             "source_diagnostics": fetched.get("source_diagnostics", {}),
+            "countrywide_region_queries": fetched.get("countrywide_region_queries", []),
             "duplicates_removed": duplicates_in_search,
             "duplicates_in_search": duplicates_in_search,
             "already_saved_matches": already_saved_matches,
@@ -2080,11 +2180,12 @@ def create_app() -> Flask:
             "discovery_location": search["discovery_location"],
             "distance_origin": search["distance_origin"],
             "location_resolution_method": search["location_resolution_method"],
+            "remote_result_groups": category_counts,
         }
         if jobs:
             jobs = sort_discovery_jobs(
                 jobs,
-                preferences.get("sort", {}).get("field") or "overall_score",
+                preferences.get("sort", {}).get("field") or "application_priority_score",
                 preferences.get("sort", {}).get("direction") or "desc",
                 preferences.get("sort", {}).get("secondary_field") or "",
                 preferences.get("sort", {}).get("secondary_direction") or "asc",
@@ -2092,6 +2193,23 @@ def create_app() -> Flask:
                 preferences.get("sort", {}).get("unknown_salary_position") or "last",
             )
         jobs = jobs[: search["total_cap"]]
+        manual_run_id = create_discovery_run(None, "manual")
+        persisted = persist_discovery_jobs(jobs, None, manual_run_id)
+        for item in jobs:
+            hydrate_discovery_identity(item)
+        processed_count = sum(1 for item in jobs if item.get("processed_discovery"))
+        jobs = [item for item in jobs if not item.get("processed_discovery")]
+        finish_discovery_run(
+            manual_run_id,
+            status="completed" if not fetched.get("errors") else "completed_with_errors",
+            fetched=len(raw_jobs),
+            new_count=int(persisted.get("new") or 0),
+            duplicate_count=int(persisted.get("duplicate") or 0),
+            errors=len(fetched.get("errors") or {}),
+            outcomes={"source_counts": source_counts, "processed_count": processed_count},
+        )
+        diagnostics["processed_count"] = processed_count
+        diagnostics["persisted"] = persisted
         diagnostics["jobs_returned_to_frontend"] = len(jobs)
         diagnostics["post_processing_row_count"] = len(jobs)
         save_discovery_search_run(search_key, search, diagnostics, raw_jobs)
@@ -2305,7 +2423,12 @@ def create_app() -> Flask:
 
     @app.get("/api/dashboard")
     def dashboard() -> Response:
-        jobs = [job_to_dict(row) for row in query_db("SELECT * FROM jobs")]
+        rows = query_db("SELECT * FROM jobs")
+        statuses = _preparation_statuses([int(row["id"]) for row in rows])
+        jobs = [
+            job_to_dict(row, include_qualification=False, include_legacy_details=False, preparation_status=statuses.get(int(row["id"])))
+            for row in rows
+        ]
         return jsonify(build_dashboard(jobs))
 
     @app.get("/export.csv")
@@ -2470,11 +2593,25 @@ def saved_search_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:
 def saved_search_to_discovery_payload(search: dict[str, Any]) -> dict[str, Any]:
     return {
         **search,
+        "candidate_profile_id": search.get("auto_prepare_candidate_profile_id") or "",
         "enabled_sources": search.get("enabled_sources") or ["linkedin", "indeed"],
         "search_depth": search.get("search_depth") or "standard",
         "total_cap": int(search.get("total_cap") or 200),
         "per_source_cap": int(search.get("per_source_cap") or 100),
     }
+
+
+def resolve_discovery_evidence_profile(payload: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the résumé used for discovery scoring, without mixing profiles."""
+    profile_id = payload.get("candidate_profile_id") or payload.get("auto_prepare_candidate_profile_id")
+    if profile_id not in (None, "", 0):
+        selected = resolve_tailoring_resume_profile({"candidate_profile_id": profile_id, "resume_id": payload.get("resume_id") or payload.get("auto_prepare_resume_id")})
+        profile = selected["profile"]
+        profile["_candidate_profile_name"] = text(selected["profile_row"].get("name")) or "Selected candidate profile"
+        return profile
+    profile = load_profile()
+    profile["_candidate_profile_name"] = "Active Profile"
+    return profile
 
 
 def discovery_remote_eligibility(job: dict[str, Any]) -> tuple[str, str]:
@@ -2506,6 +2643,17 @@ def discovery_remote_eligibility(job: dict[str, Any]) -> tuple[str, str]:
     if "remote" in arrangement:
         return "unknown", "Remote arrangement is known, but country eligibility is not stated."
     return "unknown", "Canadian eligibility is not confirmed by the posting."
+
+
+def discovery_ontario_eligibility(job: dict[str, Any]) -> tuple[str, str]:
+    """Keep Ontario-specific evidence separate from country-level eligibility."""
+    location = normalize_space(text(job.get("location"))).lower()
+    description = normalize_space(text(job.get("job_description"))).lower()
+    if re.search(r"(?:except|excluding|outside|not available in|not eligible in|excluding applicants in)\s+(?:the\s+)?ontario\b", description):
+        return "confirmed_ineligible", "Posting explicitly excludes Ontario."
+    if re.search(r"\bremote\s+(?:in\s+)?(?:the\s+)?ontario\b", description) or re.search(r"(?:work|role|position|candidates?|employees?)\s+(?:in|from|within|across|available to)\s+(?:the\s+)?ontario\b", description) or re.search(r"\b(?:toronto|ottawa|hamilton|waterloo|gta),?\s+on(?:tario)?\b", location):
+        return "confirmed_eligible", "Posting names Ontario or an Ontario city."
+    return "unknown", "The posting confirms Canada, but not Ontario-specific eligibility."
 
 
 def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, run_id: int | None) -> dict[str, Any]:
@@ -2541,6 +2689,24 @@ def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, ru
         counts["new_job_ids"].append(int(db.execute("SELECT last_insert_rowid()").fetchone()[0]))
     db.commit()
     return counts
+
+
+def hydrate_discovery_identity(job: dict[str, Any]) -> dict[str, Any]:
+    """Attach the durable job identity and hide states to a live result."""
+    existing = find_existing_job_match(job)
+    if existing is None:
+        return job
+    job["id"] = int(existing["id"])
+    job["saved_job_id"] = int(existing["id"])
+    job["saved_job_status"] = text(existing["status"])
+    job["discovery_state"] = text(existing["discovery_state"])
+    job["date_applied"] = text(existing["date_applied"])
+    job["already_saved"] = True
+    job["processed_discovery"] = (
+        text(existing["status"]) in {"Applied", "shortlisted"}
+        or text(existing["discovery_state"]) in {"ignored", "saved", "applied"}
+    )
+    return job
 
 
 def create_discovery_run(search_id: int | None, trigger: str) -> int:
@@ -2625,6 +2791,7 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         "auto_prepare_cover_letter_template_id": payload.get("auto_prepare_cover_letter_template_id", 0),
     })
     profile = load_profile()
+    evidence_profile = resolve_discovery_evidence_profile(payload)
     provider = get_geocoding_provider()
     origin = profile_home_location(profile)
     location_context = resolve_discovery_location_context(search["location"], profile, provider, use_cache=True)
@@ -2636,16 +2803,8 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         "location_resolution_method": location_context["resolution_method"],
         "location_geocode": location_context["lookup"],
     })
-    fetched = fetch_jobspy_jobs(
-        keywords=keywords,
-        location=search["discovery_location"],
-        distance=search["distance"],
-        remote_preference=search["remote_preference"],
-        results_wanted=search["request_per_source_cap"],
-        hours_old=search["hours_old"],
-        enabled_sources=search["enabled_sources"],
-        country_indeed="Canada",
-    )
+    search["keywords"] = keywords
+    fetched = fetch_discovery_jobs_for_search(search, country_indeed="Canada")
     existing_keys = existing_job_dedupe_keys()
     seen_keys: set[str] = set()
     jobs: list[dict[str, Any]] = []
@@ -2655,13 +2814,22 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
     for raw_job in fetched.get("jobs", []):
         clean = normalize_job_payload(jobspy_result_to_job_payload(raw_job))
         clean, _ = geocode_discovery_job(clean, profile, origin, provider, use_cache=True)
-        clean = enrich_discovery_job(clean, profile, {"remote_rule": "remote_after_local"})
+        clean["remote_eligibility"], clean["remote_eligibility_explanation"] = discovery_remote_eligibility(clean)
+        clean = enrich_discovery_job(clean, profile, {"remote_rule": "remote_after_local"}, evidence_profile=evidence_profile)
+        clean = apply_discovery_search_constraints(clean, search["remote_preference"], search["discovery_location"])
+        clean["discovery_remote_preference"] = search["remote_preference"]
+        clean["discovery_location_scope"] = search["discovery_location"]
+        clean["remote_search_eligible"] = "true" if clean.get("remote_search_eligible") is True else "false" if clean.get("remote_search_eligible") is False else "unknown"
+        clean["discovery_result_category"], clean["discovery_result_reason"] = discovery_result_category(clean, search["remote_preference"])
+        clean["recommendation_eligible"] = clean["discovery_result_category"] == "actionable"
         clean["source_job_id"] = text(raw_job.get("source_job_id"))
         clean["posted_date"] = text(raw_job.get("posted_date"))
         clean["description_available"] = bool(clean.get("job_description"))
+        clean["description_source"] = "jobspy" if clean.get("job_description") else "missing"
+        clean["description_fetched_at"] = datetime.now().isoformat(timespec="seconds") if clean.get("job_description") else ""
+        clean["posting_availability"] = text(clean.get("posting_availability")) or "unverified"
         clean["score_breakdown"] = parse_json_object(clean.get("score_breakdown"))
         clean["warnings"] = discovery_warning_reasons(clean, keywords, search["location"])
-        clean["remote_eligibility"], clean["remote_eligibility_explanation"] = discovery_remote_eligibility(clean)
         minimum_salary = clamp_int_default(payload.get("minimum_salary"), 0, 0, 1000000)
         salary_source = text(clean.get("salary_source")).lower()
         reliable_salary = salary_source in {"structured", "jobspy_text", "description"} and int(clean.get("salary_listed") or 0) == 1
@@ -2692,7 +2860,7 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         seen_keys.update(keys)
         jobs.append(clean)
     capped_count = max(0, len(jobs) - search["total_cap"])
-    jobs = sort_discovery_jobs(jobs, "overall_score", "desc", "", "asc", "remote_after_local", "last")[: search["total_cap"]]
+    jobs = sort_discovery_jobs(jobs, "application_priority_score", "desc", "", "asc", "remote_after_local", "last")[: search["total_cap"]]
     persisted = persist_discovery_jobs(jobs, search_id, run_id)
     auto_preparation_queued = enqueue_auto_preparation(search, persisted.get("new_job_ids", [])) if search_id else 0
     search_key = discovery_search_signature(payload)
@@ -2701,6 +2869,7 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         "source_counts": fetched.get("source_counts", {}),
         "source_errors": fetched.get("errors", {}),
         "source_diagnostics": fetched.get("source_diagnostics", {}),
+        "countrywide_region_queries": fetched.get("countrywide_region_queries", []),
         "duplicates_removed": duplicates_in_search,
         "duplicates_in_search": duplicates_in_search,
         "already_saved_matches": already_saved_matches,
@@ -2781,13 +2950,15 @@ def normalize_bool_text(value: Any, default: bool) -> str:
 def jobspy_result_to_job_payload(job: dict[str, Any]) -> dict[str, Any]:
     source = text(job.get("source"))
     description = text(job.get("description"))
+    title = text(job.get("title"))
     role_type = text(job.get("job_type"))
+    mapped_role_type = map_jobspy_role_type(role_type) or guess_role_type_for_job(title, description)
     salary_text = text(job.get("salary_text") or job.get("salary"))
     salary = determine_salary(
         {
-            "title": text(job.get("title")),
+            "title": title,
             "location": text(job.get("location")),
-            "role_type": map_jobspy_role_type(role_type),
+            "role_type": mapped_role_type,
             "seniority_level": text(job.get("experience_requirement")),
             "job_type": role_type,
             "salary_min": job.get("salary_min"),
@@ -2801,7 +2972,7 @@ def jobspy_result_to_job_payload(job: dict[str, Any]) -> dict[str, Any]:
     salary_listed = salary["salary_source"] not in {"estimated", "missing"}
     return {
         "company": text(job.get("company")) or "Unknown company",
-        "title": text(job.get("title")) or "Untitled role",
+        "title": title or "Untitled role",
         "location": text(job.get("location")),
         "url": text(job.get("job_url")),
         "application_url": text(job.get("application_url")) or text(job.get("job_url")),
@@ -2817,7 +2988,7 @@ def jobspy_result_to_job_payload(job: dict[str, Any]) -> dict[str, Any]:
         "salary_confidence": salary["salary_confidence"],
         "salary_listed": int(salary_listed),
         "remote_type": text(job.get("remote_type")),
-        "role_type": map_jobspy_role_type(role_type),
+        "role_type": mapped_role_type,
         "seniority_level": text(job.get("experience_requirement")),
         "required_skills": text(job.get("required_skills")),
         "preferred_skills": text(job.get("preferred_skills")),
@@ -2826,6 +2997,7 @@ def jobspy_result_to_job_payload(job: dict[str, Any]) -> dict[str, Any]:
         "status": "Saved",
         "source_job_id": text(job.get("source_job_id")),
         "posted_date": text(job.get("posted_date")),
+        "posting_availability": text(job.get("posting_availability")) or "unverified",
     }
 
 
@@ -2837,7 +3009,7 @@ def map_jobspy_role_type(value: str) -> str:
         return "other"
     if "part" in lowered:
         return "other"
-    if "full" in lowered:
+    if re.search(r"\bfull[- ]?stack\b", lowered) or "software developer" in lowered or "software engineer" in lowered:
         return "software developer"
     return ""
 
@@ -3421,7 +3593,10 @@ def validate_tailoring_draft_layout(draft_id: int, expected_version: str | None 
     layout["draft_version"] = version
     layout.setdefault("timings_ms", {})["word_layout_validation"] = round((time.perf_counter() - started) * 1000, 2)
     db = get_db()
-    db.execute("UPDATE tailoring_drafts SET layout_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND draft_path = ?", [dumps_json(layout), draft_id, str(draft)])
+    # Keep the race guard, but compare against the path representation stored
+    # in SQLite. safe_local_path() may normalize an equivalent path before it
+    # reaches this function, which otherwise makes the cache write a no-op.
+    db.execute("UPDATE tailoring_drafts SET layout_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND draft_path = ?", [dumps_json(layout), draft_id, text(row["draft_path"])])
     db.commit()
     return layout
 
@@ -5931,7 +6106,7 @@ def dedupe_keys(job: dict[str, Any], source_job_id: Any = "") -> set[str]:
         [
             normalize_dedupe_text(job.get("company")),
             normalize_dedupe_text(job.get("title")),
-            normalize_dedupe_text(job.get("location")),
+            normalize_dedupe_location(job.get("location")),
         ]
     )
     if composite.replace("|", ""):
@@ -5955,6 +6130,18 @@ def canonical_url(value: str) -> str:
 
 def normalize_dedupe_text(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", " ", text(value).lower()).strip()
+
+
+def normalize_dedupe_location(value: Any) -> str:
+    normalized = normalize_dedupe_text(value)
+    replacements = {
+        "ontario": "on", "quebec": "qc", "alberta": "ab", "british columbia": "bc",
+        "manitoba": "mb", "saskatchewan": "sk", "nova scotia": "ns", "new brunswick": "nb",
+        "newfoundland and labrador": "nl", "prince edward island": "pe",
+    }
+    for name, code in replacements.items():
+        normalized = normalized.replace(name, code)
+    return normalized
 
 
 def determine_salary(job: dict[str, Any]) -> dict[str, Any]:
@@ -6238,6 +6425,8 @@ def discovery_search_signature(payload: dict[str, Any]) -> str:
         "date_window": search["date_window"],
         "per_source_cap": search["per_source_cap"],
         "total_cap": search["total_cap"],
+        "candidate_profile_id": text(payload.get("candidate_profile_id") or payload.get("auto_prepare_candidate_profile_id")),
+        "resume_id": text(payload.get("resume_id") or payload.get("auto_prepare_resume_id")),
     }
     return grounding_hash(dumps_json(relevant, sort_keys=True))
 
@@ -6547,8 +6736,21 @@ def build_location_lookup_candidates(raw_value: str, profile: dict[str, str] | N
 
 
 def geocoding_cache_key(lookup_type: str, query_text: str, normalized_query: str) -> str:
-    payload = {"lookup_type": lookup_type, "query_text": normalize_space(query_text).lower(), "normalized_query": normalize_space(normalized_query).lower()}
+    payload = {"lookup_type": lookup_type, "query_text": canonical_location_cache_value(query_text), "normalized_query": canonical_location_cache_value(normalized_query)}
     return grounding_hash(dumps_json(payload, sort_keys=True))
+
+
+def canonical_location_cache_value(value: str) -> str:
+    raw = normalize_space(value)
+    postal = extract_canadian_postal_code(raw)
+    if postal:
+        return postal.replace(" ", "").lower()
+    parts = [part.strip() for part in raw.split(",") if part.strip()]
+    city = normalize_space(parts[0]) if parts else raw
+    province_code = province_code_from_text(raw)
+    if city and province_code:
+        return f"{city.lower()}|{province_code.lower()}"
+    return raw.lower()
 
 
 def load_geocoding_cache(cache_key: str) -> dict[str, Any] | None:
@@ -6707,12 +6909,15 @@ def geocode_location_value(
                     "cached": True,
                 }
             )
-            if cached_result.get("ok"):
+            if cached_result.get("ok") and geocoding_result_matches_query(raw, candidate["normalized_query"], cached_result):
                 return cached_result
+            if cached_result.get("ok"):
+                cached_result = {**cached_result, "ok": False, "status": "invalid_cached_result", "error": "Cached geocoding coordinates did not match the requested location."}
             errors.append(text(cached_result.get("error")) or "Cached geocoding failure.")
             if cached_result.get("status") == "rate_limited":
                 break
-            continue
+            if not cached.get("success"):
+                continue
         try:
             lookup = provider.geocode(candidate["query"], country="Canada")
             latitude = lookup.get("latitude")
@@ -6735,6 +6940,8 @@ def geocode_location_value(
                 "display_name": text(lookup.get("display_name")),
                 "cached": False,
             }
+            if not geocoding_result_matches_query(raw, candidate["normalized_query"], result):
+                raise ValueError("Geocoding result did not match the requested Canadian location.")
             if use_cache:
                 save_geocoding_cache(cache_key, lookup_type, candidate["query"], candidate["normalized_query"], provider.name, result, True)
             return result
@@ -6790,6 +6997,36 @@ def geocode_location_value(
     }
 
 
+def geocode_matches_canadian_location(raw_location: str, geocode: dict[str, Any]) -> bool:
+    display = normalize_space(text(geocode.get("display_name") or geocode.get("normalized_query"))).lower()
+    raw = normalize_space(raw_location).lower()
+    expected_code = province_code_from_text(raw)
+    postal = extract_canadian_postal_code(raw)
+    if postal and postal[0] == "M":
+        expected_code = "ON"
+    if expected_code:
+        province_name = next((normalize_space(text(name)).lower() for name, code in PROVINCE_CODE_BY_NAME.items() if code.lower() == expected_code.lower()), "")
+        return province_name in display or re.search(rf"(?:,|\s){re.escape(expected_code.lower())}(?:,|\s|$)", display) is not None
+    if any(token in display for token in ("united states", "usa", "new york", "london, uk", "england")):
+        return False
+    return True
+
+
+def geocoding_result_matches_query(raw_value: str, normalized_query: str, geocode: dict[str, Any]) -> bool:
+    if not geocode_matches_canadian_location(raw_value, geocode):
+        return False
+    raw = normalize_space(raw_value).lower()
+    if extract_canadian_postal_code(raw):
+        return True
+    if province_code_from_text(raw):
+        return True
+    city = normalize_space(raw.split(",", 1)[0]).lower()
+    display = normalize_space(text(geocode.get("display_name") or geocode.get("normalized_query"))).lower()
+    if city in {"", "canada", "canadian", "nationwide", "canada-wide"}:
+        return True
+    return city in display or city in normalize_space(normalized_query).lower()
+
+
 def geocode_discovery_job(
     job: dict[str, Any],
     profile: dict[str, str],
@@ -6800,6 +7037,8 @@ def geocode_discovery_job(
     provider = provider or get_geocoding_provider()
     raw_location = text(job.get("location"))
     geocode = geocode_location_value(raw_location, lookup_type="job", profile=profile, provider=provider, use_cache=use_cache)
+    if geocode.get("ok") and not geocode_matches_canadian_location(raw_location, geocode):
+        geocode = {**geocode, "ok": False, "status": "invalid_location", "latitude": "", "longitude": "", "error": "Geocoding result did not match the posting's Canadian province or country."}
     job["location_original"] = raw_location
     job["normalized_location"] = text(geocode.get("normalized_query")) or raw_location
     job["location_provider"] = text(geocode.get("provider"))
@@ -6826,18 +7065,55 @@ def profile_home_location(profile: dict[str, str]) -> dict[str, Any]:
     lat = profile.get("home_location_latitude")
     lon = profile.get("home_location_longitude")
     status = text(profile.get("home_location_status"))
+    try:
+        latitude = float(lat) if text(lat) else None
+        longitude = float(lon) if text(lon) else None
+    except (TypeError, ValueError):
+        latitude = longitude = None
+    error = text(profile.get("home_location_error"))
+    if latitude is not None and longitude is not None and not home_coordinates_match_location(profile, latitude, longitude):
+        latitude = longitude = None
+        status = "invalid_cached"
+        error = "Cached home coordinates do not match the saved Canadian location; distance remains unknown."
     return {
         "input": text(profile.get("home_location_original") or profile.get("location")),
         "normalized": normalized,
-        "latitude": float(lat) if text(lat) else None,
-        "longitude": float(lon) if text(lon) else None,
+        "latitude": latitude,
+        "longitude": longitude,
         "provider": text(profile.get("home_location_provider")),
         "confidence": clamp_int(profile.get("home_location_confidence"), 0, 100),
         "precision": text(profile.get("home_location_precision")),
         "geocoded_at": text(profile.get("home_location_geocoded_at")),
         "status": status or ("saved" if normalized else "missing"),
-        "error": text(profile.get("home_location_error")),
+        "error": error,
     }
+
+
+CANADIAN_PROVINCE_COORDINATE_BOUNDS = {
+    "ON": (41.6, 56.9, -95.2, -74.3), "AB": (48.9, 60.0, -120.0, -109.0),
+    "BC": (48.2, 60.0, -139.1, -114.0), "QC": (45.0, 62.6, -79.8, -57.0),
+    "MB": (49.0, 60.1, -102.1, -88.9), "SK": (49.0, 60.1, -110.1, -101.9),
+    "NS": (43.3, 47.1, -66.5, -59.5), "NB": (44.5, 48.1, -69.1, -63.7),
+    "NL": (46.5, 60.5, -67.8, -52.5), "PE": (46.0, 47.1, -64.6, -61.9),
+    "YT": (59.0, 69.7, -141.1, -123.8), "NT": (60.0, 78.5, -136.5, -102.0),
+    "NU": (51.0, 83.2, -120.0, -61.0),
+}
+
+
+def home_coordinates_match_location(profile: dict[str, Any], latitude: float, longitude: float) -> bool:
+    raw = " ".join(text(profile.get(field)) for field in ("location", "home_location_original", "home_location_normalized"))
+    postal = extract_canadian_postal_code(raw)
+    province = "ON" if postal and postal[0] == "M" else province_code_from_text(raw)
+    lowered = raw.lower()
+    if not province:
+        province = {"toronto": "ON", "calgary": "AB", "vancouver": "BC"}.get(
+            next((city for city in ("toronto", "calgary", "vancouver") if city in lowered), ""), ""
+        )
+    bounds = CANADIAN_PROVINCE_COORDINATE_BOUNDS.get(province)
+    if not bounds:
+        return True
+    min_lat, max_lat, min_lon, max_lon = bounds
+    return min_lat <= latitude <= max_lat and min_lon <= longitude <= max_lon
 
 
 def discovery_origin_available(profile: dict[str, str]) -> bool:
@@ -6958,6 +7234,28 @@ def resolve_discovery_location_context(
     normalized_postal = normalize_canadian_postal_code(postal) if postal else ""
     distance_origin = normalized_postal or normalized_input
     lookup_input = normalized_postal or normalized_input
+    if is_countrywide_search_location(normalized_input):
+        return {
+            "original_input": original_input,
+            "normalized_input": "Canada",
+            "distance_origin": "Canada",
+            "discovery_location": "Canada",
+            "resolution_method": "countrywide_scope",
+            "lookup": {
+                "ok": False,
+                "status": "countrywide_scope",
+                "original_input": original_input,
+                "normalized_query": "Canada",
+                "latitude": "",
+                "longitude": "",
+                "provider": provider.name,
+                "confidence": 0,
+                "precision": "country",
+                "geocoded_at": "",
+                "error": "Country-wide search does not require a single distance origin.",
+                "cached": False,
+            },
+        }
     lookup_result: dict[str, Any]
     postal_fallback_location = ""
     if postal:
@@ -7021,6 +7319,61 @@ def resolve_discovery_location_context(
         "resolution_method": resolution_method,
         "lookup": lookup_result,
     }
+
+
+CANADA_DISCOVERY_REGIONS = ("Toronto, ON", "Montreal, QC", "Vancouver, BC", "Calgary, AB", "Halifax, NS")
+
+
+def discovery_query_locations(location: str) -> list[str]:
+    if is_countrywide_search_location(location):
+        return list(CANADA_DISCOVERY_REGIONS)
+    return [normalize_space(location)]
+
+
+def is_countrywide_search_location(location: str) -> bool:
+    normalized = normalize_space(location).lower().replace(",", "")
+    return normalized in {"canada", "canadian", "canada wide", "canada-wide", "nationwide", "nation wide"}
+
+
+def fetch_discovery_jobs_for_search(search: dict[str, Any], *, country_indeed: str = "Canada") -> dict[str, Any]:
+    locations = discovery_query_locations(search.get("discovery_location") or search.get("location"))
+    per_region = max(1, (int(search["request_per_source_cap"]) + len(locations) - 1) // len(locations))
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    combined: dict[str, Any] = {"jobs": [], "errors": {}, "source_counts": {}, "source_diagnostics": {}, "source_snapshots": {}}
+    for location in locations:
+        result = fetch_jobspy_jobs(
+            keywords=search["keywords"], location=location, distance=search["distance"],
+            remote_preference=search["remote_preference"], job_type=None,
+            results_wanted=per_region, hours_old=search["hours_old"],
+            enabled_sources=search["enabled_sources"], country_indeed=country_indeed,
+        )
+        for raw in result.get("jobs", []):
+            key = text(raw.get("source_job_id") or raw.get("job_url") or raw.get("job_url_direct"))
+            if not key:
+                key = "|".join(normalize_space(text(raw.get(field))).lower() for field in ("company", "title", "location"))
+            key = key.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(raw)
+        for source, count in result.get("source_counts", {}).items():
+            combined["source_counts"][source] = int(combined["source_counts"].get(source, 0)) + int(count or 0)
+        combined["errors"].update(result.get("errors", {}))
+        combined["source_snapshots"].update(result.get("source_snapshots", {}))
+        for source, diagnostic in result.get("source_diagnostics", {}).items():
+            if source not in combined["source_diagnostics"]:
+                combined["source_diagnostics"][source] = dict(diagnostic)
+                combined["source_diagnostics"][source]["region_queries"] = locations
+                continue
+            current = combined["source_diagnostics"][source]
+            current["result_count"] = int(current.get("result_count") or 0) + int(diagnostic.get("result_count") or 0)
+            current["raw_records_row_count"] = int(current.get("raw_records_row_count") or 0) + int(diagnostic.get("raw_records_row_count") or 0)
+            current["region_queries"] = locations
+            current["success"] = bool(current.get("success") or diagnostic.get("success"))
+    combined["jobs"] = merged
+    combined["countrywide_region_queries"] = locations if len(locations) > 1 else []
+    return combined
 
 
 def discovery_city_coordinates(location: str) -> tuple[float, float] | None:
@@ -7332,9 +7685,10 @@ def discovery_score_breakdown(job: dict[str, Any], profile: dict[str, str], sett
     }
 
 
-def enrich_discovery_job(job: dict[str, Any], profile: dict[str, str], settings: dict[str, Any] | None = None) -> dict[str, Any]:
+def enrich_discovery_job(job: dict[str, Any], profile: dict[str, str], settings: dict[str, Any] | None = None, evidence_profile: dict[str, Any] | None = None) -> dict[str, Any]:
     salary_snapshot = normalize_salary_snapshot(job)
     scoring = discovery_score_breakdown({**job, **salary_snapshot}, profile, settings)
+    qualification = build_qualification_fit({**job, **salary_snapshot}, evidence_profile)
     remote_label = discovery_work_arrangement_label(text(job.get("remote_type")))
     enriched = {
         **job,
@@ -7343,6 +7697,22 @@ def enrich_discovery_job(job: dict[str, Any], profile: dict[str, str], settings:
         "distance_confidence": scoring["distance"]["confidence"],
         "distance_label": scoring["distance"]["distance_label"],
         "overall_score": scoring["overall_score"],
+        "qualification_fit_score": qualification.get("qualification_fit_score", 0),
+        "qualification_match_score": qualification.get("qualification_match_score", 0),
+        "application_priority_score": qualification.get("application_priority_score", 0),
+        "qualification_fit_label": qualification.get("qualification_fit_label", "Qualification unavailable"),
+        "qualification_fit_reasons": qualification.get("qualification_fit_reasons", []),
+        "qualification_fit_missing_requirements": qualification.get("qualification_fit_missing_requirements", []),
+        "qualification_fit_matched_requirements": qualification.get("qualification_fit_matched_requirements", []),
+        "qualification_fit_partial_requirements": qualification.get("qualification_fit_partial_requirements", []),
+        "qualification_requirements": qualification.get("qualification_requirements", []),
+        "experience_requirements": qualification.get("experience_requirements", {}),
+        "qualification_evidence_profile_id": qualification.get("qualification_evidence_profile_id", ""),
+        "qualification_evidence_profile_name": qualification.get("qualification_evidence_profile_name", "Active Profile"),
+        "qualification_evidence_source": qualification.get("qualification_evidence_source", ""),
+        "qualification_components": qualification.get("qualification_components", {}),
+        "qualification_fit_seniority": qualification.get("qualification_fit_seniority", {}),
+        "application_priority_reasons": qualification.get("application_priority_reasons", []),
         "match_score": scoring["skill_match"],
         "score_breakdown": {
             "overall_score": scoring["overall_score"],
@@ -7369,12 +7739,79 @@ def enrich_discovery_job(job: dict[str, Any], profile: dict[str, str], settings:
             "semantic_scores": scoring["semantic_scores"],
         },
         "work_arrangement": remote_label,
+        "canadian_eligibility": {"canadian_eligible": "confirmed_eligible", "restricted": "confirmed_ineligible"}.get(text(job.get("remote_eligibility")).lower(), "unknown"),
+        "posting_availability": text(job.get("posting_availability")) or "unverified",
+        "ontario_eligibility": discovery_ontario_eligibility(job)[0],
+        "ontario_eligibility_explanation": discovery_ontario_eligibility(job)[1],
+        "description_completeness": classify_job_description_completeness(job.get("job_description")),
+        "qualification_evidence_profile_name": qualification.get("qualification_evidence_profile_name", "Active Profile"),
         "posted_date_sort": text(job.get("posted_date")) or "9999-12-31",
         "distance_sort": scoring["distance"]["distance_km"],
     }
     if "salary_listed" not in enriched:
         enriched["salary_listed"] = int(salary_snapshot["salary_listed"])
     return enriched
+
+
+def apply_discovery_search_constraints(job: dict[str, Any], remote_preference: str, search_location: str = "") -> dict[str, Any]:
+    """Apply work-arrangement and requested-location constraints before ranking."""
+    preference = normalize_space(text(remote_preference)).lower()
+    if preference != "remote":
+        if search_location and outside_requested_location(job, search_location):
+            job["location_search_eligible"] = False
+            job["application_priority_score"] = 0
+            job.setdefault("application_priority_reasons", []).append("Excluded because the confirmed job location is outside the requested hybrid/on-site search area.")
+        else:
+            job["location_search_eligible"] = True if search_location else None
+        return job
+    job["location_search_eligible"] = True
+    if province_code_from_text(search_location) == "ON":
+        ontario_status, ontario_reason = discovery_ontario_eligibility(job)
+        job["ontario_eligibility"] = ontario_status
+        job["ontario_eligibility_explanation"] = ontario_reason
+        if ontario_status == "confirmed_ineligible":
+            job["application_priority_score"] = 0
+            job["remote_search_eligible"] = False
+            job.setdefault("application_priority_reasons", []).append("Excluded from the Ontario remote campaign because the posting explicitly excludes Ontario.")
+            return job
+    arrangement = normalize_space(text(job.get("work_arrangement") or job.get("remote_type"))).lower()
+    if arrangement not in {"remote", "unknown"}:
+        job["application_priority_score"] = 0
+        job["remote_search_eligible"] = False
+        job.setdefault("application_priority_reasons", []).append("Excluded from remote-only priority because the posting is confirmed onsite or hybrid.")
+    else:
+        job["remote_search_eligible"] = True if arrangement == "remote" else None
+        if arrangement == "unknown":
+            job["application_priority_score"] = min(int(job.get("application_priority_score") or 0), 59)
+            job.setdefault("application_priority_reasons", []).append("Work arrangement is unknown and requires review for a remote-only search.")
+    return job
+
+
+def discovery_result_category(job: dict[str, Any], remote_preference: str = "") -> tuple[str, str]:
+    target_role_families = {"software developer", "full-stack developer", "intern", "new grad"}
+    if normalize_space(text(remote_preference)).lower() != "remote":
+        if text(job.get("posting_availability")).lower() == "confirmed_closed":
+            return "excluded", "Posting is confirmed closed."
+        if job.get("location_search_eligible") is False or text(job.get("location_search_eligible")).lower() == "false":
+            return "excluded", "Confirmed job location is outside the requested search area."
+        role_type = text(job.get("role_type")).lower()
+        if role_type and role_type not in target_role_families:
+            return "review_required", "The stored role family is outside the selected software-developer target family."
+        seniority = job.get("qualification_fit_seniority") or {}
+        if seniority.get("stretch_role") or (text(job.get("application_priority_score")).isdigit() and int(job.get("application_priority_score")) < 50):
+            return "review_required", "The posting expects experience or seniority that is not confirmed as aligned with the selected target."
+        return "actionable", "No remote-only restriction applies."
+    if text(job.get("remote_search_eligible")).lower() == "false" or text(job.get("remote_eligibility")).lower() in {"restricted", "confirmed_ineligible"} or text(job.get("ontario_eligibility")).lower() == "confirmed_ineligible" or text(job.get("posting_availability")).lower() == "confirmed_closed":
+        return "excluded", "Confirmed onsite, hybrid, ineligible, or closed posting."
+    if text(job.get("remote_search_eligible")).lower() == "true" and text(job.get("remote_eligibility")).lower() == "canadian_eligible" and "remote" in text(job.get("remote_type")).lower():
+        role_type = text(job.get("role_type")).lower()
+        if role_type and role_type not in target_role_families:
+            return "review_required", "The stored role family is outside the selected software-developer target family."
+        seniority = job.get("qualification_fit_seniority") or {}
+        if seniority.get("stretch_role") or (text(job.get("application_priority_score")).isdigit() and int(job.get("application_priority_score")) < 50):
+            return "review_required", "The posting expects experience or seniority that is not confirmed as aligned with the selected target."
+        return "actionable", "Remote arrangement and Canadian eligibility are supported by the posting data."
+    return "review_required", "Work arrangement or Canadian eligibility requires review."
 
 
 def discovery_sort_value(job: dict[str, Any], field: str, direction: str = "desc", remote_rule: str = "remote_after_local", unknown_salary_position: str = "last") -> tuple[Any, ...]:
@@ -7422,8 +7859,8 @@ def discovery_sort_value(job: dict[str, Any], field: str, direction: str = "desc
         return (order.get(remote_label, 3), normalize_space(text(job.get("company"))).lower())
     if field == "seniority":
         return (normalize_space(text(job.get("seniority_level"))).lower(), normalize_space(text(job.get("company"))).lower())
-    if field in {"match_score", "overall_score", "score"}:
-        score_value = clamp_int(job.get("match_score") if field == "match_score" else job.get("overall_score"), 0, 100)
+    if field in {"match_score", "overall_score", "application_priority_score", "score"}:
+        score_value = clamp_int(job.get("match_score") if field == "match_score" else job.get("application_priority_score") if field == "application_priority_score" else job.get("overall_score"), 0, 100)
         return ((-score_value if direction == "desc" else score_value), normalize_space(text(job.get("company"))).lower(), normalize_space(text(job.get("title"))).lower())
     if field == "deadline":
         deadline = text(job.get("deadline")) or "9999-12-31"
@@ -7461,7 +7898,7 @@ def discovery_preferences_payload(payload: dict[str, Any]) -> dict[str, Any]:
     weights_payload = parse_json_object(payload.get("weights")) if isinstance(payload.get("weights"), dict) else parse_json_object(payload.get("weights"))
     preferences = {
         "sort": {
-            "field": normalize_space(text(sort_payload.get("field") or payload.get("sort_field") or payload.get("primary_sort_field") or "overall_score")),
+            "field": normalize_space(text(sort_payload.get("field") or payload.get("sort_field") or payload.get("primary_sort_field") or "application_priority_score")),
             "direction": "asc" if text(sort_payload.get("direction") or payload.get("sort_direction") or payload.get("primary_sort_direction")).lower() == "asc" else "desc",
             "secondary_field": normalize_space(text(secondary_payload.get("field") or payload.get("secondary_sort_field") or "")),
             "secondary_direction": "asc" if text(secondary_payload.get("direction") or payload.get("secondary_sort_direction") or "asc").lower() == "asc" else "desc",
@@ -8234,11 +8671,110 @@ def normalize_job_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return clean
 
 
-def job_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:
+def _qualification_profile_key(profile: dict[str, Any] | None) -> str:
+    if not profile:
+        return "active-profile"
+    relevant = {
+        key: profile.get(key)
+        for key in (
+            "id", "_candidate_profile_id", "updated_at", "resume_text", "work_experience",
+            "projects", "education", "key_skills", "target_seniority_levels", "maximum_required_years",
+            "willing_to_apply_to_stretch_roles", "management_roles_allowed",
+        )
+    }
+    return hashlib.sha256(json.dumps(relevant, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def _qualification_job_key(job: dict[str, Any], profile: dict[str, Any] | None) -> str:
+    relevant = {
+        "version": QUALIFICATION_CACHE_VERSION,
+        "profile": _qualification_profile_key(profile),
+        "job": {key: job.get(key) for key in (
+            "id", "updated_at", "title", "job_description", "required_skills", "preferred_skills",
+            "responsibilities", "required_experience", "preferred_experience", "remote_eligibility",
+            "posting_availability", "application_effort_score", "location", "remote_type", "role_type",
+        )},
+    }
+    return hashlib.sha256(json.dumps(relevant, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def _cached_resume_evidence(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    key = _qualification_profile_key(profile)
+    evidence = _RESUME_EVIDENCE_CACHE.get(key)
+    if evidence is None:
+        evidence = extract_resume_evidence(profile)
+        for item in evidence:
+            lowered = text(item.get("text")).lower()
+            item["_token_sequence"] = re.findall(r"[a-z0-9+#.]+", lowered)
+            item["_tokens"] = set(item["_token_sequence"])
+        if len(_RESUME_EVIDENCE_CACHE) >= QUALIFICATION_CACHE_LIMIT:
+            _RESUME_EVIDENCE_CACHE.pop(next(iter(_RESUME_EVIDENCE_CACHE)))
+        _RESUME_EVIDENCE_CACHE[key] = evidence
+    return evidence
+
+
+def _cached_qualification_terms(job: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = {key: job.get(key) for key in ("title", "required_skills", "preferred_skills", "responsibilities", "job_description")}
+    key = hashlib.sha256(json.dumps(raw, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    terms = _QUALIFICATION_TERMS_CACHE.get(key)
+    if terms is None:
+        terms = _qualification_terms(job)
+        if len(_QUALIFICATION_TERMS_CACHE) >= QUALIFICATION_CACHE_LIMIT:
+            _QUALIFICATION_TERMS_CACHE.pop(next(iter(_QUALIFICATION_TERMS_CACHE)))
+        _QUALIFICATION_TERMS_CACHE[key] = terms
+    return terms
+
+
+def _cached_qualification_fit(job: dict[str, Any], profile: dict[str, Any] | None) -> dict[str, Any]:
+    key = _qualification_job_key(job, profile)
+    cached = _QUALIFICATION_CACHE.get(key)
+    if cached is not None:
+        return copy.deepcopy(cached)
+    result = build_qualification_fit(job, profile)
+    if len(_QUALIFICATION_CACHE) >= QUALIFICATION_CACHE_LIMIT:
+        _QUALIFICATION_CACHE.pop(next(iter(_QUALIFICATION_CACHE)))
+    _QUALIFICATION_CACHE[key] = copy.deepcopy(result)
+    return result
+
+
+def _preparation_statuses(job_ids: list[int]) -> dict[int, str]:
+    if not job_ids:
+        return {}
+    placeholders = ",".join("?" for _ in job_ids)
+    rows = query_db(
+        f"SELECT job_id, status FROM application_preparation_queue WHERE job_id IN ({placeholders}) ORDER BY updated_at DESC, id DESC",
+        job_ids,
+    )
+    statuses: dict[int, str] = {}
+    for row in rows:
+        job_id = int(row["job_id"])
+        statuses.setdefault(job_id, text(row["status"]))
+    return statuses
+
+
+def job_to_dict(
+    row: sqlite3.Row | None,
+    evidence_profile: dict[str, Any] | None = None,
+    *,
+    include_qualification: bool = True,
+    include_legacy_details: bool = True,
+    preparation_status: str | None = None,
+) -> dict[str, Any]:
     if row is None:
         return {}
     data = dict(row)
     data["description_completeness"] = classify_job_description_completeness(data.get("job_description"))
+    data["work_arrangement"] = discovery_work_arrangement_label(text(data.get("remote_type")))
+    legacy_eligibility = text(data.get("remote_eligibility")).lower()
+    data["canadian_eligibility"] = {
+        "canadian_eligible": "confirmed_eligible",
+        "restricted": "confirmed_ineligible",
+    }.get(legacy_eligibility, "unknown")
+    data["ontario_eligibility"], data["ontario_eligibility_explanation"] = discovery_ontario_eligibility(data)
+    if text(data.get("discovery_location_scope")) and normalize_space(text(data.get("discovery_remote_preference"))).lower() != "remote":
+        data["location_search_eligible"] = not outside_requested_location(data, text(data.get("discovery_location_scope")))
+    data["discovery_result_category"], data["discovery_result_reason"] = discovery_result_category(data, text(data.get("discovery_remote_preference")))
+    data["recommendation_eligible"] = data["discovery_result_category"] == "actionable"
     data["score_breakdown"] = parse_json_object(data.get("score_breakdown"))
     if "profile_updated_at" in data and data.get("profile_updated_at"):
         profile_row = query_db("SELECT updated_at FROM profile WHERE id = 1", one=True)
@@ -8250,15 +8786,25 @@ def job_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:
                 data["cover_letter_generation_status"] = "Outdated — regenerate using current profile"
     job_id = clamp_int(data.get("id"), 0, 10**9)
     if job_id:
-        data["tailoring_changes"] = load_tailoring_changes(job_id)
-        data["generation_debug"] = load_generation_debug(job_id)
-        data.update(build_qualification_fit(data))
-        preparation = query_db(
-            "SELECT status FROM application_preparation_queue WHERE job_id = ? ORDER BY updated_at DESC, id DESC LIMIT 1",
-            [job_id],
-            one=True,
-        )
-        data["preparation_status"] = text(preparation["status"]) if preparation else ""
+        if include_legacy_details:
+            data["tailoring_changes"] = load_tailoring_changes(job_id)
+            data["generation_debug"] = load_generation_debug(job_id)
+        if include_qualification:
+            data.update(_cached_qualification_fit(data, evidence_profile))
+        if text(data.get("discovery_remote_preference")).lower() == "remote" and (text(data.get("remote_search_eligible")).lower() == "false" or text(data.get("ontario_eligibility")).lower() == "confirmed_ineligible"):
+            data["application_priority_score"] = 0
+            reasons = list(data.get("application_priority_reasons") or [])
+            if not any("remote-only" in text(reason).lower() for reason in reasons):
+                reasons.append("Excluded from remote-only priority because the posting was confirmed onsite or hybrid during discovery.")
+            data["application_priority_reasons"] = reasons
+        if preparation_status is None and include_legacy_details:
+            preparation = query_db(
+                "SELECT status FROM application_preparation_queue WHERE job_id = ? ORDER BY updated_at DESC, id DESC LIMIT 1",
+                [job_id],
+                one=True,
+            )
+            preparation_status = text(preparation["status"]) if preparation else ""
+        data["preparation_status"] = preparation_status or ""
     return data
 
 
@@ -8272,53 +8818,293 @@ def classify_job_description_completeness(value: Any) -> str:
     return "complete"
 
 
-def build_qualification_fit(job: dict[str, Any]) -> dict[str, Any]:
-    """Expose a transparent qualification view without changing Job Priority."""
+QUALIFICATION_ALIASES = {
+    "nodejs": {"nodejs", "node.js"},
+    "node.js": {"nodejs", "node.js"},
+    "java script": {"java script", "javascript"},
+    "javascript": {"java script", "javascript"},
+    "back-end": {"back-end", "backend"},
+    "front-end": {"front-end", "frontend"},
+    "restful apis": {"restful apis", "rest apis", "rest api"},
+    "rest apis": {"restful apis", "rest apis", "rest api"},
+    "rest api": {"restful apis", "rest apis", "rest api"},
+    "postgres": {"postgres", "postgresql"},
+    "postgresql": {"postgres", "postgresql"},
+    "tests": {"test", "tests", "testing"},
+    "testing": {"test", "tests", "testing"},
+}
+
+QUALIFICATION_TECHNICAL_TERMS = [
+    *TECHNICAL_TERMS,
+    "c++", "c#", "go", "golang", "django", "graphql", "grpc", "websocket", "nestjs",
+    "docker", "kubernetes", "linux", "systems", "systems programming", "system design",
+    "architecture", "programming", "scripting", "observability", "troubleshooting",
+    "networking", "integrations", "frameworks", "web applications", "databases",
+    "data processing", "rbac", "cloud infrastructure", "multithreaded", "full-stack", "full stack",
+    "full-stack development", "full-stack software development", "full-stack engineering", "software development",
+]
+
+
+def _qualification_key(value: Any) -> str:
+    clean = normalize_space(text(value)).lower().strip(".,:;()[]")
+    return next((key for key, values in QUALIFICATION_ALIASES.items() if clean in values), clean)
+
+
+def _qualification_phrase_present(content: str, phrase: str) -> bool:
+    pattern = r"(?<![a-z0-9])" + r"\s+".join(re.escape(part) for part in phrase.lower().split()) + r"(?![a-z0-9])"
+    return bool(re.search(pattern, content.lower()))
+
+
+def _description_requirement_importance(description: str, term: str) -> str:
+    """Classify a term using its nearest explicit qualifications section."""
+    lowered = description.lower()
+    index = lowered.find(term.lower())
+    if index < 0:
+        return "unclassified"
+    headings = list(re.finditer(
+        r"(?im)^\s*[*_`#=~\\ -]*(?P<heading>(?:minimum|basic|required)\s+qualifications?|requirements?|preferred\s+qualifications?|preferred|nice\s+to\s+have|bonus|assets?|what\s+you\s+bring|what\s+we(?:'re|\s+are|’re)\s+looking\s+for|who\s+you\s+are|your\s+background|core\s+skills(?:\s+and\s+experience)?|education\s+and\s+experience)[*_`#=~\\ -]*\s*:?[ \t]*$",
+        description[:index],
+    ))
+    if headings:
+        heading = headings[-1].group("heading").lower()
+        return "preferred" if any(value in heading for value in ("preferred", "nice", "bonus", "asset")) else "required"
+    context = lowered[max(0, index - 260):index + len(term)]
+    if re.search(r"\b(required|requirements|must have|minimum qualifications|qualifications|what you bring|what we're looking for|what we are looking for|what you’re looking for|who you are|your background|core skills)\b", context):
+        return "required"
+    if re.search(r"\b(preferred|nice to have|bonus|asset)\b", context):
+        return "preferred"
+    return "unclassified"
+
+
+def _qualification_terms(job: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build a bounded, explainable inventory from structured fields and JD text."""
+    description = text(job.get("job_description"))
+    content = " ".join(text(job.get(field)) for field in ("title", "required_skills", "preferred_skills", "responsibilities", "job_description"))
+    terms: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(value: str, importance: str, category: str, source: str) -> None:
+        value = normalize_space(value).strip(" -*•")
+        if len(value) < 3 or len(value) > 120:
+            return
+        key = _qualification_key(value)
+        if key in seen:
+            return
+        seen.add(key)
+        terms.append({"requirement": value, "normalized": key, "importance": importance, "category": category, "source": source})
+
+    has_required_section = bool(re.search(r"(?:^|\n)\s*(?:required(?: qualifications?)?|requirements?|minimum qualifications?|must have|what you bring|what we're looking for|what we are looking for|what you’re looking for|who you are|your background|core skills(?: and experience)?|education and experience)\s*(?::|$)", description, re.I | re.M))
+    for field, importance, category in (("required_skills", "required" if (not description or has_required_section) else "unclassified", "technical"), ("preferred_skills", "preferred", "technical"), ("responsibilities", "unclassified", "experience")):
+        for part in re.split(r"[,;\n]+|(?<=[.!?])\s+", text(job.get(field))):
+            add(part, importance, category, field)
+
+    lowered = content.lower()
+    for term in sorted(QUALIFICATION_TECHNICAL_TERMS, key=len, reverse=True):
+        if _qualification_phrase_present(lowered, term):
+            importance = _description_requirement_importance(description, term)
+            add(term, importance, "technical", "job description")
+
+    for match in re.finditer(r"\b\d+\+?\s*(?:to\s*\d+\+?\s*)?(?:years?|yrs?)\b[^.\n]{0,80}", content, re.I):
+        add(match.group(0), "required", "experience", "experience requirement")
+    return terms
+
+
+def _evidence_match(requirement: str, evidence: dict[str, Any]) -> tuple[str, str, int]:
+    cache_key = hashlib.sha256((requirement + "\0" + text(evidence.get("evidence_type")) + "\0" + text(evidence.get("text"))).encode("utf-8")).hexdigest()
+    cached = _EVIDENCE_MATCH_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    req = requirement.lower()
+    candidate = text(evidence.get("text")).lower()
+    aliases = QUALIFICATION_ALIASES.get(_qualification_key(requirement), {req})
+    candidate_sequence = evidence.get("_token_sequence") or re.findall(r"[a-z0-9+#.]+", candidate)
+    candidate_tokens = evidence.get("_tokens") or set(candidate_sequence)
+    alias_sequences = [re.findall(r"[a-z0-9+#.]+", alias.lower()) for alias in aliases]
+    exact = any(
+        sequence and any(
+            candidate_sequence[index:index + len(sequence)] == sequence
+            for index in range(max(0, len(candidate_sequence) - len(sequence) + 1))
+        )
+        for sequence in alias_sequences
+    )
+    req_tokens = set(re.findall(r"[a-z0-9+#.]+", req))
+    stem_overlap = 0
+    for token in req_tokens:
+        forms = {token}
+        if token.endswith("ing"):
+            forms.add(token[:-3])
+        if token.endswith("s"):
+            forms.add(token[:-1])
+        if candidate_tokens & forms:
+            stem_overlap += 1
+    related = ("api" in req or "service" in req) and bool(candidate_tokens & {"rest", "flask", "backend"})
+    if exact:
+        result = ("matched", "exact or accepted equivalent wording", 88 if evidence.get("evidence_type") == "professional experience" else 68)
+        if len(_EVIDENCE_MATCH_CACHE) >= QUALIFICATION_CACHE_LIMIT * 8:
+            _EVIDENCE_MATCH_CACHE.pop(next(iter(_EVIDENCE_MATCH_CACHE)))
+        _EVIDENCE_MATCH_CACHE[cache_key] = result
+        return result
+    if related or (len(req_tokens) >= 2 and stem_overlap / len(req_tokens) >= 0.6):
+        result = ("partial", "related résumé evidence is present, but the requirement is not stated in full", 58)
+        if len(_EVIDENCE_MATCH_CACHE) >= QUALIFICATION_CACHE_LIMIT * 8:
+            _EVIDENCE_MATCH_CACHE.pop(next(iter(_EVIDENCE_MATCH_CACHE)))
+        _EVIDENCE_MATCH_CACHE[cache_key] = result
+        return result
+    result = ("missing", "no sufficiently related evidence was found in the selected résumé", 0)
+    if len(_EVIDENCE_MATCH_CACHE) >= QUALIFICATION_CACHE_LIMIT * 8:
+        _EVIDENCE_MATCH_CACHE.pop(next(iter(_EVIDENCE_MATCH_CACHE)))
+    _EVIDENCE_MATCH_CACHE[cache_key] = result
+    return result
+
+
+def _application_priority(
+    job: dict[str, Any],
+    qualification_score: int | None,
+    profile: dict[str, Any] | None = None,
+    seniority: dict[str, Any] | None = None,
+) -> tuple[int, list[str]]:
+    if qualification_score is None:
+        return 0, ["Qualification cannot be ranked until the posting has a usable description."]
+    blocking = []
+    if text(job.get("remote_eligibility")).lower() in {"restricted", "confirmed_ineligible"}:
+        blocking.append("Canadian eligibility is confirmed incompatible.")
+    if text(job.get("posting_availability")).lower() == "confirmed_closed":
+        blocking.append("The posting is confirmed closed.")
+    if blocking:
+        return 0, blocking
+    recency = discovery_recency_score(job)
+    effort = clamp_int(job.get("application_effort_score") or 70, 0, 100)
+    profile = profile or load_profile()
+    preferred_roles = [part.strip().lower() for part in re.split(r"[,;\n]+", text(profile.get("preferred_roles"))) if part.strip()]
+    title = text(job.get("title")).lower()
+    role_preference = 100 if preferred_roles and any(role in title or title in role for role in preferred_roles) else 60 if preferred_roles else 70
+    preferred_locations = text(profile.get("preferred_locations")).lower()
+    location = text(job.get("location")).lower()
+    location_preference = 100 if preferred_locations and any(part.strip() in location for part in re.split(r"[,;\n]+", preferred_locations) if part.strip()) else 70
+    preference = round((role_preference + location_preference) / 2)
+    seniority = seniority or {}
+    seniority_score = clamp_int(seniority.get("score"), 0, 100)
+    priority = round(qualification_score * 0.50 + seniority_score * 0.25 + recency * 0.10 + effort * 0.05 + preference * 0.10)
+    reasons = ["Qualification Match and evidence-backed seniority fit are weighted first; recency, effort, and stated role/location preferences are secondary."]
+    if text(job.get("role_type")).lower() == "other":
+        priority = min(priority, 49)
+        reasons.append("The stored role family is outside the selected software-developer target family, so it requires review before applying.")
+    if seniority.get("stretch_role"):
+        reasons.append(text(seniority.get("explanation")) or "The posting expects experience or seniority above the selected target.")
+    if text(job.get("remote_eligibility")).lower() in {"", "unknown"}:
+        priority = min(priority, 59)
+        reasons.append("Canadian eligibility is unverified, so this is not treated as a confirmed eligible recommendation.")
+    if text(job.get("posting_availability")).lower() in {"", "unverified"}:
+        priority = min(priority, 69)
+        reasons.append("Posting availability is unverified.")
+    return clamp_int(priority, 0, 100), reasons
+
+
+def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Calculate transparent Qualification Match without changing Job Priority."""
     try:
-        profile = load_profile()
-        semantic = analyze_resume_match(job, profile, cache_dir=semantic_cache_dir(), use_semantic=False)
+        profile = evidence_profile or load_profile()
+        inventory = _cached_qualification_terms(job)
+        evidence = _cached_resume_evidence(profile)
         analysis = analyze_job_seniority(job)
         seniority = score_seniority_fit(profile, analysis)
     except Exception:
-        return {"qualification_fit_score": 0, "qualification_fit_label": "Review required", "qualification_fit_reasons": ["Qualification fit could not be assessed."]}
+        return {"qualification_match_status": "error", "qualification_fit_score": 0, "qualification_fit_label": "Review required", "qualification_fit_reasons": ["Qualification fit could not be assessed."]}
 
-    profile_text = " ".join(text(profile.get(field)) for field in ("resume_text", "work_experience", "projects", "key_skills", "education")).lower()
-    raw_required = [normalize_space(item) for item in re.split(r"[,;\n]+", text(job.get("required_skills"))) if normalize_space(item)]
-    required_terms = raw_required if len(raw_required) > 1 else [item for item in job_keywords(job) if len(item) > 2]
-    required_terms = list(dict.fromkeys(required_terms))
-    matched = [term for term in required_terms if contains_phrase(profile_text, term)]
-    missing = [term for term in required_terms if term not in matched]
-    skill_score = round((len(matched) / len(required_terms)) * 100) if required_terms else clamp_int(semantic.get("scores", {}).get("required_skills"), 0, 100)
-    responsibility_score = clamp_int(semantic.get("scores", {}).get("responsibilities"), 0, 100)
-    score = round(skill_score * 0.5 + seniority.get("score", 0) * 0.35 + responsibility_score * 0.15)
-    required = analysis.get("required_experience") or {}
-    max_profile = None
+    if not normalize_space(text(job.get("job_description"))) and not any(text(job.get(field)) for field in ("required_skills", "preferred_skills", "responsibilities")):
+        return {"qualification_match_status": "unavailable", "qualification_fit_score": 0, "qualification_fit_label": "Qualification unavailable", "qualification_fit_reasons": ["The posting does not contain enough description or structured requirements to assess qualification."]}
+
+    assessed: list[dict[str, Any]] = []
+    for item in inventory:
+        best = {"status": "missing", "reason": "no sufficiently related evidence was found in the selected résumé", "confidence": 0, "evidence": None}
+        for candidate in evidence:
+            status, reason, confidence = _evidence_match(item["requirement"], candidate)
+            if confidence > best["confidence"]:
+                best = {"status": status, "reason": reason, "confidence": confidence, "evidence": candidate}
+        assessed.append({
+            **item,
+            **{key: value for key, value in best.items() if key != "evidence"},
+            "evidence_text": text((best.get("evidence") or {}).get("text")),
+            "evidence_source": text((best.get("evidence") or {}).get("source_section")),
+        })
+
+    required = [item for item in assessed if item["importance"] == "required"]
+    technical = [item for item in assessed if item["category"] == "technical"]
+    experience = [item for item in assessed if item["category"] == "experience"]
+
+    def coverage(items: list[dict[str, Any]]) -> int:
+        if not items:
+            return 0
+        return round(sum(1 if item["status"] == "matched" else 0.5 if item["status"] == "partial" else 0 for item in items) / len(items) * 100)
+
+    mandatory_score = coverage(required) if required else None
+    technical_score = coverage(technical) if technical else None
+    experience_score = coverage(experience) if experience else None
+    available_components = [(mandatory_score, 40), (technical_score, 25), (experience_score, 20), (seniority.get("score", 0), 15)]
+    available_components = [(value, weight) for value, weight in available_components if value is not None]
+    score = round(sum(value * weight for value, weight in available_components) / sum(weight for _, weight in available_components)) if available_components else 0
+    insufficient_mandatory_evidence = mandatory_score is None
+    if insufficient_mandatory_evidence:
+        # A high keyword/seniority average is not evidence of qualification when
+        # the posting never supplied a clearly mandatory requirement set.
+        score = min(score, 59)
+    required_experience = analysis.get("required_experience") or {}
     try:
-        max_profile = float(text(profile.get("maximum_required_years")))
+        profile_max_years = float(text(profile.get("maximum_required_years"))) if text(profile.get("maximum_required_years")) else None
     except (TypeError, ValueError):
-        pass
-    if required.get("maximum") and max_profile is not None and float(required["maximum"]) > max_profile:
-        score = min(score, 69)
-        seniority["stretch_role"] = True
-    reasons = []
-    if matched:
-        reasons.append(f"Supported requirements: {', '.join(matched[:5])}.")
+        profile_max_years = None
+    stretch = bool(seniority.get("stretch_role")) or bool(required_experience.get("minimum") and seniority.get("score", 0) < 70)
+    if required_experience.get("maximum") and profile_max_years is not None and float(required_experience["maximum"]) > profile_max_years:
+        stretch = True
+    matched = [item for item in assessed if item["status"] == "matched"]
+    partial = [item for item in assessed if item["status"] == "partial"]
+    missing = [item for item in assessed if item["status"] == "missing"]
+    reasons = [
+        f"Mandatory qualifications: {mandatory_score}% evidence coverage." if mandatory_score is not None else "Mandatory qualifications: unavailable; no clearly classified mandatory requirements were extracted.",
+        f"Technical skills and tools: {technical_score}% evidence coverage." if technical_score is not None else "Technical skills and tools: unavailable from the stored posting.",
+        f"Professional and project experience: {experience_score}% evidence coverage." if experience_score is not None else "Professional and project experience: unavailable from the stored posting.",
+        f"Seniority assessment: {seniority.get('score', 0)}%.",
+    ]
+    if insufficient_mandatory_evidence:
+        reasons.append("Qualification confidence is limited because the stored posting has no clearly classified mandatory requirements.")
     if missing:
-        reasons.append(f"Not demonstrated in the selected profile: {', '.join(missing[:5])}.")
-    if required:
-        reasons.append(f"Posting experience requirement: {required.get('text', 'explicit experience requirement')}.")
-    if seniority.get("explanation"):
-        reasons.append(seniority["explanation"])
-    if seniority.get("stretch_role"):
-        reasons.append("Stretch opportunity: the posting expects more experience or seniority than the selected profile establishes.")
-    label = "Strong qualification match" if score >= 75 and not seniority.get("stretch_role") else "Stretch opportunity" if seniority.get("stretch_role") or score < 60 else "Review qualification fit"
+        reasons.append("Not demonstrated in the selected résumé: " + ", ".join(item["requirement"] for item in missing[:6]) + ".")
+    if stretch:
+        reasons.append("Stretch opportunity: the posting expects experience or seniority not fully established by the selected résumé.")
+    priority, priority_reasons = _application_priority(job, score, profile, seniority)
+    label = "Insufficient requirement evidence" if insufficient_mandatory_evidence else "Stretch opportunity" if stretch or score < 60 else "Strong qualification match" if score >= 75 else "Review qualification fit"
     return {
+        "qualification_match_status": "assessed" if mandatory_score is not None else "partial_evidence",
         "qualification_fit_score": clamp_int(score, 0, 100),
+        "qualification_match_score": clamp_int(score, 0, 100),
         "qualification_fit_label": label,
-        "qualification_fit_reasons": reasons or ["Review the full posting and résumé evidence before applying."],
-        "qualification_fit_matched_requirements": matched,
-        "qualification_fit_missing_requirements": missing,
+        "qualification_evidence_confidence": "low" if insufficient_mandatory_evidence else "standard",
+        "qualification_fit_reasons": reasons,
+        "qualification_fit_matched_requirements": [item["requirement"] for item in matched],
+        "qualification_fit_missing_requirements": [item["requirement"] for item in missing],
+        "qualification_fit_partial_requirements": [item["requirement"] for item in partial],
+        "qualification_requirements": assessed,
+        "experience_requirements": {
+            "required": analysis.get("required_experience"),
+            "preferred": analysis.get("preferred_experience"),
+            "ambiguous": analysis.get("ambiguous_experience", []),
+            "candidate_professional_years": explicit_professional_years(profile),
+            "candidate_years_status": "verified from explicit résumé evidence" if explicit_professional_years(profile) is not None else "unverified from selected résumé",
+            "fit_status": (
+                "unverified" if explicit_professional_years(profile) is None and (required_experience or analysis.get("detected_level") != "unknown") else
+                "stretch" if stretch else
+                "aligned" if explicit_professional_years(profile) is not None and (required_experience or analysis.get("detected_level") != "unknown") else
+                "unknown"
+            ),
+            "source_evidence": analysis.get("required_experience", {}).get("source_evidence", "") if analysis.get("required_experience") else analysis.get("preferred_experience", {}).get("source_evidence", "") if analysis.get("preferred_experience") else "",
+        },
+        "qualification_components": {"mandatory": mandatory_score, "technical": technical_score, "experience": experience_score, "seniority": seniority.get("score", 0)},
+        "qualification_evidence_profile_id": profile.get("id") or profile.get("_candidate_profile_id") or "",
+        "qualification_evidence_profile_name": profile.get("_candidate_profile_name") or "Active Profile",
+        "qualification_evidence_source": "selected candidate profile résumé DOCX, structured experience, projects, education, and skills" if profile.get("_candidate_profile_id") else "active Profile résumé text and structured evidence",
         "qualification_fit_seniority": seniority,
+        "application_priority_score": priority,
+        "application_priority_reasons": priority_reasons,
     }
 
 
@@ -8455,7 +9241,7 @@ def extract_job_details(content: str, source: str = "", existing: dict[str, Any]
     location = text(existing.get("location")) or guess_location(compact)
     salary = text(existing.get("salary")) or guess_salary(compact)
     remote_type = text(existing.get("remote_type")) or guess_remote_type(compact)
-    role_type = text(existing.get("role_type")) or guess_role_type(f"{title} {compact}")
+    role_type = text(existing.get("role_type")) or guess_role_type_for_job(title, compact)
     seniority = text(existing.get("seniority_level")) or guess_seniority(f"{title} {compact}")
     skills = keyword_hits(compact, REWARD_KEYWORDS)
     required = extract_section(content, ["requirements", "required qualifications", "what you bring"])
@@ -8541,6 +9327,22 @@ def guess_role_type(content: str) -> str:
     if "support" in lowered and "cloud" in lowered:
         return "cloud support"
     return "other"
+
+
+def guess_role_type_for_job(title: str, description: str) -> str:
+    """Prefer the advertised title and avoid body-only role-family leakage."""
+    lowered_title = normalize_space(title).lower()
+    if re.search(r"\b(?:software|full[- ]?stack|fullstack|backend|front[- ]?end)\s+(?:engineer|developer)\b", lowered_title) or re.search(r"\bfull[- ]?stack\b", lowered_title):
+        return "software developer"
+    title_role = guess_role_type(title)
+    if title_role != "other":
+        return title_role
+    # A description can mention software engineering while advertising a
+    # different job family. Keep security, quality, and executive roles out of
+    # the software-developer bucket unless the title itself says so.
+    if re.search(r"\b(?:head|chief|director|manager)\b|\bsecurity\b|\bquality\b", lowered_title):
+        return "other"
+    return guess_role_type(f"{title} {description}")
 
 
 def guess_seniority(content: str) -> str:
