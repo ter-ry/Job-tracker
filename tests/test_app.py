@@ -435,6 +435,14 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(analysis["required_experience"]["minimum"], 6)
         self.assertNotIn("30", analysis["required_experience"]["source_evidence"])
 
+    def test_experience_extraction_parses_spelled_out_ranges(self):
+        required, preferred, ambiguous = seniority.extract_experience_ranges(
+            "This role requires one to five years of relevant software experience."
+        )
+        self.assertEqual((required[0].minimum, required[0].maximum), (1.0, 5.0))
+        self.assertFalse(preferred)
+        self.assertFalse(ambiguous)
+
     def test_role_family_does_not_leak_from_body_into_security_or_quality_titles(self):
         security = self.client.post(
             "/api/jobs",
