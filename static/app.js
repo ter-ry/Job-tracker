@@ -162,6 +162,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("profile-test-location").addEventListener("click", testAndSaveLocation);
   document.getElementById("resume-upload").addEventListener("change", uploadResume);
   document.getElementById("cover-letter-template-upload").addEventListener("change", uploadCoverLetterTemplate);
+  document.getElementById("check-for-updates")?.addEventListener("click", checkForUpdates);
   document.getElementById("new-candidate-profile").addEventListener("click", () => showCandidateProfileForm());
   document.getElementById("cancel-candidate-profile").addEventListener("click", hideCandidateProfileForm);
   document.getElementById("candidate-profile-form").addEventListener("submit", saveCandidateProfile);
@@ -214,6 +215,26 @@ document.addEventListener("DOMContentLoaded", () => {
   loadDiscoveryScheduler();
   loadDiscoveryTaskStatus();
 });
+
+async function checkForUpdates() {
+  const button = document.getElementById("check-for-updates");
+  if (button) { button.disabled = true; button.textContent = "Checking…"; }
+  try {
+    const result = await api.get("/api/updates");
+    if (result.update_available && result.url) {
+      toast(`Update ${result.latest_version} is available. Open GitHub Releases to review and download it.`);
+      window.open(result.url, "_blank", "noopener,noreferrer");
+    } else if (result.status === "unavailable") {
+      toast("Update check is unavailable right now.");
+    } else {
+      toast(`Job Tracker ${result.current_version} is up to date.`);
+    }
+  } catch (error) {
+    toast(`Update check failed: ${error.message}`);
+  } finally {
+    if (button) { button.disabled = false; button.textContent = "Check for updates"; }
+  }
+}
 
 function setDiscoverySection(view) {
   const selected = ["pipeline", "find", "saved"].includes(view) ? view : "pipeline";

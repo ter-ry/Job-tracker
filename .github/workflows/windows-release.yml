@@ -1,0 +1,123 @@
+name: Windows release build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Test build version (no GitHub Release is published)"
+        required: false
+        default: "0.0.0-dev"
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate source and isolated launch
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require tagged commit to be on master
+        if: github.event_name == 'push'
+        shell: pwsh
+        run: |
+          git fetch origin master --quiet
+          git merge-base --is-ancestor "${{ github.sha }}" origin/master
+          if ($LASTEXITCODE -ne 0) { throw "Stable release tags must point to a commit reachable from origin/master" }
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install runtime and test dependencies
+        shell: pwsh
+        run: python -m pip install --upgrade pip; pip install -r requirements.txt; pip install pytest pyinstaller
+      - name: Run Python tests
+        shell: pwsh
+        run: python -m pytest -q
+      - name: Validate JavaScript
+        shell: pwsh
+        run: node --check static/app.js
+      - name: Smoke test version, health, and isolated database
+        shell: pwsh
+        run: python scripts/windows_smoke_test.py
+
+  package:
+    name: Package Windows installer
+    needs: validate
+    runs-on: windows-2022
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      installer: ${{ steps.installer.outputs.path }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Resolve build version
+        id: version
+        shell: pwsh
+        run: |
+          if ('${{ github.event_name }}' -eq 'push') { $version = '${{ github.ref_name }}'.TrimStart('v') }
+          else { $version = '${{ inputs.version }}' }
+          if ($version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$') { throw "Invalid semantic version: $version" }
+          "version=$version" >> $env:GITHUB_OUTPUT
+      - name: Install packaging dependencies
+        shell: pwsh
+        run: python -m pip install --upgrade pip; pip install -r requirements.txt; pip install pytest pyinstaller
+      - name: Build PyInstaller application
+        shell: pwsh
+        env:
+          JOB_TRACKER_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          Set-Content -Path packaging/windows/VERSION.txt -Value "${{ steps.version.outputs.version }}" -NoNewline
+          pyinstaller --noconfirm --clean packaging/windows/job_tracker.spec
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress --yes
+      - name: Build installer
+        id: installer
+        shell: pwsh
+        env:
+          JOB_TRACKER_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          & $iscc "/DAppVersion=${{ steps.version.outputs.version }}" packaging/windows/JobTracker.iss
+          $path = "Output\JobTracker-Setup-v${{ steps.version.outputs.version }}.exe"
+          if (!(Test-Path $path)) { throw "Installer was not created: $path" }
+          "path=$path" >> $env:GITHUB_OUTPUT
+      - name: Check package contents
+        shell: pwsh
+        run: python scripts/check_release_artifacts.py "${{ steps.installer.outputs.path }}"
+      - name: Generate SHA-256 checksum
+        shell: pwsh
+        run: (Get-FileHash "${{ steps.installer.outputs.path }}" -Algorithm SHA256).Hash + "  " + (Split-Path "${{ steps.installer.outputs.path }}" -Leaf) | Out-File -Encoding ascii "${{ steps.installer.outputs.path }}.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: JobTracker-Windows-${{ steps.version.outputs.version }}
+          path: |
+            ${{ steps.installer.outputs.path }}
+            ${{ steps.installer.outputs.path }}.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish approved tagged release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: windows-2022
+    permissions:
+      contents: write
+    environment: release
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: JobTracker-Windows-${{ needs.package.outputs.version }}
+          path: release
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: gh release create "${{ github.ref_name }}" release/* --title "Job Tracker ${{ github.ref_name }}" --generate-notes

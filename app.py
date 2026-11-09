@@ -74,6 +74,7 @@ from db.migrations import run_migrations
 from profile_store import CandidateProfileStore
 from services.document_generation import DocumentGenerationService
 from resume_layout import compare_docx_layout, export_docx_to_pdf
+from version import APP_NAME, APP_VERSION, GITHUB_REPOSITORY
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -82,6 +83,7 @@ DB_PATH = DATA_DIR / "jobs.sqlite"
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 _DATABASE_INIT_LOCK = threading.RLock()
 _INITIALIZED_DATABASE_PATH: Path | None = None
+_LAST_MIGRATION_BACKUP: Path | None = None
 _ACTIVE_DISCOVERY_SEARCHES: set[str] = set()
 _ACTIVE_DISCOVERY_SEARCHES_LOCK = threading.Lock()
 MAX_FETCH_BYTES = 1_200_000
@@ -225,6 +227,9 @@ def collect_environment_diagnostics() -> dict[str, Any]:
     git_commit = get_git_commit()
     cwd = os.getcwd()
     return {
+        "app_name": APP_NAME,
+        "app_version": APP_VERSION,
+        "repository": GITHUB_REPOSITORY,
         "git_commit": git_commit,
         "active_git_commit": git_commit,
         "python_executable": sys.executable,
@@ -520,7 +525,24 @@ def create_app() -> Flask:
 
     @app.get("/")
     def index() -> str:
-        return render_template("index.html", statuses=STATUSES, role_types=ROLE_TYPES)
+        return render_template("index.html", statuses=STATUSES, role_types=ROLE_TYPES, app_name=APP_NAME, app_version=APP_VERSION)
+
+    @app.get("/api/version")
+    def version_info() -> Response:
+        return jsonify({"name": APP_NAME, "version": APP_VERSION, "repository": GITHUB_REPOSITORY})
+
+    @app.get("/api/updates")
+    def check_for_updates() -> Response:
+        """Read-only release check; downloading/installing is a future opt-in flow."""
+        url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
+        try:
+            request = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": APP_NAME})
+            with urllib.request.urlopen(request, timeout=5) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            tag = text(payload.get("tag_name"))
+            return jsonify({"current_version": APP_VERSION, "latest_version": tag, "url": text(payload.get("html_url")), "update_available": bool(tag and tag != APP_VERSION)})
+        except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+            return jsonify({"current_version": APP_VERSION, "update_available": False, "status": "unavailable", "error": str(exc)}), 502
 
     @app.get("/api/profile")
     def get_profile() -> Response:
@@ -8037,8 +8059,14 @@ def get_db() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    global _INITIALIZED_DATABASE_PATH
+    global _INITIALIZED_DATABASE_PATH, _LAST_MIGRATION_BACKUP
+    if _INITIALIZED_DATABASE_PATH != DB_PATH.resolve():
+        _LAST_MIGRATION_BACKUP = None
+    database_existed = DB_PATH.exists()
     db = get_db()
+    existing_version = int(db.execute("PRAGMA user_version").fetchone()[0] or 0)
+    if database_existed and existing_version < CURRENT_DB_SCHEMA_VERSION and _LAST_MIGRATION_BACKUP is None:
+        _LAST_MIGRATION_BACKUP = backup_database_before_migration()
     # WAL lets refresh/read requests proceed while discovery commits.  This is
     # intentionally performed only during guarded initialization rather than
     # on every request, where changing journal mode would itself be a lock
@@ -8334,6 +8362,38 @@ def init_db() -> None:
     db.execute(f"PRAGMA user_version = {CURRENT_DB_SCHEMA_VERSION}")
     db.commit()
     _INITIALIZED_DATABASE_PATH = DB_PATH.resolve()
+
+
+def backup_database_before_migration() -> Path | None:
+    """Create a consistent SQLite backup before an in-place schema upgrade."""
+    if not DB_PATH.exists():
+        return None
+    backup_dir = DATA_DIR / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    target = backup_dir / f"jobs-before-migration-{stamp}.sqlite"
+    temporary = target.with_suffix(".sqlite.tmp")
+    source = destination = None
+    try:
+        source = sqlite3.connect(f"file:{DB_PATH.resolve()}?mode=ro", uri=True)
+        destination = sqlite3.connect(temporary)
+        with destination:
+            source.backup(destination)
+        destination.close()
+        destination = None
+        temporary.replace(target)
+        return target
+    except (OSError, sqlite3.Error):
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+    finally:
+        if source is not None:
+            source.close()
+        if destination is not None:
+            destination.close()
 
 
 def ensure_columns(table: str, columns: dict[str, str]) -> None:
