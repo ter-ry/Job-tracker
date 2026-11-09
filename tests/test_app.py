@@ -1501,6 +1501,42 @@ class JobAssistantTest(unittest.TestCase):
             self.assertEqual(self.client.get("/api/profile").status_code, 200)
         self.assertEqual(initialize.call_count, 1)
 
+    def test_pipeline_manual_application_preserves_job_and_allows_date_correction(self):
+        created = self.client.post(
+            "/api/jobs",
+            json={
+                "company": "Manual Apply Co",
+                "title": "Junior Software Developer",
+                "url": "https://employer.example/jobs/junior-1",
+                "job_description": "Python React SQL and REST APIs.",
+                "application_priority_score": 82,
+            },
+        ).get_json()
+        applied = self.client.post(
+            f"/api/jobs/{created['id']}/applied",
+            json={"date_applied": "2026-11-01"},
+        )
+        self.assertEqual(applied.status_code, 200)
+        self.assertEqual(applied.get_json()["status"], "Applied")
+        self.assertEqual(applied.get_json()["date_applied"], "2026-11-01")
+        self.assertEqual(applied.get_json()["url"], "https://employer.example/jobs/junior-1")
+        corrected = self.client.post(f"/api/jobs/{created['id']}/applied", json={"date_applied": "2026-11-02"}).get_json()
+        self.assertEqual(corrected["date_applied"], "2026-11-02")
+        reloaded = next(item for item in self.client.get("/api/jobs").get_json() if item["id"] == created["id"])
+        self.assertEqual(reloaded["status"], "Applied")
+        self.assertEqual(reloaded["title"], "Junior Software Developer")
+        self.assertEqual(reloaded["url"], "https://employer.example/jobs/junior-1")
+
+    def test_pipeline_actions_and_advanced_features_are_explicit_in_default_ui(self):
+        frontend = Path("static/app.js").read_text(encoding="utf-8")
+        template = Path("templates/index.html").read_text(encoding="utf-8")
+        self.assertIn("Open job posting", frontend)
+        self.assertIn("Mark Applied", frontend)
+        self.assertIn("data-detail-applied", frontend)
+        self.assertIn("jobTracker.advancedFeatures", frontend)
+        self.assertIn('class="tab advanced-feature"', template)
+        self.assertIn('id="toggle-advanced-features"', template)
+
     def test_refresh_during_active_sqlite_write_waits_without_initialization_lock_error(self):
         with self.client.application.app_context():
             app_module.init_db()

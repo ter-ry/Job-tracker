@@ -1380,6 +1380,47 @@ def create_app() -> Flask:
             for row in rows
         ])
 
+    @app.post("/api/jobs/<int:job_id>/applied")
+    def mark_job_applied(job_id: int) -> Response:
+        """Record a manual external application without changing job identity."""
+        existing = query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)
+        if existing is None:
+            return jsonify({"error": "Job not found"}), 404
+        payload = request.get_json(silent=True) or {}
+        applied_date = text(payload.get("date_applied")) or text(existing["date_applied"]) or date.today().isoformat()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", applied_date):
+            return jsonify({"error": "date_applied must use YYYY-MM-DD"}), 400
+        get_db().execute(
+            """UPDATE jobs SET status = 'Applied', date_applied = ?,
+               discovery_state = CASE WHEN discovery_first_seen_at <> '' THEN 'applied' ELSE discovery_state END,
+               updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+            [applied_date, job_id],
+        )
+        get_db().commit()
+        return jsonify(job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True), include_legacy_details=False))
+
+    @app.post("/api/jobs/<int:job_id>/save")
+    def save_job_for_later(job_id: int) -> Response:
+        existing = query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)
+        if existing is None:
+            return jsonify({"error": "Job not found"}), 404
+        get_db().execute(
+            """UPDATE jobs SET status = 'Saved',
+               discovery_state = CASE WHEN discovery_first_seen_at <> '' THEN 'saved' ELSE discovery_state END,
+               updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+            [job_id],
+        )
+        get_db().commit()
+        return jsonify(job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True), include_legacy_details=False))
+
+    @app.post("/api/jobs/<int:job_id>/skip")
+    def skip_job(job_id: int) -> Response:
+        if query_db("SELECT id FROM jobs WHERE id = ?", [job_id], one=True) is None:
+            return jsonify({"error": "Job not found"}), 404
+        get_db().execute("UPDATE jobs SET discovery_state = 'ignored', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
+        get_db().commit()
+        return jsonify({"ok": True})
+
     @app.post("/api/jobs")
     def create_job() -> Response:
         payload = request.get_json(force=True)

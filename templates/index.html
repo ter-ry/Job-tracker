@@ -14,10 +14,11 @@
       </div>
       <nav class="tabs" aria-label="Sections">
         <button class="tab active" data-tab="discovery" type="button">Discovery</button>
-        <button class="tab" data-tab="shortlist" type="button">Shortlist</button>
+        <button class="tab advanced-feature" data-tab="shortlist" type="button" hidden>Shortlist</button>
         <button class="tab" data-tab="tracker" type="button">Tracker</button>
         <button class="tab" data-tab="profile" type="button">Profile</button>
         <a class="button secondary" href="/export.csv">Export CSV</a>
+        <button class="button ghost small" id="toggle-advanced-features" type="button" aria-pressed="false">Advanced features</button>
       </nav>
     </header>
 
@@ -236,8 +237,8 @@
         </section>
       </section>
 
-      <section id="shortlist" class="tab-panel">
-        <section class="panel preparation-queue-panel">
+      <section id="shortlist" class="tab-panel advanced-feature" hidden>
+        <section class="panel preparation-queue-panel advanced-feature" hidden>
           <div class="panel-header"><div><h2>Application preparation queue</h2><p class="muted helper">Packages are prepared for review only. Nothing is submitted automatically.</p></div><div class="actions compact"><select id="preparation-status-filter"><option value="">All queue items</option><option value="ready_for_review">Ready for review</option><option value="queued">Queued</option><option value="preparing">Preparing</option><option value="failed">Failed</option><option value="approved">Approved</option><option value="skipped">Skipped</option></select><button class="button ghost small" type="button" id="refresh-preparation-queue">Refresh</button></div></div>
           <div id="preparation-queue" class="generated-output empty">No application packages queued.</div>
         </section>
