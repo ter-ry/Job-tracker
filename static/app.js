@@ -1420,6 +1420,16 @@ function pipelineSortValue(job, mode) {
 
 function sortPipelineJobs(items, mode) {
   return [...items].sort((a, b) => {
+    if (mode === "priority" || mode === "qualification") {
+      const categoryRank = (job) => {
+        if (!job.discovery_first_seen_at) return 2; // historical/manual record
+        if (job.discovery_result_category === "actionable") return 0;
+        if (job.discovery_result_category === "review_required") return 1;
+        return 3; // excluded or otherwise ineligible
+      };
+      const categoryDifference = categoryRank(a) - categoryRank(b);
+      if (categoryDifference) return categoryDifference;
+    }
     const left = pipelineSortValue(a, mode);
     const right = pipelineSortValue(b, mode);
     if (left === null && right === null) return Number(a.id || 0) - Number(b.id || 0);
@@ -1446,8 +1456,10 @@ function renderPipelineDashboard(jobs) {
     sortControl.onchange = (event) => { pipelineSort = event.target.value; renderPipelineDashboard(state.jobs); };
   }
   const filtered = pipelineCategory === "All" ? items : items.filter((job) => String(job.role_type || "") === pipelineCategory);
-  setText("pipeline-discovered", items.length);
-  setText("pipeline-matches", items.filter((job) => Number(job.qualification_fit_score || 0) >= 75).length);
+  const discovered = items.filter((job) => Boolean(job.discovery_first_seen_at));
+  const actionable = discovered.filter((job) => job.discovery_result_category === "actionable");
+  setText("pipeline-discovered", discovered.length);
+  setText("pipeline-matches", actionable.filter((job) => Number(job.qualification_fit_score || 0) >= 75).length);
   setText("pipeline-ready", items.filter((job) => ["ready_for_review"].includes(job.preparation_status)).length);
   const cards = document.getElementById("pipeline-cards");
   if (!filtered.length) {
@@ -1458,7 +1470,10 @@ function renderPipelineDashboard(jobs) {
     const score = Number(job.qualification_fit_score ?? job.fit_score ?? 0);
     const applicationPriority = Number(job.application_priority_score || 0);
     const jobPriority = Number(job.overall_score || job.fit_score || 0);
-    return `<article class="pipeline-card" data-job-id="${job.id}"><div><h3>${escapeHtml(job.title || "Untitled role")}</h3><p>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location not listed")}</p><p class="pipeline-subline">${escapeHtml(job.qualification_fit_label || "Qualification fit")}</p></div><div class="pipeline-score"><strong>${score}%</strong><span>Qualification Match</span><small>Application Priority ${applicationPriority} · Job Priority ${jobPriority}</small><button type="button" data-job-id="${job.id}" class="pipeline-action">View details</button></div></article>`;
+    const categoryLabel = job.discovery_first_seen_at
+      ? String(job.discovery_result_category || "review_required").replaceAll("_", " ")
+      : "historical/manual";
+    return `<article class="pipeline-card" data-job-id="${job.id}"><div><h3>${escapeHtml(job.title || "Untitled role")}</h3><p>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location not listed")}</p><p class="pipeline-subline">${escapeHtml(categoryLabel)} · ${escapeHtml(job.qualification_fit_label || "Qualification fit")}</p></div><div class="pipeline-score"><strong>${score}%</strong><span>Qualification Match</span><small>Application Priority ${applicationPriority} · Job Priority ${jobPriority}</small><button type="button" data-job-id="${job.id}" class="pipeline-action">View details</button></div></article>`;
   }).join("");
   cards.querySelectorAll(".pipeline-card").forEach((card) => card.addEventListener("click", (event) => {
     if (event.target.closest("button, a")) return;

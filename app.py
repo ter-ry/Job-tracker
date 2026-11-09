@@ -194,6 +194,7 @@ ROLE_TYPES = [
     "new grad",
     "other",
 ]
+ACTIONABLE_DISCOVERY_ROLE_FAMILIES = {"software developer", "full-stack developer", "new grad"}
 
 
 def get_package_version(package_name: str) -> str:
@@ -2953,7 +2954,19 @@ def jobspy_result_to_job_payload(job: dict[str, Any]) -> dict[str, Any]:
     description = text(job.get("description"))
     title = text(job.get("title"))
     role_type = text(job.get("job_type"))
-    mapped_role_type = map_jobspy_role_type(role_type) or guess_role_type_for_job(title, description)
+    advertised_role_type = guess_role_type_for_job(title, description)
+    employment_role_type = map_jobspy_role_type(role_type)
+    # JobSpy's job_type describes employment arrangement (for example,
+    # "intern"), not the advertised career family.  Prefer the title-derived
+    # family so a finance/strategy internship cannot become a software role
+    # merely because Indeed labelled it an internship.
+    mapped_role_type = advertised_role_type if advertised_role_type != "other" else employment_role_type or "other"
+    if mapped_role_type == "intern" and not re.search(
+        r"\b(?:software|developer|engineering|engineer|programmer|frontend|backend|full[- ]?stack)\b",
+        title,
+        re.I,
+    ):
+        mapped_role_type = "other"
     salary_text = text(job.get("salary_text") or job.get("salary"))
     salary = determine_salary(
         {
@@ -6105,7 +6118,7 @@ def dedupe_keys(job: dict[str, Any], source_job_id: Any = "") -> set[str]:
             keys.add(f"url:{canonical}")
     composite = "|".join(
         [
-            normalize_dedupe_text(job.get("company")),
+            normalize_dedupe_company(job.get("company")),
             normalize_dedupe_text(job.get("title")),
             normalize_dedupe_location(job.get("location")),
         ]
@@ -6133,8 +6146,15 @@ def normalize_dedupe_text(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", " ", text(value).lower()).strip()
 
 
+def normalize_dedupe_company(value: Any) -> str:
+    normalized = normalize_dedupe_text(value)
+    normalized = re.sub(r"\b(?:incorporated|inc|corporation|corp|limited|ltd|llc|co|company)\b", " ", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
 def normalize_dedupe_location(value: Any) -> str:
     normalized = normalize_dedupe_text(value)
+    normalized = re.sub(r"\b(?:canada|ca)\b", " ", normalized)
     replacements = {
         "ontario": "on", "quebec": "qc", "alberta": "ab", "british columbia": "bc",
         "manitoba": "mb", "saskatchewan": "sk", "nova scotia": "ns", "new brunswick": "nb",
@@ -6142,7 +6162,7 @@ def normalize_dedupe_location(value: Any) -> str:
     }
     for name, code in replacements.items():
         normalized = normalized.replace(name, code)
-    return normalized
+    return re.sub(r"\s+", " ", normalized).strip()
 
 
 def determine_salary(job: dict[str, Any]) -> dict[str, Any]:
@@ -7789,7 +7809,7 @@ def apply_discovery_search_constraints(job: dict[str, Any], remote_preference: s
 
 
 def discovery_result_category(job: dict[str, Any], remote_preference: str = "") -> tuple[str, str]:
-    target_role_families = {"software developer", "full-stack developer", "intern", "new grad"}
+    target_role_families = ACTIONABLE_DISCOVERY_ROLE_FAMILIES
     if normalize_space(text(remote_preference)).lower() != "remote":
         if text(job.get("posting_availability")).lower() == "confirmed_closed":
             return "excluded", "Posting is confirmed closed."
@@ -8987,7 +9007,8 @@ def _application_priority(
     seniority_score = clamp_int(seniority.get("score"), 0, 100)
     priority = round(qualification_score * 0.50 + seniority_score * 0.25 + recency * 0.10 + effort * 0.05 + preference * 0.10)
     reasons = ["Qualification Match and evidence-backed seniority fit are weighted first; recency, effort, and stated role/location preferences are secondary."]
-    if text(job.get("role_type")).lower() == "other":
+    role_type = text(job.get("role_type")).lower()
+    if role_type and role_type not in ACTIONABLE_DISCOVERY_ROLE_FAMILIES:
         priority = min(priority, 49)
         reasons.append("The stored role family is outside the selected software-developer target family, so it requires review before applying.")
     if seniority.get("stretch_role"):
@@ -9044,6 +9065,10 @@ def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any
     available_components = [(mandatory_score, 40), (technical_score, 25), (experience_score, 20), (seniority.get("score", 0), 15)]
     available_components = [(value, weight) for value, weight in available_components if value is not None]
     score = round(sum(value * weight for value, weight in available_components) / sum(weight for _, weight in available_components)) if available_components else 0
+    role_type = text(job.get("role_type")).lower()
+    non_target_role = bool(role_type and role_type not in ACTIONABLE_DISCOVERY_ROLE_FAMILIES)
+    if non_target_role:
+        score = min(score, 49)
     insufficient_mandatory_evidence = mandatory_score is None
     if insufficient_mandatory_evidence:
         # A high keyword/seniority average is not evidence of qualification when
@@ -9072,8 +9097,10 @@ def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any
         reasons.append("Not demonstrated in the selected résumé: " + ", ".join(item["requirement"] for item in missing[:6]) + ".")
     if stretch:
         reasons.append("Stretch opportunity: the posting expects experience or seniority not fully established by the selected résumé.")
+    if non_target_role:
+        reasons.append("The advertised role family is outside the selected software-developer targets and requires review before applying.")
     priority, priority_reasons = _application_priority(job, score, profile, seniority)
-    label = "Insufficient requirement evidence" if insufficient_mandatory_evidence else "Stretch opportunity" if stretch or score < 60 else "Strong qualification match" if score >= 75 else "Review qualification fit"
+    label = "Review required — non-target role family" if non_target_role else "Insufficient requirement evidence" if insufficient_mandatory_evidence else "Stretch opportunity" if stretch or score < 60 else "Strong qualification match" if score >= 75 else "Review qualification fit"
     return {
         "qualification_match_status": "assessed" if mandatory_score is not None else "partial_evidence",
         "qualification_fit_score": clamp_int(score, 0, 100),
