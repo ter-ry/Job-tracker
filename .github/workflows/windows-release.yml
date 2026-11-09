@@ -73,8 +73,8 @@ jobs:
         env:
           JOB_TRACKER_VERSION: ${{ steps.version.outputs.version }}
         run: |
-          Set-Content -Path packaging/windows/VERSION.txt -Value "${{ steps.version.outputs.version }}" -NoNewline
-          pyinstaller --noconfirm --clean packaging/windows/job_tracker.spec
+          Set-Content -Path release_packaging/windows/VERSION.txt -Value "${{ steps.version.outputs.version }}" -NoNewline
+          pyinstaller --noconfirm --clean release_packaging/windows/job_tracker.spec
       - name: Install Inno Setup
         shell: pwsh
         run: choco install innosetup --no-progress --yes
@@ -85,13 +85,14 @@ jobs:
           JOB_TRACKER_VERSION: ${{ steps.version.outputs.version }}
         run: |
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          & $iscc "/DAppVersion=${{ steps.version.outputs.version }}" packaging/windows/JobTracker.iss
+          & $iscc "/DAppVersion=${{ steps.version.outputs.version }}" release_packaging/windows/JobTracker.iss
           $path = "Output\JobTracker-Setup-v${{ steps.version.outputs.version }}.exe"
           if (!(Test-Path $path)) { throw "Installer was not created: $path" }
+          if (!(Test-Path "dist\JobTracker\JobTracker.exe")) { throw "PyInstaller bundle was not created: dist\JobTracker" }
           "path=$path" >> $env:GITHUB_OUTPUT
       - name: Check package contents
         shell: pwsh
-        run: python scripts/check_release_artifacts.py "${{ steps.installer.outputs.path }}"
+        run: python scripts/check_release_artifacts.py "${{ steps.installer.outputs.path }}" "dist\JobTracker"
       - name: Generate SHA-256 checksum
         shell: pwsh
         run: (Get-FileHash "${{ steps.installer.outputs.path }}" -Algorithm SHA256).Hash + "  " + (Split-Path "${{ steps.installer.outputs.path }}" -Leaf) | Out-File -Encoding ascii "${{ steps.installer.outputs.path }}.sha256"

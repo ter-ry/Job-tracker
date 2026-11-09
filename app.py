@@ -74,7 +74,7 @@ from db.migrations import run_migrations
 from profile_store import CandidateProfileStore
 from services.document_generation import DocumentGenerationService
 from resume_layout import compare_docx_layout, export_docx_to_pdf
-from version import APP_NAME, APP_VERSION, GITHUB_REPOSITORY
+from version import APP_NAME, APP_VERSION, GITHUB_REPOSITORY, normalize_semver, semver_key
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -539,8 +539,11 @@ def create_app() -> Flask:
             request = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": APP_NAME})
             with urllib.request.urlopen(request, timeout=5) as response:
                 payload = json.loads(response.read().decode("utf-8"))
-            tag = text(payload.get("tag_name"))
-            return jsonify({"current_version": APP_VERSION, "latest_version": tag, "url": text(payload.get("html_url")), "update_available": bool(tag and tag != APP_VERSION)})
+            tag = normalize_semver(text(payload.get("tag_name")))
+            current_key = semver_key(APP_VERSION)
+            latest_key = semver_key(tag)
+            update_available = bool(current_key and latest_key and latest_key > current_key)
+            return jsonify({"current_version": normalize_semver(APP_VERSION) or APP_VERSION, "latest_version": tag, "url": text(payload.get("html_url")), "update_available": update_available})
         except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
             return jsonify({"current_version": APP_VERSION, "update_available": False, "status": "unavailable", "error": str(exc)}), 502
 
@@ -8067,6 +8070,8 @@ def init_db() -> None:
     existing_version = int(db.execute("PRAGMA user_version").fetchone()[0] or 0)
     if database_existed and existing_version < CURRENT_DB_SCHEMA_VERSION and _LAST_MIGRATION_BACKUP is None:
         _LAST_MIGRATION_BACKUP = backup_database_before_migration()
+        if _LAST_MIGRATION_BACKUP is None:
+            raise RuntimeError("Database migration aborted: a consistent pre-migration backup could not be created.")
     # WAL lets refresh/read requests proceed while discovery commits.  This is
     # intentionally performed only during guarded initialization rather than
     # on every request, where changing journal mode would itself be a lock

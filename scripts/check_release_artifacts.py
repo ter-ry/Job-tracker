@@ -7,12 +7,12 @@ from pathlib import Path
 
 
 def main() -> None:
-    if len(sys.argv) != 2:
-        raise SystemExit("usage: check_release_artifacts.py <installer>")
+    if len(sys.argv) not in {2, 3}:
+        raise SystemExit("usage: check_release_artifacts.py <installer> [<bundle-directory>]")
     installer = Path(sys.argv[1])
     if not installer.is_file() or installer.stat().st_size < 1_000_000:
         raise SystemExit(f"installer missing or unexpectedly small: {installer}")
-    dist = installer.parent / "JobTracker"
+    dist = Path(sys.argv[2]) if len(sys.argv) == 3 else installer.parent / "JobTracker"
     if not (dist / "JobTracker.exe").is_file():
         raise SystemExit("PyInstaller executable is missing from the staging directory")
     forbidden = [path for path in dist.rglob("*") if path.name in {"jobs.sqlite", "instance.lock"}]

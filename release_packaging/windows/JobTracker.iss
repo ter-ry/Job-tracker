@@ -10,17 +10,17 @@ AppVersion={#AppVersion}
 AppPublisher=ter-ry
 DefaultDirName={autopf}\Job Tracker
 DefaultGroupName={#AppName}
+OutputDir=..\..\Output
 OutputBaseFilename=JobTracker-Setup-v{#AppVersion}
 Compression=lzma2
 SolidCompression=yes
 PrivilegesRequired=lowest
 ArchitecturesInstallIn64BitMode=x64compatible
 Uninstallable=yes
-; AppMutex prevents the installer from replacing files while the app runs.
 AppMutex=JobTrackerInstance
 
 [Files]
-Source: "dist\JobTracker\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\..\dist\JobTracker\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\JobTracker.exe"
@@ -30,5 +30,4 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\JobTracker.exe"
 Filename: "{app}\JobTracker.exe"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
-; Deliberately do not remove {userappdata}\Job Tracker. User data survives
-; uninstall/reinstall and is backed up by the application before migrations.
+; User data under {userappdata}\Job Tracker is intentionally preserved.

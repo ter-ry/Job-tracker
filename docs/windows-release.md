@@ -10,7 +10,7 @@ This document describes the future Windows distribution path. It does not publis
 - The published installer is named `JobTracker-Setup-v1.0.0.exe`, with a matching `.sha256` file.
 - PRs and merges to `master` do not publish releases.
 
-The installer contains a PyInstaller onedir application and creates Start-menu and desktop shortcuts. `packaging/windows/launcher.py` starts Waitress on `127.0.0.1:5000`, waits for `/api/health`, and opens the default browser. A lock file under the data directory prevents a second application instance. If an existing healthy instance is found, a second launch only opens the browser.
+The installer contains a PyInstaller onedir application and creates Start-menu and desktop shortcuts. `release_packaging/windows/launcher.py` starts Waitress on `127.0.0.1:5000`, waits for `/api/health`, and opens the default browser. A named Windows mutex (`JobTrackerInstance`) prevents a second application instance and matches Inno Setup's `AppMutex`; a file lock is used only on non-Windows test platforms. If an existing healthy instance is found, a second launch only opens the browser.
 
 ## User data and upgrades
 
@@ -21,7 +21,7 @@ The launcher sets `JOB_TRACKER_DATA_DIR` to `%APPDATA%\Job Tracker` before impor
 - saved searches, discovery caches, generated documents, semantic caches, and settings
 - `backups\jobs-before-migration-*.sqlite`
 
-Before a schema upgrade, the guarded database initializer creates a consistent SQLite backup using SQLite's backup API. Migrations are additive and versioned in `db/migrations.py`; they must not delete or rewrite user records. The release smoke test asserts that an isolated data root is used.
+Before a schema upgrade, the guarded database initializer creates a consistent SQLite backup using SQLite's backup API. If that backup cannot be created, the migration aborts before schema writes. Migrations are additive and versioned in `db/migrations.py`; they must not delete or rewrite user records. The release smoke test asserts that an isolated data root is used.
 
 ## Dependency and size implications
 
@@ -36,7 +36,7 @@ Ollama remains an optional local integration. The installer does not bundle or s
 
 ## Future updater safety
 
-The current `Check for updates` control is read-only: it queries the latest GitHub Release and opens the release page after user confirmation. It does not download, replace, or install anything.
+The current `Check for updates` control is read-only: it queries the latest GitHub Release, normalizes `v1.0.0` and `1.0.0` to the same semantic version, and opens the release page only when a strictly newer release exists. It does not download, replace, or install anything.
 
 A future updater must:
 
@@ -53,10 +53,10 @@ No silent updates or automatic database resets are permitted.
 ## Developer release procedure
 
 1. Finish and merge application work through normal PR review. Confirm the release branch is based on the latest `master` and that discovery, ECE search, extraction, Pipeline, concurrency, and tailoring tests pass.
-2. Run the workflow manually with a test version such as `0.0.0-rc.1`. Download the artifact, verify the checksum, install it on a disposable Windows account or VM, and confirm it starts on localhost, opens a browser, and creates data under `%APPDATA%\Job Tracker`.
+2. Run the workflow manually with a test version such as `0.0.0-rc.1`. Manual runs build validation artifacts only and cannot publish a release. Download the artifact, verify the checksum, install it on a disposable Windows account or VM, and confirm it starts on localhost, opens a browser, and creates data under `%APPDATA%\Job Tracker`.
 3. Seed disposable data, install a newer test build, and verify jobs, profiles, saved searches, documents, and application history remain intact. Test a migration from a copy of the prior SQLite database and verify the pre-migration backup.
 4. Confirm the packaged feature set, including semantic fallback, document generation, optional Ollama settings, discovery providers, export, and external job links.
-5. Configure the GitHub `release` environment with required reviewers and confirm signing credentials are available. Unsigned builds are not first-public-release ready.
+5. Configure the GitHub `release` environment with required reviewers; the workflow environment only becomes an approval gate after those reviewers are explicitly configured in repository settings. Confirm signing credentials are available. Unsigned builds are suitable for private testing but are not first-public-release ready.
 6. Create and push an approved tag: `git tag -a v1.0.0 -m "Job Tracker v1.0.0"` then `git push origin v1.0.0`. The workflow must pass before the release reviewer approves publication.
 7. Verify the GitHub Release asset filename and checksum, then test download/install from the release page on a clean Windows machine.
 

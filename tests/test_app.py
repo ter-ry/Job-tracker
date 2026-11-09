@@ -1459,6 +1459,28 @@ class JobAssistantTest(unittest.TestCase):
             self.assertEqual(self.client.get("/api/profile").status_code, 200)
         self.assertEqual(initialize.call_count, 1)
 
+    def test_update_check_uses_normalized_semver_comparison(self):
+        response = FakeUrlopenResponse({
+            "tag_name": "v1.0.0",
+            "html_url": "https://github.com/ter-ry/Job-tracker/releases/tag/v1.0.0",
+        })
+        with patch.object(app_module, "APP_VERSION", "1.0.0"), patch.object(app_module.urllib.request, "urlopen", return_value=response):
+            result = self.client.get("/api/updates")
+        self.assertEqual(result.status_code, 200)
+        self.assertFalse(result.get_json()["update_available"])
+        self.assertEqual(result.get_json()["latest_version"], "1.0.0")
+
+    def test_migration_aborts_when_pre_migration_backup_fails(self):
+        with app_module.app.app_context():
+            app_module.init_db()
+            app_module.get_db().execute("PRAGMA user_version = 1")
+            app_module.get_db().commit()
+            app_module._INITIALIZED_DATABASE_PATH = None
+            app_module._LAST_MIGRATION_BACKUP = None
+            with patch.object(app_module, "backup_database_before_migration", return_value=None):
+                with self.assertRaisesRegex(RuntimeError, "backup could not be created"):
+                    app_module.init_db()
+
     def test_refresh_during_active_sqlite_write_waits_without_initialization_lock_error(self):
         with self.client.application.app_context():
             app_module.init_db()

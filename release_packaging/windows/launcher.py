@@ -1,27 +1,21 @@
-"""Start Job Tracker as a local, single-instance Windows desktop app.
-
-This module is the PyInstaller entrypoint.  It deliberately sets the data root
-before importing Flask so frozen code and user data can never be confused.
-"""
+"""Start Job Tracker as a local, single-instance Windows desktop app."""
 
 from __future__ import annotations
 
 import atexit
-import json
+import ctypes
 import os
 from pathlib import Path
-import socket
-import sys
 import threading
 import time
 import urllib.error
 import urllib.request
 import webbrowser
 
-
 HOST = "127.0.0.1"
 PORT = 5000
 APPDATA_FOLDER = "Job Tracker"
+INSTANCE_MUTEX = "JobTrackerInstance"
 
 
 def default_data_dir() -> Path:
@@ -35,53 +29,52 @@ def default_data_dir() -> Path:
 
 
 class SingleInstance:
-    """Cross-platform testable lock; Windows uses an advisory file lock."""
+    """Hold the named mutex used by Inno Setup's AppMutex setting."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, mutex_name: str = INSTANCE_MUTEX):
         self.path = path
+        self.mutex_name = mutex_name
         self.handle = None
 
     def acquire(self) -> bool:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.handle = self.path.open("a+")
-        self.handle.seek(0)
-        self.handle.write("Job Tracker\n")
-        self.handle.flush()
         if os.name == "nt":
-            import msvcrt
-
-            try:
-                self.handle.seek(0)
-                msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
-            except OSError:
-                self.close()
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+            kernel32.CreateMutexW.restype = ctypes.c_void_p
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            handle = kernel32.CreateMutexW(None, True, self.mutex_name)
+            if not handle:
                 return False
-        else:
-            import fcntl
-
-            try:
-                fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                self.close()
+            if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+                kernel32.CloseHandle(handle)
                 return False
+            self.handle = (kernel32, handle)
+            return True
+        import fcntl
+
+        self.handle = self.path.open("a+")
+        try:
+            fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self.close()
+            return False
         return True
 
     def close(self) -> None:
         if self.handle is None:
             return
-        try:
-            if os.name == "nt":
-                import msvcrt
+        if os.name == "nt":
+            kernel32, handle = self.handle
+            kernel32.CloseHandle(handle)
+        else:
+            import fcntl
 
-                self.handle.seek(0)
-                msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
+            try:
                 fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
-        except OSError:
-            pass
-        self.handle.close()
+            except OSError:
+                pass
+            self.handle.close()
         self.handle = None
 
 
@@ -116,26 +109,25 @@ def launch() -> int:
     lock = SingleInstance(data_dir / "instance.lock")
     if not lock.acquire():
         if server_is_healthy():
-            webbrowser.open(local_health_url().replace("/api/health", "/"))
+            webbrowser.open(f"http://{HOST}:{PORT}/")
             return 0
         return 2
     atexit.register(lock.close)
 
     from waitress import serve
-
     from app import app
 
-    thread = threading.Thread(
+    server_thread = threading.Thread(
         target=serve,
         args=(app,),
         kwargs={"host": HOST, "port": PORT, "threads": 8, "ident": "JobTracker"},
         daemon=True,
     )
-    thread.start()
+    server_thread.start()
     if not wait_for_server():
         return 3
     webbrowser.open(f"http://{HOST}:{PORT}/")
-    thread.join()
+    server_thread.join()
     return 0
 
 
