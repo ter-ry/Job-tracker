@@ -79,6 +79,11 @@ from resume_layout import compare_docx_layout, export_docx_to_pdf
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("JOB_TRACKER_DATA_DIR", BASE_DIR / "data"))
 DB_PATH = DATA_DIR / "jobs.sqlite"
+SQLITE_BUSY_TIMEOUT_MS = 30_000
+_DATABASE_INIT_LOCK = threading.RLock()
+_INITIALIZED_DATABASE_PATH: Path | None = None
+_ACTIVE_DISCOVERY_SEARCHES: set[str] = set()
+_ACTIVE_DISCOVERY_SEARCHES_LOCK = threading.Lock()
 MAX_FETCH_BYTES = 1_200_000
 DISCOVERY_SOURCES = ["linkedin", "indeed", "google", "zip_recruiter"]
 GENERATED_APPLICATIONS_DIRNAME = "generated_applications"
@@ -132,6 +137,8 @@ CURRENT_DB_SCHEMA_VERSION = 9
 DISCOVERY_DEBUG_SNAPSHOT_LIMIT = 25
 GEOCODING_FAILURE_CACHE_SECONDS = 15 * 60
 DISCOVERY_TASK_NAME = "Job Tracker Discovery"
+DISCOVERY_PROVIDER_TIMEOUT_SECONDS = 45
+DISCOVERY_OVERALL_TIMEOUT_SECONDS = 180
 TESTED_DEPENDENCY_VERSIONS = {
     "python-jobspy": "1.1.82",
     "pandas": "2.3.3",
@@ -486,13 +493,31 @@ def create_app() -> Flask:
 
     @app.before_request
     def ensure_database() -> None:
-        init_db()
+        # Bootstrap is guarded and happens once per database path.  Schema
+        # checks and migrations must not run on every ordinary request: they
+        # include DDL and the user_version write, both of which can contend
+        # with a discovery persistence transaction.
+        global _INITIALIZED_DATABASE_PATH
+        database_path = DB_PATH.resolve()
+        if _INITIALIZED_DATABASE_PATH != database_path:
+            with _DATABASE_INIT_LOCK:
+                if _INITIALIZED_DATABASE_PATH != database_path:
+                    init_db()
+                    _INITIALIZED_DATABASE_PATH = database_path
 
     @app.teardown_appcontext
     def close_connection(_: Exception | None = None) -> None:
         db = g.pop("db", None)
         if db is not None:
             db.close()
+
+    @app.after_request
+    def release_discovery_search_lock(response: Response) -> Response:
+        search_key = g.pop("discovery_search_lock_key", None)
+        if search_key:
+            with _ACTIVE_DISCOVERY_SEARCHES_LOCK:
+                _ACTIVE_DISCOVERY_SEARCHES.discard(search_key)
+        return response
 
     @app.get("/")
     def index() -> str:
@@ -2056,6 +2081,13 @@ def create_app() -> Flask:
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         search_key = discovery_search_signature(payload)
+        with _ACTIVE_DISCOVERY_SEARCHES_LOCK:
+            if search_key in _ACTIVE_DISCOVERY_SEARCHES:
+                return jsonify({
+                    "error": "An identical discovery search is already running; wait for it to finish before starting another."
+                }), 409
+            _ACTIVE_DISCOVERY_SEARCHES.add(search_key)
+        g.discovery_search_lock_key = search_key
         stored_preferences = load_discovery_preferences(search_key)
         preferences = stored_preferences or discovery_preferences_payload({})
         profile = load_profile()
@@ -2758,7 +2790,8 @@ def start_discovery_search_lease_heartbeat(search_id: int, owner: str) -> tuple[
 
     def renew() -> None:
         while not stop.wait(DISCOVERY_LEASE_RENEW_SECONDS):
-            connection = sqlite3.connect(DB_PATH, timeout=5)
+            connection = sqlite3.connect(DB_PATH, timeout=SQLITE_BUSY_TIMEOUT_MS / 1000)
+            connection.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
             try:
                 expires = datetime.now() + timedelta(minutes=DISCOVERY_LEASE_MINUTES)
                 connection.execute(
@@ -3859,7 +3892,8 @@ def start_preparation_lease_heartbeat(item_id: int, owner: str) -> tuple[threadi
 
     def renew() -> None:
         while not stop.wait(PREPARATION_LEASE_RENEW_SECONDS):
-            connection = sqlite3.connect(DB_PATH, timeout=5)
+            connection = sqlite3.connect(DB_PATH, timeout=SQLITE_BUSY_TIMEOUT_MS / 1000)
+            connection.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
             try:
                 expires = datetime.now() + timedelta(minutes=PREPARATION_LEASE_MINUTES)
                 connection.execute("UPDATE application_preparation_queue SET lease_expires_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'preparing' AND lease_owner = ?", [expires.isoformat(timespec="seconds"), item_id, owner])
@@ -7357,17 +7391,22 @@ def is_countrywide_search_location(location: str) -> bool:
 
 
 def fetch_discovery_jobs_for_search(search: dict[str, Any], *, country_indeed: str = "Canada") -> dict[str, Any]:
+    started = time.monotonic()
     locations = discovery_query_locations(search.get("discovery_location") or search.get("location"))
     per_region = max(1, (int(search["request_per_source_cap"]) + len(locations) - 1) // len(locations))
     merged: list[dict[str, Any]] = []
     seen: set[str] = set()
     combined: dict[str, Any] = {"jobs": [], "errors": {}, "source_counts": {}, "source_diagnostics": {}, "source_snapshots": {}}
     for location in locations:
+        if time.monotonic() - started >= DISCOVERY_OVERALL_TIMEOUT_SECONDS:
+            combined["errors"]["overall"] = f"Discovery timed out after {DISCOVERY_OVERALL_TIMEOUT_SECONDS}s before all locations completed."
+            break
         result = fetch_jobspy_jobs(
             keywords=search["keywords"], location=location, distance=search["distance"],
             remote_preference=search["remote_preference"], job_type=None,
             results_wanted=per_region, hours_old=search["hours_old"],
             enabled_sources=search["enabled_sources"], country_indeed=country_indeed,
+            provider_timeout_seconds=DISCOVERY_PROVIDER_TIMEOUT_SECONDS,
         )
         for raw in result.get("jobs", []):
             key = text(raw.get("source_job_id") or raw.get("job_url") or raw.get("job_url_direct"))
@@ -8010,13 +8049,23 @@ def apply_discovery_filters(job: dict[str, Any], filters: dict[str, Any]) -> boo
 def get_db() -> sqlite3.Connection:
     if "db" not in g:
         DATA_DIR.mkdir(exist_ok=True)
-        g.db = sqlite3.connect(DB_PATH)
+        g.db = sqlite3.connect(DB_PATH, timeout=SQLITE_BUSY_TIMEOUT_MS / 1000)
+        g.db.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+        g.db.execute("PRAGMA foreign_keys = ON")
         g.db.row_factory = sqlite3.Row
     return g.db
 
 
 def init_db() -> None:
+    global _INITIALIZED_DATABASE_PATH
     db = get_db()
+    # WAL lets refresh/read requests proceed while discovery commits.  This is
+    # intentionally performed only during guarded initialization rather than
+    # on every request, where changing journal mode would itself be a lock
+    # source.  SQLite will retain the setting for subsequent connections.
+    db.execute("PRAGMA journal_mode = WAL")
+    db.execute("PRAGMA synchronous = NORMAL")
+    db.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS jobs (
@@ -8304,6 +8353,7 @@ def init_db() -> None:
     run_migrations(db)
     db.execute(f"PRAGMA user_version = {CURRENT_DB_SCHEMA_VERSION}")
     db.commit()
+    _INITIALIZED_DATABASE_PATH = DB_PATH.resolve()
 
 
 def ensure_columns(table: str, columns: dict[str, str]) -> None:
