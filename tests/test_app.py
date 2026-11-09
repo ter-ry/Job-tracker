@@ -2771,6 +2771,53 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(app_module.classify_title_match("Frontend Developer", "software developer", "related"), ("exact", 100))
         self.assertEqual(app_module.classify_title_match("Strategy Analyst", "software developer", "related")[0], "uncertain")
 
+    def test_title_matching_does_not_promote_generic_or_unrelated_software_titles(self):
+        self.assertEqual(app_module.classify_title_match("Civil Engineer", "software developer", "strict")[0], "uncertain")
+        self.assertEqual(app_module.classify_title_match("Real Estate Developer", "software developer", "strict")[0], "uncertain")
+        self.assertEqual(app_module.classify_title_match("Software Engineer", "software developer", "strict"), ("exact", 100))
+        self.assertEqual(app_module.classify_title_match("Backend Engineer", "software developer", "strict"), ("exact", 100))
+
+    def test_ece_title_matching_supports_rece_and_rejects_unrelated_titles(self):
+        self.assertEqual(app_module.classify_title_match("Registered Early Childhood Educator", "ECE", "strict"), ("exact", 100))
+        self.assertEqual(app_module.classify_title_match("RECE", "early childhood educator", "strict"), ("exact", 100))
+        self.assertEqual(app_module.classify_title_match("Early Childhood Teacher", "ECE", "related"), ("related", 75))
+        self.assertEqual(app_module.classify_title_match("Early Childhood Assistant", "ECE", "strict")[0], "uncertain")
+        self.assertEqual(app_module.classify_title_match("ECE Sales Representative", "RECE", "related")[0], "uncertain")
+        self.assertEqual(app_module.classify_title_match("Childcare Manager", "ECE", "related")[0], "uncertain")
+        self.assertEqual(app_module.classify_title_match("Elementary School Teacher", "ECE", "related")[0], "uncertain")
+
+    def test_exact_ece_title_is_actionable_without_software_role_family_or_resume(self):
+        category, _ = app_module.discovery_result_category(
+            {
+                "discovery_search_mode": "title",
+                "discovery_occupation": "early childhood educator",
+                "occupation_match_type": "exact",
+                "role_type": "other",
+                "location_search_eligible": True,
+                "remote_type": "Hybrid",
+                "application_priority_score": 0,
+                "qualification_fit_seniority": {"detected_level": "unknown", "management_role": False},
+            },
+            "hybrid",
+        )
+        self.assertEqual(category, "actionable")
+
+    def test_title_search_qualification_does_not_load_active_resume(self):
+        with patch.object(app_module, "load_profile", side_effect=AssertionError("active profile must not be loaded")):
+            result = app_module.build_qualification_fit(
+                {
+                    "title": "Registered Early Childhood Educator",
+                    "job_description": "Required: Early Childhood Education diploma.",
+                    "required_skills": "Early Childhood Education diploma",
+                    "role_type": "other",
+                    "discovery_search_mode": "title",
+                    "discovery_profile_independent": 1,
+                },
+                evidence_profile=None,
+            )
+        self.assertEqual(result["qualification_evidence_confidence"], "standard")
+        self.assertEqual(result["qualification_evidence_profile_name"], "No résumé selected — title search")
+
     def test_explore_mode_retains_adjacent_roles_without_global_non_target_cap(self):
         job = {"role_type": "analyst", "discovery_search_mode": "explore", "occupation_match_type": "adjacent_opportunity", "location_search_eligible": True, "remote_type": "Hybrid", "application_priority_score": 80}
         self.assertEqual(app_module.discovery_result_category(job, "hybrid")[0], "adjacent_opportunity")
