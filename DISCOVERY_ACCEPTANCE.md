@@ -289,4 +289,10 @@ The holdout policy states that all 20 postings were selected from employer ATS/c
 
 The original review-inclusive diagnostic remains 12/18 precision and 6/18 false positives. It includes review-required inventory in its denominator; the actionable metric includes only rows eligible for application recommendations. Both are reported, and the frozen threshold was not replaced. The seven actionable holdout postings are PolicyMe, Rose Rocket, Cerebras Systems, PointClickCare, Superhuman/GPTZero, Harvey, and Fellow Insights. Review-required rows include the adjacent Everbridge support role and senior/stretch roles; no suitable holdout row was suppressed.
 
-Mandatory-skill accuracy, actionable holdout precision/false-positive rate, hard eligibility, and holdout false-negative rate meet their thresholds. The known tailoring preview-cache failure remains a separate pre-existing failure. PR #12 remains draft and unmerged for final human review.
+Mandatory-skill accuracy, actionable holdout precision/false-positive rate, hard eligibility, and holdout false-negative rate meet their thresholds. PR #12 remains draft and unmerged for final human review.
+
+## Final preview-cache correction — 2026-11-09
+
+The preview-cache regression was reproduced deterministically on PR #12 and passed 3/3 on `origin/master` with the same `.venv` and exact test command. A temporary-worktree bisect identified `f33c8df` as the first bad PR commit; the relevant issue was an indirect shared path/cache interaction, not a material tailoring-route change. The layout validator normalized `draft_path` before using it in the SQLite update predicate, so an equivalent stored path could make the cache write a no-op. The fix keeps the draft-ID and path race guard but compares against the original stored SQLite path representation.
+
+Validation after the fix: the failing test passed 3/3; the tailoring group passed 25/25; discovery/audit regressions passed 38/38; and the full suite passed **229 tests, 1 skipped**. No assertion was weakened and no production database or user data was used.

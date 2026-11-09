@@ -90,4 +90,10 @@ The required-skill labels are in `audit/discovery-mandatory-skill-labels-2026-11
 
 Six extracted labels were false positives and eight authoritative labels were missed. The detailed per-posting comparison is in `.tmpqa/quality-audit-mandatory-skills-20261108.json`; no labels were fabricated or converted from preferred evidence.
 
-The 20-record holdout was selected and labeled before scoring, outside the current 21-row audit pool. Seven records are independently suitable; all seven were recommended, so recall is 7/7 = 100% and false negatives are 0/7. Recommendation coverage is 7/20 = 35%, not recall. Actionable precision is 7/7 = 100% and actionable false-positive rate is 0/7 = 0%. Mandatory-skill accuracy and the actionable holdout metrics now pass. The known tailoring preview-cache failure remains separate; PR #12 remains draft and unmerged pending final human review.
+The 20-record holdout was selected and labeled before scoring, outside the current 21-row audit pool. Seven records are independently suitable; all seven were recommended, so recall is 7/7 = 100% and false negatives are 0/7. Recommendation coverage is 7/20 = 35%, not recall. Actionable precision is 7/7 = 100% and actionable false-positive rate is 0/7 = 0%. Mandatory-skill accuracy and the actionable holdout metrics now pass; PR #12 remains draft and unmerged pending final human review.
+
+## Final preview-cache correction — 2026-11-09
+
+The preview-cache failure was reproduced on PR #12 and passed 3/3 on `origin/master` using the same virtual environment and exact test command. A temporary-worktree bisect identified `f33c8df` as the first bad PR commit. The confirmed defect was a cache write guarded by a normalized path while SQLite stored an equivalent original path; the update could affect zero rows, causing the next preview to recompute layout. The fix preserves the draft-ID/path race guard and compares the path predicate with the stored SQLite representation.
+
+Post-fix validation: failing test 3/3, tailoring group 25/25, discovery/audit regressions 38/38, full suite 229 passed and 1 skipped. No assertion was weakened; production data and unrelated local changes were untouched.

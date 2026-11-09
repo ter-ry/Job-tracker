@@ -3593,7 +3593,10 @@ def validate_tailoring_draft_layout(draft_id: int, expected_version: str | None 
     layout["draft_version"] = version
     layout.setdefault("timings_ms", {})["word_layout_validation"] = round((time.perf_counter() - started) * 1000, 2)
     db = get_db()
-    db.execute("UPDATE tailoring_drafts SET layout_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND draft_path = ?", [dumps_json(layout), draft_id, str(draft)])
+    # Keep the race guard, but compare against the path representation stored
+    # in SQLite. safe_local_path() may normalize an equivalent path before it
+    # reaches this function, which otherwise makes the cache write a no-op.
+    db.execute("UPDATE tailoring_drafts SET layout_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND draft_path = ?", [dumps_json(layout), draft_id, text(row["draft_path"])])
     db.commit()
     return layout
 
