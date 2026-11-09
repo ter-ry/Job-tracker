@@ -409,6 +409,15 @@ class JobAssistantTest(unittest.TestCase):
         url_only = jobspy_source.normalize_jobspy_row({"title": "Developer", "job_url": "https://example.test/job"}, "linkedin")
         self.assertEqual(url_only["posting_availability"], "unverified")
 
+    def test_remote_canada_wording_without_structured_location_is_eligible(self):
+        eligibility, reason = app_module.discovery_remote_eligibility({
+            "remote_type": "Remote",
+            "location": "",
+            "job_description": "This position can be performed remotely from anywhere in the US or Canada.",
+        })
+        self.assertEqual(eligibility, "canadian_eligible")
+        self.assertIn("Canadian", reason)
+
     def test_jobspy_experience_extraction_ignores_company_history(self):
         description = (
             "For 30 years, we've been on a mission to change banking for good.\n"
