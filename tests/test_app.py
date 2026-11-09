@@ -418,6 +418,18 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(eligibility, "canadian_eligible")
         self.assertIn("Canadian", reason)
 
+    def test_remote_canada_mentions_without_affirmative_scope_remain_unknown(self):
+        for description in (
+            "This is a remote role based in the UK. Our customers span Canada and Europe.",
+            "Remote role; applicants must reside outside Canada.",
+        ):
+            eligibility, _reason = app_module.discovery_remote_eligibility({
+                "remote_type": "Remote",
+                "location": "London, UK",
+                "job_description": description,
+            })
+            self.assertEqual(eligibility, "unknown")
+
     def test_jobspy_experience_extraction_ignores_company_history(self):
         description = (
             "For 30 years, we've been on a mission to change banking for good.\n"

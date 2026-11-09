@@ -2634,8 +2634,7 @@ def discovery_remote_eligibility(job: dict[str, Any]) -> tuple[str, str]:
     explicit_canadian_eligibility = bool(re.search(
         r"(?:remote|work|role|position|employees?|candidates?).{0,45}(?:in|from|within|across|eligible\s+in)\s+(?:the\s+)?canada|"
         r"canadian\s+(?:eligible|candidates?|residents?)|eligible\s+to\s+work\s+in\s+canada|"
-        r"\bremote\b.{0,80}\bcanada\b|\bcanada\b.{0,80}\bremote\b|"
-        r"\bremotely?\b.{0,120}\b(?:the\s+)?(?:us|u\.s\.|united states)\b.{0,30}\bor\s+canada\b",
+        r"\bremotely?\s+from\s+anywhere\s+in\s+(?:the\s+)?(?:us|u\.s\.|united states)\s+or\s+canada\b",
         description,
     ))
     if restricted:
