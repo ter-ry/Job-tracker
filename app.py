@@ -313,6 +313,27 @@ ROLE_KEYWORDS = [
 
 LOCATION_KEYWORDS = ["toronto", "remote", "hybrid", "gta", "ontario", "canada"]
 
+# Search vocabulary is intentionally occupation-oriented rather than tied to a
+# résumé or one provider's keyword expansion.  The advertised title is the
+# source of truth for an exact title match; description text alone never makes
+# a posting an exact match.
+OCCUPATION_TITLE_SYNONYMS = {
+    "software developer": [
+        "software developer", "software engineer", "full stack developer",
+        "full-stack developer", "full stack engineer", "full-stack engineer",
+        "frontend developer", "front-end developer", "frontend engineer", "front-end engineer",
+        "backend developer", "back-end developer", "backend engineer", "back-end engineer",
+        "web developer", "web engineer", "application developer", "application engineer",
+        "python developer", "javascript developer",
+    ],
+    "early childhood educator": [
+        "registered early childhood educator", "registered early childhood education",
+        "early childhood educator", "early childhood education", "ece", "rece",
+        "childcare educator", "child care educator", "preschool teacher",
+        "daycare educator", "early years educator",
+    ],
+}
+
 PENALTY_KEYWORDS = [
     "senior",
     "5+ years",
@@ -421,6 +442,17 @@ JOB_COLUMNS = {
     "discovery_remote_preference": "TEXT NOT NULL DEFAULT ''",
     "discovery_location_scope": "TEXT NOT NULL DEFAULT ''",
     "remote_search_eligible": "TEXT NOT NULL DEFAULT ''",
+    "discovery_occupation": "TEXT NOT NULL DEFAULT ''",
+    "discovery_profile_independent": "INTEGER NOT NULL DEFAULT 0",
+    "discovery_search_mode": "TEXT NOT NULL DEFAULT ''",
+    "title_match_mode": "TEXT NOT NULL DEFAULT 'related'",
+    "occupation_match_type": "TEXT NOT NULL DEFAULT 'uncertain'",
+    "title_match_score": "INTEGER NOT NULL DEFAULT 0",
+    "salary_evidence_text": "TEXT NOT NULL DEFAULT ''",
+    "salary_ambiguity": "TEXT NOT NULL DEFAULT ''",
+    "distance_type": "TEXT NOT NULL DEFAULT 'unknown'",
+    "commute_status": "TEXT NOT NULL DEFAULT 'unavailable'",
+    "commute_source": "TEXT NOT NULL DEFAULT ''",
 }
 
 PROFILE_COLUMNS = {
@@ -1758,10 +1790,11 @@ def create_app() -> Flask:
                 """INSERT INTO saved_search_profiles
                    (name, keywords, location, remote_preference, seniority, minimum_salary,
                     enabled_sources_json, date_window, search_depth, distance, per_source_cap, total_cap, interval_minutes, enabled,
+                    search_mode, title_match_mode,
                     auto_prepare_enabled, auto_prepare_min_priority, auto_prepare_require_canadian,
                     auto_prepare_candidate_profile_id, auto_prepare_resume_id, auto_prepare_cover_letter_template_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["search_depth"], search["distance"], search["per_source_cap"], search["total_cap"], search["interval_minutes"], search["enabled"], search["auto_prepare_enabled"], search["auto_prepare_min_priority"], search["auto_prepare_require_canadian"], search["auto_prepare_candidate_profile_id"], search["auto_prepare_resume_id"], search["auto_prepare_cover_letter_template_id"]],
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["search_depth"], search["distance"], search["per_source_cap"], search["total_cap"], search["interval_minutes"], search["enabled"], search["search_mode"], search["title_match_mode"], search["auto_prepare_enabled"], search["auto_prepare_min_priority"], search["auto_prepare_require_canadian"], search["auto_prepare_candidate_profile_id"], search["auto_prepare_resume_id"], search["auto_prepare_cover_letter_template_id"]],
             )
             get_db().commit()
         except sqlite3.IntegrityError:
@@ -1782,9 +1815,10 @@ def create_app() -> Flask:
                 """UPDATE saved_search_profiles SET name = ?, keywords = ?, location = ?, remote_preference = ?,
                    seniority = ?, minimum_salary = ?, enabled_sources_json = ?, date_window = ?, search_depth = ?, distance = ?,
                    per_source_cap = ?, total_cap = ?, interval_minutes = ?, enabled = ?, auto_prepare_enabled = ?, auto_prepare_min_priority = ?,
+                   search_mode = ?, title_match_mode = ?,
                    auto_prepare_require_canadian = ?, auto_prepare_candidate_profile_id = ?, auto_prepare_resume_id = ?,
                    auto_prepare_cover_letter_template_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
-                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["search_depth"], search["distance"], search["per_source_cap"], search["total_cap"], search["interval_minutes"], search["enabled"], search["auto_prepare_enabled"], search["auto_prepare_min_priority"], search["auto_prepare_require_canadian"], search["auto_prepare_candidate_profile_id"], search["auto_prepare_resume_id"], search["auto_prepare_cover_letter_template_id"], search_id],
+                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["search_depth"], search["distance"], search["per_source_cap"], search["total_cap"], search["interval_minutes"], search["enabled"], search["auto_prepare_enabled"], search["auto_prepare_min_priority"], search["search_mode"], search["title_match_mode"], search["auto_prepare_require_canadian"], search["auto_prepare_candidate_profile_id"], search["auto_prepare_resume_id"], search["auto_prepare_cover_letter_template_id"], search_id],
             )
             get_db().commit()
         except sqlite3.IntegrityError:
@@ -2163,6 +2197,17 @@ def create_app() -> Flask:
         for raw_job in raw_jobs:
             payload_job = jobspy_result_to_job_payload(raw_job)
             clean = normalize_job_payload(payload_job)
+            clean["discovery_occupation"] = search["occupation"]
+            clean["discovery_profile_independent"] = int(search["profile_independent"])
+            clean["discovery_search_mode"] = search["search_mode"]
+            clean["title_match_mode"] = search["title_match_mode"]
+            if search["search_mode"] == "title":
+                clean["occupation_match_type"], clean["title_match_score"] = classify_title_match(
+                    text(clean.get("title")), keywords, search["title_match_mode"]
+                )
+            else:
+                clean["occupation_match_type"] = "adjacent_opportunity"
+                clean["title_match_score"] = 50
             clean, geocode_result = geocode_discovery_job(clean, profile, origin, provider, use_cache=not bypass_cache)
             if geocode_result.get("ok"):
                 geocoding_success += 1
@@ -2612,6 +2657,8 @@ def normalize_saved_search_payload(payload: dict[str, Any], existing: dict[str, 
     interval_minutes = clamp_int_default(payload.get("interval_minutes", existing.get("interval_minutes")), 360, 15, 10080)
     minimum_salary = clamp_int_default(payload.get("minimum_salary", existing.get("minimum_salary")), 0, 0, 1000000)
     distance = clamp_int_default(payload.get("distance", existing.get("distance")), 50, 0, 1000)
+    search_mode = normalize_choice(payload.get("search_mode", existing.get("search_mode")), {"title", "explore"}) or "title"
+    title_match_mode = normalize_choice(payload.get("title_match_mode", existing.get("title_match_mode")), {"strict", "related"}) or "related"
     existing_sources = existing.get("enabled_sources")
     if not isinstance(existing_sources, list):
         try:
@@ -2639,6 +2686,8 @@ def normalize_saved_search_payload(payload: dict[str, Any], existing: dict[str, 
         "distance": distance,
         "per_source_cap": per_source_cap,
         "total_cap": total_cap,
+        "search_mode": search_mode,
+        "title_match_mode": title_match_mode,
         "interval_minutes": interval_minutes,
         "enabled": 1 if as_bool(payload.get("enabled", existing.get("enabled", False))) else 0,
         "auto_prepare_enabled": auto_prepare_enabled,
@@ -2677,7 +2726,13 @@ def saved_search_to_discovery_payload(search: dict[str, Any]) -> dict[str, Any]:
 
 def resolve_discovery_evidence_profile(payload: dict[str, Any]) -> dict[str, Any]:
     """Resolve the résumé used for discovery scoring, without mixing profiles."""
+    search_mode = normalize_choice(payload.get("search_mode"), {"title", "explore"}) or "title"
     profile_id = payload.get("candidate_profile_id") or payload.get("auto_prepare_candidate_profile_id")
+    if search_mode == "title" and profile_id in (None, "", 0):
+        # Title Search is useful before a résumé exists.  An active SWE résumé
+        # must not silently become evidence for an unrelated occupation such as
+        # ECE; qualification remains an optional, explicitly selected layer.
+        return {}
     if profile_id not in (None, "", 0):
         selected = resolve_tailoring_resume_profile({"candidate_profile_id": profile_id, "resume_id": payload.get("resume_id") or payload.get("auto_prepare_resume_id")})
         profile = selected["profile"]
@@ -2889,6 +2944,17 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
     filtered = 0
     for raw_job in fetched.get("jobs", []):
         clean = normalize_job_payload(jobspy_result_to_job_payload(raw_job))
+        clean["discovery_occupation"] = search["occupation"]
+        clean["discovery_profile_independent"] = int(search["profile_independent"])
+        clean["discovery_search_mode"] = search["search_mode"]
+        clean["title_match_mode"] = search["title_match_mode"]
+        if search["search_mode"] == "title":
+            clean["occupation_match_type"], clean["title_match_score"] = classify_title_match(
+                text(clean.get("title")), keywords, search["title_match_mode"]
+            )
+        else:
+            clean["occupation_match_type"] = "adjacent_opportunity"
+            clean["title_match_score"] = 50
         clean, _ = geocode_discovery_job(clean, profile, origin, provider, use_cache=True)
         clean["remote_eligibility"], clean["remote_eligibility_explanation"] = discovery_remote_eligibility(clean)
         clean = enrich_discovery_job(clean, profile, {"remote_rule": "remote_after_local"}, evidence_profile=evidence_profile)
@@ -3074,6 +3140,8 @@ def jobspy_result_to_job_payload(job: dict[str, Any]) -> dict[str, Any]:
         "salary_currency": salary["salary_currency"],
         "salary_source": salary["salary_source"],
         "salary_confidence": salary["salary_confidence"],
+        "salary_evidence_text": salary.get("salary_evidence_text", salary["salary_text"]),
+        "salary_ambiguity": salary.get("salary_ambiguity", ""),
         "salary_listed": int(salary_listed),
         "remote_type": text(job.get("remote_type")),
         "role_type": mapped_role_type,
@@ -6259,8 +6327,10 @@ def determine_salary(job: dict[str, Any]) -> dict[str, Any]:
         parsed_description["salary_confidence"] = max(parsed_description["salary_confidence"], 72)
         return parsed_description
 
-    estimate = estimate_market_salary(job)
-    return estimate
+    # Missing compensation must remain missing.  A market estimate is not an
+    # advertised salary and must never influence a recommendation as if it
+    # were evidence from the posting.
+    return missing_salary()
 
 
 def structured_salary(job: dict[str, Any]) -> dict[str, Any]:
@@ -6284,6 +6354,8 @@ def structured_salary(job: dict[str, Any]) -> dict[str, Any]:
         "salary_text": original,
         "salary_source": "structured",
         "salary_confidence": 95,
+        "salary_evidence_text": original,
+        "salary_ambiguity": "",
     }
 
 
@@ -6318,6 +6390,8 @@ def parse_salary_text(value: str) -> dict[str, Any]:
             "salary_text": context.strip(" .;"),
             "salary_source": "description",
             "salary_confidence": 70,
+            "salary_evidence_text": context.strip(" .;"),
+            "salary_ambiguity": "",
         }
         break
     return best
@@ -6334,7 +6408,8 @@ def split_salary_contexts(content: str) -> list[str]:
 
 
 def salary_numbers(context: str) -> list[float]:
-    pattern = r"(?:CAD\s*)?\$?\s*(\d{2,3}k|\d{2,3}(?:,\d{3})?|\d{2,3})(?:\s*(?:-|to|–|—)\s*(?:CAD\s*)?\$?\s*(\d{2,3}k|\d{2,3}(?:,\d{3})?|\d{2,3}))?"
+    number = r"(?:\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)(?:k)?"
+    pattern = rf"(?:CAD|USD|CA)?\s*\$?\s*({number})(?:\s*(?:-|to|–|—)\s*(?:CAD|USD|CA)?\s*\$?\s*({number}))?"
     match = re.search(pattern, context, re.I)
     if not match:
         return []
@@ -6406,7 +6481,7 @@ def plausible_base_salary(minimum: float, maximum: float, interval: str) -> bool
         return 400 <= high <= 7000
     if interval == "monthly":
         return 1500 <= high <= 30000
-    return 25000 <= high <= 350000
+    return 25000 <= high <= 1_000_000
 
 
 def false_salary_context(context: str) -> bool:
@@ -6466,6 +6541,8 @@ def missing_salary() -> dict[str, Any]:
         "salary_text": "",
         "salary_source": "missing",
         "salary_confidence": 0,
+        "salary_evidence_text": "",
+        "salary_ambiguity": "not stated",
     }
 
 
@@ -6521,6 +6598,8 @@ def discovery_search_signature(payload: dict[str, Any]) -> str:
         "date_window": search["date_window"],
         "per_source_cap": search["per_source_cap"],
         "total_cap": search["total_cap"],
+        "search_mode": search["search_mode"],
+        "title_match_mode": search["title_match_mode"],
         "candidate_profile_id": text(payload.get("candidate_profile_id") or payload.get("auto_prepare_candidate_profile_id")),
         "resume_id": text(payload.get("resume_id") or payload.get("auto_prepare_resume_id")),
     }
@@ -6559,7 +6638,70 @@ def discovery_search_defaults(depth: str = "standard") -> dict[str, Any]:
         "total_cap": preset["total_cap"],
         "remote_preference": "",
         "distance": 50,
+        "search_mode": "title",
+        "title_match_mode": "related",
     }
+
+
+def occupation_title_terms(keywords: str) -> list[str]:
+    query = normalize_space(keywords).lower()
+    terms: list[str] = []
+    for occupation, synonyms in OCCUPATION_TITLE_SYNONYMS.items():
+        if occupation in query or any(re.search(rf"(?<![a-z]){re.escape(token)}(?![a-z])", query) for token in synonyms):
+            terms.extend(synonyms)
+    if not terms:
+        terms.extend([part for part in re.split(r"[,/|]+", query) if len(part.strip()) >= 3])
+    return list(dict.fromkeys(normalize_space(term) for term in terms if normalize_space(term)))
+
+
+def occupation_for_keywords(keywords: str) -> str:
+    query = normalize_space(keywords).lower()
+    if "early childhood educator" in query or re.search(r"\b(?:ece|rece)\b", query):
+        return "early childhood educator"
+    if any(term in query for term in ("software developer", "software engineer", "full stack", "frontend", "front-end", "backend", "back-end", "web developer", "python developer", "javascript developer")):
+        return "software developer"
+    return query
+
+
+def _software_title_match(title_text: str, terms: list[str], match_mode: str) -> tuple[str, int]:
+    if any(re.search(rf"(?<![a-z]){re.escape(term)}(?![a-z])", title_text) for term in terms):
+        return "exact", 100
+    technical_context = re.search(
+        r"\b(?:software|full[- ]?stack|front[- ]?end|back[- ]?end|web|application|python|javascript)\b",
+        title_text,
+    )
+    technical_role = re.search(r"\b(?:developer|engineer|programmer)\b", title_text)
+    if technical_context and technical_role:
+        return ("related", 75) if match_mode == "related" else ("uncertain", 30)
+    return "uncertain", 0
+
+
+def _ece_title_match(title_text: str, terms: list[str], match_mode: str) -> tuple[str, int]:
+    exact_blockers = r"\b(?:sales|representative|manager|director|assistant|aide|coordinator|administrator)\b"
+    exact_terms = [term for term in terms if term not in {"early childhood education", "registered early childhood education"}]
+    has_exact = any(re.search(rf"(?<![a-z]){re.escape(term)}(?![a-z])", title_text) for term in exact_terms)
+    if has_exact and not re.search(exact_blockers, title_text):
+        return "exact", 100
+    early_context = re.search(r"\b(?:early childhood|early years|preschool|daycare|childcare|child care)\b", title_text)
+    educator_role = re.search(r"\b(?:educator|teacher|worker|assistant|aide)\b", title_text)
+    if early_context and educator_role:
+        return ("related", 75) if match_mode == "related" else ("uncertain", 30)
+    return "uncertain", 0
+
+
+def classify_title_match(title: str, keywords: str, match_mode: str = "related") -> tuple[str, int]:
+    title_text = normalize_space(title).lower()
+    terms = occupation_title_terms(keywords)
+    if not title_text or not terms:
+        return "uncertain", 0
+    occupation = occupation_for_keywords(keywords)
+    if occupation == "early childhood educator":
+        return _ece_title_match(title_text, terms, match_mode)
+    if occupation == "software developer":
+        return _software_title_match(title_text, terms, match_mode)
+    if any(re.search(rf"(?<![a-z]){re.escape(term)}(?![a-z])", title_text) for term in terms):
+        return "exact", 100
+    return "uncertain", 0
 
 
 def discovery_search_config(payload: dict[str, Any]) -> dict[str, Any]:
@@ -6569,6 +6711,8 @@ def discovery_search_config(payload: dict[str, Any]) -> dict[str, Any]:
     per_source_cap = clamp_int_default(payload.get("per_source_cap"), preset["per_source_cap"], 1, 1000)
     total_cap = clamp_int_default(payload.get("total_cap"), preset["total_cap"], 1, 5000)
     distance = clamp_int_default(payload.get("distance"), 50, 0, 1000)
+    search_mode = normalize_choice(payload.get("search_mode"), {"title", "explore"}) or "title"
+    title_match_mode = normalize_choice(payload.get("title_match_mode"), {"strict", "related"}) or "related"
     enabled_sources = normalize_discovery_sources(payload.get("enabled_sources"))
     validate_discovery_budget(total_cap, enabled_sources)
     # total_cap is the user's aggregate fetch/display budget.  JobSpy applies
@@ -6594,6 +6738,10 @@ def discovery_search_config(payload: dict[str, Any]) -> dict[str, Any]:
         "location": text(payload.get("location")),
         "distance": distance,
         "enabled_sources": enabled_sources,
+        "search_mode": search_mode,
+        "title_match_mode": title_match_mode,
+        "occupation": occupation_for_keywords(text(payload.get("keywords"))),
+        "profile_independent": search_mode == "title" and not text(payload.get("candidate_profile_id") or payload.get("auto_prepare_candidate_profile_id")),
     }
 
 
@@ -7149,6 +7297,9 @@ def geocode_discovery_job(
     distance = location_distance_snapshot(origin, raw_location, text(job.get("remote_type")), "remote_after_local", geocode)
     job["distance_km"] = distance["distance_km"]
     job["distance_confidence"] = distance["confidence"]
+    job["distance_type"] = "remote" if distance["distance_label"] == "remote" else "straight_line" if distance["distance_label"] == "approximate" else "unknown"
+    job["commute_status"] = "not_applicable" if distance["distance_label"] == "remote" else "unavailable"
+    job["commute_source"] = ""
     job["distance_label"] = distance["distance_label"]
     job["distance_note"] = distance.get("distance_note", "")
     job["distance_origin_label"] = distance.get("origin_label", "")
@@ -7703,14 +7854,15 @@ def discovery_work_arrangement_label(remote_type: str) -> str:
 def discovery_score_breakdown(job: dict[str, Any], profile: dict[str, str], settings: dict[str, Any] | None = None) -> dict[str, Any]:
     settings = settings or {}
     weights = {**DISCOVERY_SCORE_WEIGHTS, **parse_json_object(settings.get("weights"))}
-    semantic = analyze_resume_match(job, profile, cache_dir=semantic_cache_dir(), use_semantic=False)
+    resume_profile = {} if as_bool(job.get("discovery_profile_independent")) else profile
+    semantic = analyze_resume_match(job, resume_profile, cache_dir=semantic_cache_dir(), use_semantic=False)
     skill_match = clamp_int(max(
         semantic.get("scores", {}).get("required_skills", 0),
         semantic.get("scores", {}).get("preferred_skills", 0),
         len(keyword_hits(" ".join([text(job.get("title")), text(job.get("job_description")), text(job.get("required_skills")), text(job.get("preferred_skills"))]).lower(), REWARD_KEYWORDS)) * 7,
     ), 0, 100)
     role_fit = clamp_int(max(semantic.get("scores", {}).get("role_title", 0), 40 + len(keyword_hits(text(job.get("title")), ROLE_KEYWORDS)) * 8), 0, 100)
-    seniority_fit = clamp_int(score_seniority_fit(profile, analyze_job_seniority(job)).get("score", 0), 0, 100)
+    seniority_fit = clamp_int(score_seniority_fit(resume_profile, analyze_job_seniority(job)).get("score", 0), 0, 100)
     salary_snapshot = normalize_salary_snapshot(job)
     salary_score = discovery_salary_score({**job, **salary_snapshot}, profile)
     origin = profile_home_location(profile)
@@ -7890,14 +8042,17 @@ def apply_discovery_search_constraints(job: dict[str, Any], remote_preference: s
 
 def discovery_result_category(job: dict[str, Any], remote_preference: str = "") -> tuple[str, str]:
     target_role_families = ACTIONABLE_DISCOVERY_ROLE_FAMILIES
+    search_mode = text(job.get("discovery_search_mode")).lower() or "legacy"
     if normalize_space(text(remote_preference)).lower() != "remote":
         if text(job.get("posting_availability")).lower() == "confirmed_closed":
             return "excluded", "Posting is confirmed closed."
         if job.get("location_search_eligible") is False or text(job.get("location_search_eligible")).lower() == "false":
             return "excluded", "Confirmed job location is outside the requested search area."
+        if search_mode == "title":
+            return title_search_result_category(job)
         role_type = text(job.get("role_type")).lower()
         if role_type and role_type not in target_role_families:
-            return "review_required", "The stored role family is outside the selected software-developer target family."
+            return ("adjacent_opportunity", "Explore mode retained an adjacent role for manual review.") if search_mode == "explore" else ("review_required", "The stored role family is outside the selected software-developer target family.")
         seniority = job.get("qualification_fit_seniority") or {}
         if seniority.get("stretch_role") or (text(job.get("application_priority_score")).isdigit() and int(job.get("application_priority_score")) < 50):
             return "review_required", "The posting expects experience or seniority that is not confirmed as aligned with the selected target."
@@ -7905,14 +8060,29 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
     if text(job.get("remote_search_eligible")).lower() == "false" or text(job.get("remote_eligibility")).lower() in {"restricted", "confirmed_ineligible"} or text(job.get("ontario_eligibility")).lower() == "confirmed_ineligible" or text(job.get("posting_availability")).lower() == "confirmed_closed":
         return "excluded", "Confirmed onsite, hybrid, ineligible, or closed posting."
     if text(job.get("remote_search_eligible")).lower() == "true" and text(job.get("remote_eligibility")).lower() == "canadian_eligible" and "remote" in text(job.get("remote_type")).lower():
+        if search_mode == "title":
+            return title_search_result_category(job)
         role_type = text(job.get("role_type")).lower()
         if role_type and role_type not in target_role_families:
-            return "review_required", "The stored role family is outside the selected software-developer target family."
+            return ("adjacent_opportunity", "Explore mode retained an adjacent role for manual review.") if search_mode == "explore" else ("review_required", "The stored role family is outside the selected software-developer target family.")
         seniority = job.get("qualification_fit_seniority") or {}
         if seniority.get("stretch_role") or (text(job.get("application_priority_score")).isdigit() and int(job.get("application_priority_score")) < 50):
             return "review_required", "The posting expects experience or seniority that is not confirmed as aligned with the selected target."
         return "actionable", "Remote arrangement and Canadian eligibility are supported by the posting data."
     return "review_required", "Work arrangement or Canadian eligibility requires review."
+
+
+def title_search_result_category(job: dict[str, Any]) -> tuple[str, str]:
+    match_type = text(job.get("occupation_match_type")).lower()
+    if match_type not in {"exact", "related"}:
+        return "review_required", "The advertised title is not an exact or recognized related occupation match."
+    seniority = job.get("qualification_fit_seniority") or analyze_job_seniority(job)
+    if seniority.get("management_role") or seniority.get("detected_level") in {"senior", "lead", "manager", "director"}:
+        return "review_required", "The occupation matches, but the posting indicates senior or management scope requiring review."
+    required = seniority.get("required_experience") or {}
+    if required.get("minimum") is not None and float(required["minimum"]) > 5:
+        return "review_required", "The occupation matches, but the required experience is above the default early-career scope."
+    return "actionable", "The advertised title matches the requested occupation and no hard seniority blocker was found."
 
 
 def discovery_sort_value(job: dict[str, Any], field: str, direction: str = "desc", remote_rule: str = "remote_after_local", unknown_salary_position: str = "last") -> tuple[Any, ...]:
@@ -8255,6 +8425,13 @@ def init_db() -> None:
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         """
+    )
+    ensure_columns(
+        "saved_search_profiles",
+        {
+            "search_mode": "TEXT NOT NULL DEFAULT 'title'",
+            "title_match_mode": "TEXT NOT NULL DEFAULT 'related'",
+        },
     )
     db.execute(
         """
@@ -8758,7 +8935,7 @@ def normalize_job_payload(payload: dict[str, Any]) -> dict[str, Any]:
     clean["status"] = clean["status"] if clean["status"] in STATUSES else "Saved"
     clean["fit_score"] = clamp_int(payload.get("fit_score"), 0, 100)
     salary = determine_salary({**payload, **extracted, **clean})
-    for field in ["salary_min", "salary_max", "salary_interval", "salary_currency", "salary_source", "salary_confidence"]:
+    for field in ["salary_min", "salary_max", "salary_interval", "salary_currency", "salary_source", "salary_confidence", "salary_evidence_text", "salary_ambiguity"]:
         clean[field] = salary[field]
     clean["salary"] = salary["salary_text"]
     clean["salary_original_text"] = text(payload.get("salary_original_text") or payload.get("salary") or salary["salary_text"])
@@ -9086,7 +9263,7 @@ def _application_priority(
         return 0, blocking
     recency = discovery_recency_score(job)
     effort = clamp_int(job.get("application_effort_score") or 70, 0, 100)
-    profile = profile or load_profile()
+    profile = {} if as_bool(job.get("discovery_profile_independent")) else (profile if profile is not None else load_profile())
     preferred_roles = [part.strip().lower() for part in re.split(r"[,;\n]+", text(profile.get("preferred_roles"))) if part.strip()]
     title = text(job.get("title")).lower()
     role_preference = 100 if preferred_roles and any(role in title or title in role for role in preferred_roles) else 60 if preferred_roles else 70
@@ -9099,7 +9276,7 @@ def _application_priority(
     priority = round(qualification_score * 0.50 + seniority_score * 0.25 + recency * 0.10 + effort * 0.05 + preference * 0.10)
     reasons = ["Qualification Match and evidence-backed seniority fit are weighted first; recency, effort, and stated role/location preferences are secondary."]
     role_type = text(job.get("role_type")).lower()
-    if role_type and role_type not in ACTIONABLE_DISCOVERY_ROLE_FAMILIES:
+    if role_type and role_type not in ACTIONABLE_DISCOVERY_ROLE_FAMILIES and text(job.get("discovery_search_mode")).lower() not in {"explore", "title"}:
         priority = min(priority, 49)
         reasons.append("The stored role family is outside the selected software-developer target family, so it requires review before applying.")
     if seniority.get("stretch_role"):
@@ -9116,7 +9293,7 @@ def _application_priority(
 def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any] | None = None) -> dict[str, Any]:
     """Calculate transparent Qualification Match without changing Job Priority."""
     try:
-        profile = evidence_profile or load_profile()
+        profile = {} if as_bool(job.get("discovery_profile_independent")) else (evidence_profile if evidence_profile is not None else load_profile())
         inventory = _cached_qualification_terms(job)
         evidence = _cached_resume_evidence(profile)
         analysis = analyze_job_seniority(job)
@@ -9157,7 +9334,8 @@ def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any
     available_components = [(value, weight) for value, weight in available_components if value is not None]
     score = round(sum(value * weight for value, weight in available_components) / sum(weight for _, weight in available_components)) if available_components else 0
     role_type = text(job.get("role_type")).lower()
-    non_target_role = bool(role_type and role_type not in ACTIONABLE_DISCOVERY_ROLE_FAMILIES)
+    search_mode = text(job.get("discovery_search_mode")).lower()
+    non_target_role = bool(role_type and role_type not in ACTIONABLE_DISCOVERY_ROLE_FAMILIES and search_mode not in {"explore", "title"})
     if non_target_role:
         score = min(score, 49)
     insufficient_mandatory_evidence = mandatory_score is None
@@ -9219,8 +9397,8 @@ def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any
         },
         "qualification_components": {"mandatory": mandatory_score, "technical": technical_score, "experience": experience_score, "seniority": seniority.get("score", 0)},
         "qualification_evidence_profile_id": profile.get("id") or profile.get("_candidate_profile_id") or "",
-        "qualification_evidence_profile_name": profile.get("_candidate_profile_name") or "Active Profile",
-        "qualification_evidence_source": "selected candidate profile résumé DOCX, structured experience, projects, education, and skills" if profile.get("_candidate_profile_id") else "active Profile résumé text and structured evidence",
+        "qualification_evidence_profile_name": "No résumé selected — title search" if as_bool(job.get("discovery_profile_independent")) else profile.get("_candidate_profile_name") or "Active Profile",
+        "qualification_evidence_source": "No résumé selected; qualification is optional for occupation title search" if as_bool(job.get("discovery_profile_independent")) else "selected candidate profile résumé DOCX, structured experience, projects, education, and skills" if profile.get("_candidate_profile_id") else "active Profile résumé text and structured evidence",
         "qualification_fit_seniority": seniority,
         "application_priority_score": priority,
         "application_priority_reasons": priority_reasons,
