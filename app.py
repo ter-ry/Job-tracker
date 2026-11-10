@@ -135,7 +135,7 @@ DISCOVERY_DATE_WINDOWS = {
 # Keep the public diagnostics field stable for existing API clients.  The
 # database itself is now tracked independently by the migration runner.
 APP_SCHEMA_VERSION = 1
-CURRENT_DB_SCHEMA_VERSION = 9
+CURRENT_DB_SCHEMA_VERSION = 12
 DISCOVERY_DEBUG_SNAPSHOT_LIMIT = 25
 GEOCODING_FAILURE_CACHE_SECONDS = 15 * 60
 DISCOVERY_TASK_NAME = "Job Tracker Discovery"
@@ -190,7 +190,7 @@ DISCOVERY_SEARCH_DEPTHS = {
     "thorough": {"per_source_cap": 250, "total_cap": 500, "days": 30},
 }
 
-STATUSES = ["Saved", "shortlisted", "Drafting", "Applied", "Interview", "Offer", "Rejected", "Archived"]
+STATUSES = ["Discovered", "Saved", "shortlisted", "Drafting", "Applied", "Interview", "Offer", "Rejected", "Archived"]
 
 ROLE_TYPES = [
     "full-stack developer",
@@ -2880,7 +2880,10 @@ def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, ru
             )
             continue
         clean = {column: job.get(column, "") for column in JOB_COLUMNS}
-        clean["status"] = "Saved"
+        # Discovery is not an explicit user save.  Keep the user-facing
+        # Saved state reserved for manual saves while preserving all legacy
+        # records through the migration runner.
+        clean["status"] = "Discovered"
         clean["date_added"] = clean.get("date_added") or date.today().isoformat()
         clean["discovery_first_seen_at"] = now
         clean["discovery_last_seen_at"] = now
@@ -3312,6 +3315,13 @@ def obvious_unrelated_role(content: str, query: str) -> bool:
 def outside_requested_location(job: dict[str, Any], requested_location: str) -> bool:
     remote_type = text(job.get("remote_type")).lower()
     if "remote" in remote_type:
+        return False
+    # A verified workplace distance is stronger evidence than a city-name
+    # mismatch (for example, Toronto versus North York). Radius enforcement
+    # is handled separately by apply_discovery_search_constraints().
+    distance_km = clamp_int(job.get("distance_km"), 0, 9999)
+    distance_confidence = clamp_int(job.get("distance_confidence"), 0, 100)
+    if distance_km < 9999 and distance_confidence >= 70 and text(job.get("distance_type")).lower() in {"straight_line", "approximate", ""}:
         return False
     requested_parts = [part for part in re.split(r"[\s,]+", requested_location.lower()) if len(part) >= 4]
     location = text(job.get("location")).lower()
@@ -9204,6 +9214,8 @@ def normalize_job_payload(payload: dict[str, Any]) -> dict[str, Any]:
     clean = {column: text(payload_for_extraction.get(column, extracted.get(column, ""))) for column in JOB_COLUMNS}
     clean["date_added"] = text(payload.get("date_added")) or today
     clean["status"] = clean["status"] if clean["status"] in STATUSES else "Saved"
+    if text(payload.get("discovery_first_seen_at")) and not text(payload.get("status")):
+        clean["status"] = "Discovered"
     quality_flags = []
     if text(clean.get("provider_company")) and normalize_space(text(clean.get("provider_company"))).lower() != normalize_space(text(clean.get("company"))).lower():
         quality_flags.append("provider/company mismatch")
@@ -11255,7 +11267,7 @@ def build_dashboard(jobs: list[dict[str, Any]]) -> dict[str, Any]:
         "rejection_rate": round(len(rejected) / len(applied) * 100, 1) if applied else 0,
         "missing_salary": sum(1 for job in jobs if not job["salary"]),
         "high_coding_risk": sum(1 for job in jobs if int(job["coding_risk_score"] or 100) < 60),
-        "pending": sum(1 for job in jobs if job["status"] in {"Saved", "Drafting", "Applied", "Interview"}),
+        "pending": sum(1 for job in jobs if job["status"] in {"Discovered", "Saved", "Drafting", "Applied", "Interview"}),
     }
 
 

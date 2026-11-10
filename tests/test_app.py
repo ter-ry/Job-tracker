@@ -1741,6 +1741,17 @@ class JobAssistantTest(unittest.TestCase):
         self.assertFalse(outside["location_search_eligible"])
         self.assertEqual(unknown["distance_radius_status"], "unknown")
 
+    def test_verified_distance_overrides_city_name_mismatch_but_unknown_stays_reviewable(self):
+        inside = {
+            "location": "Toronto, ON",
+            "distance_km": 12,
+            "distance_confidence": 90,
+            "distance_type": "straight_line",
+        }
+        unknown = {"location": "Toronto, ON", "distance_km": 9999, "distance_confidence": 0, "distance_type": "unknown"}
+        self.assertFalse(app_module.outside_requested_location(inside, "North York"))
+        self.assertTrue(app_module.outside_requested_location(unknown, "North York"))
+
     def test_invalid_canadian_postal_code_is_rejected(self):
         response = self.client.post("/api/profile", json={"location": "M5V2T"})
         self.assertEqual(response.status_code, 400)
@@ -2374,10 +2385,15 @@ class JobAssistantTest(unittest.TestCase):
             first = self.client.post("/api/discovery/jobspy", json={"keywords": "software developer", "enabled_sources": ["linkedin", "indeed"]}).get_json()
             by_title = {job["title"]: job for job in first["jobs"]}
             self.assertTrue(all(job.get("id") for job in by_title.values()))
+            persisted = {job["title"]: job for job in self.client.get("/api/jobs").get_json()}
+            self.assertEqual(persisted["Junior React Developer"]["status"], "Discovered")
+            self.assertEqual(persisted["Junior React Developer"]["record_origin"], "discovered")
             save_id = by_title["Junior React Developer"]["id"]
             skip_id = by_title["Python Developer"]["id"]
             apply_id = by_title["Backend Developer"]["id"]
-            self.assertEqual(self.client.post(f"/api/discovery/inbox/{save_id}/save", json={}).status_code, 200)
+            saved_response = self.client.post(f"/api/discovery/inbox/{save_id}/save", json={})
+            self.assertEqual(saved_response.status_code, 200)
+            self.assertEqual(saved_response.get_json()["status"], "Saved")
             self.assertEqual(self.client.post(f"/api/discovery/inbox/{skip_id}/ignore", json={}).status_code, 200)
             applied = self.client.post(f"/api/discovery/inbox/{apply_id}/applied", json={}).get_json()
             self.assertEqual(applied["status"], "Applied")

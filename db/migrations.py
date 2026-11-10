@@ -231,6 +231,20 @@ def _migration_011_versioned_tailoring_drafts(db: sqlite3.Connection) -> None:
         """
     )
 
+
+def _migration_012_discovery_status_semantics(db: sqlite3.Connection) -> None:
+    """Separate automatic discovery from explicit user saves without losing history."""
+    columns = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
+    if "discovery_first_seen_at" not in columns or "status" not in columns:
+        return
+    db.execute(
+        """UPDATE jobs
+           SET status = 'Discovered', updated_at = CURRENT_TIMESTAMP
+         WHERE discovery_first_seen_at <> ''
+           AND status = 'Saved'
+           AND discovery_state NOT IN ('saved', 'applied')"""
+    )
+
 MIGRATIONS: tuple[tuple[int, str, Migration], ...] = (
     (1, "legacy baseline", _migration_001_baseline),
     (2, "candidate document profiles", _migration_002_candidate_documents),
@@ -243,6 +257,7 @@ MIGRATIONS: tuple[tuple[int, str, Migration], ...] = (
     (9, "skill confirmation metadata", _migration_009_skill_confirmation_metadata),
     (10, "tailoring revision history", _migration_010_tailoring_revision_history),
     (11, "versioned tailoring drafts", _migration_011_versioned_tailoring_drafts),
+    (12, "discovery status semantics", _migration_012_discovery_status_semantics),
 )
 
 
