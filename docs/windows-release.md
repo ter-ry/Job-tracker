@@ -5,12 +5,13 @@ This document describes the future Windows distribution path. It does not publis
 ## Design
 
 - `.github/workflows/windows-release.yml` runs source tests, JavaScript validation, an isolated Flask launch smoke test, a PyInstaller build, package checks, Inno Setup, and SHA-256 generation.
+- `pull_request` runs the same validation and packaging path for packaging-related changes, using a non-release version such as `0.0.0-ci.123`; it uploads an internal installer artifact but has no release-publishing path.
 - `workflow_dispatch` creates a validation artifact only. It never publishes a GitHub Release.
 - A stable release requires an explicitly pushed semantic-version tag such as `v1.0.0`. The `release` environment must require an approved reviewer before the publishing job can run.
 - The published installer is named `JobTracker-Setup-v1.0.0.exe`, with a matching `.sha256` file.
 - PRs and merges to `master` do not publish releases.
 
-The installer contains a PyInstaller onedir application and creates Start-menu and desktop shortcuts. `release_packaging/windows/launcher.py` starts Waitress on `127.0.0.1:5000`, waits for `/api/health`, and opens the default browser. A named Windows mutex (`JobTrackerInstance`) prevents a second application instance and matches Inno Setup's `AppMutex`; a file lock is used only on non-Windows test platforms. If an existing healthy instance is found, a second launch only opens the browser.
+The installer contains a PyInstaller onedir application and creates Start-menu and desktop shortcuts. `release_packaging/windows/launcher.py` starts Waitress on `127.0.0.1:5000`, waits for `/api/health`, and opens the default browser. `scripts/frozen_windows_smoke_test.py` launches the actual frozen executable against disposable data and checks health, version, templates, static assets, SQLite creation, and clean shutdown. A named Windows mutex (`JobTrackerInstance`) prevents a second application instance and matches Inno Setup's `AppMutex`; a file lock is used only on non-Windows test platforms. If an existing healthy instance is found, a second launch only opens the browser.
 
 ## User data and upgrades
 
@@ -57,7 +58,7 @@ No silent updates or automatic database resets are permitted.
 3. Seed disposable data, install a newer test build, and verify jobs, profiles, saved searches, documents, and application history remain intact. Test a migration from a copy of the prior SQLite database and verify the pre-migration backup.
 4. Confirm the packaged feature set, including semantic fallback, document generation, optional Ollama settings, discovery providers, export, and external job links.
 5. Configure the GitHub `release` environment with required reviewers; the workflow environment only becomes an approval gate after those reviewers are explicitly configured in repository settings. Confirm signing credentials are available. Unsigned builds are suitable for private testing but are not first-public-release ready.
-6. Create and push an approved tag: `git tag -a v1.0.0 -m "Job Tracker v1.0.0"` then `git push origin v1.0.0`. The workflow must pass before the release reviewer approves publication.
+6. Create and push an approved stable tag: `git tag -a v1.0.0 -m "Job Tracker v1.0.0"` then `git push origin v1.0.0`. Only `vMAJOR.MINOR.PATCH` tags can reach the publish job; prerelease tags such as `v1.0.0-rc.1` are validation-only. The workflow must pass before the release reviewer approves publication.
 7. Verify the GitHub Release asset filename and checksum, then test download/install from the release page on a clean Windows machine.
 
 ## Rollback
