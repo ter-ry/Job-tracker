@@ -2,7 +2,7 @@
 # the executable and bundled runtime separate from the user's AppData data.
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_data_files
 
 REPO_ROOT = Path(SPECPATH).resolve().parents[1]
 
@@ -14,22 +14,17 @@ datas = [
     (str(REPO_ROOT / "db"), "db"),
     (str(REPO_ROOT / "release_packaging/windows/VERSION.txt"), "."),
 ]
+datas += collect_data_files("sentence_transformers")
 binaries = []
 hiddenimports = [
     "app",
     "version",
     "release_packaging.windows.launcher",
+    "sentence_transformers",
+    "sentence_transformers.SentenceTransformer",
     "pandas._libs.tslibs.timedeltas",
     "pandas._libs.tslibs.np_datetime",
-    "jobspy",
 ]
-
-# Keep the optional semantic backend available in the packaged application.
-for package in ("sentence_transformers",):
-    package_datas, package_binaries, package_hidden = collect_all(package)
-    datas += package_datas
-    binaries += package_binaries
-    hiddenimports += package_hidden
 a = Analysis(
     [str(REPO_ROOT / "release_packaging/windows/launcher.py")],
     pathex=[str(REPO_ROOT)],
