@@ -7610,8 +7610,7 @@ def resolve_discovery_location_context(
     postal = extract_canadian_postal_code(original_input)
     normalized_postal = normalize_canadian_postal_code(postal) if postal else ""
     private_origin = normalize_space(distance_origin_input)
-    profile_origin = profile_home_location(profile)
-    distance_origin = normalize_canadian_postal_code(extract_canadian_postal_code(private_origin)) if extract_canadian_postal_code(private_origin) else private_origin or text(profile_origin.get("normalized"))
+    distance_origin = normalize_canadian_postal_code(extract_canadian_postal_code(private_origin)) if extract_canadian_postal_code(private_origin) else private_origin or normalized_postal or normalized_input
     distance_origin_lookup = geocode_location_value(private_origin, lookup_type="distance_origin", profile=profile, provider=provider, use_cache=use_cache) if private_origin else {}
     lookup_input = normalized_postal or normalized_input
     if is_countrywide_search_location(normalized_input):
