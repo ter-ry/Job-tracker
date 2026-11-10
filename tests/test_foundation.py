@@ -5,9 +5,14 @@ from pathlib import Path
 
 from db.migrations import run_migrations
 from profile_store import CandidateProfileStore
+from seniority import analyze_job_seniority
 
 
 class FoundationArchitectureTest(unittest.TestCase):
+    def test_experience_parser_captures_years_with_work_context(self):
+        analysis = analyze_job_seniority({"title": "Software Engineer", "job_description": "Requirements: 3+ years building and shipping production software."})
+        self.assertEqual(analysis["required_experience"]["minimum"], 3)
+
     def test_migrations_are_versioned_and_repeatable(self):
         db = sqlite3.connect(":memory:")
         first = run_migrations(db)

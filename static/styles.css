@@ -1234,6 +1234,9 @@ th {
 .pipeline-score strong { color: #f2f2f2; font-size: 1.45rem; }
 .pipeline-card:first-child .pipeline-score strong { color: #25c976; }
 .pipeline-score span { color: #9d9d9d; font-size: .75rem; }
+.pipeline-actions, .pipeline-detail-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.pipeline-actions { flex-basis: 100%; justify-content: flex-start; margin-top: 12px; }
+.pipeline-detail-actions { margin: 18px 0 4px; padding: 12px 0; border-top: 1px solid #2a2a2a; border-bottom: 1px solid #2a2a2a; }
 .pipeline-action { border: 0; border-radius: 20px; background: #252525; color: #e5e5e5; cursor: pointer; font: inherit; font-weight: 700; margin-top: 8px; padding: 6px 13px; }
 .pipeline-empty { color: #9d9d9d; padding: 18px 0 4px; }
 .pipeline-card { cursor: pointer; }

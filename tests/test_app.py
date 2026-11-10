@@ -502,6 +502,48 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("Full-time salaried", affirm["job_description"])
         self.assertEqual(security["role_type"], "other")
 
+    def test_non_technical_internship_does_not_enter_software_recommendations(self):
+        strategy = app_module.jobspy_result_to_job_payload(
+            {
+                "title": "Associate, Enterprise Strategy and Corporate Development",
+                "job_type": "intern",
+                "description": "Support financial modelling, valuation, research, and corporate strategy.",
+            }
+        )
+        self.assertEqual(strategy["role_type"], "other")
+        category, reason = app_module.discovery_result_category(
+            {**strategy, "application_priority_score": 84, "posting_availability": "likely_active"},
+            "hybrid",
+        )
+        self.assertEqual(category, "review_required")
+        self.assertIn("role family", reason)
+        fit = app_module.build_qualification_fit(
+            {**strategy, "job_description": strategy["job_description"]},
+            evidence_profile={
+                "resume_text": "Built Python and React applications.",
+                "work_experience": "Software developer with two years of experience.",
+                "target_seniority_levels": "entry_level,junior,intermediate",
+                "maximum_required_years": "3",
+                "willing_to_apply_to_stretch_roles": "true",
+                "management_roles_allowed": "false",
+            },
+        )
+        self.assertLessEqual(fit["qualification_fit_score"], 49)
+        self.assertLessEqual(fit["application_priority_score"], 49)
+
+    def test_dedupe_normalizes_common_company_legal_suffixes(self):
+        linkedin = {"company": "Rose Rocket", "title": "Junior Software Engineer", "location": "Toronto, Ontario, Canada"}
+        indeed = {"company": "Rose Rocket Inc.", "title": "Junior Software Engineer", "location": "Toronto, ON, CA"}
+        self.assertEqual(app_module.dedupe_keys(linkedin) & app_module.dedupe_keys(indeed), {
+            "ctl:rose rocket|junior software engineer|toronto on"
+        })
+
+    def test_pipeline_counter_and_sort_separate_discovered_actionable_and_history(self):
+        source = (Path(__file__).parents[1] / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("const discovered = items.filter((job) => Boolean(job.discovery_first_seen_at));", source)
+        self.assertIn("historical/manual", source)
+        self.assertIn("categoryRank", source)
+
     def test_application_priority_is_the_discovery_best_match_sort(self):
         preferences = app_module.discovery_preferences_payload({})
         self.assertEqual(preferences["sort"]["field"], "application_priority_score")
@@ -1484,6 +1526,42 @@ class JobAssistantTest(unittest.TestCase):
             with patch.object(app_module, "backup_database_before_migration", return_value=None):
                 with self.assertRaisesRegex(RuntimeError, "backup could not be created"):
                     app_module.init_db()
+
+    def test_pipeline_manual_application_preserves_job_and_allows_date_correction(self):
+        created = self.client.post(
+            "/api/jobs",
+            json={
+                "company": "Manual Apply Co",
+                "title": "Junior Software Developer",
+                "url": "https://employer.example/jobs/junior-1",
+                "job_description": "Python React SQL and REST APIs.",
+                "application_priority_score": 82,
+            },
+        ).get_json()
+        applied = self.client.post(
+            f"/api/jobs/{created['id']}/applied",
+            json={"date_applied": "2026-11-01"},
+        )
+        self.assertEqual(applied.status_code, 200)
+        self.assertEqual(applied.get_json()["status"], "Applied")
+        self.assertEqual(applied.get_json()["date_applied"], "2026-11-01")
+        self.assertEqual(applied.get_json()["url"], "https://employer.example/jobs/junior-1")
+        corrected = self.client.post(f"/api/jobs/{created['id']}/applied", json={"date_applied": "2026-11-02"}).get_json()
+        self.assertEqual(corrected["date_applied"], "2026-11-02")
+        reloaded = next(item for item in self.client.get("/api/jobs").get_json() if item["id"] == created["id"])
+        self.assertEqual(reloaded["status"], "Applied")
+        self.assertEqual(reloaded["title"], "Junior Software Developer")
+        self.assertEqual(reloaded["url"], "https://employer.example/jobs/junior-1")
+
+    def test_pipeline_actions_and_advanced_features_are_explicit_in_default_ui(self):
+        frontend = Path("static/app.js").read_text(encoding="utf-8")
+        template = Path("templates/index.html").read_text(encoding="utf-8")
+        self.assertIn("Open job posting", frontend)
+        self.assertIn("Mark Applied", frontend)
+        self.assertIn("data-detail-applied", frontend)
+        self.assertIn("jobTracker.advancedFeatures", frontend)
+        self.assertIn('class="tab advanced-feature"', template)
+        self.assertIn('id="toggle-advanced-features"', template)
 
     def test_refresh_during_active_sqlite_write_waits_without_initialization_lock_error(self):
         with self.client.application.app_context():
@@ -2699,7 +2777,17 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(hourly["salary_interval"], "hourly")
         self.assertEqual(hourly["salary_min"], 62400)
 
-    def test_salary_parser_avoids_false_bonus_matches_and_estimates_missing(self):
+    def test_salary_parser_preserves_decimal_and_currency_prefixed_range_endpoints(self):
+        hourly = app_module.parse_salary_text("Salary: $18.00-$21.00 per hour")
+        self.assertEqual((hourly["salary_min"], hourly["salary_max"], hourly["salary_interval"], hourly["salary_currency"]), (37440, 43680, "hourly", "CAD"))
+        annual = app_module.parse_salary_text("Base salary: CA$90,000–CA$130,000 CAD per year")
+        self.assertEqual((annual["salary_min"], annual["salary_max"], annual["salary_interval"], annual["salary_currency"]), (90000, 130000, "yearly", "CAD"))
+
+    def test_salary_parser_accepts_legitimate_high_compensation_ranges(self):
+        parsed = app_module.parse_salary_text("Base salary CA$157K-$367K")
+        self.assertEqual((parsed["salary_min"], parsed["salary_max"], parsed["salary_currency"]), (157000, 367000, "CAD"))
+
+    def test_salary_parser_avoids_false_bonus_matches_and_keeps_missing_unestimated(self):
         false_match = app_module.parse_salary_text("Includes a $5,000 signing bonus and wellness benefits.")
         estimate = app_module.determine_salary(
             {
@@ -2711,8 +2799,64 @@ class JobAssistantTest(unittest.TestCase):
             }
         )
         self.assertEqual(false_match["salary_source"], "missing")
-        self.assertEqual(estimate["salary_source"], "estimated")
-        self.assertIn("Estimated market range", estimate["salary_text"])
+        self.assertEqual(estimate["salary_source"], "missing")
+        self.assertEqual(estimate["salary_text"], "")
+        self.assertEqual(estimate["salary_ambiguity"], "not stated")
+
+    def test_title_search_uses_advertised_title_not_description_keywords(self):
+        self.assertEqual(app_module.classify_title_match("Frontend Developer", "software developer", "related"), ("exact", 100))
+        self.assertEqual(app_module.classify_title_match("Strategy Analyst", "software developer", "related")[0], "uncertain")
+
+    def test_title_matching_does_not_promote_generic_or_unrelated_software_titles(self):
+        self.assertEqual(app_module.classify_title_match("Civil Engineer", "software developer", "strict")[0], "uncertain")
+        self.assertEqual(app_module.classify_title_match("Real Estate Developer", "software developer", "strict")[0], "uncertain")
+        self.assertEqual(app_module.classify_title_match("Software Engineer", "software developer", "strict"), ("exact", 100))
+        self.assertEqual(app_module.classify_title_match("Backend Engineer", "software developer", "strict"), ("exact", 100))
+
+    def test_ece_title_matching_supports_rece_and_rejects_unrelated_titles(self):
+        self.assertEqual(app_module.classify_title_match("Registered Early Childhood Educator", "ECE", "strict"), ("exact", 100))
+        self.assertEqual(app_module.classify_title_match("RECE", "early childhood educator", "strict"), ("exact", 100))
+        self.assertEqual(app_module.classify_title_match("Early Childhood Teacher", "ECE", "related"), ("related", 75))
+        self.assertEqual(app_module.classify_title_match("Early Childhood Assistant", "ECE", "strict")[0], "uncertain")
+        self.assertEqual(app_module.classify_title_match("ECE Sales Representative", "RECE", "related")[0], "uncertain")
+        self.assertEqual(app_module.classify_title_match("Childcare Manager", "ECE", "related")[0], "uncertain")
+        self.assertEqual(app_module.classify_title_match("Elementary School Teacher", "ECE", "related")[0], "uncertain")
+
+    def test_exact_ece_title_is_actionable_without_software_role_family_or_resume(self):
+        category, _ = app_module.discovery_result_category(
+            {
+                "discovery_search_mode": "title",
+                "discovery_occupation": "early childhood educator",
+                "occupation_match_type": "exact",
+                "role_type": "other",
+                "location_search_eligible": True,
+                "remote_type": "Hybrid",
+                "application_priority_score": 0,
+                "qualification_fit_seniority": {"detected_level": "unknown", "management_role": False},
+            },
+            "hybrid",
+        )
+        self.assertEqual(category, "actionable")
+
+    def test_title_search_qualification_does_not_load_active_resume(self):
+        with patch.object(app_module, "load_profile", side_effect=AssertionError("active profile must not be loaded")):
+            result = app_module.build_qualification_fit(
+                {
+                    "title": "Registered Early Childhood Educator",
+                    "job_description": "Required: Early Childhood Education diploma.",
+                    "required_skills": "Early Childhood Education diploma",
+                    "role_type": "other",
+                    "discovery_search_mode": "title",
+                    "discovery_profile_independent": 1,
+                },
+                evidence_profile=None,
+            )
+        self.assertEqual(result["qualification_evidence_confidence"], "standard")
+        self.assertEqual(result["qualification_evidence_profile_name"], "No résumé selected — title search")
+
+    def test_explore_mode_retains_adjacent_roles_without_global_non_target_cap(self):
+        job = {"role_type": "analyst", "discovery_search_mode": "explore", "occupation_match_type": "adjacent_opportunity", "location_search_eligible": True, "remote_type": "Hybrid", "application_priority_score": 80}
+        self.assertEqual(app_module.discovery_result_category(job, "hybrid")[0], "adjacent_opportunity")
 
     def test_revised_scoring_salary_location_dominate_and_missing_not_zero(self):
         profile = {

@@ -1,0 +1,16 @@
+{
+  "generated_at": "2026-11-09",
+  "scope": "focused PR17 occupation-search correction",
+  "base_commit": "7501e0b",
+  "independent_authoritative_evidence_policy": "Provider descriptions and URLs are not independent ground truth.",
+  "metrics": {
+    "title_regression_cases": {"correct": 11, "evaluated": 11, "value": 1.0, "decision": "PASS", "note": "Four software-title cases and seven ECE/unrelated-title cases."},
+    "salary_exact_accuracy": {"correct": 0, "evaluated": 0, "value": null, "decision": "INCONCLUSIVE", "required_evaluated": 20, "note": "No independent employer-labeled salary sample was available."},
+    "salary_unspecified_cases": {"correct": 0, "evaluated": 0, "value": null, "required_evaluated": 10, "decision": "INCONCLUSIVE", "note": "The 10 no-pay provider records are not independent labels."},
+    "required_experience_prior_comparable": {"correct": 6, "evaluated": 6, "value": 1.0, "decision": "PASS", "required_evaluated": 20, "note": "Prior authoritative subset; not sufficient for the requested ECE-inclusive denominator."},
+    "required_experience_requested_sample": {"correct": 0, "evaluated": 0, "value": null, "required_evaluated": 20, "decision": "INCONCLUSIVE"},
+    "location_extraction_accuracy": {"correct": 0, "evaluated": 0, "value": null, "required_evaluated": 20, "decision": "INCONCLUSIVE", "note": "No independent field-by-field extraction labels were captured."}
+  },
+  "fresh_windows_replay": {"provider_records": 26, "parseable_compensation_records": 16, "unpriced_records": 10, "estimated_records_created": 0},
+  "remaining_limitation": "Collect only the missing authoritative salary, ECE experience, and location labels in a future targeted Windows evidence run; do not tune against the holdout."
+}
