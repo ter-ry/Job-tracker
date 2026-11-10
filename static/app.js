@@ -2899,7 +2899,7 @@ function renderDiscoveryRow(job) {
       <td>${escapeHtml(job.salary || "Salary unavailable")}</td>
       <td>${escapeHtml(job.posted_date || "Unknown")}</td>
       <td>${escapeHtml(job.work_arrangement || job.remote_type || "Unknown")}</td>
-      <td><strong>${Number(job.discovery_profile_independent || 0) ? "Job Opportunity Score" : "Application Priority"}</strong><br>${scorePill(job.opportunity_score || job.application_priority_score || 0)}<br><span class="muted">${Number(job.discovery_profile_independent || 0) ? "Résumé qualification not assessed" : `Qualification ${scorePill(job.qualification_match_score ?? job.qualification_fit_score ?? 0)}`}</span></td>
+      <td><strong>${Number(job.discovery_profile_independent || 0) ? "Job Opportunity Score" : "Application Priority"}</strong><br>${scorePill(job.opportunity_score || job.application_priority_score || 0)}<br><span class="muted">${Number(job.discovery_profile_independent || 0) ? "Posting-evidence score" : `Qualification ${scorePill(job.qualification_match_score ?? job.qualification_fit_score ?? 0)}`}</span></td>
       <td>${escapeHtml(job.source || "JobSpy")}</td>
     </tr>
     <tr>
@@ -2939,13 +2939,13 @@ function renderDiscoveryCard(job) {
             ${badge("Distance", distanceBadge(job))}
             ${badge("Salary", displaySalary(job))}
             ${badge(Number(job.discovery_profile_independent || 0) ? "Job Opportunity Score" : "Application Priority", Number(job.opportunity_score || job.application_priority_score || 0))}
-            ${Number(job.discovery_profile_independent || 0) ? badge("Résumé qualification", "Not assessed") : badge("Qualification Match", Number(job.qualification_match_score ?? job.qualification_fit_score ?? 0))}
+            ${Number(job.discovery_profile_independent || 0) ? badge("Score basis", "Posting evidence") : badge("Qualification Match", Number(job.qualification_match_score ?? job.qualification_fit_score ?? 0))}
             ${badge("Source", job.source || "JobSpy")}
             ${badge("Posted", job.posted_date || "Unknown")}
             ${badge("Work", job.work_arrangement || job.remote_type || "Unknown")}
           </div>
         </div>
-        <div><strong>${Number(job.discovery_profile_independent || 0) ? "Job Opportunity Score" : "Application Priority"}</strong><br>${scorePill(job.opportunity_score || job.application_priority_score || 0)}<br><span class="muted">${Number(job.discovery_profile_independent || 0) ? "Résumé qualification not assessed" : `Qualification ${scorePill(job.qualification_match_score ?? job.qualification_fit_score ?? 0)}`}</span>${saved}</div>
+        <div><strong>${Number(job.discovery_profile_independent || 0) ? "Job Opportunity Score" : "Application Priority"}</strong><br>${scorePill(job.opportunity_score || job.application_priority_score || 0)}<br><span class="muted">${Number(job.discovery_profile_independent || 0) ? "Posting-evidence score" : `Qualification ${scorePill(job.qualification_match_score ?? job.qualification_fit_score ?? 0)}`}</span>${saved}</div>
       </div>
       ${warnings}
       ${renderExperienceSummary(job)}
@@ -2979,7 +2979,7 @@ function renderExperienceSummary(job) {
   const level = job.qualification_fit_seniority?.detected_level || job.seniority_level || "unknown";
   const ambiguous = experience.ambiguous || [];
   const requiredLabel = experience.required ? formatExperienceRange(experience.required) : ambiguous.length ? `Experience mentioned (unclassified): ${formatExperienceRange(ambiguous[0])}` : "No minimum years stated";
-  if (independent) return `<div class="experience-summary"><strong>Experience:</strong> Required ${escapeHtml(requiredLabel)} · Preferred ${escapeHtml(formatExperienceRange(experience.preferred) || "Not specified")} · Candidate suitability not assessed without a résumé · Seniority ${escapeHtml(level)}</div>`;
+  if (independent) return `<div class="experience-summary"><strong>Experience:</strong> Required ${escapeHtml(requiredLabel)} · Preferred ${escapeHtml(formatExperienceRange(experience.preferred) || "Not specified")} · Seniority ${escapeHtml(level)}</div>`;
   return `<div class="experience-summary"><strong>Experience:</strong> Required ${escapeHtml(requiredLabel)} · Preferred ${escapeHtml(formatExperienceRange(experience.preferred) || "Not specified")} · Candidate ${escapeHtml(candidateText)} · Fit ${escapeHtml(fit)} · Seniority ${escapeHtml(level)}</div>`;
 }
 
@@ -3171,7 +3171,7 @@ function renderDiscoveryWhy(job) {
         <summary>Why this job ranks here</summary>
         <ul>
           <li><strong>Job Opportunity Score:</strong> ${opportunity}/100</li>
-          <li><strong>Résumé qualification:</strong> Not assessed — no résumé selected.</li>
+          <li><strong>Score basis:</strong> Posting evidence only; candidate documents are not used.</li>
           ${opportunityReasons.map((reason) => `<li>${escapeHtml(reason)}</li>`).join("")}
           <li><strong>Eligibility:</strong> ${escapeHtml(job.canadian_eligibility || "unknown")} · ${escapeHtml(job.work_arrangement || job.remote_type || "unknown arrangement")}</li>
           <li><strong>Evidence source:</strong> ${escapeHtml(job.description_completeness || "description status unknown")}</li>

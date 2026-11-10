@@ -2887,6 +2887,67 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(result["qualification_fit_label"], "Not assessed — title search")
         self.assertIn("No résumé or candidate profile", " ".join(result["opportunity_score_reasons"]))
 
+    def test_opportunity_score_compares_advertised_pay_and_distance(self):
+        base = {
+            "occupation_match_type": "exact", "title_match_score": 100,
+            "remote_type": "Hybrid", "remote_eligibility": "canadian_eligible",
+            "distance_type": "straight_line", "posted_date": date.today().isoformat(),
+            "salary_interval": "hourly", "salary_source": "structured",
+            "salary_currency": "CAD", "salary_advertised_min": 26,
+            "salary_advertised_max": 26, "salary_annual_min": 54080,
+            "salary_annual_max": 54080, "salary_annual_midpoint": 54080,
+            "job_description": "Health and dental benefits.",
+        }
+        higher_pay = app_module.build_job_opportunity_fit({**base, "distance_km": 3, "salary_advertised_min": 30, "salary_advertised_max": 30, "salary_annual_min": 62400, "salary_annual_max": 62400, "salary_annual_midpoint": 62400})
+        lower_pay = app_module.build_job_opportunity_fit({**base, "distance_km": 3})
+        farther = app_module.build_job_opportunity_fit({**base, "distance_km": 30})
+        self.assertGreater(higher_pay["opportunity_score"], lower_pay["opportunity_score"])
+        self.assertGreater(lower_pay["opportunity_score"], farther["opportunity_score"])
+        self.assertTrue(any("$30" in reason for reason in higher_pay["opportunity_score_reasons"]))
+
+    def test_opportunity_score_keeps_unspecified_benefits_neutral_and_rewards_freshness(self):
+        base = {
+            "occupation_match_type": "exact", "title_match_score": 100,
+            "remote_type": "Hybrid", "remote_eligibility": "canadian_eligible",
+            "distance_km": 3, "distance_type": "straight_line",
+            "salary_interval": "yearly", "salary_source": "structured",
+            "salary_currency": "CAD", "salary_annual_min": 70000,
+            "salary_annual_max": 70000, "salary_annual_midpoint": 70000,
+        }
+        recent_benefits = app_module.build_job_opportunity_fit({**base, "posted_date": date.today().isoformat(), "job_description": "Extended health and paid vacation."})
+        old_unspecified = app_module.build_job_opportunity_fit({**base, "posted_date": (date.today() - timedelta(days=60)).isoformat(), "job_description": "Build software products."})
+        self.assertGreater(recent_benefits["opportunity_score"], old_unspecified["opportunity_score"])
+        self.assertIn("neutral component", " ".join(old_unspecified["opportunity_score_reasons"]))
+
+    def test_opportunity_score_keeps_exact_title_stronger_than_pay_and_unpaid_is_not_missing_salary(self):
+        exact_rece = app_module.build_job_opportunity_fit({
+            "occupation_match_type": "exact", "title_match_score": 100,
+            "salary_interval": "hourly", "salary_source": "structured", "salary_currency": "CAD",
+            "salary_annual_midpoint": 54080, "salary_advertised_min": 26, "salary_advertised_max": 26,
+            "distance_km": 3, "distance_type": "straight_line", "posted_date": date.today().isoformat(),
+            "job_description": "Registered Early Childhood Educator. Unspecified salary.",
+        })
+        unrelated = app_module.build_job_opportunity_fit({
+            "occupation_match_type": "uncertain", "title_match_score": 0,
+            "salary_interval": "yearly", "salary_source": "structured", "salary_currency": "CAD",
+            "salary_annual_midpoint": 150000, "salary_advertised_min": 150000, "salary_advertised_max": 150000,
+            "distance_km": 3, "distance_type": "straight_line", "posted_date": date.today().isoformat(),
+            "job_description": "Enterprise Strategy role.",
+        })
+        missing_salary = app_module.build_job_opportunity_fit({
+            "occupation_match_type": "exact", "title_match_score": 100, "distance_km": 3,
+            "distance_type": "straight_line", "posted_date": date.today().isoformat(),
+            "job_description": "Registered Early Childhood Educator. No salary stated.",
+        })
+        unpaid = app_module.build_job_opportunity_fit({
+            "occupation_match_type": "exact", "title_match_score": 100, "distance_km": 3,
+            "distance_type": "straight_line", "posted_date": date.today().isoformat(),
+            "job_description": "This unpaid internship is for a Registered Early Childhood Educator.",
+        })
+        self.assertGreater(exact_rece["opportunity_score"], unrelated["opportunity_score"])
+        self.assertGreater(missing_salary["opportunity_score"], unpaid["opportunity_score"])
+        self.assertIn("explicitly unpaid", " ".join(unpaid["opportunity_score_reasons"]))
+
     def test_packaged_exit_requires_local_token_and_invokes_shutdown_callback(self):
         called = []
         original = app_module.app.config.get("JOB_TRACKER_SHUTDOWN")
@@ -2902,6 +2963,20 @@ class JobAssistantTest(unittest.TestCase):
                 break
             time.sleep(0.01)
         self.assertTrue(called)
+
+    def test_packaged_exit_waits_for_active_discovery(self):
+        original = app_module.app.config.get("JOB_TRACKER_SHUTDOWN")
+        with patch.dict(os.environ, {"JOB_TRACKER_EXIT_TOKEN": "test-exit-token"}, clear=False):
+            app_module.app.config["JOB_TRACKER_SHUTDOWN"] = lambda: None
+            with app_module._ACTIVE_DISCOVERY_SEARCHES_LOCK:
+                app_module._ACTIVE_DISCOVERY_SEARCHES.add("active-test")
+            try:
+                blocked = self.client.post("/api/app/exit", headers={"X-Job-Tracker-Exit-Token": "test-exit-token"})
+            finally:
+                with app_module._ACTIVE_DISCOVERY_SEARCHES_LOCK:
+                    app_module._ACTIVE_DISCOVERY_SEARCHES.discard("active-test")
+                app_module.app.config["JOB_TRACKER_SHUTDOWN"] = original
+        self.assertEqual(blocked.status_code, 409)
 
     def test_explore_mode_retains_adjacent_roles_without_global_non_target_cap(self):
         job = {"role_type": "analyst", "discovery_search_mode": "explore", "occupation_match_type": "adjacent_opportunity", "location_search_eligible": True, "remote_type": "Hybrid", "application_priority_score": 80}

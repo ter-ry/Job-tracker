@@ -584,6 +584,9 @@ def create_app() -> Flask:
         local_origin = not origin or origin.startswith("http://127.0.0.1") or origin.startswith("http://localhost")
         if not expected or supplied != expected or request.remote_addr not in {"127.0.0.1", "::1"} or not local_origin:
             return jsonify({"error": "Local application exit is not authorized."}), 403
+        with _ACTIVE_DISCOVERY_SEARCHES_LOCK:
+            if _ACTIVE_DISCOVERY_SEARCHES:
+                return jsonify({"error": "Discovery is still active; wait for it to finish before exiting."}), 409
         callback = current_app.config.get("JOB_TRACKER_SHUTDOWN")
         if not callable(callback):
             return jsonify({"error": "Application shutdown is unavailable in this runtime."}), 503
@@ -9645,22 +9648,39 @@ def build_job_opportunity_fit(job: dict[str, Any]) -> dict[str, Any]:
     title_type = text(job.get("occupation_match_type")).lower()
     title_component = title_score if title_score else {"exact": 100, "related": 72}.get(title_type, 35)
     salary = normalize_salary_snapshot(job)
-    salary_component = 72 if salary.get("salary_source") in {"structured", "description"} else 48 if salary.get("salary_source") == "estimated" else 42
+    salary_component, salary_reason = opportunity_salary_component(job, salary)
     distance = clamp_int(job.get("distance_km"), 0, 9999)
-    distance_component = 78 if distance < 9999 else 55
+    distance_known = distance < 9999 and (text(job.get("distance_type")).lower() in {"straight_line", "approximate", ""})
+    distance_component = max(20, 100 - min(distance * 2, 80)) if distance_known else 60
     arrangement = text(job.get("work_arrangement") or job.get("remote_type")).lower()
-    arrangement_component = 90 if arrangement in {"remote", "hybrid"} else 72 if arrangement == "onsite" else 55
+    arrangement_component = 90 if arrangement in {"remote", "hybrid"} else 72 if arrangement in {"onsite", "on-site"} else 60
     eligibility = text(job.get("remote_eligibility")).lower()
     eligibility_component = 95 if eligibility in {"canadian_eligible", "eligible"} else 45 if eligibility in {"restricted", "confirmed_ineligible"} else 60
-    score = round(title_component * 0.40 + salary_component * 0.15 + distance_component * 0.15 + arrangement_component * 0.15 + eligibility_component * 0.15)
+    benefits_component, benefits_reason = opportunity_benefits_component(job)
+    freshness_component, freshness_reason = opportunity_freshness_component(job)
+    score = round(
+        title_component * 0.55
+        + salary_component * 0.12
+        + distance_component * 0.10
+        + arrangement_component * 0.08
+        + eligibility_component * 0.08
+        + benefits_component * 0.04
+        + freshness_component * 0.03
+    )
+    unpaid = explicit_unpaid_evidence(job)
+    if unpaid:
+        score = min(score, 20)
     reasons = [
-        f"Title relevance: {title_component}% ({title_type or 'unclassified'} match).",
-        f"Advertised compensation evidence: {salary_component}%.",
-        "Distance is based on the configured origin and straight-line geocoding only." if distance < 9999 else "Distance is unavailable; no distance penalty was applied.",
+        f"Title relevance: {title_component}/100 ({title_type or 'unclassified'} match; strongest factor).",
+        salary_reason,
+        f"Distance: {distance_component}/100 ({distance} km straight-line)." if distance_known else "Distance: unavailable; neutral score used.",
         f"Work arrangement: {arrangement or 'unspecified'}.",
         f"Eligibility evidence: {eligibility or 'unknown'}.",
-        "No résumé or candidate profile was used for this title-search score.",
+        benefits_reason,
+        freshness_reason,
     ]
+    if unpaid:
+        reasons.append("The posting explicitly describes the role as unpaid or volunteer; recommendation score capped.")
     if title_type not in {"exact", "related"}:
         score = min(score, 49)
     if eligibility in {"restricted", "confirmed_ineligible"}:
@@ -9693,6 +9713,46 @@ def build_job_opportunity_fit(job: dict[str, Any]) -> dict[str, Any]:
         "opportunity_score": score,
         "opportunity_score_reasons": reasons,
     }
+
+
+def opportunity_salary_component(job: dict[str, Any], salary: dict[str, Any]) -> tuple[int, str]:
+    if explicit_unpaid_evidence(job):
+        return 10, "Advertised compensation: explicitly unpaid; lowest component used."
+    annual_midpoint = float(salary.get("salary_annual_midpoint") or 0)
+    source = text(salary.get("salary_source")).lower()
+    currency = text(salary.get("salary_currency") or "CAD").upper()
+    if annual_midpoint <= 0 or source in {"missing", "estimated"}:
+        return 55, "Advertised compensation: unspecified; neutral component used."
+    if currency != "CAD":
+        return 55, f"Advertised compensation: {currency} {salary.get('salary_interval') or 'unit'}; currency conversion unavailable, neutral component used."
+    component = round(max(35, min(90, 35 + ((annual_midpoint - 40_000) / 80_000) * 55)))
+    advertised = salary.get("salary_original_text") or salary.get("salary_text") or salary_range_label(
+        float(salary.get("salary_advertised_min") or 0), float(salary.get("salary_advertised_max") or 0), text(salary.get("salary_interval")), currency,
+    )
+    return component, f"Advertised compensation: {advertised}; annual comparison value ${round(annual_midpoint):,}/year ({component}/100)."
+
+
+def opportunity_benefits_component(job: dict[str, Any]) -> tuple[int, str]:
+    benefits = normalize_space(text(job.get("benefits")))
+    description = normalize_space(text(job.get("job_description")))
+    evidence = benefits or description
+    terms = re.findall(r"\b(?:health|dental|vision|medical|rrsp|pension|paid vacation|paid time off|benefits|wellness|insurance)\b", evidence.lower())
+    if terms:
+        return 78, "Benefits: advertised evidence found (" + ", ".join(sorted(set(terms))[:4]) + ")."
+    return 60, "Benefits: not specified; neutral component used rather than treating it as no benefits."
+
+
+def opportunity_freshness_component(job: dict[str, Any]) -> tuple[int, str]:
+    raw = text(job.get("posted_date"))
+    if not raw:
+        return 60, "Posting freshness: date unavailable; neutral component used."
+    try:
+        posted = datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
+        days_old = max(0, (date.today() - posted).days)
+    except (TypeError, ValueError):
+        return 60, "Posting freshness: date could not be interpreted; neutral component used."
+    component = 95 if days_old <= 3 else 82 if days_old <= 7 else 68 if days_old <= 14 else 52 if days_old <= 30 else 40
+    return component, f"Posting freshness: {days_old} day(s) old ({component}/100)."
 
 
 def load_tailoring_changes(job_id: int) -> dict[str, Any]:
