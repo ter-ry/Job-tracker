@@ -17,6 +17,12 @@ def get(url: str) -> tuple[int, bytes]:
         return response.status, response.read()
 
 
+def post_exit(url: str, token: str) -> tuple[int, bytes]:
+    request = urllib.request.Request(url, method="POST", headers={"X-Job-Tracker-Exit-Token": token})
+    with urllib.request.urlopen(request, timeout=5) as response:
+        return response.status, response.read()
+
+
 def main() -> None:
     if len(sys.argv) != 2:
         raise SystemExit("usage: frozen_windows_smoke_test.py <frozen-executable>")
@@ -27,6 +33,7 @@ def main() -> None:
         env = os.environ.copy()
         env["JOB_TRACKER_DATA_DIR"] = data_root
         env["JOB_TRACKER_VERSION"] = "0.0.0-frozen-smoke"
+        env["JOB_TRACKER_EXIT_TOKEN"] = "frozen-smoke-exit-token"
         process = subprocess.Popen([str(executable)], env=env, cwd=str(executable.parent))
         base = "http://127.0.0.1:5000"
         deadline = time.monotonic() + 45
@@ -48,9 +55,13 @@ def main() -> None:
             assert index_status == 200 and b"Job Tracker" in index_body
             assert static_status == 200 and b"function" in static_body
             assert Path(data_root, "jobs.sqlite").is_file(), "Frozen app did not create isolated SQLite data"
-            print(json.dumps({"health": 200, "version": 200, "index": len(index_body), "static": len(static_body), "data_root": data_root}))
+            exit_status, _ = post_exit(f"{base}/api/app/exit", env["JOB_TRACKER_EXIT_TOKEN"])
+            assert exit_status == 200
+            process.wait(timeout=15)
+            print(json.dumps({"health": 200, "version": 200, "index": len(index_body), "static": len(static_body), "data_root": data_root, "exit": 200}))
         finally:
-            process.terminate()
+            if process.poll() is None:
+                process.terminate()
             try:
                 process.wait(timeout=15)
             except subprocess.TimeoutExpired:

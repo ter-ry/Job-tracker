@@ -105,6 +105,7 @@ def launch() -> int:
     os.environ["JOB_TRACKER_DATA_DIR"] = str(data_dir)
     os.environ.setdefault("JOB_TRACKER_BIND_HOST", HOST)
     os.environ.setdefault("JOB_TRACKER_PORT", str(PORT))
+    os.environ.setdefault("JOB_TRACKER_EXIT_TOKEN", os.urandom(32).hex())
 
     lock = SingleInstance(data_dir / "instance.lock")
     if not lock.acquire():
@@ -114,13 +115,13 @@ def launch() -> int:
         return 2
     atexit.register(lock.close)
 
-    from waitress import serve
+    from waitress import create_server
     from app import app
 
+    server = create_server(app, host=HOST, port=PORT, threads=8, ident="JobTracker")
+    app.config["JOB_TRACKER_SHUTDOWN"] = server.close
     server_thread = threading.Thread(
-        target=serve,
-        args=(app,),
-        kwargs={"host": HOST, "port": PORT, "threads": 8, "ident": "JobTracker"},
+        target=server.run,
         daemon=True,
     )
     server_thread.start()
@@ -128,6 +129,7 @@ def launch() -> int:
         return 3
     webbrowser.open(f"http://{HOST}:{PORT}/")
     server_thread.join()
+    server.close()
     return 0
 
 

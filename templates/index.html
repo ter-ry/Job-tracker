@@ -20,6 +20,7 @@
         <a class="button secondary" href="/export.csv">Export CSV</a>
         <button class="button ghost small" type="button" id="check-for-updates">Check for updates</button>
         <button class="button ghost small" id="toggle-advanced-features" type="button" aria-pressed="false">Advanced features</button>
+        {% if exit_token %}<button class="button ghost small" id="exit-job-tracker" type="button">Exit Job Tracker</button>{% endif %}
       </nav>
     </header>
 
@@ -114,6 +115,7 @@
               </label>
               <label>Keywords<input id="discovery-keywords" required placeholder="software developer"></label>
               <label>Search area<input id="discovery-location" placeholder="Toronto, Ontario"></label>
+              <label>Private distance origin (optional)<input id="discovery-distance-origin" placeholder="Postal code or city"><small class="muted">Used only for straight-line distance; not sent to job providers.</small></label>
               <label>Distance<input id="discovery-distance" type="number" min="0" step="1" placeholder="50 km"></label>
               <label>Remote preference
                 <select id="discovery-remote-preference">
@@ -531,6 +533,7 @@
 
     </main>
 
+    <script>window.JOB_TRACKER_EXIT_TOKEN = {{ exit_token|tojson }};</script>
     <script src="{{ url_for('static', filename='app.js') }}"></script>
   </body>
 </html>

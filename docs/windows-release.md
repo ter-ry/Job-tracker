@@ -39,6 +39,10 @@ Ollama remains an optional local integration. The installer does not bundle or s
 
 The current `Check for updates` control is read-only: it queries the latest GitHub Release, normalizes `v1.0.0` and `1.0.0` to the same semantic version, and opens the release page only when a strictly newer release exists. It does not download, replace, or install anything.
 
+Packaged local builds expose an in-app `Exit Job Tracker` action. The launcher owns the Waitress server and the named `JobTrackerInstance` mutex; the action is accepted only from localhost with the per-process exit token, closes the server, and releases the mutex. Source/development runs do not expose this control.
+
+Discovery preserves advertised salary quantities and cadence separately from annual comparison values. Hourly and annual ranges are displayed in their advertised units; annual equivalents are used only for configured salary thresholds and numeric ranking. A private distance-origin field may be supplied for straight-line distance calculations and is not sent to providers; road and transit estimates remain unavailable without a routing provider.
+
 A future updater must:
 
 1. ask for confirmation;

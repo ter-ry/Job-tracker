@@ -2503,7 +2503,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(first["runs"], 1)
         self.assertEqual(second["runs"], 0)
 
-    def test_discovery_salary_normalization_and_hourly_conversion(self):
+    def test_discovery_salary_normalization_preserves_advertised_hourly_units(self):
         salary = app_module.determine_salary(
             {
                 "salary_text": "$30 an hour",
@@ -2511,8 +2511,16 @@ class JobAssistantTest(unittest.TestCase):
             }
         )
         self.assertEqual(salary["salary_interval"], "hourly")
-        self.assertEqual(salary["salary_min"], 62400)
-        self.assertEqual(salary["salary_max"], 62400)
+        self.assertEqual((salary["salary_min"], salary["salary_max"]), (30, 30))
+        self.assertEqual((salary["salary_annual_min"], salary["salary_annual_max"]), (62400, 62400))
+        self.assertEqual((salary["salary_advertised_min"], salary["salary_advertised_max"]), (30, 30))
+
+    def test_salary_parser_preserves_decimal_hourly_advertised_values(self):
+        salary = app_module.parse_salary_text("Salary: $24.47-$28.36/hour")
+        self.assertEqual(salary["salary_interval"], "hourly")
+        self.assertEqual((salary["salary_advertised_min"], salary["salary_advertised_max"]), (24.47, 28.36))
+        self.assertEqual((salary["salary_annual_min"], salary["salary_annual_max"]), (round(24.47 * 2080), round(28.36 * 2080)))
+        self.assertIn("24.47", salary["salary_text"])
 
     def test_discovery_salary_sorting_keeps_unknowns_after_known_when_requested(self):
         jobs = [
@@ -2769,17 +2777,19 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(salary["salary_min"], 65000)
         self.assertEqual(salary["salary_max"], 80000)
 
-    def test_salary_extraction_from_description_and_hourly_annualization(self):
+    def test_salary_extraction_from_description_keeps_advertised_and_annual_values(self):
         yearly = app_module.parse_salary_text("Compensation range: $65,000-$80,000 per year plus benefits.")
         hourly = app_module.parse_salary_text("From $30 an hour for full-time support work.")
         self.assertEqual(yearly["salary_source"], "description")
         self.assertEqual(yearly["salary_max"], 80000)
         self.assertEqual(hourly["salary_interval"], "hourly")
-        self.assertEqual(hourly["salary_min"], 62400)
+        self.assertEqual(hourly["salary_min"], 30)
+        self.assertEqual(hourly["salary_annual_min"], 62400)
 
     def test_salary_parser_preserves_decimal_and_currency_prefixed_range_endpoints(self):
         hourly = app_module.parse_salary_text("Salary: $18.00-$21.00 per hour")
-        self.assertEqual((hourly["salary_min"], hourly["salary_max"], hourly["salary_interval"], hourly["salary_currency"]), (37440, 43680, "hourly", "CAD"))
+        self.assertEqual((hourly["salary_min"], hourly["salary_max"], hourly["salary_interval"], hourly["salary_currency"]), (18, 21, "hourly", "CAD"))
+        self.assertEqual((hourly["salary_annual_min"], hourly["salary_annual_max"]), (37440, 43680))
         annual = app_module.parse_salary_text("Base salary: CA$90,000–CA$130,000 CAD per year")
         self.assertEqual((annual["salary_min"], annual["salary_max"], annual["salary_interval"], annual["salary_currency"]), (90000, 130000, "yearly", "CAD"))
 
@@ -2851,8 +2861,47 @@ class JobAssistantTest(unittest.TestCase):
                 },
                 evidence_profile=None,
             )
-        self.assertEqual(result["qualification_evidence_confidence"], "standard")
+        self.assertEqual(result["qualification_match_status"], "not_applicable")
+        self.assertEqual(result["qualification_evidence_confidence"], "not_applicable")
         self.assertEqual(result["qualification_evidence_profile_name"], "No résumé selected — title search")
+        self.assertGreater(result["opportunity_score"], 0)
+
+    def test_title_search_opportunity_score_is_not_resume_qualification(self):
+        result = app_module.build_qualification_fit({
+            "title": "Registered Early Childhood Educator",
+            "discovery_search_mode": "title",
+            "discovery_profile_independent": 1,
+            "occupation_match_type": "exact",
+            "title_match_score": 100,
+            "location": "Toronto, ON",
+            "remote_type": "Hybrid",
+            "remote_eligibility": "canadian_eligible",
+            "salary": "CAD $26/hour",
+            "salary_source": "description",
+            "salary_advertised_min": 26,
+            "salary_advertised_max": 26,
+            "salary_interval": "hourly",
+            "job_description": "No minimum years stated.",
+        })
+        self.assertEqual(result["qualification_fit_score"], 0)
+        self.assertEqual(result["qualification_fit_label"], "Not assessed — title search")
+        self.assertIn("No résumé or candidate profile", " ".join(result["opportunity_score_reasons"]))
+
+    def test_packaged_exit_requires_local_token_and_invokes_shutdown_callback(self):
+        called = []
+        original = app_module.app.config.get("JOB_TRACKER_SHUTDOWN")
+        with patch.dict(os.environ, {"JOB_TRACKER_EXIT_TOKEN": "test-exit-token"}, clear=False):
+            app_module.app.config["JOB_TRACKER_SHUTDOWN"] = lambda: called.append(True)
+            denied = self.client.post("/api/app/exit", headers={"X-Job-Tracker-Exit-Token": "wrong"})
+            accepted = self.client.post("/api/app/exit", headers={"X-Job-Tracker-Exit-Token": "test-exit-token"})
+        app_module.app.config["JOB_TRACKER_SHUTDOWN"] = original
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(accepted.status_code, 200)
+        for _ in range(20):
+            if called:
+                break
+            time.sleep(0.01)
+        self.assertTrue(called)
 
     def test_explore_mode_retains_adjacent_roles_without_global_non_target_cap(self):
         job = {"role_type": "analyst", "discovery_search_mode": "explore", "occupation_match_type": "adjacent_opportunity", "location_search_eligible": True, "remote_type": "Hybrid", "application_priority_score": 80}
