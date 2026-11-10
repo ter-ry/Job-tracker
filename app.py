@@ -7494,9 +7494,6 @@ def home_coordinates_match_location(profile: dict[str, Any], latitude: float, lo
 
 def discovery_origin_available(profile: dict[str, str]) -> bool:
     origin = profile_home_location(profile)
-    if location_context.get("distance_origin_lookup", {}).get("ok"):
-        origin_result = location_context["distance_origin_lookup"]
-        origin = {"input": origin_result.get("original_input"), "normalized": origin_result.get("normalized_query"), "latitude": origin_result.get("latitude"), "longitude": origin_result.get("longitude"), "provider": origin_result.get("provider"), "confidence": origin_result.get("confidence"), "precision": origin_result.get("precision"), "geocoded_at": origin_result.get("geocoded_at"), "status": origin_result.get("status"), "error": origin_result.get("error", "")}
     return origin["latitude"] is not None and origin["longitude"] is not None and origin["status"] in {"saved", "cached"}
 
 
