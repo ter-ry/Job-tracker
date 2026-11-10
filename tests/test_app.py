@@ -2885,7 +2885,7 @@ class JobAssistantTest(unittest.TestCase):
         })
         self.assertEqual(result["qualification_fit_score"], 0)
         self.assertEqual(result["qualification_fit_label"], "Not assessed — title search")
-        self.assertIn("No résumé or candidate profile", " ".join(result["opportunity_score_reasons"]))
+        self.assertIn("Title relevance", " ".join(result["opportunity_score_reasons"]))
 
     def test_opportunity_score_compares_advertised_pay_and_distance(self):
         base = {

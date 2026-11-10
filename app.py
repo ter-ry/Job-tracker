@@ -9660,12 +9660,12 @@ def build_job_opportunity_fit(job: dict[str, Any]) -> dict[str, Any]:
     freshness_component, freshness_reason = opportunity_freshness_component(job)
     score = round(
         title_component * 0.55
-        + salary_component * 0.12
-        + distance_component * 0.10
-        + arrangement_component * 0.08
-        + eligibility_component * 0.08
-        + benefits_component * 0.04
-        + freshness_component * 0.03
+        + salary_component * 0.18
+        + distance_component * 0.08
+        + arrangement_component * 0.07
+        + eligibility_component * 0.07
+        + benefits_component * 0.03
+        + freshness_component * 0.02
     )
     unpaid = explicit_unpaid_evidence(job)
     if unpaid:
