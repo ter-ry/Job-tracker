@@ -24,6 +24,8 @@ const state = {
   selectedCandidateProfileId: (() => { try { return localStorage.getItem("jobTracker.selectedCandidateProfileId") || ""; } catch (_) { return ""; } })(),
   discoveryInboxJobs: [],
   discoveryInboxCategory: "new_actionable",
+  advancedFeatures: (() => { try { return localStorage.getItem("jobTracker.advancedFeatures") === "true"; } catch (_) { return false; } })(),
+  pendingAppliedJobs: new Set(),
   tailoring: { draftId: null, jobId: null, profileId: null, resumeId: null, data: null, selectedParagraph: null, selectedKeyword: null, aiImproveJobId: null },
 };
 
@@ -139,6 +141,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("discovery-test-sources").addEventListener("click", testJobSources);
   document.getElementById("save-current-discovery-search").addEventListener("click", saveCurrentDiscoverySearch);
   document.getElementById("refresh-shortlist").addEventListener("click", loadAll);
+  document.getElementById("toggle-advanced-features")?.addEventListener("click", toggleAdvancedFeatures);
   document.getElementById("refresh-preparation-queue")?.addEventListener("click", loadPreparationQueue);
   document.getElementById("close-tailoring-studio")?.addEventListener("click", closeTailoringStudio);
   document.getElementById("tailoring-new-revision")?.addEventListener("click", createTailoringRevision);
@@ -171,6 +174,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("discovery-clear-filters").addEventListener("click", clearDiscoveryFilters);
   document.getElementById("discovery-show-all").addEventListener("click", showAllFetchedDiscoveryJobs);
   setDiscoverySection("pipeline");
+  applyAdvancedFeaturesVisibility();
   ["search", "status-filter", "fit-filter", "role-filter", "remote-filter", "risk-filter", "sort-by"].forEach((id) => {
     document.getElementById(id).addEventListener("input", renderJobs);
     document.getElementById(id).addEventListener("change", renderJobs);
@@ -214,6 +218,22 @@ document.addEventListener("DOMContentLoaded", () => {
   loadDiscoveryScheduler();
   loadDiscoveryTaskStatus();
 });
+
+function applyAdvancedFeaturesVisibility() {
+  document.querySelectorAll(".advanced-feature").forEach((element) => { element.hidden = !state.advancedFeatures; });
+  const toggle = document.getElementById("toggle-advanced-features");
+  if (toggle) {
+    toggle.setAttribute("aria-pressed", state.advancedFeatures ? "true" : "false");
+    toggle.textContent = state.advancedFeatures ? "Hide advanced features" : "Advanced features";
+  }
+}
+
+function toggleAdvancedFeatures() {
+  state.advancedFeatures = !state.advancedFeatures;
+  try { localStorage.setItem("jobTracker.advancedFeatures", String(state.advancedFeatures)); } catch (_) { /* storage may be disabled */ }
+  applyAdvancedFeaturesVisibility();
+  renderPipelineDashboard(state.jobs);
+}
 
 function setDiscoverySection(view) {
   const selected = ["pipeline", "find", "saved"].includes(view) ? view : "pipeline";
@@ -1420,6 +1440,19 @@ function pipelineSortValue(job, mode) {
 
 function sortPipelineJobs(items, mode) {
   return [...items].sort((a, b) => {
+    if (mode === "priority" || mode === "qualification") {
+      const categoryRank = (job) => {
+        if (!job.discovery_first_seen_at) return 5; // historical/manual record
+        if (job.status === "Applied" || job.discovery_state === "applied") return 3;
+        if (job.discovery_state === "saved") return 1;
+        if (job.discovery_state === "ignored") return 4;
+        if (job.discovery_result_category === "actionable") return 0;
+        if (job.discovery_result_category === "review_required") return 2;
+        return 6; // excluded or otherwise ineligible
+      };
+      const categoryDifference = categoryRank(a) - categoryRank(b);
+      if (categoryDifference) return categoryDifference;
+    }
     const left = pipelineSortValue(a, mode);
     const right = pipelineSortValue(b, mode);
     if (left === null && right === null) return Number(a.id || 0) - Number(b.id || 0);
@@ -1446,8 +1479,10 @@ function renderPipelineDashboard(jobs) {
     sortControl.onchange = (event) => { pipelineSort = event.target.value; renderPipelineDashboard(state.jobs); };
   }
   const filtered = pipelineCategory === "All" ? items : items.filter((job) => String(job.role_type || "") === pipelineCategory);
-  setText("pipeline-discovered", items.length);
-  setText("pipeline-matches", items.filter((job) => Number(job.qualification_fit_score || 0) >= 75).length);
+  const discovered = items.filter((job) => Boolean(job.discovery_first_seen_at));
+  const actionable = discovered.filter((job) => job.discovery_result_category === "actionable");
+  setText("pipeline-discovered", discovered.length);
+  setText("pipeline-matches", actionable.filter((job) => Number(job.qualification_fit_score || 0) >= 75).length);
   setText("pipeline-ready", items.filter((job) => ["ready_for_review"].includes(job.preparation_status)).length);
   const cards = document.getElementById("pipeline-cards");
   if (!filtered.length) {
@@ -1458,7 +1493,16 @@ function renderPipelineDashboard(jobs) {
     const score = Number(job.qualification_fit_score ?? job.fit_score ?? 0);
     const applicationPriority = Number(job.application_priority_score || 0);
     const jobPriority = Number(job.overall_score || job.fit_score || 0);
-    return `<article class="pipeline-card" data-job-id="${job.id}"><div><h3>${escapeHtml(job.title || "Untitled role")}</h3><p>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location not listed")}</p><p class="pipeline-subline">${escapeHtml(job.qualification_fit_label || "Qualification fit")}</p></div><div class="pipeline-score"><strong>${score}%</strong><span>Qualification Match</span><small>Application Priority ${applicationPriority} · Job Priority ${jobPriority}</small><button type="button" data-job-id="${job.id}" class="pipeline-action">View details</button></div></article>`;
+    const categoryLabel = job.discovery_first_seen_at
+      ? String(job.discovery_result_category || "review_required").replaceAll("_", " ")
+      : "historical/manual";
+    const postingUrl = job.application_url || job.url || "";
+    const openPosting = postingUrl
+      ? `<a class="button small" href="${escapeAttribute(postingUrl)}" target="_blank" rel="noreferrer">Open job posting</a>`
+      : `<button class="button small" type="button" disabled title="No original or application URL was stored.">Open job posting</button>`;
+    const applied = job.status === "Applied" || job.discovery_state === "applied";
+    const statusActions = `<div class="pipeline-actions" aria-label="Job actions">${openPosting}<button class="button small ghost" type="button" data-pipeline-action="applied" data-job-id="${job.id}" ${applied ? "disabled" : ""}>${applied ? "Applied" : "Mark Applied"}</button><button class="button small ghost" type="button" data-pipeline-action="save" data-job-id="${job.id}" ${applied ? "disabled" : ""}>Save for later</button><button class="button small ghost" type="button" data-pipeline-action="skip" data-job-id="${job.id}">Skip</button><button type="button" data-job-id="${job.id}" class="button small ghost pipeline-action">View details</button></div>`;
+    return `<article class="pipeline-card" data-job-id="${job.id}"><div><h3>${escapeHtml(job.title || "Untitled role")}</h3><p>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location not listed")}</p><p class="pipeline-subline">${escapeHtml(categoryLabel)} · ${escapeHtml(job.qualification_fit_label || "Qualification fit")}</p></div><div class="pipeline-score"><strong>${score}%</strong><span>Qualification Match</span><small>Application Priority ${applicationPriority} · Job Priority ${jobPriority}</small></div>${statusActions}</article>`;
   }).join("");
   cards.querySelectorAll(".pipeline-card").forEach((card) => card.addEventListener("click", (event) => {
     if (event.target.closest("button, a")) return;
@@ -1467,6 +1511,58 @@ function renderPipelineDashboard(jobs) {
   cards.querySelectorAll(".pipeline-action").forEach((button) => button.addEventListener("click", () => {
     openPipelineJobDetails(Number(button.dataset.jobId));
   }));
+  cards.querySelectorAll("[data-pipeline-action]").forEach((button) => button.addEventListener("click", () => {
+    const id = Number(button.dataset.jobId);
+    if (button.dataset.pipelineAction === "applied") markPipelineApplied(id);
+    else if (button.dataset.pipelineAction === "save") savePipelineJob(id);
+    else skipPipelineJob(id);
+  }));
+}
+
+function todayIsoDate() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+async function markPipelineApplied(id) {
+  const job = state.jobs.find((item) => Number(item.id) === Number(id));
+  if (!job || job.status === "Applied" || state.pendingAppliedJobs.has(id)) return;
+  const appliedDate = window.prompt("Application date (YYYY-MM-DD)", todayIsoDate());
+  if (appliedDate === null) return;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(appliedDate)) return toast("Use an application date in YYYY-MM-DD format.");
+  if (!window.confirm(`Mark ${job.title || "this job"} as applied?`)) return;
+  state.pendingAppliedJobs.add(id);
+  try {
+    const applied = await api.send(`/api/jobs/${id}/applied`, "POST", { date_applied: appliedDate });
+    const index = state.jobs.findIndex((item) => Number(item.id) === Number(id));
+    if (index >= 0) state.jobs[index] = { ...state.jobs[index], ...applied };
+    toast(`Marked applied on ${applied.date_applied || appliedDate}`);
+    renderPipelineDashboard(state.jobs);
+    if (!document.getElementById("pipeline-job-details")?.hidden) openPipelineJobDetails(id);
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    state.pendingAppliedJobs.delete(id);
+  }
+}
+
+async function savePipelineJob(id) {
+  try {
+    const saved = await api.send(`/api/jobs/${id}/save`, "POST", {});
+    const index = state.jobs.findIndex((item) => Number(item.id) === Number(id));
+    if (index >= 0) state.jobs[index] = { ...state.jobs[index], ...saved };
+    toast("Saved for later");
+    renderPipelineDashboard(state.jobs);
+  } catch (error) { toast(error.message); }
+}
+
+async function skipPipelineJob(id) {
+  try {
+    await api.send(`/api/jobs/${id}/skip`, "POST", {});
+    const index = state.jobs.findIndex((item) => Number(item.id) === Number(id));
+    if (index >= 0) state.jobs[index] = { ...state.jobs[index], discovery_state: "ignored" };
+    toast("Skipped; it remains available in history");
+    renderPipelineDashboard(state.jobs);
+  } catch (error) { toast(error.message); }
 }
 
 function openPipelineJobDetails(id) {
@@ -1476,7 +1572,11 @@ function openPipelineJobDetails(id) {
   if (panel.hidden) pipelineDetailScrollY = window.scrollY;
   const requirements = [job.required_skills, job.preferred_skills, job.responsibilities].filter(Boolean).join("\n\n");
   const reasons = (job.qualification_fit_reasons || []).map((reason) => `<li>${escapeHtml(reason)}</li>`).join("") || "<li>Review the full posting and résumé evidence before applying.</li>";
-  panel.innerHTML = `<div class="pipeline-detail-header"><div><span class="eyebrow">Job details</span><h3 id="pipeline-detail-title">${escapeHtml(job.title || "Untitled role")}</h3><p>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location not listed")}</p></div><button class="button ghost small" type="button" data-close-job-details>Close</button></div><div class="pipeline-detail-grid"><div><strong>Qualification Match</strong><p class="pipeline-detail-score">${Number(job.qualification_fit_score ?? job.fit_score ?? 0)}% · ${escapeHtml(job.qualification_fit_label || "Review required")}</p><p class="muted">Technical qualification strength is separate from Canadian eligibility.</p><ul>${reasons}</ul><div class="experience-summary">${renderExperienceSummary(job)}</div><p class="muted">Source evidence: ${escapeHtml(job.qualification_evidence_source || "Not available")}</p></div><div><strong>Application Priority</strong><p>${Number(job.application_priority_score || 0)}</p><strong>Canada eligibility</strong><p>${escapeHtml(job.canadian_eligibility || "unknown")}</p><strong>Posting status</strong><p>${escapeHtml(job.posting_availability || "unverified")}</p><strong>Job Priority (legacy)</strong><p>${Number(job.overall_score || 0)}</p><strong>Salary</strong><p>${escapeHtml(job.salary || "Not listed")}</p><strong>Posting date</strong><p>${escapeHtml(job.posted_date || "Not listed")}</p><strong>Deadline</strong><p>${escapeHtml(job.deadline || "Not listed")}</p></div></div><details open><summary>Requirements and responsibilities</summary><pre>${escapeHtml(requirements || "No structured requirements were stored.")}</pre></details><details><summary>Full job description</summary><pre>${escapeHtml(job.job_description || "No job description was stored.")}</pre></details><p class="pipeline-detail-links">${job.url ? `<a href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Original posting</a>` : "Original posting unavailable"}${job.application_url && job.application_url !== job.url ? ` · <a href="${escapeAttribute(job.application_url)}" target="_blank" rel="noreferrer">Application page</a>` : ""}</p><div class="actions"><button class="button" type="button" data-prepare-job="${job.id}">Prepare application</button><button class="button ghost" type="button" data-edit-job="${job.id}">Edit job</button></div>`;
+  const postingUrl = job.application_url || job.url || "";
+  const applied = job.status === "Applied" || job.discovery_state === "applied";
+  const primaryActions = `<div class="pipeline-detail-actions" aria-label="Job actions">${postingUrl ? `<a class="button" href="${escapeAttribute(postingUrl)}" target="_blank" rel="noreferrer">Open job posting</a>` : `<button class="button" type="button" disabled title="No original or application URL was stored.">Open job posting unavailable</button>`}<button class="button ghost" type="button" data-detail-applied="${job.id}" ${applied ? "disabled" : ""}>${applied ? "Applied" : "Mark Applied"}</button><button class="button ghost" type="button" data-detail-save="${job.id}" ${applied ? "disabled" : ""}>Save for later</button><button class="button ghost" type="button" data-detail-skip="${job.id}">Skip</button></div>`;
+  const advancedActions = state.advancedFeatures ? `<button class="button ghost" type="button" data-prepare-job="${job.id}">Prepare application</button>` : "";
+  panel.innerHTML = `<div class="pipeline-detail-header"><div><span class="eyebrow">Job details</span><h3 id="pipeline-detail-title">${escapeHtml(job.title || "Untitled role")}</h3><p>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location not listed")}</p></div><button class="button ghost small" type="button" data-close-job-details>Close</button></div>${primaryActions}<div class="pipeline-detail-grid"><div><strong>Qualification Match</strong><p class="pipeline-detail-score">${Number(job.qualification_fit_score ?? job.fit_score ?? 0)}% · ${escapeHtml(job.qualification_fit_label || "Review required")}</p><p class="muted">Technical qualification strength is separate from Canadian eligibility.</p><ul>${reasons}</ul><div class="experience-summary">${renderExperienceSummary(job)}</div><p class="muted">Source evidence: ${escapeHtml(job.qualification_evidence_source || "Not available")}</p></div><div><strong>Application Priority</strong><p>${Number(job.application_priority_score || 0)}</p><strong>Canada eligibility</strong><p>${escapeHtml(job.canadian_eligibility || "unknown")}</p><strong>Posting status</strong><p>${escapeHtml(job.posting_availability || "unverified")}</p><strong>Job Priority (legacy)</strong><p>${Number(job.overall_score || 0)}</p><strong>Salary</strong><p>${escapeHtml(job.salary || "Not listed")}</p><strong>Posting date</strong><p>${escapeHtml(job.posted_date || "Not listed")}</p><strong>Deadline</strong><p>${escapeHtml(job.deadline || "Not listed")}</p></div></div><details open><summary>Requirements and responsibilities</summary><pre>${escapeHtml(requirements || "No structured requirements were stored.")}</pre></details><details><summary>Full job description</summary><pre>${escapeHtml(job.job_description || "No job description was stored.")}</pre></details><p class="pipeline-detail-links">${job.url ? `<a href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Original posting</a>` : "Original posting unavailable"}${job.application_url && job.application_url !== job.url ? ` · <a href="${escapeAttribute(job.application_url)}" target="_blank" rel="noreferrer">Application page</a>` : ""}</p><div class="actions">${advancedActions}<button class="button ghost" type="button" data-edit-job="${job.id}">Edit job</button></div>`;
   panel.setAttribute("role", "dialog");
   panel.setAttribute("aria-modal", "true");
   panel.setAttribute("aria-labelledby", "pipeline-detail-title");
@@ -1487,7 +1587,10 @@ function openPipelineJobDetails(id) {
     panel.classList.remove("is-open");
     window.scrollTo({ top: pipelineDetailScrollY, behavior: "auto" });
   });
-  panel.querySelector("[data-prepare-job]").addEventListener("click", () => queueDiscoveryJob(id));
+  panel.querySelector("[data-detail-applied]")?.addEventListener("click", () => markPipelineApplied(id));
+  panel.querySelector("[data-detail-save]")?.addEventListener("click", () => savePipelineJob(id));
+  panel.querySelector("[data-detail-skip]")?.addEventListener("click", () => skipPipelineJob(id));
+  panel.querySelector("[data-prepare-job]")?.addEventListener("click", () => queueDiscoveryJob(id));
   panel.querySelector("[data-edit-job]").addEventListener("click", () => { panel.hidden = true; switchTab({ currentTarget: { dataset: { tab: "tracker" } } }); loadJob(job); });
   panel.querySelector("[data-close-job-details]").focus();
   const existingPreparation = state.preparationQueue.find((item) => Number(item.job_id) === Number(id));

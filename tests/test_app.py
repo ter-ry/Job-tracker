@@ -501,6 +501,48 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("Full-time salaried", affirm["job_description"])
         self.assertEqual(security["role_type"], "other")
 
+    def test_non_technical_internship_does_not_enter_software_recommendations(self):
+        strategy = app_module.jobspy_result_to_job_payload(
+            {
+                "title": "Associate, Enterprise Strategy and Corporate Development",
+                "job_type": "intern",
+                "description": "Support financial modelling, valuation, research, and corporate strategy.",
+            }
+        )
+        self.assertEqual(strategy["role_type"], "other")
+        category, reason = app_module.discovery_result_category(
+            {**strategy, "application_priority_score": 84, "posting_availability": "likely_active"},
+            "hybrid",
+        )
+        self.assertEqual(category, "review_required")
+        self.assertIn("role family", reason)
+        fit = app_module.build_qualification_fit(
+            {**strategy, "job_description": strategy["job_description"]},
+            evidence_profile={
+                "resume_text": "Built Python and React applications.",
+                "work_experience": "Software developer with two years of experience.",
+                "target_seniority_levels": "entry_level,junior,intermediate",
+                "maximum_required_years": "3",
+                "willing_to_apply_to_stretch_roles": "true",
+                "management_roles_allowed": "false",
+            },
+        )
+        self.assertLessEqual(fit["qualification_fit_score"], 49)
+        self.assertLessEqual(fit["application_priority_score"], 49)
+
+    def test_dedupe_normalizes_common_company_legal_suffixes(self):
+        linkedin = {"company": "Rose Rocket", "title": "Junior Software Engineer", "location": "Toronto, Ontario, Canada"}
+        indeed = {"company": "Rose Rocket Inc.", "title": "Junior Software Engineer", "location": "Toronto, ON, CA"}
+        self.assertEqual(app_module.dedupe_keys(linkedin) & app_module.dedupe_keys(indeed), {
+            "ctl:rose rocket|junior software engineer|toronto on"
+        })
+
+    def test_pipeline_counter_and_sort_separate_discovered_actionable_and_history(self):
+        source = (Path(__file__).parents[1] / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("const discovered = items.filter((job) => Boolean(job.discovery_first_seen_at));", source)
+        self.assertIn("historical/manual", source)
+        self.assertIn("categoryRank", source)
+
     def test_application_priority_is_the_discovery_best_match_sort(self):
         preferences = app_module.discovery_preferences_payload({})
         self.assertEqual(preferences["sort"]["field"], "application_priority_score")
@@ -1458,6 +1500,42 @@ class JobAssistantTest(unittest.TestCase):
             self.assertEqual(self.client.get("/api/profile").status_code, 200)
             self.assertEqual(self.client.get("/api/profile").status_code, 200)
         self.assertEqual(initialize.call_count, 1)
+
+    def test_pipeline_manual_application_preserves_job_and_allows_date_correction(self):
+        created = self.client.post(
+            "/api/jobs",
+            json={
+                "company": "Manual Apply Co",
+                "title": "Junior Software Developer",
+                "url": "https://employer.example/jobs/junior-1",
+                "job_description": "Python React SQL and REST APIs.",
+                "application_priority_score": 82,
+            },
+        ).get_json()
+        applied = self.client.post(
+            f"/api/jobs/{created['id']}/applied",
+            json={"date_applied": "2026-11-01"},
+        )
+        self.assertEqual(applied.status_code, 200)
+        self.assertEqual(applied.get_json()["status"], "Applied")
+        self.assertEqual(applied.get_json()["date_applied"], "2026-11-01")
+        self.assertEqual(applied.get_json()["url"], "https://employer.example/jobs/junior-1")
+        corrected = self.client.post(f"/api/jobs/{created['id']}/applied", json={"date_applied": "2026-11-02"}).get_json()
+        self.assertEqual(corrected["date_applied"], "2026-11-02")
+        reloaded = next(item for item in self.client.get("/api/jobs").get_json() if item["id"] == created["id"])
+        self.assertEqual(reloaded["status"], "Applied")
+        self.assertEqual(reloaded["title"], "Junior Software Developer")
+        self.assertEqual(reloaded["url"], "https://employer.example/jobs/junior-1")
+
+    def test_pipeline_actions_and_advanced_features_are_explicit_in_default_ui(self):
+        frontend = Path("static/app.js").read_text(encoding="utf-8")
+        template = Path("templates/index.html").read_text(encoding="utf-8")
+        self.assertIn("Open job posting", frontend)
+        self.assertIn("Mark Applied", frontend)
+        self.assertIn("data-detail-applied", frontend)
+        self.assertIn("jobTracker.advancedFeatures", frontend)
+        self.assertIn('class="tab advanced-feature"', template)
+        self.assertIn('id="toggle-advanced-features"', template)
 
     def test_refresh_during_active_sqlite_write_waits_without_initialization_lock_error(self):
         with self.client.application.app_context():
