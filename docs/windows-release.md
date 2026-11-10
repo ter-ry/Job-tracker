@@ -26,12 +26,12 @@ Before a schema upgrade, the guarded database initializer creates a consistent S
 
 ## Dependency and size implications
 
-The package keeps the current runtime dependencies, including JobSpy, pandas, python-docx, Flask, Waitress, sentence-transformers, and PyTorch-related modules. The PyInstaller spec explicitly collects the sentence-transformers package and torch submodules instead of silently disabling semantic matching. These packages can make the onedir bundle and installer substantially larger than the source application; the CI artifact size is part of the package check and must be recorded during the first real build.
+The core package installs the runtime dependencies in `requirements.txt`, including JobSpy, pandas, python-docx, Flask, and Waitress. Semantic résumé matching is an optional backend in `requirements-optional-semantic.txt`; the core Windows build uses the deterministic keyword fallback and reports the semantic backend as unavailable when that optional dependency is absent. This keeps discovery, ECE title search, extraction, tracking, and Pipeline operation independent of the ML stack. Ollama remains optional and is not bundled.
 
-The `all-MiniLM-L6-v2` model weights are not silently replaced by keyword matching. The current application already falls back to keyword matching if the model is unavailable. A release decision must choose one of these explicit policies before v1.0.0:
+The `all-MiniLM-L6-v2` model weights are not downloaded during ordinary title searches. A release decision must choose one of these explicit policies before v1.0.0:
 
-1. bundle the model cache, accepting a much larger installer; or
-2. download the model on first semantic-search use into the user's cache, with visible progress and a documented offline fallback.
+1. provide a separate optional semantic package/model installation, accepting a larger footprint; or
+2. add a future full-feature build that bundles the optional dependency and downloads the model only on first semantic-search use into the user's cache, with visible progress and a documented offline fallback.
 
 Ollama remains an optional local integration. The installer does not bundle or start Ollama, does not download a model, and does not remove its existing settings or APIs. The UI continues to report when Ollama is unavailable.
 
