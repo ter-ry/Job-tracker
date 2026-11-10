@@ -12,6 +12,7 @@ on:
       - "app.py"
       - "version.py"
       - "requirements.txt"
+      - "requirements-optional-semantic.txt"
       - "templates/**"
       - "static/**"
       - "db/**"
