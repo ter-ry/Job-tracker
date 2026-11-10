@@ -1,14 +1,18 @@
 # PyInstaller onedir build. The installer packages this directory, keeping
 # the executable and bundled runtime separate from the user's AppData data.
+from pathlib import Path
+
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
+REPO_ROOT = Path(SPECPATH).resolve().parents[1]
+
 datas = [
-    ("templates", "templates"),
-    ("static", "static"),
-    ("sources", "sources"),
-    ("services", "services"),
-    ("db", "db"),
-    ("release_packaging/windows/VERSION.txt", "."),
+    (str(REPO_ROOT / "templates"), "templates"),
+    (str(REPO_ROOT / "static"), "static"),
+    (str(REPO_ROOT / "sources"), "sources"),
+    (str(REPO_ROOT / "services"), "services"),
+    (str(REPO_ROOT / "db"), "db"),
+    (str(REPO_ROOT / "release_packaging/windows/VERSION.txt"), "."),
 ]
 binaries = []
 hiddenimports = [
@@ -29,8 +33,8 @@ for package in ("sentence_transformers",):
 hiddenimports += collect_submodules("torch")
 
 a = Analysis(
-    ["release_packaging/windows/launcher.py"],
-    pathex=["."],
+    [str(REPO_ROOT / "release_packaging/windows/launcher.py")],
+    pathex=[str(REPO_ROOT)],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
