@@ -2,7 +2,7 @@
 # the executable and bundled runtime separate from the user's AppData data.
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_all, collect_submodules
+from PyInstaller.utils.hooks import collect_all
 
 REPO_ROOT = Path(SPECPATH).resolve().parents[1]
 
@@ -30,8 +30,6 @@ for package in ("sentence_transformers",):
     datas += package_datas
     binaries += package_binaries
     hiddenimports += package_hidden
-hiddenimports += collect_submodules("torch")
-
 a = Analysis(
     [str(REPO_ROOT / "release_packaging/windows/launcher.py")],
     pathex=[str(REPO_ROOT)],
