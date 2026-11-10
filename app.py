@@ -398,6 +398,10 @@ JOB_COLUMNS = {
     "seniority_level": "TEXT NOT NULL DEFAULT ''",
     "distance_km": "INTEGER NOT NULL DEFAULT 0",
     "distance_confidence": "INTEGER NOT NULL DEFAULT 0",
+    "distance_radius_status": "TEXT NOT NULL DEFAULT ''",
+    "distance_origin_label": "TEXT NOT NULL DEFAULT ''",
+    "distance_origin_precision": "TEXT NOT NULL DEFAULT ''",
+    "distance_origin_status": "TEXT NOT NULL DEFAULT ''",
     "required_skills": "TEXT NOT NULL DEFAULT ''",
     "preferred_skills": "TEXT NOT NULL DEFAULT ''",
     "responsibilities": "TEXT NOT NULL DEFAULT ''",
@@ -2194,6 +2198,13 @@ def create_app() -> Flask:
             return jsonify({"error": "Discovery search not found"}), 404
         return jsonify(run)
 
+    @app.get("/api/discovery/results/latest")
+    def discovery_results_latest_get() -> Response:
+        run = load_latest_discovery_search_run()
+        if not run:
+            return jsonify({"found": False, "jobs": []})
+        return jsonify({"found": True, **run})
+
     @app.get("/api/discovery/debug/latest")
     def discovery_debug_latest() -> Response:
         latest = load_latest_discovery_debug_run()
@@ -2240,6 +2251,8 @@ def create_app() -> Flask:
         if location_context.get("distance_origin_lookup", {}).get("ok"):
             origin_result = location_context["distance_origin_lookup"]
             origin = {"input": origin_result.get("original_input"), "normalized": origin_result.get("normalized_query"), "latitude": origin_result.get("latitude"), "longitude": origin_result.get("longitude"), "provider": origin_result.get("provider"), "confidence": origin_result.get("confidence"), "precision": origin_result.get("precision"), "geocoded_at": origin_result.get("geocoded_at"), "status": origin_result.get("status"), "error": origin_result.get("error", "")}
+        elif search.get("distance_origin_input"):
+            origin = {"input": search["distance_origin_input"], "normalized": search["distance_origin_input"], "status": "unresolved", "precision": "unknown", "error": "The requested private distance origin could not be resolved."}
 
         search["keywords"] = keywords
         fetched = fetch_discovery_jobs_for_search(search, country_indeed=text(payload.get("country_indeed")) or "Canada")
@@ -2279,8 +2292,8 @@ def create_app() -> Flask:
             if clean.get("distance_label") == "unknown":
                 geocoding_unknown += 1
             clean["remote_eligibility"], clean["remote_eligibility_explanation"] = discovery_remote_eligibility(clean)
-            clean = enrich_discovery_job(clean, profile, {"weights": preferences.get("weights", {}), "remote_rule": preferences.get("sort", {}).get("remote_rule")}, evidence_profile=evidence_profile)
-            clean = apply_discovery_search_constraints(clean, search["remote_preference"], search["discovery_location"])
+            clean = enrich_discovery_job(clean, profile, {"weights": preferences.get("weights", {}), "remote_rule": preferences.get("sort", {}).get("remote_rule"), "distance_origin": origin}, evidence_profile=evidence_profile)
+            clean = apply_discovery_search_constraints(clean, search["remote_preference"], search["discovery_location"], search["distance"])
             clean["discovery_remote_preference"] = search["remote_preference"]
             clean["discovery_location_scope"] = search["discovery_location"]
             clean["remote_search_eligible"] = "true" if clean.get("remote_search_eligible") is True else "false" if clean.get("remote_search_eligible") is False else "unknown"
@@ -2323,6 +2336,8 @@ def create_app() -> Flask:
         for item in jobs:
             category = item.get("discovery_result_category") or "review_required"
             category_counts[category] = category_counts.get(category, 0) + 1
+        outside_radius_count = sum(1 for item in jobs if text(item.get("distance_radius_status")) == "outside_radius")
+        unknown_distance_count = sum(1 for item in jobs if text(item.get("distance_radius_status")) == "unknown")
         capped_count = max(0, len(jobs) - search["total_cap"])
         diagnostics = {
             "bypass_cache": bypass_cache,
@@ -2342,7 +2357,9 @@ def create_app() -> Flask:
             "jobs_geocoded_successfully": geocoding_success,
             "jobs_using_cached_coordinates": geocoding_cached,
             "jobs_with_unknown_distance": geocoding_unknown,
-            "jobs_excluded_by_radius": 0,
+            "jobs_excluded_by_radius": outside_radius_count,
+            "outside_radius_count": outside_radius_count,
+            "unknown_distance_count": unknown_distance_count,
             "source_counts": source_counts,
             "source_errors": fetched.get("errors", {}),
             "source_diagnostics": fetched.get("source_diagnostics", {}),
@@ -2392,7 +2409,8 @@ def create_app() -> Flask:
         diagnostics["persisted"] = persisted
         diagnostics["jobs_returned_to_frontend"] = len(jobs)
         diagnostics["post_processing_row_count"] = len(jobs)
-        save_discovery_search_run(search_key, search, diagnostics, raw_jobs)
+        diagnostics["display_jobs"] = jobs
+        save_discovery_search_run(search_key, search, diagnostics, jobs)
         save_discovery_debug_run(
             search_key,
             {"keywords": keywords, **search, "bypass_cache": bypass_cache},
@@ -2998,6 +3016,8 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
     if location_context.get("distance_origin_lookup", {}).get("ok"):
         origin_result = location_context["distance_origin_lookup"]
         origin = {"input": origin_result.get("original_input"), "normalized": origin_result.get("normalized_query"), "latitude": origin_result.get("latitude"), "longitude": origin_result.get("longitude"), "provider": origin_result.get("provider"), "confidence": origin_result.get("confidence"), "precision": origin_result.get("precision"), "geocoded_at": origin_result.get("geocoded_at"), "status": origin_result.get("status"), "error": origin_result.get("error", "")}
+    elif search.get("distance_origin_input"):
+        origin = {"input": search["distance_origin_input"], "normalized": search["distance_origin_input"], "status": "unresolved", "precision": "unknown", "error": "The requested private distance origin could not be resolved."}
     search["keywords"] = keywords
     fetched = fetch_discovery_jobs_for_search(search, country_indeed="Canada")
     existing_keys = existing_job_dedupe_keys()
@@ -3021,8 +3041,8 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
             clean["title_match_score"] = 50
         clean, _ = geocode_discovery_job(clean, profile, origin, provider, use_cache=True)
         clean["remote_eligibility"], clean["remote_eligibility_explanation"] = discovery_remote_eligibility(clean)
-        clean = enrich_discovery_job(clean, profile, {"remote_rule": "remote_after_local"}, evidence_profile=evidence_profile)
-        clean = apply_discovery_search_constraints(clean, search["remote_preference"], search["discovery_location"])
+        clean = enrich_discovery_job(clean, profile, {"remote_rule": "remote_after_local", "distance_origin": origin}, evidence_profile=evidence_profile)
+        clean = apply_discovery_search_constraints(clean, search["remote_preference"], search["discovery_location"], search["distance"])
         clean["discovery_remote_preference"] = search["remote_preference"]
         clean["discovery_location_scope"] = search["discovery_location"]
         clean["remote_search_eligible"] = "true" if clean.get("remote_search_eligible") is True else "false" if clean.get("remote_search_eligible") is False else "unknown"
@@ -3084,12 +3104,13 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         "visible_count": len(jobs),
         "raw_jobs_returned": len(fetched.get("jobs", [])),
         "displayed_jobs": len(jobs),
+        "display_jobs": jobs,
         "filtered_by_saved_search": filtered,
         "persisted": persisted,
         "auto_preparation_queued": auto_preparation_queued,
         "filtered": filtered,
     }
-    save_discovery_search_run(search_key, search, metadata, fetched.get("jobs", []))
+    save_discovery_search_run(search_key, search, metadata, jobs)
     save_discovery_debug_run(search_key, {**payload, "search_id": search_id}, metadata, fetched.get("source_snapshots", {}))
     return {
         "jobs": jobs,
@@ -6912,16 +6933,23 @@ def load_discovery_search_run(search_key: str) -> dict[str, Any]:
     if row is None:
         return {}
     raw_jobs = parse_json_array(row["raw_jobs_json"])
+    metadata = parse_json_object(row["metadata_json"])
+    jobs = metadata.get("display_jobs") if isinstance(metadata.get("display_jobs"), list) else raw_jobs
     return {
         "search_key": search_key,
         "search": parse_json_object(row["search_json"]),
-        "metadata": parse_json_object(row["metadata_json"]),
-        "jobs": raw_jobs,
+        "metadata": metadata,
+        "jobs": jobs,
         "cache_hit": True,
         "cache_created_at": text(row["created_at"]),
         "cache_updated_at": text(row["updated_at"]),
-        "cached_raw_result_count": len(raw_jobs),
+        "cached_raw_result_count": int(metadata.get("raw_jobs_returned") or len(raw_jobs)),
     }
+
+
+def load_latest_discovery_search_run() -> dict[str, Any]:
+    row = query_db("SELECT search_key FROM discovery_search_runs ORDER BY updated_at DESC, created_at DESC LIMIT 1", one=True)
+    return load_discovery_search_run(text(row["search_key"])) if row else {}
 
 
 def save_discovery_debug_run(search_key: str, request_json: dict[str, Any], metadata_json: dict[str, Any], source_snapshot_json: dict[str, Any]) -> None:
@@ -7435,6 +7463,8 @@ def geocode_discovery_job(
     job["distance_label"] = distance["distance_label"]
     job["distance_note"] = distance.get("distance_note", "")
     job["distance_origin_label"] = distance.get("origin_label", "")
+    job["distance_origin_precision"] = text(origin.get("precision"))
+    job["distance_origin_status"] = text(origin.get("status"))
     job["distance_cached"] = bool(geocode.get("cached"))
     return job, geocode
 
@@ -8019,7 +8049,7 @@ def discovery_score_breakdown(job: dict[str, Any], profile: dict[str, str], sett
     seniority_fit = clamp_int(score_seniority_fit(resume_profile, analyze_job_seniority(job)).get("score", 0), 0, 100)
     salary_snapshot = normalize_salary_snapshot(job)
     salary_score = discovery_salary_score({**job, **salary_snapshot}, profile)
-    origin = profile_home_location(profile)
+    origin = settings.get("distance_origin") if isinstance(settings.get("distance_origin"), dict) else profile_home_location(profile)
     distance_rule = normalize_choice(settings.get("remote_rule") or settings.get("remote_distance_rule"), DISCOVERY_REMOTE_DISTANCE_RULES) or "remote_after_local"
     job_location_record = {
         "latitude": job.get("location_latitude"),
@@ -8164,7 +8194,7 @@ def enrich_discovery_job(job: dict[str, Any], profile: dict[str, str], settings:
     return enriched
 
 
-def apply_discovery_search_constraints(job: dict[str, Any], remote_preference: str, search_location: str = "") -> dict[str, Any]:
+def apply_discovery_search_constraints(job: dict[str, Any], remote_preference: str, search_location: str = "", max_distance_km: int = 0) -> dict[str, Any]:
     """Apply work-arrangement and requested-location constraints before ranking."""
     preference = normalize_space(text(remote_preference)).lower()
     if preference != "remote":
@@ -8172,7 +8202,16 @@ def apply_discovery_search_constraints(job: dict[str, Any], remote_preference: s
             job["location_search_eligible"] = False
             job["application_priority_score"] = 0
             job.setdefault("application_priority_reasons", []).append("Excluded because the confirmed job location is outside the requested hybrid/on-site search area.")
+        elif max_distance_km and "remote" not in text(job.get("remote_type")).lower() and clamp_int(job.get("distance_km"), 0, 9999) >= 9999:
+            job["distance_radius_status"] = "unknown"
+            job["location_search_eligible"] = None
+            job["application_priority_score"] = min(int(job.get("application_priority_score") or 0), 49)
+        elif max_distance_km and "remote" not in text(job.get("remote_type")).lower() and int(job.get("distance_km") or 0) > max_distance_km:
+            job["distance_radius_status"] = "outside_radius"
+            job["location_search_eligible"] = False
+            job["application_priority_score"] = 0
         else:
+            job["distance_radius_status"] = "within_radius" if max_distance_km else "not_checked"
             job["location_search_eligible"] = True if search_location else None
         return job
     job["location_search_eligible"] = True
@@ -8204,6 +8243,10 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
     if normalize_space(text(remote_preference)).lower() != "remote":
         if text(job.get("posting_availability")).lower() == "confirmed_closed":
             return "excluded", "Posting is confirmed closed."
+        if text(job.get("distance_radius_status")).lower() == "outside_radius":
+            return "excluded", "Confirmed workplace distance is outside the requested radius."
+        if text(job.get("distance_radius_status")).lower() == "unknown":
+            return "review_required", "Workplace distance could not be verified against the requested radius."
         if job.get("location_search_eligible") is False or text(job.get("location_search_eligible")).lower() == "false":
             return "excluded", "Confirmed job location is outside the requested search area."
         if search_mode == "title":
@@ -8217,6 +8260,8 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
         return "actionable", "No remote-only restriction applies."
     if text(job.get("remote_search_eligible")).lower() == "false" or text(job.get("remote_eligibility")).lower() in {"restricted", "confirmed_ineligible"} or text(job.get("ontario_eligibility")).lower() == "confirmed_ineligible" or text(job.get("posting_availability")).lower() == "confirmed_closed":
         return "excluded", "Confirmed onsite, hybrid, ineligible, or closed posting."
+    if text(job.get("distance_radius_status")).lower() == "unknown":
+        return "review_required", "Remote eligibility or workplace distance requires review."
     if text(job.get("remote_search_eligible")).lower() == "true" and text(job.get("remote_eligibility")).lower() == "canadian_eligible" and "remote" in text(job.get("remote_type")).lower():
         if search_mode == "title":
             return title_search_result_category(job)
@@ -9285,6 +9330,7 @@ def job_to_dict(
     if row is None:
         return {}
     data = dict(row)
+    data["record_origin"] = "discovered" if text(data.get("discovery_first_seen_at")) else "manual"
     data["description_completeness"] = classify_job_description_completeness(data.get("job_description"))
     data["work_arrangement"] = discovery_work_arrangement_label(text(data.get("remote_type")))
     legacy_eligibility = text(data.get("remote_eligibility")).lower()

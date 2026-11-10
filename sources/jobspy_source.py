@@ -127,7 +127,9 @@ def fetch_jobspy_jobs(
             "request_params": {
                 "keywords": keywords,
                 "location": location,
-                "distance": distance,
+                "distance": round(float(distance or 0) * 0.621371) if distance is not None else None,
+                "distance_km": distance,
+                "distance_unit": "miles",
                 "job_type": job_type,
                 "remote_preference": remote_preference,
                 "results_wanted": results_wanted,
@@ -168,7 +170,8 @@ def fetch_jobspy_jobs(
                     "search_term": keywords,
                     "google_search_term": f"{keywords} jobs near {location}",
                     "location": location,
-                    "distance": distance,
+                    # JobSpy expects miles; the application accepts kilometres.
+                    "distance": round(float(distance or 0) * 0.621371) if distance is not None else None,
                     "is_remote": (remote_preference or "").lower() == "remote",
                     "job_type": job_type or None,
                     "results_wanted": results_wanted,
@@ -394,19 +397,23 @@ def infer_remote_type(row: dict[str, Any]) -> str:
     location = clean(row.get("location")).lower()
     description = clean(row.get("description")).lower()
     title = clean(row.get("title")).lower()
-    text = " ".join([location, title, description])
+    provider_arrangement = clean(row.get("remote_type") or row.get("work_arrangement")).lower()
+    text = " ".join([location, title, provider_arrangement, description])
     if re.search(r"\b(?:not|no)\s+remote\b|remote\s+(?:work\s+)?(?:is\s+)?not\s+(?:available|offered)", text):
         return "On-site"
-    if "hybrid" in text:
+    if "hybrid" in text or provider_arrangement == "hybrid":
         return "Hybrid"
     if isinstance(explicit, bool):
         if explicit:
             return "Remote"
+        return "On-site"
     elif clean(explicit).lower() in {"true", "1", "yes"}:
         return "Remote"
+    elif clean(explicit).lower() in {"false", "0", "no"}:
+        return "On-site"
     if "on-site" in text or "onsite" in text:
         return "On-site"
-    if re.search(r"\bremote\b", text):
+    if re.search(r"\b(?:fully|100%|work(?:ing)?|position|role|job)\s+(?:is\s+)?remote\b", text) or re.search(r"\bremote\s+(?:position|role|work|job|in\s+canada)\b", text) or re.search(r"\bwork\s+from\s+home\b", text):
         return "Remote"
     return "Unknown"
 

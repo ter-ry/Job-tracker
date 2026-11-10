@@ -1721,6 +1721,26 @@ class JobAssistantTest(unittest.TestCase):
             self.assertEqual(cached_profile["home_location_normalized"], "M5V 2T6, Canada")
             self.assertEqual(len(provider.calls), 1)
 
+    def test_discovery_score_uses_search_origin_and_radius_status(self):
+        job = {
+            "location": "Toronto, ON",
+            "remote_type": "On-site",
+            "location_latitude": 43.7000,
+            "location_longitude": -79.3500,
+            "location_confidence": 95,
+            "location_precision": "city",
+        }
+        origin = {"normalized": "M2J 0B6", "latitude": 43.7800, "longitude": -79.3400, "confidence": 95, "precision": "postal code", "status": "saved"}
+        breakdown = app_module.discovery_score_breakdown(job, {}, {"distance_origin": origin})
+        self.assertGreater(breakdown["distance"]["distance_km"], 0)
+        within = app_module.apply_discovery_search_constraints({**job, "distance_km": 10}, "", "Toronto, ON", 20)
+        outside = app_module.apply_discovery_search_constraints({**job, "distance_km": 30}, "", "Toronto, ON", 20)
+        unknown = app_module.apply_discovery_search_constraints({**job, "distance_km": 9999}, "", "Toronto, ON", 20)
+        self.assertEqual(within["distance_radius_status"], "within_radius")
+        self.assertEqual(outside["distance_radius_status"], "outside_radius")
+        self.assertFalse(outside["location_search_eligible"])
+        self.assertEqual(unknown["distance_radius_status"], "unknown")
+
     def test_invalid_canadian_postal_code_is_rejected(self):
         response = self.client.post("/api/profile", json={"location": "M5V2T"})
         self.assertEqual(response.status_code, 400)
@@ -2153,8 +2173,20 @@ class JobAssistantTest(unittest.TestCase):
         )
         self.assertTrue(captured[0]["linkedin_fetch_description"])
         self.assertEqual(result["jobs"][0]["remote_type"], "Unknown")
-        self.assertEqual(jobspy_source.infer_remote_type({"is_remote": False, "location": "Toronto, ON"}), "Unknown")
+        self.assertEqual(jobspy_source.infer_remote_type({"is_remote": False, "location": "Toronto, ON"}), "On-site")
+        self.assertEqual(jobspy_source.infer_remote_type({"location": "Maple, ON", "description": "Join our remote team supporting a childcare centre."}), "Unknown")
+        self.assertEqual(jobspy_source.infer_remote_type({"location": "Canada", "description": "This is a fully remote RECE position."}), "Remote")
         self.assertEqual(jobspy_source.infer_remote_type({"is_remote": True, "location": "London, UK"}), "Remote")
+
+    def test_jobspy_converts_application_kilometres_to_provider_miles(self):
+        captured = []
+
+        def fake_scrape_jobs(**kwargs):
+            captured.append(kwargs)
+            return []
+
+        jobspy_source.fetch_jobspy_jobs(keywords="ECE", location="Toronto", distance=20, enabled_sources=["indeed"], scrape_jobs_func=fake_scrape_jobs)
+        self.assertEqual(captured[0]["distance"], 12)
 
     def test_jobspy_discovery_scores_saved_profile_and_handles_missing_fields(self):
         self.client.post(
@@ -2762,6 +2794,10 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(stored["metadata"]["raw_jobs_returned"], 2)
         self.assertTrue(stored["cache_hit"])
         self.assertEqual(stored["cached_raw_result_count"], 2)
+        latest = self.client.get("/api/discovery/results/latest").get_json()
+        self.assertTrue(latest["found"])
+        self.assertEqual(len(latest["jobs"]), 2)
+        self.assertEqual(latest["jobs"][0]["discovery_search_mode"], "title")
 
     def test_salary_extraction_from_structured_fields(self):
         salary = app_module.determine_salary(

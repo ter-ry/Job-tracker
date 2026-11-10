@@ -319,6 +319,7 @@ async function loadAll() {
     renderOllamaHealth({ status: "loading", summary: "Checking local AI status…" });
     renderEvidenceLibrary(evidence);
     renderJobs();
+    await restoreLatestDiscoverySearch();
     renderShortlist();
     // These package/memory surfaces are unrelated to the initial Discovery view.
     // Load them after the useful page is painted instead of blocking category access.
@@ -1527,11 +1528,12 @@ function renderPipelineDashboard(jobs) {
     return;
   }
   cards.innerHTML = sortPipelineJobs(filtered, pipelineSort).map((job) => {
-    const score = Number(job.qualification_fit_score ?? job.fit_score ?? 0);
+    const profileFree = Boolean(job.discovery_profile_independent);
+    const score = Number(profileFree ? (job.opportunity_score ?? job.application_priority_score ?? 0) : (job.qualification_fit_score ?? job.fit_score ?? 0));
     const applicationPriority = Number(job.application_priority_score || 0);
     const jobPriority = Number(job.overall_score || job.fit_score || 0);
     const categoryLabel = job.discovery_first_seen_at
-      ? String(job.discovery_result_category || "review_required").replaceAll("_", " ")
+      ? `Discovered · ${String(job.discovery_result_category || "review_required").replaceAll("_", " ")}`
       : "historical/manual";
     const postingUrl = job.application_url || job.url || "";
     const openPosting = postingUrl
@@ -1539,7 +1541,9 @@ function renderPipelineDashboard(jobs) {
       : `<button class="button small" type="button" disabled title="No original or application URL was stored.">Open job posting</button>`;
     const applied = job.status === "Applied" || job.discovery_state === "applied";
     const statusActions = `<div class="pipeline-actions" aria-label="Job actions">${openPosting}<button class="button small ghost" type="button" data-pipeline-action="applied" data-job-id="${job.id}" ${applied ? "disabled" : ""}>${applied ? "Applied" : "Mark Applied"}</button><button class="button small ghost" type="button" data-pipeline-action="save" data-job-id="${job.id}" ${applied ? "disabled" : ""}>Save for later</button><button class="button small ghost" type="button" data-pipeline-action="skip" data-job-id="${job.id}">Skip</button><button type="button" data-job-id="${job.id}" class="button small ghost pipeline-action">View details</button></div>`;
-    return `<article class="pipeline-card" data-job-id="${job.id}"><div><h3>${escapeHtml(job.title || "Untitled role")}</h3><p>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location not listed")}</p><p class="pipeline-subline">${escapeHtml(categoryLabel)} · ${escapeHtml(job.qualification_fit_label || "Qualification fit")}</p></div><div class="pipeline-score"><strong>${score}%</strong><span>Qualification Match</span><small>Application Priority ${applicationPriority} · Job Priority ${jobPriority}</small></div>${statusActions}</article>`;
+    const scoreLabel = profileFree ? "Job Opportunity Score" : "Qualification Match";
+    const scoreMeta = profileFree ? "Posting evidence only" : `Application Priority ${applicationPriority} · Job Priority ${jobPriority}`;
+    return `<article class="pipeline-card" data-job-id="${job.id}"><div><h3>${escapeHtml(job.title || "Untitled role")}</h3><p>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location not listed")}</p><p class="pipeline-subline">${escapeHtml(categoryLabel)}${profileFree ? "" : ` · ${escapeHtml(job.qualification_fit_label || "Qualification fit")}`}</p></div><div class="pipeline-score"><strong>${score}%</strong><span>${scoreLabel}</span><small>${scoreMeta}</small></div>${statusActions}</article>`;
   }).join("");
   cards.querySelectorAll(".pipeline-card").forEach((card) => card.addEventListener("click", (event) => {
     if (event.target.closest("button, a")) return;
@@ -1608,12 +1612,15 @@ function openPipelineJobDetails(id) {
   if (!job || !panel) return;
   if (panel.hidden) pipelineDetailScrollY = window.scrollY;
   const requirements = [job.required_skills, job.preferred_skills, job.responsibilities].filter(Boolean).join("\n\n");
-  const reasons = (job.qualification_fit_reasons || []).map((reason) => `<li>${escapeHtml(reason)}</li>`).join("") || "<li>Review the full posting and résumé evidence before applying.</li>";
+  const profileFree = Boolean(job.discovery_profile_independent);
+  const reasons = (profileFree ? (job.opportunity_score_reasons || []) : (job.qualification_fit_reasons || [])).map((reason) => `<li>${escapeHtml(reason)}</li>`).join("") || "<li>Review the original posting evidence before applying.</li>";
   const postingUrl = job.application_url || job.url || "";
   const applied = job.status === "Applied" || job.discovery_state === "applied";
   const primaryActions = `<div class="pipeline-detail-actions" aria-label="Job actions">${postingUrl ? `<a class="button" href="${escapeAttribute(postingUrl)}" target="_blank" rel="noreferrer">Open job posting</a>` : `<button class="button" type="button" disabled title="No original or application URL was stored.">Open job posting unavailable</button>`}<button class="button ghost" type="button" data-detail-applied="${job.id}" ${applied ? "disabled" : ""}>${applied ? "Applied" : "Mark Applied"}</button><button class="button ghost" type="button" data-detail-save="${job.id}" ${applied ? "disabled" : ""}>Save for later</button><button class="button ghost" type="button" data-detail-skip="${job.id}">Skip</button></div>`;
   const advancedActions = state.advancedFeatures ? `<button class="button ghost" type="button" data-prepare-job="${job.id}">Prepare application</button>` : "";
-  panel.innerHTML = `<div class="pipeline-detail-header"><div><span class="eyebrow">Job details</span><h3 id="pipeline-detail-title">${escapeHtml(job.title || "Untitled role")}</h3><p>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location not listed")}</p></div><button class="button ghost small" type="button" data-close-job-details>Close</button></div>${primaryActions}<div class="pipeline-detail-grid"><div><strong>Qualification Match</strong><p class="pipeline-detail-score">${Number(job.qualification_fit_score ?? job.fit_score ?? 0)}% · ${escapeHtml(job.qualification_fit_label || "Review required")}</p><p class="muted">Technical qualification strength is separate from Canadian eligibility.</p><ul>${reasons}</ul><div class="experience-summary">${renderExperienceSummary(job)}</div><p class="muted">Source evidence: ${escapeHtml(job.qualification_evidence_source || "Not available")}</p></div><div><strong>Application Priority</strong><p>${Number(job.application_priority_score || 0)}</p><strong>Canada eligibility</strong><p>${escapeHtml(job.canadian_eligibility || "unknown")}</p><strong>Posting status</strong><p>${escapeHtml(job.posting_availability || "unverified")}</p><strong>Job Priority (legacy)</strong><p>${Number(job.overall_score || 0)}</p><strong>Salary</strong><p>${escapeHtml(job.salary || "Not listed")}</p><strong>Posting date</strong><p>${escapeHtml(job.posted_date || "Not listed")}</p><strong>Deadline</strong><p>${escapeHtml(job.deadline || "Not listed")}</p></div></div><details open><summary>Requirements and responsibilities</summary><pre>${escapeHtml(requirements || "No structured requirements were stored.")}</pre></details><details><summary>Full job description</summary><pre>${escapeHtml(job.job_description || "No job description was stored.")}</pre></details><p class="pipeline-detail-links">${job.url ? `<a href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Original posting</a>` : "Original posting unavailable"}${job.application_url && job.application_url !== job.url ? ` · <a href="${escapeAttribute(job.application_url)}" target="_blank" rel="noreferrer">Application page</a>` : ""}</p><div class="actions">${advancedActions}<button class="button ghost" type="button" data-edit-job="${job.id}">Edit job</button></div>`;
+  const detailScoreLabel = profileFree ? "Job Opportunity Score" : "Qualification Match";
+  const detailScore = profileFree ? Number(job.opportunity_score ?? job.application_priority_score ?? 0) : Number(job.qualification_fit_score ?? job.fit_score ?? 0);
+  panel.innerHTML = `<div class="pipeline-detail-header"><div><span class="eyebrow">Job details</span><h3 id="pipeline-detail-title">${escapeHtml(job.title || "Untitled role")}</h3><p>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location not listed")}</p></div><button class="button ghost small" type="button" data-close-job-details>Close</button></div>${primaryActions}<div class="pipeline-detail-grid"><div><strong>${detailScoreLabel}</strong><p class="pipeline-detail-score">${detailScore}%</p><p class="muted">${profileFree ? "Based on posting evidence; no résumé was used." : "Technical qualification strength is separate from Canadian eligibility."}</p><ul>${reasons}</ul><div class="experience-summary">${renderExperienceSummary(job)}</div><p class="muted">Source evidence: ${escapeHtml(job.qualification_evidence_source || "Not available")}</p></div><div><strong>Salary</strong><p>${escapeHtml(job.salary || "Not listed")}</p><strong>Distance</strong><p>${escapeHtml(job.distance_note || (job.distance_km && Number(job.distance_km) < 9999 ? `${job.distance_km} km straight-line` : "Unavailable"))}</p><strong>Canada eligibility</strong><p>${escapeHtml(job.canadian_eligibility || "unknown")}</p><strong>Posting status</strong><p>${escapeHtml(job.posting_availability || "unverified")}</p><strong>Posting date</strong><p>${escapeHtml(job.posted_date || "Not listed")}</p><strong>Deadline</strong><p>${escapeHtml(job.deadline || "Not listed")}</p></div></div><details open><summary>Requirements and responsibilities</summary><pre>${escapeHtml(requirements || "No structured requirements were stored.")}</pre></details><details><summary>Full job description</summary><pre>${escapeHtml(job.job_description || "No job description was stored.")}</pre></details><p class="pipeline-detail-links">${job.url ? `<a href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Original posting</a>` : "Original posting unavailable"}${job.application_url && job.application_url !== job.url ? ` · <a href="${escapeAttribute(job.application_url)}" target="_blank" rel="noreferrer">Application page</a>` : ""}</p><div class="actions">${advancedActions}<button class="button ghost" type="button" data-edit-job="${job.id}">Edit job</button></div>`;
   panel.setAttribute("role", "dialog");
   panel.setAttribute("aria-modal", "true");
   panel.setAttribute("aria-labelledby", "pipeline-detail-title");
@@ -2408,6 +2415,41 @@ function discoverySearchCriteriaFromControls() {
   };
 }
 
+function applyDiscoverySearchCriteriaToControls(criteria = {}) {
+  setValue("discovery-search-mode", criteria.search_mode || "title");
+  setValue("discovery-title-match-mode", criteria.title_match_mode || "related");
+  setValue("discovery-keywords", criteria.keywords || "");
+  setValue("discovery-location", criteria.location || criteria.discovery_location || "");
+  setValue("discovery-distance-origin", criteria.distance_origin_input || criteria.distance_origin || "");
+  setValue("discovery-distance", criteria.distance ?? 50);
+  setValue("discovery-remote-preference", criteria.remote_preference || "");
+  setValue("discovery-search-depth", criteria.search_depth || "standard");
+  setValue("discovery-date-window", criteria.date_window || "14d");
+  setValue("discovery-per-source-cap", criteria.per_source_cap || 100);
+  setValue("discovery-total-cap", criteria.total_cap || 200);
+  document.querySelectorAll('input[name="discovery-source"]').forEach((input) => { input.checked = (criteria.enabled_sources || []).includes(input.value); });
+}
+
+async function restoreLatestDiscoverySearch() {
+  try {
+    const latest = await api.get("/api/discovery/results/latest");
+    if (!latest.found || !Array.isArray(latest.jobs)) return;
+    const metadata = latest.metadata || {};
+    state.discoveryResults = latest.jobs;
+    state.discoverySearchKey = latest.search_key || "";
+    state.discoverySearchCriteria = latest.search || {};
+    applyDiscoverySearchCriteriaToControls(state.discoverySearchCriteria);
+    const savedPreferences = state.discoverySearchKey ? await api.get(`/api/discovery/preferences?search_key=${encodeURIComponent(state.discoverySearchKey)}`).catch(() => ({})) : {};
+    state.discoveryPreferences = savedPreferences.preferences || discoveryPreferencesFromControls();
+    applyDiscoveryPreferencesToControls(state.discoveryPreferences);
+    state.discoveryMeta = { total: Number(metadata.raw_jobs_returned || latest.jobs.length), visible_total: Number(metadata.visible_count || latest.jobs.length), duplicates: Number(metadata.duplicates_in_search || metadata.duplicates_removed || 0), source_counts: metadata.source_counts || {}, errors: metadata.source_errors || {}, diagnostics: metadata, cap_reached: Boolean(metadata.capped_count), restored_at: latest.cache_updated_at || latest.cache_created_at || "" };
+    setDiscoveryControlsEnabled(true);
+    renderDiscoveryResults(state.discoveryMeta);
+    const status = document.getElementById("discovery-status");
+    if (status) status.textContent = `Restored last completed search (${latest.cache_updated_at || latest.cache_created_at || "time unavailable"}).`;
+  } catch (_) { /* a missing snapshot leaves the normal empty search view usable */ }
+}
+
 function setDiscoveryControlsEnabled(enabled) {
   ["discovery-sort-mode", "discovery-filter-toggle", "discovery-clear-filters", "discovery-show-all", "discovery-view-cards", "discovery-view-table"].forEach((id) => {
     const element = document.getElementById(id);
@@ -2600,8 +2642,8 @@ async function testJobSources(event) {
   const status = document.getElementById("discovery-status");
   const output = document.getElementById("discovery-source-test-output");
   const criteria = {
-    keywords: "software developer",
-    location: "Toronto, ON",
+    keywords: value("discovery-keywords") || "software developer",
+    location: value("discovery-location") || "Toronto, ON",
     enabled_sources: selectedDiscoverySources(),
     bypass_cache: checked("discovery-bypass-cache"),
   };
@@ -2672,6 +2714,7 @@ function renderDiscoveryResults(result) {
   const jobs = applyDiscoveryClientFiltersAndSort(state.discoveryResults || [], prefs);
   const visibleCount = jobs.length;
   const totalCount = Number(result.total || state.discoveryMeta.total || state.discoveryResults.length || 0);
+  const profileFreeResults = jobs.length > 0 && jobs.every((job) => Boolean(job.discovery_profile_independent));
   const evidenceProfileName = jobs[0]?.qualification_evidence_profile_name || state.discoveryResults[0]?.qualification_evidence_profile_name || (value("discovery-profile") ? "Selected candidate profile" : "Active Profile");
   const categoryCounts = (state.discoveryResults || []).reduce((counts, job) => { const key = job.discovery_result_category || "review_required"; counts[key] = (counts[key] || 0) + 1; return counts; }, {});
   document.getElementById("discovery-active-state").textContent = describeDiscoveryState(prefs, visibleCount, totalCount);
@@ -2716,7 +2759,7 @@ function renderDiscoveryResults(result) {
         <div><strong>${visibleCount}</strong><span>Visible</span></div>
       </div>
       <p class="muted">${escapeHtml(countText || "No source counts returned")}</p>
-      <p class="muted">Qualification résumé: ${escapeHtml(evidenceProfileName)}</p>
+      <p class="muted">${profileFreeResults ? "Score basis: posting evidence only; no résumé used." : `Qualification evidence: ${escapeHtml(evidenceProfileName)}`}</p>
       <p class="muted">Remote result groups: actionable ${Number(categoryCounts.actionable || 0)} · review required ${Number(categoryCounts.review_required || 0)} · excluded ${Number(categoryCounts.excluded || 0)}</p>
       ${errorText}
     </div>
@@ -2733,8 +2776,17 @@ function renderDiscoveryResults(result) {
 }
 
 function renderDiscoveryOriginSummary() {
-  const element = document.getElementById("discovery-distance-origin");
+  const element = document.getElementById("discovery-distance-origin-summary");
   if (!element) return;
+  const diagnostics = state.discoveryMeta?.diagnostics || {};
+  const origin = diagnostics.saved_origin || diagnostics.distance_origin || state.discoverySearchCriteria?.distance_origin || "";
+  if (origin) {
+    const label = typeof origin === "object" ? (origin.normalized || origin.input || "configured origin") : origin;
+    const precision = diagnostics.origin_precision || origin.precision || "approximate";
+    const status = diagnostics.origin_geocode_status || origin.status || "resolved";
+    element.textContent = `Distance calculated from: ${label} (${precision}, ${status}).`;
+    return;
+  }
   const profile = state.profile || {};
   if (!hasDiscoveryOrigin()) {
     element.textContent = "Distance calculated from: not configured. Save a home postal code or location in Profile.";
@@ -2770,6 +2822,7 @@ function renderDiscoveryDiagnostics(diagnostics, visibleCount, totalCount) {
     diagnostics.cache_created_at ? `created=${diagnostics.cache_created_at}` : "",
     diagnostics.cached_raw_result_count !== undefined ? `cached raw=${diagnostics.cached_raw_result_count}` : "",
     diagnostics.bypass_cache ? "bypassed" : "",
+    diagnostics.restored_at ? `last fetched=${diagnostics.restored_at}` : "",
   ].filter(Boolean).join("; ") || "not available")}</li>`);
   details.push(`<li><strong>Discovery location:</strong> ${escapeHtml([
     diagnostics.original_location ? `input=${diagnostics.original_location}` : "",
@@ -2790,7 +2843,7 @@ function renderDiscoveryDiagnostics(diagnostics, visibleCount, totalCount) {
   details.push(`<li><strong>Hidden by local filters:</strong> ${hiddenByLocalFilters}</li>`);
   details.push(`<li><strong>Duplicates removed:</strong> ${Number(diagnostics.duplicates_removed || 0)}</li>`);
   details.push(`<li><strong>Cap reached:</strong> ${capReached}</li>`);
-  details.push(`<li><strong>Geocoding:</strong> success ${Number(diagnostics.jobs_geocoded_successfully || 0)} | cached ${Number(diagnostics.jobs_using_cached_coordinates || 0)} | unknown ${Number(diagnostics.jobs_with_unknown_distance || 0)} | radius excluded ${Number(diagnostics.jobs_excluded_by_radius || 0)}</li>`);
+  details.push(`<li><strong>Geocoding:</strong> success ${Number(diagnostics.jobs_geocoded_successfully || 0)} | cached ${Number(diagnostics.jobs_using_cached_coordinates || 0)} | unknown ${Number(diagnostics.jobs_with_unknown_distance || 0)} | radius excluded ${Number(diagnostics.jobs_excluded_by_radius || 0)} | outside radius ${Number(diagnostics.outside_radius_count || 0)}</li>`);
   if (Object.keys(sourceCounts).length) {
     details.push(`<li><strong>By source:</strong> ${escapeHtml(Object.entries(sourceCounts).map(([source, count]) => `${sourceLabel(source)}=${count}`).join(" | "))}</li>`);
   }
