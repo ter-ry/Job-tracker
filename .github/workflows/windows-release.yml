@@ -86,9 +86,11 @@ jobs:
         shell: pwsh
         run: python -m pip install --upgrade pip; pip install -r requirements.txt; pip install pytest pyinstaller
       - name: Probe JobSpy-only PyInstaller build
-        continue-on-error: true
         shell: pwsh
         run: pyinstaller --noconfirm --clean --distpath build\jobspy-probe-dist --workpath build\jobspy-probe-work release_packaging/windows/jobspy_probe.spec
+      - name: Run JobSpy-only frozen probe
+        shell: pwsh
+        run: build\jobspy-probe-dist\JobSpyProbe\JobSpyProbe.exe
       - name: Build PyInstaller application
         shell: pwsh
         env:

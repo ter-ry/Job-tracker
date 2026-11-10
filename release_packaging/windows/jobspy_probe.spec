@@ -3,9 +3,9 @@ from pathlib import Path
 REPO_ROOT = Path(SPECPATH).resolve().parents[1]
 
 a = Analysis(
-    [],
+    [str(REPO_ROOT / "release_packaging/windows/jobspy_probe.py")],
     pathex=[str(REPO_ROOT)],
-    hiddenimports=["jobspy"],
+    hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
