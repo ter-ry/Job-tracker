@@ -2992,6 +2992,9 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         "location_resolution_method": location_context["resolution_method"],
         "location_geocode": location_context["lookup"],
     })
+    if location_context.get("distance_origin_lookup", {}).get("ok"):
+        origin_result = location_context["distance_origin_lookup"]
+        origin = {"input": origin_result.get("original_input"), "normalized": origin_result.get("normalized_query"), "latitude": origin_result.get("latitude"), "longitude": origin_result.get("longitude"), "provider": origin_result.get("provider"), "confidence": origin_result.get("confidence"), "precision": origin_result.get("precision"), "geocoded_at": origin_result.get("geocoded_at"), "status": origin_result.get("status"), "error": origin_result.get("error", "")}
     search["keywords"] = keywords
     fetched = fetch_discovery_jobs_for_search(search, country_indeed="Canada")
     existing_keys = existing_job_dedupe_keys()
@@ -6545,7 +6548,7 @@ def infer_salary_interval_from_magnitude(minimum: float, maximum: float) -> str:
     high = max(minimum, maximum)
     if 20 <= high <= 40:
         return "hourly"
-    if 40_000 <= high <= 100_000:
+    if 40_000 <= high <= 500_000:
         return "yearly"
     return ""
 
@@ -8065,7 +8068,7 @@ def discovery_score_breakdown(job: dict[str, Any], profile: dict[str, str], sett
     if unknown_location_penalty:
         penalties.append({"label": "Workplace location missing", "items": ["workplace location unknown"], "points": 4})
     elif distance_snapshot["distance_km"] >= 9999 and text(job.get("location")) and "remote" not in text(job.get("remote_type")).lower():
-        reasons.append("Workplace location is known; distance is unavailable because no usable origin or geocode is available.")
+        distance_snapshot["distance_note"] = "Workplace location is known; distance unavailable because no usable origin or geocode is available."
     return {
         "overall_score": clamp_int(total, 0, 100),
         "components": components,
