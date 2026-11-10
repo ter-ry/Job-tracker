@@ -1,6 +1,7 @@
 import json
 import gc
 import io
+import os
 import re
 import tempfile
 import time
@@ -1389,7 +1390,10 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(prepared.status_code, 200, prepared.get_json())
         package = prepared.get_json()
         self.assertEqual(package["status"], "ready_for_review", package)
-        self.assertEqual(Path(package["prepared_resume_path"]), tailored_path)
+        self.assertEqual(
+            os.path.normcase(os.path.realpath(package["prepared_resume_path"])),
+            os.path.normcase(os.path.realpath(tailored_path)),
+        )
         self.assertIn("rest apis", [item["normalized"] for item in package["keywords_score"].get("matched", [])], {"score": package["keywords_score"], "text": app_module.extract_docx_text(tailored_path.read_bytes()), "job": package["job"].get("required_skills")})
         self.assertIn("REST APIs", app_module.extract_docx_text(tailored_path.read_bytes()))
         tailored_path.unlink()
