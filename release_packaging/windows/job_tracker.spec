@@ -2,6 +2,8 @@
 # the executable and bundled runtime separate from the user's AppData data.
 from pathlib import Path
 
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
+
 REPO_ROOT = Path(SPECPATH).resolve().parents[1]
 
 datas = [
@@ -12,7 +14,8 @@ datas = [
     (str(REPO_ROOT / "db"), "db"),
     (str(REPO_ROOT / "release_packaging/windows/VERSION.txt"), "."),
 ]
-binaries = []
+datas += collect_data_files("tls_client")
+binaries = collect_dynamic_libs("tls_client")
 hiddenimports = [
     "app",
     "version",
