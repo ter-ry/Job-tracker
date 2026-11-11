@@ -1732,6 +1732,25 @@ class JobAssistantTest(unittest.TestCase):
         self.assertTrue(app_module.geocode_matches_canadian_location("M5V2T6", result))
         self.assertFalse(app_module.geocode_matches_canadian_location("M5V 2T7", result))
 
+    def test_postal_match_accepts_postal_level_country_evidence_when_display_omits_province(self):
+        result = {
+            "latitude": 43.787,
+            "longitude": -79.353,
+            "display_name": "M2J 0B6, Canada",
+            "match_level": "postal",
+            "raw": {"country_code": "ca"},
+        }
+        self.assertTrue(app_module.geocode_matches_canadian_location("M2J0B6", result))
+
+    def test_postal_match_does_not_accept_country_only_coordinates_without_postal_evidence(self):
+        result = {
+            "latitude": 43.787,
+            "longitude": -79.353,
+            "display_name": "Toronto, Canada",
+            "raw": {"country_code": "ca"},
+        }
+        self.assertFalse(app_module.geocode_matches_canadian_location("M2J0B6", result))
+
     def test_geocoder_ca_provider_parses_canadian_coordinates_and_postal(self):
         response = FakeUrlopenResponse({
             "latt": "43.6426",
@@ -2237,6 +2256,19 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(row["workplace_postal_code"], "L6A 1P4")
         self.assertEqual(row["workplace_precision"], "street address")
         self.assertEqual(row["salary_text"], "From $31.00 per hour")
+
+    def test_jobspy_extracts_unlabeled_street_workplace_from_description(self):
+        row = jobspy_source.normalize_jobspy_row(
+            {
+                "title": "Registered Early Childhood Educator",
+                "location": "Maple, ON",
+                "description": "The Maple RECE posting is based at 9350 Keele St, Maple, ON L6A 1P4.",
+            },
+            fallback_source="indeed",
+        )
+        self.assertEqual(row["workplace_address"], "9350 Keele St")
+        self.assertEqual(row["workplace_postal_code"], "L6A 1P4")
+        self.assertEqual(row["workplace_precision"], "street address")
 
     def test_remote_provider_conflict_is_reviewable(self):
         row = {"is_remote": True, "location": "Toronto, ON", "description": "Work remotely: No"}

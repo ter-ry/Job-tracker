@@ -457,11 +457,23 @@ def extract_workplace_location(row: dict[str, Any], description: str, provider_l
     field_value = next((value for value in raw_fields if value), "")
     source = "provider field" if field_value else ""
     labeled = re.search(r"(?im)^\s*(?:location|work\s+location|address|office\s+location)\s*:\s*([^\n\r|]+)", description)
-    evidence = field_value or (labeled.group(1).strip() if labeled else "")
+    # Accept an explicitly written street address even when the provider does
+    # not add a field label (for example, "Maple RECE — 9350 Keele St"). The
+    # pattern is intentionally Canadian-street-shaped and never turns a city
+    # or employer headquarters into a workplace.
+    street = re.search(
+        r"\b\d{1,6}\s+[A-Z0-9][A-Za-z0-9.'-]*(?:\s+[A-Za-z0-9.'-]+){0,5}\s+"
+        r"(?:Street|St\.?|Avenue|Ave\.?|Road|Rd\.?|Drive|Dr\.?|Boulevard|Blvd\.?|Way|Parkway|Pkwy\.?)\b",
+        description,
+        re.I,
+    )
+    if not labeled and street:
+        labeled = street
+    evidence = field_value or ((labeled.group(1) if labeled.lastindex else labeled.group(0)).strip() if labeled else "")
     if evidence:
         source = source or "description labeled workplace field"
     postal = clean(row.get("postal_code") or row.get("zip_code") or row.get("workplace_postal_code"))
-    postal_match = re.search(postal_pattern, evidence or description, re.I)
+    postal_match = re.search(postal_pattern, f"{evidence} {description}", re.I)
     postal = postal or (postal_match.group(0).upper().replace(" ", " ") if postal_match else "")
     address = evidence
     if not address and postal:

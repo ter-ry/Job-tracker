@@ -7388,6 +7388,8 @@ class NominatimGeocodingProvider(GeocodingProvider):
             "latitude": float(match.get("lat")),
             "longitude": float(match.get("lon")),
             "display_name": text(match.get("display_name")),
+            "postal_code": text((match.get("address") or {}).get("postcode")) if isinstance(match.get("address"), dict) else "",
+            "match_level": text(match.get("type") or match.get("category")),
             "raw": match,
         }
 
@@ -7404,7 +7406,9 @@ class GeocoderCaProvider(GeocodingProvider):
     name = "geocoder.ca"
 
     def geocode(self, query: str, *, country: str = "Canada") -> dict[str, Any]:
-        params = {"locate": query, "geoit": "json", "standard": "1"}
+        # geocoder.ca's current JSON endpoint is XML mode with json=1. The
+        # older geoit=json form serves the HTML map page and cannot be parsed.
+        params = {"locate": query, "geoit": "XML", "json": "1", "standard": "1"}
         token = text(os.environ.get("JOB_TRACKER_GEOCODER_CA_TOKEN"))
         if token:
             params["auth"] = token
@@ -7430,6 +7434,32 @@ class GeocoderCaProvider(GeocodingProvider):
         }
 
 
+class CanadianPostalAwareProvider(GeocodingProvider):
+    """Use a Canadian postal resolver for postal inputs, with Nominatim fallback.
+
+    geocoder.ca is an optional, no-subscription public service. It is used only
+    for postal-bearing queries so city/address lookups retain the existing
+    Nominatim behavior. Users can still explicitly select either provider.
+    """
+
+    name = "geocoder.ca+nominatim"
+
+    def __init__(self) -> None:
+        self.canadian = GeocoderCaProvider()
+        self.nominatim = NominatimGeocodingProvider()
+
+    def geocode(self, query: str, *, country: str = "Canada") -> dict[str, Any]:
+        if extract_canadian_postal_code(query):
+            try:
+                return self.canadian.geocode(query, country=country)
+            except Exception as first_error:
+                try:
+                    return self.nominatim.geocode(query, country=country)
+                except Exception:
+                    raise first_error
+        return self.nominatim.geocode(query, country=country)
+
+
 class DisabledGeocodingProvider(GeocodingProvider):
     name = "disabled"
 
@@ -7443,7 +7473,9 @@ def get_geocoding_provider() -> GeocodingProvider:
         return DisabledGeocodingProvider()
     if configured == "geocoder.ca":
         return GeocoderCaProvider()
-    return NominatimGeocodingProvider()
+    if configured in {"nominatim", "osm"}:
+        return NominatimGeocodingProvider()
+    return CanadianPostalAwareProvider()
 
 
 def classify_geocoding_exception(exc: Exception) -> tuple[str, str]:
@@ -7594,6 +7626,9 @@ def geocode_location_value(
                 "error": "",
                 "used_fallback": bool(candidate["used_postal_fallback"]),
                 "display_name": text(lookup.get("display_name")),
+                "postal_code": text(lookup.get("postal_code") or lookup.get("postcode") or lookup.get("postalcode")),
+                "match_level": text(lookup.get("match_level") or lookup.get("matchlevel")),
+                "raw": lookup.get("raw") if isinstance(lookup.get("raw"), dict) else {},
                 "cached": False,
             }
             if not geocoding_result_matches_query(raw, candidate["normalized_query"], result):
@@ -7662,6 +7697,16 @@ def geocode_matches_canadian_location(raw_location: str, geocode: dict[str, Any]
     )
     if postal and returned_postal:
         return postal == returned_postal
+    if postal and not returned_postal:
+        # A source-backed Canadian postal result may omit Ontario from its
+        # display label. Require explicit country and postal-level evidence
+        # before accepting it; never accept a province-only fallback here.
+        raw_result = geocode.get("raw") if isinstance(geocode.get("raw"), dict) else {}
+        address = raw_result.get("address") if isinstance(raw_result.get("address"), dict) else {}
+        country_code = text(geocode.get("country_code") or raw_result.get("country_code") or address.get("country_code")).lower()
+        match_level = text(geocode.get("match_level") or geocode.get("matchlevel") or raw_result.get("type")).lower()
+        if country_code in {"ca", "can", "canada"} and match_level in {"postal", "postcode", "post code", "postalcode", "zip", "zipcode"}:
+            return True
     if postal and postal[0] == "M":
         expected_code = "ON"
     if expected_code:
