@@ -3058,8 +3058,8 @@ class JobAssistantTest(unittest.TestCase):
             },
             evidence_profile={
                 "_candidate_profile_id": "",
-                "resume_text": "Built Python APIs and React dashboards as projects.",
-                "projects": "React dashboard with Python backend.",
+                "resume_text": "",
+                "projects": "Built Python APIs and React dashboards as projects.",
                 "work_experience": "",
                 "key_skills": "",
                 "target_seniority_levels": "junior",
