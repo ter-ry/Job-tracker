@@ -99,6 +99,17 @@ def wait_for_server(timeout: float = 30.0) -> bool:
     return False
 
 
+def stop_waitress_server(server: object, server_thread: threading.Thread) -> None:
+    server.close()
+    server_thread.join(timeout=5)
+    if server_thread.is_alive():
+        # Browsers can keep accepted HTTP connections open after the listener
+        # closes. Waitress will not leave its event loop until those close too.
+        from waitress import wasyncore
+
+        wasyncore.close_all(server._map)
+
+
 def launch() -> int:
     data_dir = default_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -119,11 +130,12 @@ def launch() -> int:
     from app import app
 
     server = create_server(app, host=HOST, port=PORT, threads=8, ident="JobTracker")
-    app.config["JOB_TRACKER_SHUTDOWN"] = server.close
     server_thread = threading.Thread(
         target=server.run,
         daemon=True,
     )
+
+    app.config["JOB_TRACKER_SHUTDOWN"] = lambda: stop_waitress_server(server, server_thread)
     server_thread.start()
     if not wait_for_server():
         return 3

@@ -1,10 +1,12 @@
 import os
 from pathlib import Path
+import socket
 import tempfile
+import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from release_packaging.windows.launcher import INSTANCE_MUTEX, SingleInstance, default_data_dir
+from release_packaging.windows.launcher import INSTANCE_MUTEX, SingleInstance, default_data_dir, stop_waitress_server
 from version import normalize_semver, semver_key
 from packaging.version import Version
 
@@ -29,6 +31,39 @@ class WindowsReleaseTests(unittest.TestCase):
     def test_inno_mutex_matches_launcher_mutex(self):
         script = Path(__file__).parents[1] / "release_packaging" / "windows" / "JobTracker.iss"
         self.assertIn(f"AppMutex={INSTANCE_MUTEX}", script.read_text(encoding="utf-8"))
+
+    def test_shutdown_closes_browser_keepalive_channels(self):
+        server = Mock()
+        server._map = {1: Mock()}
+        server_thread = Mock()
+        server_thread.is_alive.return_value = True
+        with patch("waitress.wasyncore.close_all") as close_all:
+            stop_waitress_server(server, server_thread)
+        server.close.assert_called_once_with()
+        server_thread.join.assert_called_once_with(timeout=5)
+        close_all.assert_called_once_with(server._map)
+
+    def test_waitress_exits_with_browser_keepalive_connection(self):
+        from waitress import create_server
+
+        def respond(_environ, start_response):
+            start_response("200 OK", [("Content-Type", "text/plain")])
+            return [b"ready"]
+
+        server = create_server(respond, host="127.0.0.1", port=0)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        try:
+            with socket.create_connection(("127.0.0.1", server.effective_port), timeout=5) as browser:
+                browser.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                self.assertIn(b"200 OK", browser.recv(4096))
+                self.assertTrue(thread.is_alive())
+                stop_waitress_server(server, thread)
+                thread.join(timeout=3)
+                self.assertFalse(thread.is_alive())
+        finally:
+            if thread.is_alive():
+                server.close()
 
     def test_semver_normalization_and_ordering(self):
         self.assertEqual(normalize_semver("v1.0.0"), "1.0.0")
