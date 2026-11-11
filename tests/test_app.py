@@ -2289,6 +2289,14 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(row["workplace_postal_code"], "L6A 1P4")
         self.assertEqual(row["workplace_precision"], "street address")
 
+    def test_jobspy_does_not_use_employer_mailing_address_as_workplace(self):
+        row = jobspy_source.normalize_jobspy_row(
+            {"title": "Developer", "location": "Toronto, ON", "description": "Work remotely in Canada. Corporate mailing address: 9350 Keele St, Maple, ON L6A 1P4."},
+            fallback_source="indeed",
+        )
+        self.assertEqual(row["workplace_address"], "")
+        self.assertEqual(row["workplace_postal_code"], "")
+
     def test_remote_provider_conflict_is_reviewable(self):
         row = {"is_remote": True, "location": "Toronto, ON", "description": "Work remotely: No"}
         self.assertEqual(jobspy_source.infer_remote_type(row), "Unknown")
@@ -2305,6 +2313,8 @@ class JobAssistantTest(unittest.TestCase):
 
         truncated = app_module.determine_salary({"salary_min": 60000, "salary_max": 63, "salary_interval": "yearly"})
         self.assertEqual(truncated["salary_source"], "missing")
+        truncated_text = app_module.determine_salary({"salary_text": "$60,000-$63/year"})
+        self.assertEqual(truncated_text["salary_source"], "missing")
 
         benefits = app_module.determine_salary(
             {"job_description": "Pay: $20.60-$23.54 per hour. Wage enhancement up to $2/hour is separate."}

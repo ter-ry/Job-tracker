@@ -467,13 +467,16 @@ def extract_workplace_location(row: dict[str, Any], description: str, provider_l
         description,
         re.I,
     )
-    if not labeled and street:
+    street_context = description[max(0, street.start() - 90):street.start()].lower() if street else ""
+    workplace_cue = re.search(r"(?:work(?:place|\s+location)?|role|position|job|office|based|located|report(?:ing)?\s+to)\s+(?:is\s+|at\s+|in\s+|on\s+|near\s+|from\s+|:)?\s*$", street_context)
+    if not labeled and street and workplace_cue and not re.search(r"(?:headquarters|corporate|mailing|registered)\s+(?:address|office)?\s*$", street_context):
         labeled = street
     evidence = field_value or ((labeled.group(1) if labeled.lastindex else labeled.group(0)).strip() if labeled else "")
     if evidence:
         source = source or "description labeled workplace field"
     postal = clean(row.get("postal_code") or row.get("zip_code") or row.get("workplace_postal_code"))
-    postal_match = re.search(postal_pattern, f"{evidence} {description}", re.I)
+    postal_context = description[street.start():street.end() + 90] if street and workplace_cue and labeled is street else evidence
+    postal_match = re.search(postal_pattern, postal_context, re.I)
     postal = postal or (postal_match.group(0).upper().replace(" ", " ") if postal_match else "")
     address = evidence
     if not address and postal:

@@ -6638,6 +6638,10 @@ def parse_salary_text(value: str) -> dict[str, Any]:
             continue
         minimum = numbers[0]
         maximum = numbers[1] if len(numbers) > 1 else numbers[0]
+        if len(numbers) > 1 and maximum < minimum:
+            # A truncated upper endpoint (for example $60,000-$63/year)
+            # cannot be repaired from the posting without inventing digits.
+            continue
         if "up to" in context.lower() and len(numbers) == 1:
             minimum = 0
         if "from" in context.lower() and len(numbers) == 1:
@@ -6709,6 +6713,8 @@ def infer_salary_interval(context: str) -> str:
         return "weekly"
     if "month" in lowered:
         return "monthly"
+    if re.search(r"\b(?:year|yearly|annual|annually|yr)\b|/yr\b", lowered):
+        return "yearly"
     if "contract" in lowered or "day rate" in lowered:
         return "contract"
     return ""
