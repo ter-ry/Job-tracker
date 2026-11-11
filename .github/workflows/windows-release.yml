@@ -9,6 +9,7 @@ on:
       - "scripts/check_release_artifacts.py"
       - "scripts/windows_smoke_test.py"
       - "scripts/frozen_windows_smoke_test.py"
+      - "scripts/windows_installer_lifecycle.ps1"
       - "app.py"
       - "version.py"
       - "requirements.txt"
