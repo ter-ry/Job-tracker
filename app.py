@@ -135,7 +135,7 @@ DISCOVERY_DATE_WINDOWS = {
 # Keep the public diagnostics field stable for existing API clients.  The
 # database itself is now tracked independently by the migration runner.
 APP_SCHEMA_VERSION = 1
-CURRENT_DB_SCHEMA_VERSION = 12
+CURRENT_DB_SCHEMA_VERSION = 13
 DISCOVERY_DEBUG_SNAPSHOT_LIMIT = 25
 GEOCODING_FAILURE_CACHE_SECONDS = 15 * 60
 DISCOVERY_TASK_NAME = "Job Tracker Discovery"
@@ -430,6 +430,14 @@ JOB_COLUMNS = {
     "source_job_id": "TEXT NOT NULL DEFAULT ''",
     "provider_company": "TEXT NOT NULL DEFAULT ''",
     "provider_location": "TEXT NOT NULL DEFAULT ''",
+    "workplace_address": "TEXT NOT NULL DEFAULT ''",
+    "workplace_postal_code": "TEXT NOT NULL DEFAULT ''",
+    "workplace_evidence": "TEXT NOT NULL DEFAULT ''",
+    "workplace_evidence_source": "TEXT NOT NULL DEFAULT ''",
+    "workplace_precision": "TEXT NOT NULL DEFAULT ''",
+    "workplace_confidence": "INTEGER NOT NULL DEFAULT 0",
+    "remote_classification_conflict": "TEXT NOT NULL DEFAULT ''",
+    "provider_raw_json": "TEXT NOT NULL DEFAULT '{}'",
     "provider_title": "TEXT NOT NULL DEFAULT ''",
     "data_quality_flags": "TEXT NOT NULL DEFAULT '[]'",
     "posted_date": "TEXT NOT NULL DEFAULT ''",
@@ -3212,13 +3220,22 @@ def jobspy_result_to_job_payload(job: dict[str, Any]) -> dict[str, Any]:
         }
     )
     salary_listed = salary["salary_source"] not in {"estimated", "missing"}
+    raw_provider = job.get("raw") if isinstance(job.get("raw"), dict) else {}
     return {
         "company": text(job.get("company")) or "Unknown company",
         "provider_company": text(job.get("company")),
-        "provider_location": text(job.get("location")),
+        "provider_location": text(job.get("provider_location") or job.get("location")),
+        "workplace_address": text(job.get("workplace_address")),
+        "workplace_postal_code": text(job.get("workplace_postal_code")),
+        "workplace_evidence": text(job.get("workplace_evidence")),
+        "workplace_evidence_source": text(job.get("workplace_evidence_source")),
+        "workplace_precision": text(job.get("workplace_precision")),
+        "workplace_confidence": clamp_int(job.get("workplace_confidence"), 0, 100),
+        "remote_classification_conflict": text(job.get("remote_classification_conflict")),
+        "provider_raw_json": dumps_json(raw_provider, sort_keys=True, default=str),
         "provider_title": title,
         "title": title or "Untitled role",
-        "location": text(job.get("location")),
+        "location": text(job.get("location")) or text(job.get("provider_location")),
         "url": text(job.get("job_url")),
         "application_url": text(job.get("application_url")) or text(job.get("job_url")),
         "source": source.title() if source else "JobSpy",
@@ -6429,6 +6446,15 @@ def normalize_dedupe_location(value: Any) -> str:
 def determine_salary(job: dict[str, Any]) -> dict[str, Any]:
     structured = structured_salary(job)
     if structured["salary_source"] != "missing":
+        # JobSpy often supplies numeric fields alongside the original text.
+        # Keep a meaningful qualifier such as "From" instead of presenting a
+        # floor as a guaranteed range.
+        original = text(job.get("salary_text") or job.get("salary"))
+        qualifier = re.match(r"\s*(from|starting(?:\s+at)?|up\s+to)\b", original, re.I)
+        if qualifier:
+            structured["salary_text"] = f"{qualifier.group(1).title()} {structured['salary_text']}"
+            structured["salary_original_text"] = original
+            structured["salary_evidence_text"] = original
         return structured
 
     salary_text = text(job.get("salary_text") or job.get("salary"))
@@ -6463,6 +6489,12 @@ def structured_salary(job: dict[str, Any]) -> dict[str, Any]:
         maximum = minimum
     if minimum is None:
         minimum = maximum
+    # A few providers truncate the upper bound (for example 60,000 and 63)
+    # while still labelling the pair as annual salary. Never turn that into a
+    # misleading advertised range; let the original text parser decide whether
+    # a complete authoritative range is available.
+    if maximum < minimum and maximum < minimum * 0.5:
+        return missing_salary()
     if not raw_interval:
         interval = infer_salary_interval_from_magnitude(minimum or 0, maximum or 0)
     annual_min, annual_max = annualize_salary(minimum or 0, maximum or 0, interval)
@@ -6632,7 +6664,12 @@ def plausible_base_salary(minimum: float, maximum: float, interval: str) -> bool
 def false_salary_context(context: str) -> bool:
     lowered = context.lower()
     blocked = ["bonus", "signing", "benefit", "allowance", "expense", "revenue", "budget", "equity", "stock", "rrsp", "401k"]
-    return any(term in lowered for term in blocked) and not any(term in lowered for term in ["salary", "compensation range", "pay range"])
+    if not any(term in lowered for term in blocked):
+        return False
+    # A sentence can mention benefits after a real base-pay statement. Keep
+    # that evidence, while still rejecting standalone benefit amounts.
+    explicit_pay = re.search(r"\b(?:salary|compensation|base\s+pay|pay|wage)\b", lowered)
+    return not explicit_pay
 
 
 def looks_like_estimate(value: str) -> bool:
@@ -6718,7 +6755,8 @@ def salary_range_label(minimum: float, maximum: float, interval: str, currency: 
         "contract": "contract",
         "yearly": "per year",
     }.get(interval, "unit unspecified")
-    return f"{left}-{right} {cadence}" if minimum != maximum else f"{left} {cadence}"
+    separator = "" if cadence.startswith("/") else " "
+    return f"{left}-{right}{separator}{cadence}" if minimum != maximum else f"{left}{separator}{cadence}"
 
 
 DISCOVERY_CITY_COORDS = {
@@ -7450,8 +7488,29 @@ def geocode_discovery_job(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     provider = provider or get_geocoding_provider()
     raw_location = text(job.get("location"))
-    geocode = geocode_location_value(raw_location, lookup_type="job", profile=profile, provider=provider, use_cache=use_cache)
-    if geocode.get("ok") and not geocode_matches_canadian_location(raw_location, geocode):
+    provider_location = text(job.get("provider_location"))
+    workplace_address = text(job.get("workplace_address"))
+    workplace_postal = text(job.get("workplace_postal_code"))
+    lookup_values: list[tuple[str, str]] = []
+    for label, value in (
+        ("street address", workplace_address),
+        ("postal code", workplace_postal),
+        ("provider location", provider_location),
+        ("posting location", raw_location),
+    ):
+        if value and value not in {item[1] for item in lookup_values}:
+            lookup_values.append((label, value))
+    geocode = {}
+    attempts: list[str] = []
+    for label, lookup in lookup_values or [("posting location", raw_location)]:
+        candidate = geocode_location_value(lookup, lookup_type="job", profile=profile, provider=provider, use_cache=use_cache)
+        attempts.append(f"{label}: {lookup} -> {text(candidate.get('status')) or ('ok' if candidate.get('ok') else 'failed')}")
+        if candidate.get("ok") and geocode_matches_canadian_location(lookup, candidate):
+            geocode = candidate
+            break
+        if not geocode:
+            geocode = candidate
+    if geocode.get("ok") and not geocode_matches_canadian_location(raw_location or workplace_address, geocode):
         geocode = {**geocode, "ok": False, "status": "invalid_location", "latitude": "", "longitude": "", "error": "Geocoding result did not match the posting's Canadian province or country."}
     job["location_original"] = raw_location
     job["normalized_location"] = text(geocode.get("normalized_query")) or raw_location
@@ -7459,7 +7518,7 @@ def geocode_discovery_job(
     job["location_confidence"] = clamp_int(geocode.get("confidence"), 0, 100)
     job["location_precision"] = text(geocode.get("precision"))
     job["location_geocoded_at"] = text(geocode.get("geocoded_at"))
-    job["location_geocoding_error"] = text(geocode.get("error"))
+    job["location_geocoding_error"] = "; ".join(attempts) if attempts and not geocode.get("ok") else text(geocode.get("error"))
     job["location_cached"] = bool(geocode.get("cached"))
     job["location_geocode_status"] = text(geocode.get("status"))
     job["location_latitude"] = geocode.get("latitude")

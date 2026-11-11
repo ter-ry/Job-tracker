@@ -2189,6 +2189,53 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(jobspy_source.infer_remote_type({"location": "Canada", "description": "This is a fully remote RECE position."}), "Remote")
         self.assertEqual(jobspy_source.infer_remote_type({"is_remote": True, "location": "London, UK"}), "Remote")
 
+    def test_jobspy_preserves_explicit_maple_workplace_and_remote_negative_evidence(self):
+        row = jobspy_source.normalize_jobspy_row(
+            {
+                "title": "Registered Early Childhood Educator",
+                "company": "Community of Maple Child Care Services",
+                "location": "Maple, ON",
+                "is_remote": False,
+                "salary": "From $31.00 per hour",
+                "description": (
+                    "Location: 9350 Keele St, Maple, ON L6A 1P4\n"
+                    "Work remotely: No\n"
+                    "Permanent full-time. Benefits include paid time off, dental and vision."
+                ),
+                "job_url": "https://ca.indeed.com/viewjob?jk=17d1a3d362cc12f0",
+            },
+            fallback_source="indeed",
+        )
+        self.assertEqual(row["remote_type"], "On-site")
+        self.assertEqual(row["workplace_address"], "9350 Keele St, Maple, ON L6A 1P4")
+        self.assertEqual(row["workplace_postal_code"], "L6A 1P4")
+        self.assertEqual(row["workplace_precision"], "street address")
+        self.assertEqual(row["salary_text"], "From $31.00 per hour")
+
+    def test_remote_provider_conflict_is_reviewable(self):
+        row = {"is_remote": True, "location": "Toronto, ON", "description": "Work remotely: No"}
+        self.assertEqual(jobspy_source.infer_remote_type(row), "Unknown")
+        self.assertEqual(
+            jobspy_source.remote_classification_conflict(row),
+            "provider_remote_conflicts_with_explicit_on_site_evidence",
+        )
+
+    def test_salary_parser_preserves_from_and_rejects_truncated_structured_range(self):
+        maple = app_module.determine_salary({"salary_text": "From $31.00 per hour"})
+        self.assertEqual(maple["salary_interval"], "hourly")
+        self.assertIn("From CAD $31", maple["salary_text"])
+        self.assertEqual(maple["salary_advertised_min"], maple["salary_advertised_max"])
+
+        truncated = app_module.determine_salary({"salary_min": 60000, "salary_max": 63, "salary_interval": "yearly"})
+        self.assertEqual(truncated["salary_source"], "missing")
+
+        benefits = app_module.determine_salary(
+            {"job_description": "Pay: $20.60-$23.54 per hour. Wage enhancement up to $2/hour is separate."}
+        )
+        self.assertEqual(benefits["salary_interval"], "hourly")
+        self.assertEqual(benefits["salary_advertised_min"], 20.60)
+        self.assertEqual(benefits["salary_advertised_max"], 23.54)
+
     def test_jobspy_converts_application_kilometres_to_provider_miles(self):
         captured = []
 

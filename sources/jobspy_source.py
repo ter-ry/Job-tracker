@@ -311,6 +311,7 @@ def normalize_jobspy_row(row: dict[str, Any], fallback_source: str = "") -> dict
     city = clean(row.get("city"))
     state = clean(row.get("state") or row.get("state_province"))
     description = clean(row.get("description"))
+    workplace = extract_workplace_location(row, description, location or ", ".join([part for part in [city, state] if part]))
     raw_status = clean(row.get("status") or row.get("posting_status")).lower()
     if row.get("is_closed") is True or raw_status in {"closed", "expired", "removed"}:
         posting_availability = "confirmed_closed"
@@ -325,10 +326,18 @@ def normalize_jobspy_row(row: dict[str, Any], fallback_source: str = "") -> dict
         "source_job_id": clean(row.get("id") or row.get("job_id")),
         "title": clean(row.get("title")),
         "company": clean(row.get("company")),
-        "location": location or ", ".join([part for part in [city, state] if part]),
+        "location": workplace["display_location"] or location or ", ".join([part for part in [city, state] if part]),
+        "provider_location": location or ", ".join([part for part in [city, state] if part]),
+        "workplace_address": workplace["address"],
+        "workplace_postal_code": workplace["postal_code"],
+        "workplace_evidence": workplace["evidence"],
+        "workplace_evidence_source": workplace["evidence_source"],
+        "workplace_precision": workplace["precision"],
+        "workplace_confidence": workplace["confidence"],
         "city": city,
         "state_province": state,
         "remote_type": infer_remote_type(row),
+        "remote_classification_conflict": remote_classification_conflict(row),
         "job_type": clean(row.get("job_type")),
         "salary_min": min_amount,
         "salary_max": max_amount,
@@ -399,23 +408,70 @@ def infer_remote_type(row: dict[str, Any]) -> str:
     title = clean(row.get("title")).lower()
     provider_arrangement = clean(row.get("remote_type") or row.get("work_arrangement")).lower()
     text = " ".join([location, title, provider_arrangement, description])
-    if re.search(r"\b(?:not|no)\s+remote\b|remote\s+(?:work\s+)?(?:is\s+)?not\s+(?:available|offered)", text):
+    negative = bool(re.search(r"\b(?:not|no)\s+remote\b|remote\s*(?::|-)?\s*(?:no|false)\b|work\s+remotely\s*(?::|-)?\s*no\b|work\s+location\s*:\s*in\s+person\b|on[- ]site\s+only", text))
+    positive = bool(re.search(r"\b(?:fully|100%|work(?:ing)?|position|role|job)\s+(?:is\s+)?remote\b|\bremote\s+(?:position|role|work|job|in\s+canada)\b|\bwork\s+from\s+home\b", text))
+    explicit = clean(explicit).lower()
+    if negative and explicit in {"true", "1", "yes"}:
+        return "Unknown"
+    if positive and explicit in {"false", "0", "no"}:
+        return "Unknown"
+    if negative:
         return "On-site"
     if "hybrid" in text or provider_arrangement == "hybrid":
         return "Hybrid"
-    if isinstance(explicit, bool):
-        if explicit:
+    if isinstance(row.get("is_remote"), bool):
+        if row.get("is_remote"):
             return "Remote"
         return "On-site"
-    elif clean(explicit).lower() in {"true", "1", "yes"}:
+    elif explicit in {"true", "1", "yes"}:
         return "Remote"
-    elif clean(explicit).lower() in {"false", "0", "no"}:
+    elif explicit in {"false", "0", "no"}:
         return "On-site"
     if "on-site" in text or "onsite" in text:
         return "On-site"
-    if re.search(r"\b(?:fully|100%|work(?:ing)?|position|role|job)\s+(?:is\s+)?remote\b", text) or re.search(r"\bremote\s+(?:position|role|work|job|in\s+canada)\b", text) or re.search(r"\bwork\s+from\s+home\b", text):
+    if positive:
         return "Remote"
     return "Unknown"
+
+
+def remote_classification_conflict(row: dict[str, Any]) -> str:
+    location = clean(row.get("location")).lower()
+    description = clean(row.get("description")).lower()
+    title = clean(row.get("title")).lower()
+    arrangement = clean(row.get("remote_type") or row.get("work_arrangement")).lower()
+    content = " ".join([location, title, arrangement, description])
+    negative = bool(re.search(r"\b(?:not|no)\s+remote\b|remote\s*(?::|-)?\s*(?:no|false)\b|work\s+remotely\s*(?::|-)?\s*no\b|work\s+location\s*:\s*in\s+person\b|on[- ]site\s+only", content))
+    positive = bool(re.search(r"\b(?:fully|100%|work(?:ing)?|position|role|job)\s+(?:is\s+)?remote\b|\bremote\s+(?:position|role|work|job|in\s+canada)\b|\bwork\s+from\s+home\b", content))
+    explicit = clean(row.get("is_remote")).lower()
+    if negative and explicit in {"true", "1", "yes"}:
+        return "provider_remote_conflicts_with_explicit_on_site_evidence"
+    if positive and explicit in {"false", "0", "no"}:
+        return "provider_on_site_conflicts_with_explicit_remote_evidence"
+    return ""
+
+
+def extract_workplace_location(row: dict[str, Any], description: str, provider_location: str) -> dict[str, Any]:
+    """Extract only explicitly labeled workplace evidence; never infer an employer HQ."""
+    postal_pattern = r"[A-Z]\d[A-Z][ -]?\d[A-Z]\d"
+    raw_fields = [clean(row.get(key)) for key in ("workplace_address", "address", "street_address", "office_address", "office_location")]
+    field_value = next((value for value in raw_fields if value), "")
+    source = "provider field" if field_value else ""
+    labeled = re.search(r"(?im)^\s*(?:location|work\s+location|address|office\s+location)\s*:\s*([^\n\r|]+)", description)
+    evidence = field_value or (labeled.group(1).strip() if labeled else "")
+    if evidence:
+        source = source or "description labeled workplace field"
+    postal = clean(row.get("postal_code") or row.get("zip_code") or row.get("workplace_postal_code"))
+    postal_match = re.search(postal_pattern, evidence or description, re.I)
+    postal = postal or (postal_match.group(0).upper().replace(" ", " ") if postal_match else "")
+    address = evidence
+    if not address and postal:
+        address = postal
+        source = "description postal code"
+    if not address and provider_location:
+        return {"display_location": provider_location, "address": "", "postal_code": postal, "evidence": "", "evidence_source": "", "precision": "city" if provider_location else "unknown", "confidence": 65 if provider_location else 0}
+    display = address or provider_location
+    precision = "street address" if re.search(r"\b\d{1,6}\s+[^,\n]+\b(?:street|st|avenue|ave|road|rd|drive|dr|boulevard|blvd|way|parkway|pkwy)\b", address, re.I) else "postal code" if postal else "city"
+    return {"display_location": display, "address": address, "postal_code": postal, "evidence": evidence or address, "evidence_source": source or "provider location", "precision": precision, "confidence": 95 if precision == "street address" else 88 if precision == "postal code" else 65}
 
 
 def extract_experience_requirement(description: str) -> str:

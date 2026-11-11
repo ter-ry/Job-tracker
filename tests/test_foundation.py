@@ -17,9 +17,9 @@ class FoundationArchitectureTest(unittest.TestCase):
         db = sqlite3.connect(":memory:")
         first = run_migrations(db)
         second = run_migrations(db)
-        self.assertEqual(first, 12)
-        self.assertEqual(second, 12)
-        self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 12)
+        self.assertEqual(first, 13)
+        self.assertEqual(second, 13)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 13)
         self.assertTrue(db.execute("SELECT 1 FROM sqlite_master WHERE name = 'base_resumes'").fetchone())
 
     def test_profile_store_supports_multiple_document_variants(self):
@@ -39,9 +39,9 @@ class FoundationArchitectureTest(unittest.TestCase):
         db = sqlite3.connect(":memory:")
         db.execute("CREATE TABLE legacy_jobs (id INTEGER PRIMARY KEY, title TEXT)")
         db.execute("PRAGMA user_version = 1")
-        self.assertEqual(run_migrations(db), 12)
+        self.assertEqual(run_migrations(db), 13)
         applied = db.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
-        self.assertEqual(applied, [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,), (11,), (12,)])
+        self.assertEqual(applied, [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,), (11,), (12,), (13,)])
         self.assertTrue(db.execute("SELECT 1 FROM sqlite_master WHERE name = 'legacy_jobs'").fetchone())
         self.assertTrue(db.execute("SELECT 1 FROM sqlite_master WHERE name = 'candidate_profiles'").fetchone())
 

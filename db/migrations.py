@@ -245,6 +245,28 @@ def _migration_012_discovery_status_semantics(db: sqlite3.Connection) -> None:
            AND discovery_state NOT IN ('saved', 'applied')"""
     )
 
+
+def _migration_013_workplace_evidence(db: sqlite3.Connection) -> None:
+    """Store explicit workplace and provider-conflict evidence for re-enrichment."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'jobs'").fetchone():
+        # Profile-only migration tests and newly created stores create the jobs
+        # table later during application initialization.
+        return
+    columns = {
+        "workplace_address": "TEXT NOT NULL DEFAULT ''",
+        "workplace_postal_code": "TEXT NOT NULL DEFAULT ''",
+        "workplace_evidence": "TEXT NOT NULL DEFAULT ''",
+        "workplace_evidence_source": "TEXT NOT NULL DEFAULT ''",
+        "workplace_precision": "TEXT NOT NULL DEFAULT ''",
+        "workplace_confidence": "INTEGER NOT NULL DEFAULT 0",
+        "remote_classification_conflict": "TEXT NOT NULL DEFAULT ''",
+        "provider_raw_json": "TEXT NOT NULL DEFAULT '{}'",
+    }
+    existing = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
+    for name, definition in columns.items():
+        if name not in existing:
+            db.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
+
 MIGRATIONS: tuple[tuple[int, str, Migration], ...] = (
     (1, "legacy baseline", _migration_001_baseline),
     (2, "candidate document profiles", _migration_002_candidate_documents),
@@ -258,6 +280,7 @@ MIGRATIONS: tuple[tuple[int, str, Migration], ...] = (
     (10, "tailoring revision history", _migration_010_tailoring_revision_history),
     (11, "versioned tailoring drafts", _migration_011_versioned_tailoring_drafts),
     (12, "discovery status semantics", _migration_012_discovery_status_semantics),
+    (13, "workplace evidence", _migration_013_workplace_evidence),
 )
 
 

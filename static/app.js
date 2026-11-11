@@ -1616,7 +1616,7 @@ function openPipelineJobDetails(id) {
   const reasons = (profileFree ? (job.opportunity_score_reasons || []) : (job.qualification_fit_reasons || [])).map((reason) => `<li>${escapeHtml(reason)}</li>`).join("") || "<li>Review the original posting evidence before applying.</li>";
   const postingUrl = job.application_url || job.url || "";
   const applied = job.status === "Applied" || job.discovery_state === "applied";
-  const primaryActions = `<div class="pipeline-detail-actions" aria-label="Job actions">${postingUrl ? `<a class="button" href="${escapeAttribute(postingUrl)}" target="_blank" rel="noreferrer">Open job posting</a>` : `<button class="button" type="button" disabled title="No original or application URL was stored.">Open job posting unavailable</button>`}<button class="button ghost" type="button" data-detail-applied="${job.id}" ${applied ? "disabled" : ""}>${applied ? "Applied" : "Mark Applied"}</button><button class="button ghost" type="button" data-detail-save="${job.id}" ${applied ? "disabled" : ""}>Save for later</button><button class="button ghost" type="button" data-detail-skip="${job.id}">Skip</button></div>`;
+  const primaryActions = `<div class="pipeline-detail-actions" aria-label="Job actions">${postingUrl ? `<a class="button" href="${escapeAttribute(postingUrl)}" target="_blank" rel="noreferrer">Open job posting</a>` : `<button class="button" type="button" disabled title="No original or application URL was stored.">Open job posting unavailable</button>`}<button class="button ghost" type="button" data-detail-applied="${job.id}" ${applied ? "disabled" : ""}>${applied ? "Applied" : "Mark Applied"}</button><button class="button ghost" type="button" data-detail-save="${job.id}" ${applied ? "disabled" : ""}>Save for later</button><button class="button ghost" type="button" data-detail-skip="${job.id}">Skip</button>${renderMapLinks(job)}</div>`;
   const advancedActions = state.advancedFeatures ? `<button class="button ghost" type="button" data-prepare-job="${job.id}">Prepare application</button>` : "";
   const detailScoreLabel = profileFree ? "Job Opportunity Score" : "Qualification Match";
   const detailScore = profileFree ? Number(job.opportunity_score ?? job.application_priority_score ?? 0) : Number(job.qualification_fit_score ?? job.fit_score ?? 0);
@@ -1639,6 +1639,24 @@ function openPipelineJobDetails(id) {
   panel.querySelector("[data-close-job-details]").focus();
   const existingPreparation = state.preparationQueue.find((item) => Number(item.job_id) === Number(id));
   if (existingPreparation) renderPipelinePreparationState(job, existingPreparation);
+}
+
+function mapDestination(job) {
+  return String(job?.workplace_address || job?.workplace_postal_code || job?.location || job?.normalized_location || "").trim();
+}
+
+function googleMapsUrl(job, mode = "driving") {
+  const destination = mapDestination(job);
+  const arrangement = String(job?.work_arrangement || job?.remote_type || "").toLowerCase();
+  if (!destination || arrangement.includes("remote")) return "";
+  return `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(destination)}&travelmode=${encodeURIComponent(mode)}`;
+}
+
+function renderMapLinks(job) {
+  const driving = googleMapsUrl(job, "driving");
+  const transit = googleMapsUrl(job, "transit");
+  if (!driving) return "";
+  return `<span class="map-links" aria-label="Map directions"><a class="button ghost small" href="${escapeAttribute(driving)}" target="_blank" rel="noreferrer">Driving directions</a><a class="button ghost small" href="${escapeAttribute(transit)}" target="_blank" rel="noreferrer">Transit directions</a></span>`;
 }
 
 function renderPipelinePreparationState(_job, item) {
@@ -2962,6 +2980,7 @@ function renderDiscoveryRow(job) {
           <button class="button small ghost" type="button" data-discovery-action="applied" data-job-key="${key}">Mark Applied</button>
           <button class="button small ghost" type="button" data-discovery-action="hide" data-job-key="${key}">Skip</button>
           ${job.url ? `<a class="button small ghost" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open job</a>` : ""}
+          ${renderMapLinks(job)}
           ${applicationUrl ? `<a class="button small ghost" href="${escapeAttribute(applicationUrl)}" target="_blank" rel="noreferrer">Application</a>` : ""}
         </div>
       </td>
@@ -3009,6 +3028,7 @@ function renderDiscoveryCard(job) {
         <button class="button small ghost" type="button" data-discovery-action="applied" data-job-key="${key}">Mark Applied</button>
         <button class="button small ghost" type="button" data-discovery-action="hide" data-job-key="${key}">Skip</button>
         ${job.url ? `<a class="button small ghost" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open job</a>` : ""}
+        ${renderMapLinks(job)}
         ${applicationUrl ? `<a class="button small ghost" href="${escapeAttribute(applicationUrl)}" target="_blank" rel="noreferrer">Application</a>` : ""}
       </div>
     </section>
