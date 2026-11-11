@@ -2523,7 +2523,7 @@ class JobAssistantTest(unittest.TestCase):
 
     def test_geocoding_failures_are_categorized_without_exposing_coordinates(self):
         cases = [
-            ("M5V 2", ValueError("invalid"), "invalid_input"),
+            ("M5V 2T", ValueError("invalid"), "invalid_input"),
             ("M5V 2T6", ValueError("No geocoding match found"), "no_match"),
             ("M5V 2T6", urllib.error.HTTPError("https://example.test", 403, "Forbidden", {}, None), "http_403"),
             ("M5V 2T6", urllib.error.URLError("offline"), "network_error"),

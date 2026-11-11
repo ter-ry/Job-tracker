@@ -7527,6 +7527,8 @@ def geocode_location_value(
                 cached_result = {**cached_result, "ok": False, "status": "invalid_cached_result", "error": "Cached geocoding coordinates did not match the requested location."}
                 failure_reasons.append("invalid_cached_result")
             errors.append(text(cached_result.get("error")) or "Cached geocoding failure.")
+            if not cached_result.get("ok"):
+                failure_reasons.append(text(cached_result.get("status")) or "provider_error")
             if cached_result.get("status") == "rate_limited":
                 break
             if not cached.get("success"):
