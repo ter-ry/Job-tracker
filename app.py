@@ -9874,7 +9874,7 @@ def _technical_compatibility(assessed: list[dict[str, Any]], profile: dict[str, 
         "required_demonstrated": [item["requirement"] for item in required if item["state"] == "Demonstrated"],
         "required_unverified": unverified,
         "required_no_experience": confirmed_gaps,
-        "explanation": "Missing résumé evidence is unverified; only an explicit skill confirmation marks no experience.",
+        "explanation": "Missing résumé evidence is Unverified; only an explicit skill confirmation marks No experience.",
     }
 
 
