@@ -10005,6 +10005,11 @@ def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any
     if non_target_role:
         reasons.append("The advertised role family is outside the selected software-developer targets and requires review before applying.")
     priority, priority_reasons = _application_priority(job, score, profile, seniority)
+    if technical_compatibility["required_no_experience"]:
+        priority = min(priority, 39)
+        priority_reasons.append(
+            "Confirmed missing core technology: " + ", ".join(technical_compatibility["required_no_experience"][:5]) + "."
+        )
     label = "Review required — non-target role family" if non_target_role else "Insufficient requirement evidence" if insufficient_mandatory_evidence else "Stretch opportunity" if stretch or score < 60 else "Strong qualification match" if score >= 75 else "Review qualification fit"
     return {
         "qualification_match_status": "assessed" if mandatory_score is not None else "partial_evidence",
