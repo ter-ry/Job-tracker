@@ -3118,6 +3118,7 @@ function displaySalary(job) {
 
 function distanceBadge(job) {
   if (job.distance_label === "remote") return "Remote";
+  if (job.city_estimate_km !== undefined && job.city_estimate_km !== null) return `Exact workplace unknown · city estimate ${Number(job.city_estimate_km)} km`;
   if (job.distance_km === undefined || job.distance_km === null) return "Unknown";
   if (Number(job.distance_km) >= 9999) return "Unknown";
   return job.distance_note ? `${job.distance_note} · ${Number(job.distance_km)} km (straight-line)` : `${Number(job.distance_km)} km (straight-line)`;
@@ -3302,6 +3303,8 @@ function renderDiscoveryWhy(job) {
         </ul>
       </details>`;
   }
+  const compatibility = job.technical_compatibility || {};
+  const compatibilityItems = (compatibility.items || []).slice(0, 8).map((item) => `${item.requirement}: ${item.state}`).join(" | ");
   const lines = [
     `<li><strong>Qualification Match:</strong> ${qualification}/100</li>`,
     `<li><strong>Application Priority:</strong> ${priority}/100</li>`,
@@ -3309,6 +3312,7 @@ function renderDiscoveryWhy(job) {
     `<li><strong>Partial:</strong> ${escapeHtml(partial.join(", ") || "None identified")}</li>`,
     `<li><strong>Missing mandatory or preferred:</strong> ${escapeHtml(missing.join(", ") || "None identified")}</li>`,
     `<li><strong>Résumé evidence:</strong> ${escapeHtml(evidence.join(" | ") || "No bounded evidence was found")}</li>`,
+    `<li><strong>Technical compatibility:</strong> ${escapeHtml(compatibility.decision || "Unverified")} · ${escapeHtml(compatibilityItems || compatibility.explanation || "No technical evidence was evaluated")}</li>`,
     `<li><strong>Seniority:</strong> ${escapeHtml(job.qualification_fit_seniority?.explanation || job.qualification_fit_label || "Review required")}</li>`,
     `<li><strong>Eligibility:</strong> ${escapeHtml(job.canadian_eligibility || "unknown")} · ${escapeHtml(job.work_arrangement || job.remote_type || "unknown arrangement")}</li>`,
     `<li><strong>Evidence source:</strong> ${escapeHtml(job.qualification_evidence_profile_name || "Active Profile")} · ${escapeHtml(job.description_completeness || "description status unknown")}</li>`,

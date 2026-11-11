@@ -269,9 +269,11 @@ class JobAssistantTest(unittest.TestCase):
         toronto_distance = app_module.location_distance_snapshot(toronto, "Toronto, ON", "", "remote_after_local", toronto_job)
         calgary_distance = app_module.location_distance_snapshot(toronto, "Calgary, AB", "", "remote_after_local", calgary_job)
         vancouver_distance = app_module.location_distance_snapshot(toronto, "Vancouver, BC", "", "remote_after_local", vancouver_job)
-        self.assertEqual(toronto_distance["distance_km"], 0)
-        self.assertGreater(calgary_distance["distance_km"], 2000)
-        self.assertGreater(vancouver_distance["distance_km"], 3000)
+        self.assertEqual(toronto_distance["distance_km"], 9999)
+        self.assertEqual(toronto_distance["distance_label"], "unknown")
+        self.assertEqual(toronto_distance["city_estimate_km"], 0)
+        self.assertGreater(calgary_distance["city_estimate_km"], 2000)
+        self.assertGreater(vancouver_distance["city_estimate_km"], 3000)
 
     def test_persisted_apple_markdown_record_reaches_api_with_required_years(self):
         created = self.client.post(
@@ -1715,11 +1717,34 @@ class JobAssistantTest(unittest.TestCase):
             self.assertEqual(profile["home_location_normalized"], "M5V 2T6, Canada")
             self.assertEqual(profile["home_location_precision"], "postal code")
             self.assertEqual(len(provider.calls), 1)
-
             cached_profile, second = app_module.geocode_profile_home_location(profile, provider)
             self.assertTrue(second["ok"])
             self.assertEqual(cached_profile["home_location_normalized"], "M5V 2T6, Canada")
             self.assertEqual(len(provider.calls), 1)
+
+    def test_postal_match_accepts_provider_postal_evidence_without_province_name(self):
+        result = {
+            "latitude": 43.6426,
+            "longitude": -79.3871,
+            "display_name": "M5V 2T6, Canada",
+            "raw": {"address": {"postcode": "M5V 2T6", "country_code": "ca"}},
+        }
+        self.assertTrue(app_module.geocode_matches_canadian_location("M5V2T6", result))
+        self.assertFalse(app_module.geocode_matches_canadian_location("M5V 2T7", result))
+
+    def test_geocoder_ca_provider_parses_canadian_coordinates_and_postal(self):
+        response = FakeUrlopenResponse({
+            "latt": "43.6426",
+            "longt": "-79.3871",
+            "standardized": "M5V 2T6, Canada",
+            "postal": "M5V 2T6",
+            "matchlevel": "postal",
+        })
+        with patch.object(app_module.urllib.request, "urlopen", return_value=response):
+            result = app_module.GeocoderCaProvider().geocode("M5V 2T6, Canada")
+        self.assertEqual(result["postal_code"], "M5V 2T6")
+        self.assertEqual(result["match_level"], "postal")
+        self.assertAlmostEqual(result["latitude"], 43.6426)
 
     def test_discovery_score_uses_search_origin_and_radius_status(self):
         job = {
@@ -1978,9 +2003,10 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(body["total"], 1)
         job = body["jobs"][0]
         self.assertEqual(job["normalized_location"], "M5V 2T6, Canada")
-        self.assertEqual(job["distance_label"], "approximate")
-        self.assertTrue(job["distance_note"].startswith("Approx. distance from Toronto, ON"))
-        self.assertGreaterEqual(job["distance_km"], 0)
+        self.assertEqual(job["distance_label"], "unknown")
+        self.assertIn("city-centre distance is an estimate", job["distance_note"])
+        self.assertEqual(job["distance_km"], 9999)
+        self.assertGreaterEqual(job["city_estimate_km"], 0)
 
     def test_discovery_jobspy_accepts_date_objects_in_raw_payloads(self):
         provider = FakeGeocodingProvider(
@@ -3021,6 +3047,29 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(result["qualification_fit_score"], 0)
         self.assertEqual(result["qualification_fit_label"], "Not assessed — title search")
         self.assertIn("Title relevance", " ".join(result["opportunity_score_reasons"]))
+
+    def test_resume_technical_compatibility_is_conservative_and_evidence_backed(self):
+        result = app_module.build_qualification_fit(
+            {
+                "title": "Junior Full Stack Developer",
+                "required_skills": "Python, React, Kubernetes",
+                "job_description": "Requirements:\nPython, React, Kubernetes",
+                "remote_eligibility": "canadian_eligible",
+            },
+            evidence_profile={
+                "_candidate_profile_id": "",
+                "resume_text": "Built Python APIs and React dashboards as projects.",
+                "projects": "React dashboard with Python backend.",
+                "work_experience": "",
+                "key_skills": "",
+                "target_seniority_levels": "junior",
+            },
+        )
+        states = {item["requirement"].lower(): item["state"] for item in result["technical_compatibility"]["items"]}
+        self.assertEqual(states["python"], "Familiar")
+        self.assertEqual(states["react"], "Familiar")
+        self.assertEqual(states["kubernetes"], "Unverified")
+        self.assertIn("Unverified", result["technical_compatibility"]["explanation"])
 
     def test_opportunity_score_compares_advertised_pay_and_distance(self):
         base = {

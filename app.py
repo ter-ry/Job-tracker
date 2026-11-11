@@ -7392,6 +7392,44 @@ class NominatimGeocodingProvider(GeocodingProvider):
         }
 
 
+class GeocoderCaProvider(GeocodingProvider):
+    """Optional Canadian postal/address resolver selected by configuration.
+
+    The service is deliberately opt-in.  It is useful when the public
+    Nominatim instance does not return a postal-code match, but callers must
+    still respect the provider's current terms, rate limits, and any required
+    account/token.  No credentials are embedded in the application.
+    """
+
+    name = "geocoder.ca"
+
+    def geocode(self, query: str, *, country: str = "Canada") -> dict[str, Any]:
+        params = {"locate": query, "geoit": "json", "standard": "1"}
+        token = text(os.environ.get("JOB_TRACKER_GEOCODER_CA_TOKEN"))
+        if token:
+            params["auth"] = token
+        url = f"https://geocoder.ca/?{urlencode(params)}"
+        request_obj = urllib.request.Request(url, headers={"User-Agent": "Job Tracker/1.0 (local geocoding)"})
+        with urllib.request.urlopen(request_obj, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("No geocoding match found")
+        latitude = payload.get("latt") or payload.get("lat") or payload.get("latitude")
+        longitude = payload.get("longt") or payload.get("lon") or payload.get("longitude")
+        if latitude in [None, ""] or longitude in [None, ""]:
+            if text(payload.get("error")):
+                raise ValueError(text(payload.get("error")))
+            raise ValueError("No geocoding match found")
+        return {
+            "latitude": float(latitude),
+            "longitude": float(longitude),
+            "display_name": text(payload.get("standardized") or payload.get("address") or query),
+            "raw": payload,
+            "postal_code": text(payload.get("postal") or payload.get("postalcode") or payload.get("postcode")),
+            "match_level": text(payload.get("matchlevel") or payload.get("match_level")),
+        }
+
+
 class DisabledGeocodingProvider(GeocodingProvider):
     name = "disabled"
 
@@ -7400,8 +7438,11 @@ class DisabledGeocodingProvider(GeocodingProvider):
 
 
 def get_geocoding_provider() -> GeocodingProvider:
-    if text(os.environ.get("JOB_TRACKER_GEOCODING_PROVIDER")).lower() in {"none", "disabled", "off"}:
+    configured = text(os.environ.get("JOB_TRACKER_GEOCODING_PROVIDER")).lower().replace("_", ".")
+    if configured in {"none", "disabled", "off"}:
         return DisabledGeocodingProvider()
+    if configured == "geocoder.ca":
+        return GeocoderCaProvider()
     return NominatimGeocodingProvider()
 
 
@@ -7605,6 +7646,22 @@ def geocode_matches_canadian_location(raw_location: str, geocode: dict[str, Any]
     raw = normalize_space(raw_location).lower()
     expected_code = province_code_from_text(raw)
     postal = extract_canadian_postal_code(raw)
+    returned_postal = extract_canadian_postal_code(
+        " ".join(
+            text(value)
+            for value in (
+                geocode.get("postal_code"),
+                geocode.get("postcode"),
+                geocode.get("postalcode"),
+                (geocode.get("raw") or {}).get("postal_code") if isinstance(geocode.get("raw"), dict) else "",
+                (geocode.get("raw") or {}).get("postalcode") if isinstance(geocode.get("raw"), dict) else "",
+                (geocode.get("raw") or {}).get("postcode") if isinstance(geocode.get("raw"), dict) else "",
+                (geocode.get("raw") or {}).get("address", {}).get("postcode") if isinstance((geocode.get("raw") or {}).get("address"), dict) else "",
+            )
+        )
+    )
+    if postal and returned_postal:
+        return postal == returned_postal
     if postal and postal[0] == "M":
         expected_code = "ON"
     if expected_code:
@@ -7652,16 +7709,18 @@ def geocode_discovery_job(
         if value and value not in {item[1] for item in lookup_values}:
             lookup_values.append((label, value))
     geocode = {}
+    geocode_lookup_value = ""
     attempts: list[str] = []
     for label, lookup in lookup_values or [("posting location", raw_location)]:
         candidate = geocode_location_value(lookup, lookup_type="job", profile=profile, provider=provider, use_cache=use_cache)
         attempts.append(f"{label}: {lookup} -> {text(candidate.get('status')) or ('ok' if candidate.get('ok') else 'failed')}")
         if candidate.get("ok") and geocode_matches_canadian_location(lookup, candidate):
             geocode = candidate
+            geocode_lookup_value = lookup
             break
         if not geocode:
             geocode = candidate
-    if geocode.get("ok") and not geocode_matches_canadian_location(raw_location or workplace_address, geocode):
+    if geocode.get("ok") and geocode_lookup_value and not geocode_matches_canadian_location(geocode_lookup_value, geocode):
         geocode = {**geocode, "ok": False, "status": "invalid_location", "latitude": "", "longitude": "", "error": "Geocoding result did not match the posting's Canadian province or country."}
     job["location_original"] = raw_location
     job["normalized_location"] = text(geocode.get("normalized_query")) or raw_location
@@ -7676,6 +7735,7 @@ def geocode_discovery_job(
     job["location_longitude"] = geocode.get("longitude")
     distance = location_distance_snapshot(origin, raw_location, text(job.get("remote_type")), "remote_after_local", geocode)
     job["distance_km"] = distance["distance_km"]
+    job["city_estimate_km"] = distance.get("city_estimate_km")
     job["distance_confidence"] = distance["confidence"]
     job["distance_type"] = "remote" if distance["distance_label"] == "remote" else "straight_line" if distance["distance_label"] == "approximate" else "unknown"
     job["commute_status"] = "not_applicable" if distance["distance_label"] == "remote" else "unavailable"
@@ -8061,6 +8121,15 @@ def location_distance_snapshot(
     confidence = min(clamp_int(origin.get("confidence"), 0, 100), clamp_int(job_record.get("confidence"), 0, 100))
     if "city" in {origin_precision, job_precision}:
         confidence = min(confidence or 75, 78)
+        origin_label = text(origin.get("normalized")) or text(origin.get("input"))
+        return {
+            "distance_km": 9999,
+            "city_estimate_km": distance_km,
+            "confidence": confidence or 70,
+            "distance_label": "unknown",
+            "distance_note": "Exact workplace unknown; city-centre distance is an estimate and is not used for radius eligibility.",
+            "origin_label": origin_label,
+        }
     if "street address" in {origin_precision, job_precision} or "postal code" in {origin_precision, job_precision}:
         confidence = max(confidence, 85)
     distance_label = "approximate"
@@ -8068,7 +8137,7 @@ def location_distance_snapshot(
     distance_note = f"Approx. distance from {origin_label or 'saved origin'}"
     if origin_precision == "city" and origin_label:
         distance_note = f"Approx. distance from {origin_label} city centre"
-    return {"distance_km": distance_km, "confidence": confidence or 70, "distance_label": distance_label, "distance_note": distance_note, "origin_label": origin_label}
+    return {"distance_km": distance_km, "city_estimate_km": None, "confidence": confidence or 70, "distance_label": distance_label, "distance_note": distance_note, "origin_label": origin_label}
 
 
 def haversine_distance_km(origin: tuple[float, float], destination: tuple[float, float]) -> int:
@@ -8355,6 +8424,7 @@ def enrich_discovery_job(job: dict[str, Any], profile: dict[str, str], settings:
         "distance_km": scoring["distance"]["distance_km"],
         "distance_confidence": scoring["distance"]["confidence"],
         "distance_label": scoring["distance"]["distance_label"],
+        "city_estimate_km": scoring["distance"].get("city_estimate_km"),
         "overall_score": scoring["overall_score"],
         "qualification_fit_score": qualification.get("qualification_fit_score", 0),
         "qualification_match_score": qualification.get("qualification_match_score", 0),
@@ -8365,6 +8435,7 @@ def enrich_discovery_job(job: dict[str, Any], profile: dict[str, str], settings:
         "qualification_fit_matched_requirements": qualification.get("qualification_fit_matched_requirements", []),
         "qualification_fit_partial_requirements": qualification.get("qualification_fit_partial_requirements", []),
         "qualification_requirements": qualification.get("qualification_requirements", []),
+        "technical_compatibility": qualification.get("technical_compatibility", {}),
         "experience_requirements": qualification.get("experience_requirements", {}),
         "qualification_evidence_profile_id": qualification.get("qualification_evidence_profile_id", ""),
         "qualification_evidence_profile_name": qualification.get("qualification_evidence_profile_name", "Active Profile"),
@@ -9749,6 +9820,64 @@ def _evidence_match(requirement: str, evidence: dict[str, Any]) -> tuple[str, st
     return result
 
 
+def _technical_compatibility(assessed: list[dict[str, Any]], profile: dict[str, Any]) -> dict[str, Any]:
+    """Present conservative résumé-assisted technical evidence states.
+
+    A missing résumé match is intentionally Unverified.  It becomes No
+    experience only after an explicit negative skill confirmation has been
+    recorded for the selected candidate profile.
+    """
+    explicit_no: set[str] = set()
+    profile_id = profile.get("_candidate_profile_id") or profile.get("id")
+    if profile_id and has_app_context():
+        try:
+            rows = query_db(
+                "SELECT normalized_keyword FROM keyword_memory WHERE candidate_profile_id = ? AND confirmation_source = 'skill_confirmation' AND status = 'no'",
+                [int(profile_id)],
+            )
+            explicit_no = {normalize_keyword(text(row["normalized_keyword"])) for row in rows}
+        except Exception:
+            explicit_no = set()
+    items = []
+    for item in assessed:
+        if item.get("category") != "technical":
+            continue
+        normalized = normalize_keyword(text(item.get("normalized") or item.get("requirement")))
+        if item.get("status") == "matched":
+            evidence_type = text(item.get("evidence_type") or "")
+            state = "Demonstrated" if evidence_type == "professional experience" else "Familiar"
+        elif item.get("status") == "partial":
+            state = "Familiar"
+        elif normalized in explicit_no or normalize_keyword(text(item.get("requirement"))) in explicit_no:
+            state = "No experience"
+        else:
+            state = "Unverified"
+        items.append({
+            "requirement": item.get("requirement", ""),
+            "importance": item.get("importance", "unclassified"),
+            "state": state,
+            "evidence": item.get("evidence_text", ""),
+            "evidence_source": item.get("evidence_source", ""),
+        })
+    required = [item for item in items if item["importance"] == "required"]
+    confirmed_gaps = [item["requirement"] for item in required if item["state"] == "No experience"]
+    unverified = [item["requirement"] for item in required if item["state"] == "Unverified"]
+    if confirmed_gaps:
+        decision = "Significant gaps"
+    elif not items or (required and unverified):
+        decision = "Possible / stretch — evidence incomplete"
+    else:
+        decision = "Strong technical match" if all(item["state"] == "Demonstrated" for item in required) else "Possible / stretch"
+    return {
+        "decision": decision,
+        "items": items,
+        "required_demonstrated": [item["requirement"] for item in required if item["state"] == "Demonstrated"],
+        "required_unverified": unverified,
+        "required_no_experience": confirmed_gaps,
+        "explanation": "Missing résumé evidence is unverified; only an explicit skill confirmation marks no experience.",
+    }
+
+
 def _application_priority(
     job: dict[str, Any],
     qualification_score: int | None,
@@ -9821,6 +9950,7 @@ def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any
             **{key: value for key, value in best.items() if key != "evidence"},
             "evidence_text": text((best.get("evidence") or {}).get("text")),
             "evidence_source": text((best.get("evidence") or {}).get("source_section")),
+            "evidence_type": text((best.get("evidence") or {}).get("evidence_type")),
         })
 
     required = [item for item in assessed if item["importance"] == "required"]
@@ -9859,6 +9989,7 @@ def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any
     matched = [item for item in assessed if item["status"] == "matched"]
     partial = [item for item in assessed if item["status"] == "partial"]
     missing = [item for item in assessed if item["status"] == "missing"]
+    technical_compatibility = _technical_compatibility(assessed, profile)
     reasons = [
         f"Mandatory qualifications: {mandatory_score}% evidence coverage." if mandatory_score is not None else "Mandatory qualifications: unavailable; no clearly classified mandatory requirements were extracted.",
         f"Technical skills and tools: {technical_score}% evidence coverage." if technical_score is not None else "Technical skills and tools: unavailable from the stored posting.",
@@ -9886,6 +10017,7 @@ def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any
         "qualification_fit_missing_requirements": [item["requirement"] for item in missing],
         "qualification_fit_partial_requirements": [item["requirement"] for item in partial],
         "qualification_requirements": assessed,
+        "technical_compatibility": technical_compatibility,
         "experience_requirements": {
             "required": analysis.get("required_experience"),
             "preferred": analysis.get("preferred_experience"),
