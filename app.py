@@ -6555,7 +6555,7 @@ def determine_salary(job: dict[str, Any]) -> dict[str, Any]:
             structured["salary_text"] = f"{qualifier.group(1).title()} {structured['salary_text']}"
             structured["salary_original_text"] = original
             structured["salary_evidence_text"] = original
-        return structured
+        return annualize_using_posted_weekly_hours(structured, text(job.get("job_description")))
 
     salary_text = text(job.get("salary_text") or job.get("salary"))
     if salary_text and not looks_like_estimate(salary_text):
@@ -6565,7 +6565,7 @@ def determine_salary(job: dict[str, Any]) -> dict[str, Any]:
             parsed["salary_confidence"] = max(parsed["salary_confidence"], 82)
             parsed["salary_original_text"] = salary_text
             parsed["salary_text"] = normalized_salary_display(parsed, salary_text)
-            return parsed
+            return annualize_using_posted_weekly_hours(parsed, text(job.get("job_description")))
 
     parsed_description = parse_salary_text(text(job.get("job_description")))
     if parsed_description["salary_source"] != "missing":
@@ -6573,7 +6573,7 @@ def determine_salary(job: dict[str, Any]) -> dict[str, Any]:
         parsed_description["salary_confidence"] = max(parsed_description["salary_confidence"], 72)
         parsed_description["salary_original_text"] = parsed_description.get("salary_evidence_text", "")
         parsed_description["salary_text"] = normalized_salary_display(parsed_description, parsed_description.get("salary_evidence_text", ""))
-        return parsed_description
+        return annualize_using_posted_weekly_hours(parsed_description, text(job.get("job_description")))
 
     # Missing compensation must remain missing.  A market estimate is not an
     # advertised salary and must never influence a recommendation as if it
@@ -6581,9 +6581,36 @@ def determine_salary(job: dict[str, Any]) -> dict[str, Any]:
     return missing_salary()
 
 
+def annualize_using_posted_weekly_hours(salary: dict[str, Any], description: str) -> dict[str, Any]:
+    """Use a stated weekly schedule rather than silently assuming 40 hours."""
+    if salary.get("salary_interval") != "hourly":
+        return salary
+    hours = {
+        float(value)
+        for value in re.findall(r"\b(\d{1,2}(?:\.\d+)?)\s*(?:hours?|hrs?)\s*(?:per|/)\s*week\b", description, re.I)
+        if 1 <= float(value) <= 80
+    }
+    if len(hours) != 1:
+        return salary
+    weekly_hours = hours.pop()
+    annual_min = float(salary.get("salary_advertised_min") or 0) * weekly_hours * 52
+    annual_max = float(salary.get("salary_advertised_max") or 0) * weekly_hours * 52
+    salary["salary_annual_min"] = int(round(annual_min))
+    salary["salary_annual_max"] = int(round(annual_max))
+    salary["salary_annual_midpoint"] = int(round((annual_min + annual_max) / 2))
+    note = f"Annualized using advertised {weekly_hours:g} hours/week"
+    salary["salary_ambiguity"] = "; ".join(filter(None, (salary.get("salary_ambiguity", ""), note)))
+    return salary
+
+
 def structured_salary(job: dict[str, Any]) -> dict[str, Any]:
-    minimum = money_number(job.get("salary_min") or job.get("min_amount"))
-    maximum = money_number(job.get("salary_max") or job.get("max_amount"))
+    # Discovery payloads retain exact advertised decimals separately from
+    # legacy integer salary_min/max. Do not round a posted hourly wage again
+    # when normalizing it for persistence.
+    advertised_min = money_number(job.get("salary_advertised_min"))
+    advertised_max = money_number(job.get("salary_advertised_max"))
+    minimum = advertised_min if advertised_min is not None and advertised_min > 0 else money_number(job.get("salary_min") or job.get("min_amount"))
+    maximum = advertised_max if advertised_max is not None and advertised_max > 0 else money_number(job.get("salary_max") or job.get("max_amount"))
     raw_interval = text(job.get("salary_interval") or job.get("interval"))
     interval = normalize_salary_interval(raw_interval)
     currency = normalize_currency(text(job.get("salary_currency") or job.get("currency")))

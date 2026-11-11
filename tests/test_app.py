@@ -452,6 +452,23 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(analysis["required_experience"]["minimum"], 6)
         self.assertNotIn("30", analysis["required_experience"]["source_evidence"])
 
+    def test_employer_longevity_across_region_is_not_job_experience(self):
+        # Source: Villa Charities ECE posting, January 2026. Its company-history
+        # sentence precedes qualitative experience requirements, not a 50-year bar.
+        description = (
+            "For\tmore\tthan\t50\tyears\tacross\tthe GTA, Villa Charities has provided programs.\n"
+            "Qualifications Required\nExperience working with toddler/preschool children."
+        )
+        normalized = jobspy_source.normalize_jobspy_row(
+            {"title": "Early Childhood Educator", "description": description}, "indeed"
+        )
+        self.assertEqual(normalized["experience_requirement"], "")
+        analysis = seniority.analyze_job_seniority(
+            {"title": "Early Childhood Educator", "job_description": description}
+        )
+        self.assertIsNone(analysis["required_experience"])
+        self.assertFalse(analysis["ambiguous_experience"])
+
     def test_experience_extraction_parses_spelled_out_ranges(self):
         required, preferred, ambiguous = seniority.extract_experience_ranges(
             "This role requires one to five years of relevant software experience."
@@ -3007,6 +3024,52 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(hourly["salary_interval"], "hourly")
         self.assertEqual(hourly["salary_min"], 30)
         self.assertEqual(hourly["salary_annual_min"], 62400)
+
+    def test_advertised_35_hour_schedule_controls_hourly_annualization(self):
+        # Mothercraft RECE Float PDF states both 35 hours/week and this hourly
+        # hiring range. The advertised range must stay hourly and unchanged.
+        salary = app_module.determine_salary({
+            "job_description": "Full-Time, 12-Month Contract (35 hours per week)\nPosition level: Level 4\nHiring range: $24.47 – $28.36 per hour\nSalary range: $24.47 – $32.88 per hour",
+        })
+        self.assertEqual((salary["salary_advertised_min"], salary["salary_advertised_max"]), (24.47, 28.36))
+        self.assertEqual((salary["salary_annual_min"], salary["salary_annual_max"]), (44535, 51615))
+        self.assertEqual(salary["salary_interval"], "hourly")
+        self.assertIn("35 hours/week", salary["salary_ambiguity"])
+        provider = jobspy_source.normalize_jobspy_row({
+            "site": "indeed", "title": "Registered Early Childhood Educator - Float",
+            "company": "Mothercraft", "location": "Toronto, ON",
+            "description": "Full-Time, 12-Month Contract (35 hours per week)\nPosition level: Level 4\nHiring range: $24.47 – $28.36 per hour\nSalary range: $24.47 – $32.88 per hour",
+        })
+        saved = self.client.post("/api/jobs", json=app_module.jobspy_result_to_job_payload(provider))
+        self.assertEqual(saved.status_code, 201)
+        self.assertEqual((saved.get_json()["salary_advertised_min"], saved.get_json()["salary_advertised_max"]), (24.47, 28.36))
+        self.assertEqual((saved.get_json()["salary_annual_min"], saved.get_json()["salary_annual_max"]), (44535, 51615))
+
+    def test_source_backed_childcare_addresses_have_distinct_distances(self):
+        # Villa Charities Jan 2026 ECE PDF names both workplaces; Toronto's
+        # City Hall page supplies the origin address. Coordinates are matching
+        # Nominatim address-level results, not Toronto city centroids.
+        origin = {"latitude": 43.6536032, "longitude": -79.3840055,
+                  "precision": "street address", "confidence": 90,
+                  "normalized": "100 Queen St W, Toronto, ON M5H 2N2"}
+        locations = [
+            (43.7110390, -79.4594629, 9),   # 70 Playfair Ave, M6B 2P9
+            (43.7205044, -79.4822959, 11),  # 340 Falstaff Ave, M6L 3E7
+        ]
+        for lat, lon, expected_km in locations:
+            distance = app_module.location_distance_snapshot(
+                origin, "Toronto, ON", "On-site", "remote_after_local",
+                {"latitude": lat, "longitude": lon, "precision": "street address", "confidence": 90},
+            )
+            self.assertEqual(distance["distance_km"], expected_km)
+            self.assertEqual(distance["distance_label"], "approximate")
+            self.assertIsNone(distance["city_estimate_km"])
+        city = app_module.location_distance_snapshot(
+            origin, "Toronto, ON", "On-site", "remote_after_local",
+            {"latitude": 43.6536, "longitude": -79.3832, "precision": "city", "confidence": 70},
+        )
+        self.assertEqual(city["distance_km"], 9999)
+        self.assertEqual(city["distance_label"], "unknown")
 
     def test_salary_parser_preserves_decimal_and_currency_prefixed_range_endpoints(self):
         hourly = app_module.parse_salary_text("Salary: $18.00-$21.00 per hour")
