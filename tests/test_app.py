@@ -2521,6 +2521,42 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(provider.calls, 1)
         self.assertIn("temporarily rate limited", second["error"])
 
+    def test_geocoding_failures_are_categorized_without_exposing_coordinates(self):
+        cases = [
+            ("M5V 2", ValueError("invalid"), "invalid_input"),
+            ("M5V 2T6", ValueError("No geocoding match found"), "no_match"),
+            ("M5V 2T6", urllib.error.HTTPError("https://example.test", 403, "Forbidden", {}, None), "http_403"),
+            ("M5V 2T6", urllib.error.URLError("offline"), "network_error"),
+        ]
+        for value, failure, expected in cases:
+            provider = FakeGeocodingProvider({"M5V 2T6, Canada": failure})
+            with app_module.app.app_context():
+                app_module.init_db()
+                result = app_module.geocode_location_value(value, lookup_type="distance_origin", provider=provider, use_cache=False)
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["status"], expected)
+            self.assertIn(expected, result["failure_reasons"])
+            self.assertNotIn("latitude", result["error"].lower())
+            self.assertNotIn("longitude", result["error"].lower())
+
+    def test_discovery_search_signature_changes_with_private_distance_origin(self):
+        base = {"keywords": "software developer", "location": "Toronto", "enabled_sources": ["linkedin"], "distance": 50}
+        first = app_module.discovery_search_signature({**base, "distance_origin_input": "M5V 2T6"})
+        second = app_module.discovery_search_signature({**base, "distance_origin_input": "M2J 0B6"})
+        self.assertNotEqual(first, second)
+
+    def test_private_origin_recalculates_cached_workplace_distance_without_scraping(self):
+        provider = FakeGeocodingProvider({
+            "M5V 2T6, Canada": {"latitude": 43.6426, "longitude": -79.3871, "display_name": "Toronto, Ontario, Canada"},
+            "M2J 0B6, Canada": {"latitude": 43.787, "longitude": -79.353, "display_name": "Toronto, Ontario, Canada"},
+        })
+        job = {"location": "M2J 0B6", "workplace_postal_code": "M2J 0B6", "remote_type": "On-site"}
+        origin = app_module.geocode_location_value("M5V 2T6", lookup_type="distance_origin", provider=provider, use_cache=False)
+        refreshed, _ = app_module.geocode_discovery_job(job, {}, origin, provider, use_cache=False)
+        self.assertEqual(refreshed["distance_type"], "straight_line")
+        self.assertGreater(refreshed["distance_km"], 0)
+        self.assertEqual(refreshed["location_precision"], "postal code")
+
     def test_discovery_task_status_is_read_only_and_scripts_are_present(self):
         response = self.client.get("/api/discovery/task-status")
         self.assertEqual(response.status_code, 200)

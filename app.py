@@ -2258,9 +2258,10 @@ def create_app() -> Flask:
         search["location_geocode"] = location_context["lookup"]
         if location_context.get("distance_origin_lookup", {}).get("ok"):
             origin_result = location_context["distance_origin_lookup"]
-            origin = {"input": origin_result.get("original_input"), "normalized": origin_result.get("normalized_query"), "latitude": origin_result.get("latitude"), "longitude": origin_result.get("longitude"), "provider": origin_result.get("provider"), "confidence": origin_result.get("confidence"), "precision": origin_result.get("precision"), "geocoded_at": origin_result.get("geocoded_at"), "status": origin_result.get("status"), "error": origin_result.get("error", "")}
+            origin = {"input": origin_result.get("original_input"), "normalized": origin_result.get("normalized_query"), "latitude": origin_result.get("latitude"), "longitude": origin_result.get("longitude"), "provider": origin_result.get("provider"), "confidence": origin_result.get("confidence"), "precision": origin_result.get("precision"), "geocoded_at": origin_result.get("geocoded_at"), "status": origin_result.get("status"), "error": origin_result.get("error", ""), "cached": origin_result.get("cached", False), "failure_reasons": origin_result.get("failure_reasons", [])}
         elif search.get("distance_origin_input"):
-            origin = {"input": search["distance_origin_input"], "normalized": search["distance_origin_input"], "status": "unresolved", "precision": "unknown", "error": "The requested private distance origin could not be resolved."}
+            origin_lookup = location_context.get("distance_origin_lookup") or {}
+            origin = {"input": search["distance_origin_input"], "normalized": search["distance_origin_input"], "provider": origin_lookup.get("provider", ""), "status": origin_lookup.get("status") or "unresolved", "precision": "unknown", "error": origin_lookup.get("error") or "The requested private distance origin could not be resolved.", "failure_reasons": origin_lookup.get("failure_reasons", [])}
 
         search["keywords"] = keywords
         fetched = fetch_discovery_jobs_for_search(search, country_indeed=text(payload.get("country_indeed")) or "Canada")
@@ -2353,13 +2354,24 @@ def create_app() -> Flask:
             "cache_created_at": "",
             "cached_raw_result_count": 0,
             "search_criteria": search,
-            "saved_origin": origin,
+            "saved_origin": {
+                "input": redact_location_input(text(origin.get("input"))),
+                "normalized": redact_location_input(text(origin.get("normalized"))),
+                "provider": text(origin.get("provider")),
+                "status": text(origin.get("status")),
+                "precision": text(origin.get("precision")),
+                "cached": bool(origin.get("cached")),
+            },
             "original_location": search.get("original_location"),
             "normalized_location": search.get("normalized_location"),
             "distance_origin": search.get("distance_origin"),
             "discovery_location": search.get("discovery_location"),
             "location_resolution_method": search.get("location_resolution_method"),
             "origin_geocode_status": origin.get("status"),
+            "origin_geocode_error": text(origin.get("error")),
+            "origin_geocode_failure_reasons": location_context.get("distance_origin_lookup", {}).get("failure_reasons", []),
+            "origin_geocode_provider": text(origin.get("provider")),
+            "origin_input_redacted": redact_location_input(text(search.get("distance_origin_input"))),
             "origin_precision": origin.get("precision"),
             "origin_available": discovery_origin_available(profile),
             "jobs_geocoded_successfully": geocoding_success,
@@ -2489,6 +2501,78 @@ def create_app() -> Flask:
                 "total": len(fetched.get("jobs", [])),
             }
         )
+
+    @app.post("/api/discovery/recalculate-distances")
+    def recalculate_discovery_distances() -> Response:
+        """Recompute cached discovery distances without contacting job boards."""
+        payload = request.get_json(silent=True) or {}
+        search_key = text(payload.get("search_key")) or text(request.args.get("search_key"))
+        cached_run = load_discovery_search_run(search_key) if search_key else load_latest_discovery_search_run()
+        if not cached_run:
+            return jsonify({"error": "No cached discovery results are available to re-enrich."}), 404
+        search = dict(cached_run.get("search") or {})
+        profile = load_profile()
+        origin_input = normalize_space(text(payload.get("distance_origin_input") or payload.get("distance_origin")))
+        if not origin_input:
+            origin_input = text(search.get("distance_origin_input")) or text(profile.get("home_location_original") or profile.get("location"))
+        provider = get_geocoding_provider()
+        try:
+            location_context = resolve_discovery_location_context(
+                text(search.get("location")), profile, provider, use_cache=True,
+                distance_origin_input=origin_input,
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        origin_lookup = location_context.get("distance_origin_lookup") or {}
+        if origin_lookup.get("ok"):
+            origin = {
+                "input": origin_lookup.get("original_input"), "normalized": origin_lookup.get("normalized_query"),
+                "latitude": origin_lookup.get("latitude"), "longitude": origin_lookup.get("longitude"),
+                "provider": origin_lookup.get("provider"), "confidence": origin_lookup.get("confidence"),
+                "precision": origin_lookup.get("precision"), "status": origin_lookup.get("status"),
+                "error": origin_lookup.get("error", ""), "cached": origin_lookup.get("cached", False),
+            }
+        else:
+            origin = {"input": origin_input, "normalized": origin_input, "status": "unresolved", "precision": "unknown", "error": origin_lookup.get("error") or "The requested private distance origin could not be resolved.", "failure_reasons": origin_lookup.get("failure_reasons", [])}
+        evidence_profile = resolve_discovery_evidence_profile(search)
+        refreshed_jobs: list[dict[str, Any]] = []
+        updated = 0
+        for cached_job in cached_run.get("jobs") or []:
+            job = dict(cached_job)
+            job, _ = geocode_discovery_job(job, profile, origin, provider, use_cache=True)
+            job = enrich_discovery_job(job, profile, {"remote_rule": "remote_after_local", "distance_origin": origin}, evidence_profile=evidence_profile)
+            refreshed_jobs.append(job)
+            job_id = clamp_int(job.get("id"), 0, 10**9)
+            if job_id:
+                get_db().execute(
+                    """UPDATE jobs SET distance_km = ?, distance_confidence = ?, distance_origin_label = ?,
+                       distance_origin_precision = ?, distance_origin_status = ?, distance_type = ?,
+                       commute_status = ?, commute_source = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+                    [job.get("distance_km", 9999), job.get("distance_confidence", 0), job.get("distance_origin_label", ""),
+                     job.get("distance_origin_precision", ""), job.get("distance_origin_status", ""), job.get("distance_type", "unknown"),
+                     job.get("commute_status", "unavailable"), job.get("commute_source", ""), job_id],
+                )
+                updated += 1
+        get_db().commit()
+        search["distance_origin_input"] = origin_input
+        search["distance_origin"] = normalize_canadian_postal_code(extract_canadian_postal_code(origin_input)) if extract_canadian_postal_code(origin_input) else origin_input
+        diagnostics = dict(cached_run.get("metadata") or {})
+        diagnostics.update({
+            "saved_origin": {"input": redact_location_input(origin.get("input", "")), "normalized": redact_location_input(origin.get("normalized", "")), "provider": origin.get("provider", ""), "status": origin.get("status", ""), "precision": origin.get("precision", ""), "cached": bool(origin.get("cached"))},
+            "origin_geocode_status": origin.get("status", ""),
+            "origin_geocode_error": origin.get("error", ""),
+            "origin_geocode_failure_reasons": origin_lookup.get("failure_reasons", []),
+            "origin_geocode_provider": origin.get("provider", ""),
+            "origin_input_redacted": redact_location_input(origin_input),
+            "jobs_with_unknown_distance": sum(1 for job in refreshed_jobs if job.get("distance_km", 9999) >= 9999),
+            "jobs_geocoded_successfully": sum(1 for job in refreshed_jobs if text(job.get("location_geocode_status")) in {"saved", "cached"}),
+            "jobs_using_cached_coordinates": sum(1 for job in refreshed_jobs if job.get("location_cached")),
+            "recalculated_without_scraping": True,
+            "recalculated_job_count": len(refreshed_jobs),
+        })
+        refreshed_search_key = discovery_search_signature(search)
+        save_discovery_search_run(refreshed_search_key, search, diagnostics, refreshed_jobs)
+        return jsonify({"ok": True, "search_key": refreshed_search_key, "search": search, "jobs": refreshed_jobs, "updated_persisted_jobs": updated, "diagnostics": diagnostics, "scraped": False})
 
     @app.post("/api/generate")
     def generate_materials() -> Response:
@@ -3026,9 +3110,10 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
     })
     if location_context.get("distance_origin_lookup", {}).get("ok"):
         origin_result = location_context["distance_origin_lookup"]
-        origin = {"input": origin_result.get("original_input"), "normalized": origin_result.get("normalized_query"), "latitude": origin_result.get("latitude"), "longitude": origin_result.get("longitude"), "provider": origin_result.get("provider"), "confidence": origin_result.get("confidence"), "precision": origin_result.get("precision"), "geocoded_at": origin_result.get("geocoded_at"), "status": origin_result.get("status"), "error": origin_result.get("error", "")}
+        origin = {"input": origin_result.get("original_input"), "normalized": origin_result.get("normalized_query"), "latitude": origin_result.get("latitude"), "longitude": origin_result.get("longitude"), "provider": origin_result.get("provider"), "confidence": origin_result.get("confidence"), "precision": origin_result.get("precision"), "geocoded_at": origin_result.get("geocoded_at"), "status": origin_result.get("status"), "error": origin_result.get("error", ""), "cached": origin_result.get("cached", False), "failure_reasons": origin_result.get("failure_reasons", [])}
     elif search.get("distance_origin_input"):
-        origin = {"input": search["distance_origin_input"], "normalized": search["distance_origin_input"], "status": "unresolved", "precision": "unknown", "error": "The requested private distance origin could not be resolved."}
+        origin_lookup = location_context.get("distance_origin_lookup") or {}
+        origin = {"input": search["distance_origin_input"], "normalized": search["distance_origin_input"], "provider": origin_lookup.get("provider", ""), "status": origin_lookup.get("status") or "unresolved", "precision": "unknown", "error": origin_lookup.get("error") or "The requested private distance origin could not be resolved.", "failure_reasons": origin_lookup.get("failure_reasons", [])}
     search["keywords"] = keywords
     fetched = fetch_discovery_jobs_for_search(search, country_indeed="Canada")
     existing_keys = existing_job_dedupe_keys()
@@ -3120,6 +3205,11 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         "persisted": persisted,
         "auto_preparation_queued": auto_preparation_queued,
         "filtered": filtered,
+        "origin_geocode_status": origin.get("status"),
+        "origin_geocode_error": text(origin.get("error")),
+        "origin_geocode_failure_reasons": origin.get("failure_reasons", []),
+        "origin_geocode_provider": text(origin.get("provider")),
+        "origin_input_redacted": redact_location_input(text(search.get("distance_origin_input"))),
     }
     save_discovery_search_run(search_key, search, metadata, jobs)
     save_discovery_debug_run(search_key, {**payload, "search_id": search_id}, metadata, fetched.get("source_snapshots", {}))
@@ -6806,6 +6896,7 @@ def discovery_search_signature(payload: dict[str, Any]) -> str:
     relevant = {
         "keywords": search["keywords"],
         "location": search["location"],
+        "distance_origin_input": search.get("distance_origin_input", ""),
         "distance": search["distance"],
         "enabled_sources": search["enabled_sources"],
         "remote_preference": search["remote_preference"],
@@ -7314,6 +7405,36 @@ def get_geocoding_provider() -> GeocodingProvider:
     return NominatimGeocodingProvider()
 
 
+def classify_geocoding_exception(exc: Exception) -> tuple[str, str]:
+    """Return a stable, user-safe diagnostic category and message."""
+    if isinstance(exc, urllib.error.HTTPError):
+        if exc.code == 403:
+            return "http_403", "The geocoding provider denied this request (HTTP 403)."
+        if exc.code == 429:
+            return "rate_limited", "The geocoding provider is temporarily rate limited (HTTP 429)."
+        return f"http_{exc.code}", f"The geocoding provider returned HTTP {exc.code}."
+    if isinstance(exc, urllib.error.URLError):
+        return "network_error", "The geocoding provider could not be reached."
+    if isinstance(exc, TimeoutError) or "timed out" in str(exc).lower():
+        return "network_error", "The geocoding provider request timed out."
+    if isinstance(exc, ValueError) and "no geocoding match" in str(exc).lower():
+        return "no_match", "The geocoding provider found no Canadian match."
+    if isinstance(exc, ValueError) and "did not match" in str(exc).lower():
+        return "rejected_result", "The geocoding result was rejected because it did not match the requested Canadian location."
+    if isinstance(exc, RuntimeError) and "disabled" in str(exc).lower():
+        return "provider_disabled", "Geocoding is disabled in this installation."
+    return "provider_error", "The geocoding provider returned an unusable result."
+
+
+def redact_location_input(value: str) -> str:
+    """Keep diagnostics useful without echoing a complete private postal code."""
+    raw = normalize_space(value)
+    postal = extract_canadian_postal_code(raw)
+    if postal:
+        return f"Canadian postal code ending {postal[-3:]}"
+    return raw[:80]
+
+
 def geocode_location_value(
     raw_value: str,
     *,
@@ -7342,6 +7463,25 @@ def geocode_location_value(
             "cached": False,
         }
 
+    if looks_like_invalid_postal_code(raw):
+        return {
+            "ok": False,
+            "status": "invalid_input",
+            "original_input": raw,
+            "normalized_query": raw,
+            "latitude": "",
+            "longitude": "",
+            "provider": provider.name,
+            "confidence": 0,
+            "precision": "",
+            "geocoded_at": datetime.now().isoformat(timespec="seconds"),
+            "error": "The Canadian postal code format is invalid.",
+            "failure_reasons": ["invalid_input"],
+            "attempt_count": 0,
+            "used_fallback": False,
+            "cached": False,
+        }
+
     candidates = build_location_lookup_candidates(raw, profile)
     if not candidates:
         return {
@@ -7361,9 +7501,14 @@ def geocode_location_value(
         }
 
     errors: list[str] = []
+    failure_reasons: list[str] = []
     for candidate in candidates:
         cache_key = geocoding_cache_key(lookup_type, candidate["query"], candidate["normalized_query"])
-        cached = load_geocoding_cache(cache_key) if use_cache else None
+        try:
+            cached = load_geocoding_cache(cache_key) if use_cache else None
+        except Exception:
+            cached = None
+            failure_reasons.append("cache_failure")
         if cached is not None:
             cached_result = dict(cached["result"])
             cached_result.update(
@@ -7380,6 +7525,7 @@ def geocode_location_value(
                 return cached_result
             if cached_result.get("ok"):
                 cached_result = {**cached_result, "ok": False, "status": "invalid_cached_result", "error": "Cached geocoding coordinates did not match the requested location."}
+                failure_reasons.append("invalid_cached_result")
             errors.append(text(cached_result.get("error")) or "Cached geocoding failure.")
             if cached_result.get("status") == "rate_limited":
                 break
@@ -7410,46 +7556,32 @@ def geocode_location_value(
             if not geocoding_result_matches_query(raw, candidate["normalized_query"], result):
                 raise ValueError("Geocoding result did not match the requested Canadian location.")
             if use_cache:
-                save_geocoding_cache(cache_key, lookup_type, candidate["query"], candidate["normalized_query"], provider.name, result, True)
+                try:
+                    save_geocoding_cache(cache_key, lookup_type, candidate["query"], candidate["normalized_query"], provider.name, result, True)
+                except Exception:
+                    failure_reasons.append("cache_failure")
             return result
-        except urllib.error.HTTPError as exc:
-            rate_limited = exc.code == 429
-            error_message = "The location service is temporarily rate limited." if rate_limited else f"HTTP {exc.code}: geocoding unavailable."
+        except Exception as exc:
+            status, error_message = classify_geocoding_exception(exc)
             failure = {
-                "ok": False, "status": "rate_limited" if rate_limited else "failed", "original_input": raw,
+                "ok": False, "status": status, "original_input": raw,
                 "normalized_query": candidate["normalized_query"], "latitude": "", "longitude": "",
                 "provider": provider.name, "confidence": 0, "precision": candidate["precision"],
                 "geocoded_at": datetime.now().isoformat(timespec="seconds"), "error": error_message,
                 "used_fallback": bool(candidate["used_postal_fallback"]), "cached": False,
             }
             if use_cache:
-                save_geocoding_cache(cache_key, lookup_type, candidate["query"], candidate["normalized_query"], provider.name, failure, False)
+                try:
+                    save_geocoding_cache(cache_key, lookup_type, candidate["query"], candidate["normalized_query"], provider.name, failure, False)
+                except Exception:
+                    failure_reasons.append("cache_failure")
             errors.append(error_message)
-            if rate_limited:
+            failure_reasons.append(status)
+            if status == "rate_limited":
                 break
-        except Exception as exc:
-            error_message = f"{type(exc).__name__}: {exc}"
-            failure = {
-                "ok": False,
-                "status": "failed",
-                "original_input": raw,
-                "normalized_query": candidate["normalized_query"],
-                "latitude": "",
-                "longitude": "",
-                "provider": provider.name,
-                "confidence": 0,
-                "precision": candidate["precision"],
-                "geocoded_at": datetime.now().isoformat(timespec="seconds"),
-                "error": error_message,
-                "used_fallback": bool(candidate["used_postal_fallback"]),
-                "cached": False,
-            }
-            if use_cache:
-                save_geocoding_cache(cache_key, lookup_type, candidate["query"], candidate["normalized_query"], provider.name, failure, False)
-            errors.append(error_message)
     return {
         "ok": False,
-        "status": "rate_limited" if any("rate limited" in error.lower() for error in errors) else "failed",
+        "status": "rate_limited" if "rate_limited" in failure_reasons else (failure_reasons[-1] if failure_reasons else "failed"),
         "original_input": raw,
         "normalized_query": candidates[-1]["normalized_query"],
         "latitude": "",
@@ -7458,7 +7590,9 @@ def geocode_location_value(
         "confidence": 0,
         "precision": candidates[-1]["precision"],
         "geocoded_at": datetime.now().isoformat(timespec="seconds"),
-        "error": "The location service is temporarily rate limited." if any("rate limited" in error.lower() for error in errors) else ("Location enrichment is unavailable; distance remains unknown." if errors else "Location could not be geocoded."),
+        "error": errors[-1] if errors else "Location could not be geocoded.",
+        "failure_reasons": list(dict.fromkeys(failure_reasons)),
+        "attempt_count": len(candidates),
         "used_fallback": bool(candidates[-1]["used_postal_fallback"]),
         "cached": False,
     }

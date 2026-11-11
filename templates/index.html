@@ -128,7 +128,7 @@
               <label>Fetch limit<input id="discovery-total-cap" type="number" min="1" step="1" value="200"></label>
               <label>Résumé profile<select id="discovery-profile"><option value="">Use active Profile</option></select></label>
             </div>
-            <p class="muted helper">Job Title Search uses the advertised title and recognized occupation synonyms. Explore Opportunities may retain adjacent roles for manual review and does not require a résumé profile.</p>
+            <p class="muted helper">Keywords retrieve postings from the selected sources. A selected résumé evaluates returned listings; it does not discover every suitable position. Job Title Search uses the advertised title and recognized occupation synonyms. Explore Opportunities may retain adjacent roles for manual review and does not require a résumé profile.</p>
             <fieldset class="source-picker">
               <legend>Sources</legend>
               <label><input type="checkbox" name="discovery-source" value="linkedin" checked> LinkedIn</label>
@@ -166,6 +166,7 @@
               <button class="button" type="submit" id="discovery-submit">Search jobs</button>
               <button class="button ghost" type="button" id="save-current-discovery-search">Save current search</button>
               <button class="button ghost" type="button" id="discovery-test-sources">Test job sources</button>
+              <button class="button ghost" type="button" id="discovery-recalculate-distances">Recalculate distances</button>
             </div>
           </form>
 

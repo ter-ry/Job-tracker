@@ -139,6 +139,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("refresh-discovery-task-status")?.addEventListener("click", loadDiscoveryTaskStatus);
   document.getElementById("csv-import-form").addEventListener("submit", importCsv);
   document.getElementById("discovery-test-sources").addEventListener("click", testJobSources);
+  document.getElementById("discovery-recalculate-distances")?.addEventListener("click", recalculateDiscoveryDistances);
   document.getElementById("save-current-discovery-search").addEventListener("click", saveCurrentDiscoverySearch);
   document.getElementById("refresh-shortlist").addEventListener("click", loadAll);
   document.getElementById("toggle-advanced-features")?.addEventListener("click", toggleAdvancedFeatures);
@@ -2681,6 +2682,38 @@ async function testJobSources(event) {
   }
 }
 
+async function recalculateDiscoveryDistances(event) {
+  event.preventDefault();
+  const button = document.getElementById("discovery-recalculate-distances");
+  const status = document.getElementById("discovery-status");
+  if (!state.discoverySearchKey && !state.discoveryResults.length) {
+    toast("Run or restore a discovery search first.");
+    return;
+  }
+  button.disabled = true;
+  if (status) status.textContent = "Recalculating distances from the private origin using cached workplace evidence...";
+  try {
+    const result = await api.send("/api/discovery/recalculate-distances", "POST", {
+      search_key: state.discoverySearchKey,
+      distance_origin_input: value("discovery-distance-origin"),
+    });
+    state.discoveryResults = result.jobs || [];
+    state.discoverySearchKey = result.search_key || state.discoverySearchKey;
+    state.discoverySearchCriteria = { ...(state.discoverySearchCriteria || {}), ...(result.search || {}), distance_origin_input: value("discovery-distance-origin") };
+    state.discoveryMeta = { ...(state.discoveryMeta || {}), diagnostics: result.diagnostics || {}, total: state.discoveryResults.length, visible_total: state.discoveryResults.length };
+    renderDiscoveryResults(state.discoveryMeta);
+    renderDiscoveryOriginSummary();
+    if (status) status.textContent = result.diagnostics?.origin_geocode_status === "unresolved"
+      ? "Origin could not be resolved; jobs were kept and distances remain unknown."
+      : `Distances recalculated for ${state.discoveryResults.length} cached jobs without scraping again.`;
+  } catch (error) {
+    if (status) status.textContent = error.message;
+    toast(error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function selectedDiscoverySources() {
   return [...document.querySelectorAll('input[name="discovery-source"]:checked')].map((input) => input.value);
 }
@@ -2853,9 +2886,27 @@ function renderDiscoveryDiagnostics(diagnostics, visibleCount, totalCount) {
     details.push(`<li><strong>Country-wide provider regions:</strong> ${escapeHtml(diagnostics.countrywide_region_queries.join(" | "))}</li>`);
   }
   details.push(`<li><strong>Origin:</strong> ${escapeHtml([
+    diagnostics.origin_input_redacted ? `input=${diagnostics.origin_input_redacted}` : "",
     diagnostics.origin_geocode_status ? `status=${diagnostics.origin_geocode_status}` : "",
     diagnostics.origin_precision ? `precision=${diagnostics.origin_precision}` : "",
+    diagnostics.origin_geocode_provider ? `provider=${diagnostics.origin_geocode_provider}` : "",
   ].filter(Boolean).join("; ") || (origin.status ? "configured" : "not configured"))}</li>`);
+  if (diagnostics.origin_geocode_error || (diagnostics.origin_geocode_failure_reasons || []).length) {
+    const reasons = diagnostics.origin_geocode_failure_reasons || [];
+    const guidance = reasons.includes("invalid_input") || reasons.includes("no_match") || reasons.includes("rejected_result")
+      ? "Check the postal-code format or use a city/province origin for an approximate distance."
+      : reasons.includes("http_403") || reasons.includes("provider_disabled")
+        ? "The geocoding provider is unavailable for this installation; try a city/province origin or retry later."
+        : reasons.includes("rate_limited")
+          ? "The provider rate limit was reached; cached results remain available and retrying later is safer."
+          : reasons.includes("network_error")
+            ? "The provider could not be reached; retry when network access is available."
+            : reasons.includes("cache_failure")
+              ? "The local geocoding cache could not be read or written; distances remain unverified until retry."
+              : "The origin could not be verified; distances remain unknown until a trusted result is available.";
+    details.push(`<li><strong>Origin diagnostic:</strong> ${escapeHtml([diagnostics.origin_geocode_error || "", reasons.join(", ")].filter(Boolean).join("; "))}</li>`);
+    details.push(`<li><strong>Origin next step:</strong> ${escapeHtml(guidance)}</li>`);
+  }
   details.push(`<li><strong>Raw fetched:</strong> ${fetched}</li>`);
   details.push(`<li><strong>Visible after local filters:</strong> ${Number(visibleCount || 0)}</li>`);
   details.push(`<li><strong>Hidden by local filters:</strong> ${hiddenByLocalFilters}</li>`);
