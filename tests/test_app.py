@@ -1663,6 +1663,7 @@ class JobAssistantTest(unittest.TestCase):
             "latitude": 43.787,
             "longitude": -79.353,
             "display_name": "Toronto, Ontario, Canada",
+            "postal_code": "M2J 0B6",
         }
         provider = FakeGeocodingProvider({"M2J 0B6, Canada": good})
         with app_module.app.app_context():
@@ -1704,6 +1705,7 @@ class JobAssistantTest(unittest.TestCase):
                     "provider": "fake",
                     "confidence": 95,
                     "precision": "postal code",
+                    "postal_code": "M5V 2T6",
                     "geocoded_at": "2026-06-20T10:00:00",
                     "normalized_query": "M5V 2T6, Canada",
                     "error": "",
@@ -1732,7 +1734,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertTrue(app_module.geocode_matches_canadian_location("M5V2T6", result))
         self.assertFalse(app_module.geocode_matches_canadian_location("M5V 2T7", result))
 
-    def test_postal_match_accepts_postal_level_country_evidence_when_display_omits_province(self):
+    def test_postal_match_rejects_postal_level_country_evidence_without_exact_code(self):
         result = {
             "latitude": 43.787,
             "longitude": -79.353,
@@ -1740,7 +1742,7 @@ class JobAssistantTest(unittest.TestCase):
             "match_level": "postal",
             "raw": {"country_code": "ca"},
         }
-        self.assertTrue(app_module.geocode_matches_canadian_location("M2J0B6", result))
+        self.assertFalse(app_module.geocode_matches_canadian_location("M2J0B6", result))
 
     def test_postal_match_does_not_accept_country_only_coordinates_without_postal_evidence(self):
         result = {
@@ -1750,6 +1752,22 @@ class JobAssistantTest(unittest.TestCase):
             "raw": {"country_code": "ca"},
         }
         self.assertFalse(app_module.geocode_matches_canadian_location("M2J0B6", result))
+
+    def test_postal_match_rejects_other_canadian_postal_code(self):
+        result = {"display_name": "Toronto, Ontario, Canada", "postal_code": "M5V 2T6", "match_level": "postal"}
+        self.assertFalse(app_module.geocode_matches_canadian_location("M2J 0B6", result))
+
+    def test_geocoder_ca_requires_explicit_installation_configuration(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsInstance(app_module.get_geocoding_provider(), app_module.NominatimGeocodingProvider)
+        with patch.dict(os.environ, {"JOB_TRACKER_GEOCODING_PROVIDER": "geocoder.ca"}):
+            self.assertIsInstance(app_module.get_geocoding_provider(), app_module.GeocoderCaProvider)
+
+    def test_postal_provider_failure_never_substitutes_city_coordinates(self):
+        provider = FakeGeocodingProvider({"M2J 0B6, Canada": ValueError("No geocoding match found")})
+        result = app_module.geocode_location_value("M2J0B6", lookup_type="distance_origin", provider=provider, use_cache=False)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["latitude"], "")
 
     def test_geocoder_ca_provider_parses_canadian_coordinates_and_postal(self):
         response = FakeUrlopenResponse({
@@ -1976,6 +1994,7 @@ class JobAssistantTest(unittest.TestCase):
                     "latitude": 43.6426,
                     "longitude": -79.3871,
                     "display_name": "Toronto, Ontario, Canada",
+                    "postal_code": "M5V 2T6",
                     "ok": True,
                     "status": "saved",
                     "provider": "fake",
@@ -2605,8 +2624,8 @@ class JobAssistantTest(unittest.TestCase):
 
     def test_private_origin_recalculates_cached_workplace_distance_without_scraping(self):
         provider = FakeGeocodingProvider({
-            "M5V 2T6, Canada": {"latitude": 43.6426, "longitude": -79.3871, "display_name": "Toronto, Ontario, Canada"},
-            "M2J 0B6, Canada": {"latitude": 43.787, "longitude": -79.353, "display_name": "Toronto, Ontario, Canada"},
+            "M5V 2T6, Canada": {"latitude": 43.6426, "longitude": -79.3871, "display_name": "Toronto, Ontario, Canada", "postal_code": "M5V 2T6"},
+            "M2J 0B6, Canada": {"latitude": 43.787, "longitude": -79.353, "display_name": "Toronto, Ontario, Canada", "postal_code": "M2J 0B6"},
         })
         job = {"location": "M2J 0B6", "workplace_postal_code": "M2J 0B6", "remote_type": "On-site"}
         origin = app_module.geocode_location_value("M5V 2T6", lookup_type="distance_origin", provider=provider, use_cache=False)
@@ -3098,8 +3117,8 @@ class JobAssistantTest(unittest.TestCase):
             },
         )
         states = {item["requirement"].lower(): item["state"] for item in result["technical_compatibility"]["items"]}
-        self.assertEqual(states["python"], "Familiar")
-        self.assertEqual(states["react"], "Familiar")
+        self.assertEqual(states["python"], "Demonstrated")
+        self.assertEqual(states["react"], "Demonstrated")
         self.assertEqual(states["kubernetes"], "Unverified")
         self.assertIn("Unverified", result["technical_compatibility"]["explanation"])
 

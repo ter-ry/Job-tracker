@@ -2232,6 +2232,8 @@ def create_app() -> Flask:
             search = discovery_search_config(payload)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
+        if search["search_mode"] == "shortlist" and not text(payload.get("candidate_profile_id")):
+            return jsonify({"error": "Select a candidate résumé profile for the technical shortlist."}), 400
         search_key = discovery_search_signature(payload)
         with _ACTIVE_DISCOVERY_SEARCHES_LOCK:
             if search_key in _ACTIVE_DISCOVERY_SEARCHES:
@@ -2416,6 +2418,13 @@ def create_app() -> Flask:
             hydrate_discovery_identity(item)
         processed_count = sum(1 for item in jobs if item.get("processed_discovery"))
         jobs = [item for item in jobs if not item.get("processed_discovery")]
+        shortlist_jobs: list[dict[str, Any]] = []
+        if search["search_mode"] == "shortlist":
+            rank = {"Strong technical match": 0, "Possible / stretch": 1, "Possible / stretch — evidence incomplete": 2, "Significant gaps": 3}
+            ordered = sorted(jobs, key=lambda item: (rank.get(text((item.get("technical_compatibility") or {}).get("decision")), 4), -int(item.get("application_priority_score") or 0)))
+            if as_bool(payload.get("strict_technical")):
+                ordered = [item for item in ordered if not (item.get("technical_compatibility") or {}).get("required_no_experience")]
+            shortlist_jobs = ordered[:clamp_int_default(payload.get("shortlist_size"), 15, 1, 100)]
         finish_discovery_run(
             manual_run_id,
             status="completed" if not fetched.get("errors") else "completed_with_errors",
@@ -2440,6 +2449,7 @@ def create_app() -> Flask:
         return jsonify(
             {
                 "jobs": jobs,
+                "technical_shortlist": shortlist_jobs,
                 "errors": fetched.get("errors", {}),
                 "source_counts": source_counts,
                 "total": len(raw_jobs),
@@ -2828,7 +2838,7 @@ def normalize_saved_search_payload(payload: dict[str, Any], existing: dict[str, 
     interval_minutes = clamp_int_default(payload.get("interval_minutes", existing.get("interval_minutes")), 360, 15, 10080)
     minimum_salary = clamp_int_default(payload.get("minimum_salary", existing.get("minimum_salary")), 0, 0, 1000000)
     distance = clamp_int_default(payload.get("distance", existing.get("distance")), 50, 0, 1000)
-    search_mode = normalize_choice(payload.get("search_mode", existing.get("search_mode")), {"title", "explore"}) or "title"
+    search_mode = normalize_choice(payload.get("search_mode", existing.get("search_mode")), {"title", "explore", "shortlist"}) or "title"
     title_match_mode = normalize_choice(payload.get("title_match_mode", existing.get("title_match_mode")), {"strict", "related"}) or "related"
     existing_sources = existing.get("enabled_sources")
     if not isinstance(existing_sources, list):
@@ -2897,7 +2907,7 @@ def saved_search_to_discovery_payload(search: dict[str, Any]) -> dict[str, Any]:
 
 def resolve_discovery_evidence_profile(payload: dict[str, Any]) -> dict[str, Any]:
     """Resolve the résumé used for discovery scoring, without mixing profiles."""
-    search_mode = normalize_choice(payload.get("search_mode"), {"title", "explore"}) or "title"
+    search_mode = normalize_choice(payload.get("search_mode"), {"title", "explore", "shortlist"}) or "title"
     profile_id = payload.get("candidate_profile_id") or payload.get("auto_prepare_candidate_profile_id")
     if search_mode == "title" and profile_id in (None, "", 0):
         # Title Search is useful before a résumé exists.  An active SWE résumé
@@ -7017,7 +7027,7 @@ def discovery_search_config(payload: dict[str, Any]) -> dict[str, Any]:
     per_source_cap = clamp_int_default(payload.get("per_source_cap"), preset["per_source_cap"], 1, 1000)
     total_cap = clamp_int_default(payload.get("total_cap"), preset["total_cap"], 1, 5000)
     distance = clamp_int_default(payload.get("distance"), 50, 0, 1000)
-    search_mode = normalize_choice(payload.get("search_mode"), {"title", "explore"}) or "title"
+    search_mode = normalize_choice(payload.get("search_mode"), {"title", "explore", "shortlist"}) or "title"
     title_match_mode = normalize_choice(payload.get("title_match_mode"), {"strict", "related"}) or "related"
     enabled_sources = normalize_discovery_sources(payload.get("enabled_sources"))
     validate_discovery_budget(total_cap, enabled_sources)
@@ -7475,7 +7485,9 @@ def get_geocoding_provider() -> GeocodingProvider:
         return GeocoderCaProvider()
     if configured in {"nominatim", "osm"}:
         return NominatimGeocodingProvider()
-    return CanadianPostalAwareProvider()
+    # geocoder.ca requires registration and eligibility for its free tier.
+    # An explicit installation setting is the consent boundary.
+    return NominatimGeocodingProvider()
 
 
 def classify_geocoding_exception(exc: Exception) -> tuple[str, str]:
@@ -7697,16 +7709,9 @@ def geocode_matches_canadian_location(raw_location: str, geocode: dict[str, Any]
     )
     if postal and returned_postal:
         return postal == returned_postal
-    if postal and not returned_postal:
-        # A source-backed Canadian postal result may omit Ontario from its
-        # display label. Require explicit country and postal-level evidence
-        # before accepting it; never accept a province-only fallback here.
-        raw_result = geocode.get("raw") if isinstance(geocode.get("raw"), dict) else {}
-        address = raw_result.get("address") if isinstance(raw_result.get("address"), dict) else {}
-        country_code = text(geocode.get("country_code") or raw_result.get("country_code") or address.get("country_code")).lower()
-        match_level = text(geocode.get("match_level") or geocode.get("matchlevel") or raw_result.get("type")).lower()
-        if country_code in {"ca", "can", "canada"} and match_level in {"postal", "postcode", "post code", "postalcode", "zip", "zipcode"}:
-            return True
+    if postal:
+        # A postal-level result for another code is not evidence for this one.
+        return False
     if postal and postal[0] == "M":
         expected_code = "ON"
     if expected_code:
@@ -8077,16 +8082,18 @@ def is_countrywide_search_location(location: str) -> bool:
 def fetch_discovery_jobs_for_search(search: dict[str, Any], *, country_indeed: str = "Canada") -> dict[str, Any]:
     started = time.monotonic()
     locations = discovery_query_locations(search.get("discovery_location") or search.get("location"))
-    per_region = max(1, (int(search["request_per_source_cap"]) + len(locations) - 1) // len(locations))
+    queries = [normalize_space(part) for part in re.split(r"[\n;]+", text(search.get("keywords"))) if normalize_space(part)]
+    queries = list(dict.fromkeys(queries))[:7]
+    per_region = max(1, int(search["request_per_source_cap"]) // (len(locations) * len(queries)))
     merged: list[dict[str, Any]] = []
     seen: set[str] = set()
     combined: dict[str, Any] = {"jobs": [], "errors": {}, "source_counts": {}, "source_diagnostics": {}, "source_snapshots": {}}
-    for location in locations:
+    for location, keyword_query in ((location, query) for location in locations for query in queries):
         if time.monotonic() - started >= DISCOVERY_OVERALL_TIMEOUT_SECONDS:
             combined["errors"]["overall"] = f"Discovery timed out after {DISCOVERY_OVERALL_TIMEOUT_SECONDS}s before all locations completed."
             break
         result = fetch_jobspy_jobs(
-            keywords=search["keywords"], location=location, distance=search["distance"],
+            keywords=keyword_query, location=location, distance=search["distance"],
             remote_preference=search["remote_preference"], job_type=None,
             results_wanted=per_region, hours_old=search["hours_old"],
             enabled_sources=search["enabled_sources"], country_indeed=country_indeed,
@@ -8116,6 +8123,7 @@ def fetch_discovery_jobs_for_search(search: dict[str, Any], *, country_indeed: s
             current["region_queries"] = locations
             current["success"] = bool(current.get("success") or diagnostic.get("success"))
     combined["jobs"] = merged
+    combined["keyword_queries"] = queries
     combined["countrywide_region_queries"] = locations if len(locations) > 1 else []
     return combined
 
@@ -9872,29 +9880,31 @@ def _technical_compatibility(assessed: list[dict[str, Any]], profile: dict[str, 
     experience only after an explicit negative skill confirmation has been
     recorded for the selected candidate profile.
     """
-    explicit_no: set[str] = set()
+    confirmations: dict[str, str] = {}
     profile_id = profile.get("_candidate_profile_id") or profile.get("id")
     if profile_id and has_app_context():
         try:
             rows = query_db(
-                "SELECT normalized_keyword FROM keyword_memory WHERE candidate_profile_id = ? AND confirmation_source = 'skill_confirmation' AND status = 'no'",
+                "SELECT normalized_keyword, status FROM keyword_memory WHERE candidate_profile_id = ? AND confirmation_source = 'skill_confirmation'",
                 [int(profile_id)],
             )
-            explicit_no = {normalize_keyword(text(row["normalized_keyword"])) for row in rows}
+            confirmations = {normalize_keyword(text(row["normalized_keyword"])): text(row["status"]) for row in rows}
         except Exception:
-            explicit_no = set()
+            confirmations = {}
     items = []
     for item in assessed:
         if item.get("category") != "technical":
             continue
         normalized = normalize_keyword(text(item.get("normalized") or item.get("requirement")))
-        if item.get("status") == "matched":
-            evidence_type = text(item.get("evidence_type") or "")
-            state = "Demonstrated" if evidence_type == "professional experience" else "Familiar"
-        elif item.get("status") == "partial":
-            state = "Familiar"
-        elif normalized in explicit_no or normalize_keyword(text(item.get("requirement"))) in explicit_no:
+        confirmation = confirmations.get(normalized) or confirmations.get(normalize_keyword(text(item.get("requirement"))))
+        if confirmation == "no":
             state = "No experience"
+        elif item.get("status") == "matched":
+            state = "Demonstrated"
+        elif item.get("status") == "partial":
+            state = "Familiar" if confirmation == "yes" else "Unverified"
+        elif confirmation == "yes":
+            state = "Familiar"
         else:
             state = "Unverified"
         items.append({

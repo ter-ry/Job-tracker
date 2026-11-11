@@ -119,6 +119,9 @@ jobs:
       - name: Check package contents
         shell: pwsh
         run: python scripts/check_release_artifacts.py "${{ steps.installer.outputs.path }}" "dist\JobTracker"
+      - name: Test disposable installer lifecycle
+        shell: pwsh
+        run: ./scripts/windows_installer_lifecycle.ps1 "${{ steps.installer.outputs.path }}"
       - name: Generate SHA-256 checksum
         shell: pwsh
         run: (Get-FileHash "${{ steps.installer.outputs.path }}" -Algorithm SHA256).Hash + "  " + (Split-Path "${{ steps.installer.outputs.path }}" -Leaf) | Out-File -Encoding ascii "${{ steps.installer.outputs.path }}.sha256"

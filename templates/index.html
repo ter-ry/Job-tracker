@@ -105,6 +105,7 @@
                 <select id="discovery-search-mode">
                   <option value="title" selected>Job Title Search</option>
                   <option value="explore">Explore Opportunities</option>
+                  <option value="shortlist">Technical shortlist (select résumé)</option>
                 </select>
               </label>
               <label>Title matching
@@ -113,7 +114,9 @@
                   <option value="strict">Exact titles only</option>
                 </select>
               </label>
-              <label>Keywords<input id="discovery-keywords" required placeholder="software developer"></label>
+              <label>Keywords<input id="discovery-keywords" required placeholder="software developer; junior software engineer; React developer"><small class="muted">Separate up to seven targeted queries with semicolons.</small></label>
+              <label>Shortlist size<input id="discovery-shortlist-size" type="number" min="1" max="100" value="15"></label>
+              <label><input id="discovery-strict-technical" type="checkbox"> Hide confirmed missing required technologies from shortlist</label>
               <label>Search area<input id="discovery-location" placeholder="Toronto, Ontario"></label>
               <label>Private distance origin (optional)<input id="discovery-distance-origin" placeholder="Postal code or city"><small class="muted">Used only for straight-line distance; not sent to job providers.</small></label>
               <label>Distance<input id="discovery-distance" type="number" min="0" step="1" placeholder="50 km"></label>
@@ -171,6 +174,7 @@
           </form>
 
           <section class="panel discovery-results-panel discovery-view-find">
+            <button class="button ghost small" type="button" id="discovery-show-all" onclick="showAllDiscoveryResults()" hidden>Show all retrieved jobs</button>
             <div class="panel-header discovery-toolbar">
               <div>
                 <h2>Discovery results</h2>

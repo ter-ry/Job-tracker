@@ -6,14 +6,14 @@ available workplace evidence. A city-only provider result is retained as
 estimate. It is not used for strict radius eligibility or precise ranking;
 the distance remains unknown until a more precise workplace is available.
 
-Canadian postal-code geocoding uses geocoder.ca's documented JSON endpoint by
-default, with Nominatim as a fallback. City and general address lookups retain
-Nominatim. An installation may explicitly select either provider with
-`JOB_TRACKER_GEOCODING_PROVIDER=geocoder.ca` or `nominatim`; geocoder.ca may
-also use `JOB_TRACKER_GEOCODER_CA_TOKEN` when its current service requires it.
-Users must review the provider's current terms, quotas, attribution, privacy
-handling, and any token requirements. The application does not embed
-credentials or claim that a free endpoint is unlimited. A future Canada
+Nominatim remains the default geocoder. The installation owner can explicitly
+select `JOB_TRACKER_GEOCODING_PROVIDER=geocoder.ca` after registering and
+confirming eligibility for geocoder.ca's noncommercial free tier, whitelisting,
+limits, attribution, and privacy terms. The optional
+`JOB_TRACKER_GEOCODER_CA_TOKEN` supplies the registered token. Postal results
+are accepted only when the provider returns the exact requested six-character
+code. A failed lookup leaves the origin unresolved. The application does not
+embed credentials or claim that a free endpoint is unlimited. A future Canada
 Post/StatsCan PCCF integration would require licensed data and an explicit
 product decision; it must not be silently added.
 

@@ -2431,6 +2431,8 @@ function discoverySearchCriteriaFromControls() {
     total_cap: value("discovery-total-cap") || 200,
     bypass_cache: checked("discovery-bypass-cache"),
     candidate_profile_id: value("discovery-profile"),
+    shortlist_size: value("discovery-shortlist-size") || 15,
+    strict_technical: checked("discovery-strict-technical"),
   };
 }
 
@@ -2621,7 +2623,10 @@ async function searchDiscovery(event) {
   }, 1000);
   try {
     const result = await api.send("/api/discovery/jobspy", "POST", criteria);
-    state.discoveryResults = result.jobs || [];
+    state.discoveryAllResults = result.jobs || [];
+    state.discoveryResults = criteria.search_mode === "shortlist" ? (result.technical_shortlist || []) : state.discoveryAllResults;
+    const showAll = document.getElementById("discovery-show-all");
+    if (showAll) showAll.hidden = criteria.search_mode !== "shortlist";
     state.discoverySearchKey = result.search_key || "";
     state.discoveryPreferences = result.preferences || discoveryPreferencesFromControls();
     state.discoverySearchCriteria = result.search || criteria;
@@ -2748,6 +2753,13 @@ function renderSourceTestResult(result) {
       </ul>
     </details>
   `;
+}
+
+function showAllDiscoveryResults() {
+  state.discoveryResults = state.discoveryAllResults || [];
+  const showAll = document.getElementById("discovery-show-all");
+  if (showAll) showAll.hidden = true;
+  renderDiscoveryResults(state.discoveryMeta || {});
 }
 
 function renderDiscoveryResults(result) {
