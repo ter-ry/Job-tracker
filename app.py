@@ -6463,12 +6463,16 @@ def determine_salary(job: dict[str, Any]) -> dict[str, Any]:
         if parsed["salary_source"] != "missing":
             parsed["salary_source"] = "jobspy_text"
             parsed["salary_confidence"] = max(parsed["salary_confidence"], 82)
+            parsed["salary_original_text"] = salary_text
+            parsed["salary_text"] = normalized_salary_display(parsed, salary_text)
             return parsed
 
     parsed_description = parse_salary_text(text(job.get("job_description")))
     if parsed_description["salary_source"] != "missing":
         parsed_description["salary_source"] = "description"
         parsed_description["salary_confidence"] = max(parsed_description["salary_confidence"], 72)
+        parsed_description["salary_original_text"] = parsed_description.get("salary_evidence_text", "")
+        parsed_description["salary_text"] = normalized_salary_display(parsed_description, parsed_description.get("salary_evidence_text", ""))
         return parsed_description
 
     # Missing compensation must remain missing.  A market estimate is not an
@@ -6757,6 +6761,17 @@ def salary_range_label(minimum: float, maximum: float, interval: str, currency: 
     }.get(interval, "unit unspecified")
     separator = "" if cadence.startswith("/") else " "
     return f"{left}-{right}{separator}{cadence}" if minimum != maximum else f"{left}{separator}{cadence}"
+
+
+def normalized_salary_display(parsed: dict[str, Any], original: str) -> str:
+    label = salary_range_label(
+        float(parsed.get("salary_advertised_min") or 0),
+        float(parsed.get("salary_advertised_max") or 0),
+        text(parsed.get("salary_interval")),
+        text(parsed.get("salary_currency") or "CAD"),
+    )
+    qualifier = re.match(r"\s*(from|starting(?:\s+at)?|up\s+to)\b", text(original), re.I)
+    return f"{qualifier.group(1).title()} {label}" if qualifier else label
 
 
 DISCOVERY_CITY_COORDS = {
