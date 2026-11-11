@@ -1,17 +1,24 @@
 param(
     [Parameter(Mandatory=$true)][string]$PreviousInstaller,
     [Parameter(Mandatory=$true)][string]$CurrentInstaller,
+    [Parameter(Mandatory=$true)][string]$RollbackInstaller,
     [Parameter(Mandatory=$true)][string]$PreviousVersion,
-    [Parameter(Mandatory=$true)][string]$CurrentVersion
+    [Parameter(Mandatory=$true)][string]$CurrentVersion,
+    [Parameter(Mandatory=$true)][string]$RollbackVersion
 )
 $ErrorActionPreference = 'Stop'
 $previousPath = (Resolve-Path $PreviousInstaller).Path
 $currentPath = (Resolve-Path $CurrentInstaller).Path
-if ($PreviousVersion -eq $CurrentVersion) { throw 'Version lifecycle requires genuinely different application versions' }
+$rollbackPath = (Resolve-Path $RollbackInstaller).Path
+if ($PreviousVersion -eq $CurrentVersion -or $RollbackVersion -eq $CurrentVersion -or $PreviousVersion -eq $RollbackVersion) { throw 'Version lifecycle requires three genuinely different application versions' }
 $checksumPath = "$previousPath.sha256"
 if (!(Test-Path $checksumPath)) { throw 'Historical installer checksum is missing' }
 $expectedHash = ((Get-Content $checksumPath -Raw).Trim() -split '\s+')[0]
 if ((Get-FileHash $previousPath -Algorithm SHA256).Hash -ne $expectedHash) { throw 'Historical installer checksum mismatch' }
+$rollbackChecksumPath = "$rollbackPath.sha256"
+if (!(Test-Path $rollbackChecksumPath)) { throw 'Rollback installer checksum is missing' }
+$expectedRollbackHash = ((Get-Content $rollbackChecksumPath -Raw).Trim() -split '\s+')[0]
+if ((Get-FileHash $rollbackPath -Algorithm SHA256).Hash -ne $expectedRollbackHash) { throw 'Rollback installer checksum mismatch' }
 $root = Join-Path $env:RUNNER_TEMP ([guid]::NewGuid().ToString())
 $installDir = Join-Path $root 'install'
 $appData = Join-Path $root 'AppData'
@@ -101,20 +108,21 @@ try {
     if ($backups.Count -lt 1) { throw 'Upgrade did not retain a pre-migration SQLite backup' }
     Stop-Version $true
 
-    # Roll back only in this disposable data root. The older app may reject a
-    # newer schema; if so, fail the acceptance test rather than claim support.
-    Install-Version $previousPath
-    Start-Version $PreviousVersion
+    # ci.8 is not a safe rollback target: its old binary overwrites the
+    # upgraded user_version marker. Use ci.29, which has the same schema as
+    # the current build, to test a compatible code-version rollback instead.
+    Install-Version $rollbackPath
+    Start-Version $RollbackVersion
     Assert-Job $jobId $appliedDate
     if ((Get-SchemaVersion) -ne $newSchema) { throw 'Rollback changed the upgraded SQLite schema version' }
-    Stop-Version $false
+    Stop-Version $true
 
     Install-Version $currentPath
     Start-Version $CurrentVersion
     Assert-Job $jobId $appliedDate
     if ((Get-SchemaVersion) -ne $newSchema) { throw 'Re-upgrade changed the SQLite schema version' }
     Stop-Version $true
-    Write-Host "Version lifecycle passed: $PreviousVersion (schema $oldSchema) -> $CurrentVersion (schema $newSchema) -> $PreviousVersion -> $CurrentVersion; saved job and Applied status retained."
+    Write-Host "Version lifecycle passed: $PreviousVersion (schema $oldSchema) -> $CurrentVersion (schema $newSchema) -> $RollbackVersion (same schema) -> $CurrentVersion; saved job and Applied status retained. Rollback to $PreviousVersion is unsafe and was not retried."
 } finally {
     if ($script:appProcess -and !$script:appProcess.HasExited) { Stop-Process -Id $script:appProcess.Id -Force }
     $env:APPDATA = $originalAppData

@@ -135,10 +135,18 @@ jobs:
           run-id: 42742356948
           github-token: ${{ github.token }}
           path: build/previous-installer
+      - name: Download schema-compatible Windows installer for rollback test
+        if: github.event_name == 'pull_request'
+        uses: actions/download-artifact@v4
+        with:
+          name: JobTracker-Windows-0.0.0-ci.29
+          run-id: 43101896965
+          github-token: ${{ github.token }}
+          path: build/rollback-installer
       - name: Test version-to-version upgrade and rollback in disposable AppData
         if: github.event_name == 'pull_request'
         shell: pwsh
-        run: ./scripts/windows_version_lifecycle.ps1 "build/previous-installer/JobTracker-Setup-v0.0.0-ci.8.exe" "${{ steps.installer.outputs.path }}" "0.0.0-ci.8" "${{ steps.version.outputs.version }}"
+        run: ./scripts/windows_version_lifecycle.ps1 "build/previous-installer/JobTracker-Setup-v0.0.0-ci.8.exe" "${{ steps.installer.outputs.path }}" "build/rollback-installer/JobTracker-Setup-v0.0.0-ci.29.exe" "0.0.0-ci.8" "${{ steps.version.outputs.version }}" "0.0.0-ci.29"
       - name: Generate SHA-256 checksum
         shell: pwsh
         run: (Get-FileHash "${{ steps.installer.outputs.path }}" -Algorithm SHA256).Hash + "  " + (Split-Path "${{ steps.installer.outputs.path }}" -Leaf) | Out-File -Encoding ascii "${{ steps.installer.outputs.path }}.sha256"
