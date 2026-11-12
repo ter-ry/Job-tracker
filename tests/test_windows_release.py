@@ -32,13 +32,18 @@ class WindowsReleaseTests(unittest.TestCase):
         script = Path(__file__).parents[1] / "release_packaging" / "windows" / "JobTracker.iss"
         self.assertIn(f"AppMutex={INSTANCE_MUTEX}", script.read_text(encoding="utf-8"))
 
-    def test_shutdown_closes_browser_keepalive_channels(self):
+    def test_shutdown_closes_browser_keepalive_channels_before_waiting(self):
         server = Mock()
         server._map = {1: Mock()}
         server_thread = Mock()
         server_thread.is_alive.return_value = True
+        events = []
+        server.close.side_effect = lambda: events.append("server.close")
+        server_thread.join.side_effect = lambda timeout: events.append("thread.join")
         with patch("waitress.wasyncore.close_all") as close_all:
+            close_all.side_effect = lambda server_map: events.append("close_all")
             stop_waitress_server(server, server_thread)
+        self.assertEqual(events, ["server.close", "close_all", "thread.join"])
         server.close.assert_called_once_with()
         server_thread.join.assert_called_once_with(timeout=5)
         close_all.assert_called_once_with(server._map)
