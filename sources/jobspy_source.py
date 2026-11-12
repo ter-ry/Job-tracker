@@ -311,11 +311,18 @@ def normalize_jobspy_row(row: dict[str, Any], fallback_source: str = "") -> dict
     city = clean(row.get("city"))
     state = clean(row.get("state") or row.get("state_province"))
     description = clean(row.get("description"))
-    workplace = extract_workplace_location(row, description, location or ", ".join([part for part in [city, state] if part]))
+    remote_type = infer_remote_type(row)
+    workplace_row = row
+    # A provider location can be a legitimate advertised street address, but
+    # a geographic label on a remote posting is not a workplace.  Keep the
+    # provider's explicit workplace fields available while avoiding an
+    # inferred commute destination from a remote location label.
+    if remote_type == "Remote" and not any(clean(row.get(key)) for key in ("workplace_address", "address", "street_address", "office_address", "office_location")):
+        workplace_row = {key: value for key, value in row.items() if key != "location"}
+    workplace = extract_workplace_location(workplace_row, description, location or ", ".join([part for part in [city, state] if part]))
     required_skills, preferred_skills = extract_keyword_requirements(description)
     credentials = extract_explicit_credentials(description)
     benefits = extract_explicit_benefits(description)
-    remote_type = infer_remote_type(row)
     raw_status = clean(row.get("status") or row.get("posting_status")).lower()
     if row.get("is_closed") is True or raw_status in {"closed", "expired", "removed"}:
         posting_availability = "confirmed_closed"
@@ -463,6 +470,12 @@ def infer_remote_type(row: dict[str, Any]) -> str:
         return "Unknown"
     if negative:
         return "On-site"
+    # A specific hybrid statement in the posting is stronger than JobSpy's
+    # boolean is_remote flag, which is also used for hybrid source records.
+    # Explicit provider work-model fields were handled above and remain the
+    # highest-confidence source classification.
+    if re.search(r"\bhybrid\b", description):
+        return "Hybrid"
     if isinstance(row.get("is_remote"), bool):
         return "Remote" if row.get("is_remote") else "On-site"
     if explicit in {"true", "1", "yes"}:
@@ -547,8 +560,11 @@ def extract_workplace_alternatives(row: dict[str, Any], description: str) -> lis
     supplied = row.get("workplace_alternatives")
     if isinstance(supplied, list):
         return [dict(item) for item in supplied if isinstance(item, dict) and clean(item.get("address") or item.get("postal_code"))]
-    raw_fields = [clean(row.get(key)) for key in ("workplace_address", "address", "street_address", "office_address", "office_location")]
-    field_value = next((value for value in raw_fields if value), "")
+    raw_fields = [(key, clean(row.get(key))) for key in ("workplace_address", "address", "street_address", "office_address", "office_location", "location")]
+    field_key, field_value = next(
+        ((key, value) for key, value in raw_fields if value and (key != "location" or STREET_PATTERN.search(value) or re.search(POSTAL_PATTERN, value, re.I))),
+        ("", ""),
+    )
     candidates: list[dict[str, Any]] = []
     if field_value:
         postal_match = re.search(POSTAL_PATTERN, field_value, re.I)
@@ -558,7 +574,7 @@ def extract_workplace_alternatives(row: dict[str, Any], description: str) -> lis
             "precision": "street address" if STREET_PATTERN.search(field_value) else "postal code" if postal_match else "city",
             "confidence": 95 if STREET_PATTERN.search(field_value) else 88 if postal_match else 65,
             "evidence": field_value,
-            "evidence_source": "provider field",
+            "evidence_source": "provider location" if field_key == "location" else "provider field",
             "assignment_status": "confirmed",
         })
     matches = list(STREET_PATTERN.finditer(description or ""))
@@ -606,7 +622,8 @@ def extract_workplace_location(row: dict[str, Any], description: str, provider_l
         item = alternatives[0]
         legacy_address_match = STREET_PATTERN.search(clean(item.get("address")))
         explicitly_labelled = bool(re.match(r"\s*(?:work\s+)?location\s*:", clean(item.get("evidence")), re.I))
-        legacy_address = clean(item.get("address")) if explicitly_labelled else clean(legacy_address_match.group(0)) if legacy_address_match else clean(item.get("address"))
+        preserve_provider_value = clean(item.get("evidence_source")) == "provider location"
+        legacy_address = clean(item.get("address")) if explicitly_labelled or preserve_provider_value else clean(legacy_address_match.group(0)) if legacy_address_match else clean(item.get("address"))
         return {
             "display_location": clean(item.get("address")) or provider_location,
             "address": legacy_address, "postal_code": clean(item.get("postal_code")),
@@ -753,7 +770,10 @@ def extract_explicit_credentials(description: str) -> list[dict[str, Any]]:
 
 def extract_explicit_benefits(description: str) -> list[dict[str, Any]]:
     return _evidence_records(description, [
-        ("time off", r"\b(?:generous\s+)?PTO\s*[-–:]?\s*\d+\s+vacation\s+days\b|\b\d+\s+weeks?\s+of\s+vacation\b"),
+        ("time off", r"\b(?:generous\s+)?PTO\b|\bpaid\s+time\s+off\b|\b\d+\s+weeks?\s+of\s+vacation\b"),
+        ("health", r"\bdental\s+(?:and\s+)?vision\b|\bvision\s+(?:and\s+)?dental\b|\bdental\b|\bvision\b|\bextended\s+health(?:\s+benefits?)?\b"),
+        ("development", r"\btuition\s+reimbursement\b|\btuition\s+assistance\b"),
+        ("family", r"\bon[- ]site\s+(?:childcare|child\s+care)\b|\bon[- ]site\s+daycare\b"),
         ("health", r"\bcomprehensive\s+benefits(?:\s+plan|\s+program)?\b[^.;\n]{0,100}"),
         ("health", r"\bhealth\s+care\s+spending\s+account\b"),
         ("family", r"\bparental\s+leave\s+top-up\b"),

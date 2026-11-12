@@ -2380,6 +2380,102 @@ class JobAssistantTest(unittest.TestCase):
             "provider_remote_conflicts_with_explicit_on_site_evidence",
         )
 
+    def test_private_beta_source_linked_accuracy_cases_preserve_original_evidence(self):
+        exa = jobspy_source.normalize_jobspy_row(
+            {
+                "id": "12ff082aaa676235",
+                "title": "Full Stack Developer",
+                "company": "ExaSystems",
+                "location": "Mississauga ON L5L 5Y1",
+                "is_remote": True,
+                "salary": "From $23/hour",
+                "description": "Work Location: Hybrid remote in Mississauga, ON L5L 5Y1.",
+                "job_url": "https://ca.indeed.com/viewjob?jk=12ff082aaa676235",
+            },
+            fallback_source="indeed",
+        )
+        self.assertEqual(exa["source_job_id"], "12ff082aaa676235")
+        self.assertEqual(exa["company"], "ExaSystems")
+        self.assertEqual(exa["salary_text"], "From $23/hour")
+        self.assertEqual(exa["remote_type"], "Hybrid")
+        self.assertEqual(exa["workplace_postal_code"], "L5L 5Y1")
+        self.assertEqual(exa["job_url"], "https://ca.indeed.com/viewjob?jk=12ff082aaa676235")
+
+        lullaboo = jobspy_source.normalize_jobspy_row(
+            {
+                "id": "70075bfc7b7c2f68",
+                "title": "Early Childhood Teacher",
+                "company": "Lullaboo",
+                "location": "860 College Street, Toronto ON M6H 1A2",
+                "salary": "$25.86/hour",
+                "description": "Benefits include PTO, dental, vision and other benefits.",
+                "job_url": "https://ca.indeed.com/viewjob?jk=70075bfc7b7c2f68",
+            },
+            fallback_source="indeed",
+        )
+        self.assertEqual(lullaboo["source_job_id"], "70075bfc7b7c2f68")
+        self.assertEqual(lullaboo["company"], "Lullaboo")
+        self.assertEqual(lullaboo["salary_text"], "$25.86/hour")
+        self.assertEqual(lullaboo["workplace_address"], "860 College Street, Toronto ON M6H 1A2")
+        self.assertEqual(lullaboo["workplace_postal_code"], "M6H 1A2")
+        self.assertEqual({item["value"] for item in lullaboo["benefits"]}, {"PTO", "dental", "vision"})
+        self.assertEqual(lullaboo["job_url"], "https://ca.indeed.com/viewjob?jk=70075bfc7b7c2f68")
+
+    def test_private_beta_workplace_alternatives_keep_source_addresses_for_distance_lookup(self):
+        description = (
+            "Work locations: 296 Lawrence Avenue East, Toronto ON M4N 1T7; "
+            "1293 Meredith Avenue, Mississauga ON L5E 2E6."
+        )
+        row = jobspy_source.normalize_jobspy_row(
+            {
+                "id": "tfs-source-1",
+                "title": "Registered Early Childhood Educator",
+                "company": "Toronto French School",
+                "location": "Toronto, ON",
+                "description": description,
+                "job_url": "https://example.invalid/source-unavailable-in-ci-report",
+            },
+            fallback_source="indeed",
+        )
+        self.assertEqual(
+            [(item["address"], item["postal_code"]) for item in row["workplace_alternatives"]],
+            [
+                ("296 Lawrence Avenue East, Toronto ON M4N 1T7", "M4N 1T7"),
+                ("1293 Meredith Avenue, Mississauga ON L5E 2E6", "L5E 2E6"),
+            ],
+        )
+        self.assertEqual(row["job_url"], "https://example.invalid/source-unavailable-in-ci-report")
+
+        provider = FakeGeocodingProvider({
+            "296 Lawrence Avenue East, Toronto ON M4N 1T7, Canada": {
+                "latitude": 43.725, "longitude": -79.401, "display_name": "296 Lawrence Avenue East, Toronto, Ontario, M4N 1T7, Canada", "postal_code": "M4N 1T7",
+            },
+            "1293 Meredith Avenue, Mississauga ON L5E 2E6, Canada": {
+                "latitude": 43.585, "longitude": -79.57, "display_name": "1293 Meredith Avenue, Mississauga, Ontario, L5E 2E6, Canada", "postal_code": "L5E 2E6",
+            },
+        })
+        enriched, result = app_module.geocode_discovery_job(
+            {"remote_type": "On-site", "location": "Toronto, ON", "workplace_alternatives": row["workplace_alternatives"]},
+            {},
+            {"normalized": "M5V 2T6", "latitude": 43.643, "longitude": -79.387, "confidence": 95, "precision": "postal code", "status": "saved"},
+            provider,
+            use_cache=False,
+        )
+        self.assertEqual(result["status"], "multiple_alternatives")
+        self.assertTrue(all(item["coordinates_verified"] for item in enriched["workplace_alternatives"]))
+        self.assertTrue(all(item["distance_label"] == "approximate" and item["geocode_precision"] == "street address" for item in enriched["workplace_alternatives"]))
+        self.assertEqual(enriched["distance_label"], "multiple_alternatives")
+
+    def test_source_identifiers_prevent_same_provider_similar_title_merge(self):
+        first = {"source": "indeed", "source_job_id": "12ff082aaa676235", "company": "ExaSystems", "title": "Full Stack Developer", "location": "Mississauga, ON"}
+        second = {"source": "indeed", "source_job_id": "70075bfc7b7c2f68", "company": "ExaSystems", "title": "Full Stack Developer", "location": "Mississauga, ON"}
+        self.assertFalse(app_module.dedupe_match(first, second))
+
+    def test_hybrid_prose_overrides_boolean_remote_without_provider_work_model(self):
+        row = {"is_remote": True, "location": "Mississauga, ON", "description": "Hybrid remote in Mississauga, ON L5L 5Y1."}
+        self.assertEqual(jobspy_source.infer_remote_type(row), "Hybrid")
+        self.assertEqual(jobspy_source.remote_classification_conflict(row), "provider_remote_conflicts_with_description_hybrid_evidence")
+
     def test_indeed_remote_classification_wins_over_hybrid_prose_and_preserves_salary(self):
         row = jobspy_source.normalize_jobspy_row(
             {
