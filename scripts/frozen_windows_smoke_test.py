@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import http.client
 import os
 from pathlib import Path
 import subprocess
@@ -20,7 +21,14 @@ def get(url: str) -> tuple[int, bytes]:
 def post_exit(url: str, token: str) -> tuple[int, bytes]:
     request = urllib.request.Request(url, method="POST", headers={"X-Job-Tracker-Exit-Token": token})
     with urllib.request.urlopen(request, timeout=5) as response:
-        return response.status, response.read()
+        try:
+            body = response.read()
+        except http.client.IncompleteRead as error:
+            # The shutdown handler closes Waitress keep-alive channels before
+            # the process exits. The status line is already received, so a
+            # truncated JSON body is acceptable as long as HTTP returned 200.
+            body = error.partial
+        return response.status, body
 
 
 def main() -> None:

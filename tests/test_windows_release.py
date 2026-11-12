@@ -1,12 +1,14 @@
 import os
+import http.client
 from pathlib import Path
 import socket
 import tempfile
 import threading
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 from release_packaging.windows.launcher import INSTANCE_MUTEX, SingleInstance, default_data_dir, stop_waitress_server
+from scripts.frozen_windows_smoke_test import post_exit
 from version import normalize_semver, semver_key
 from packaging.version import Version
 
@@ -69,6 +71,13 @@ class WindowsReleaseTests(unittest.TestCase):
         finally:
             if thread.is_alive():
                 server.close()
+
+    def test_frozen_exit_probe_accepts_shutdown_connection_close_after_status(self):
+        response = MagicMock(status=200)
+        response.read.side_effect = http.client.IncompleteRead(b"")
+        response.__enter__.return_value = response
+        with patch("urllib.request.urlopen", return_value=response):
+            self.assertEqual(post_exit("http://127.0.0.1:5000/api/app/exit", "token"), (200, b""))
 
     def test_semver_normalization_and_ordering(self):
         self.assertEqual(normalize_semver("v1.0.0"), "1.0.0")
