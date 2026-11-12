@@ -106,9 +106,9 @@ data.
 
 ## Windows version lifecycle
 
-GitHub Actions Windows run
-[#31](https://github.com/ter-ry/Job-tracker/actions/runs/43109065306) completed
-successfully for exact commit `a4f7b9d2355c2b898f75961f7250961164aba014`.
+Post-fix GitHub Actions Windows run
+[#32](https://github.com/ter-ry/Job-tracker/actions/runs/43223255352) completed
+successfully for exact commit `c79b2bb0899d6de98b50a5b4528adf21f31d194a`.
 The package job and its version-lifecycle step both report success. The test used
 disposable AppData and three genuinely different installer versions:
 
@@ -127,7 +127,7 @@ correctly not attempted.
 ## Release decision
 
 Targeted Linux regressions after the shortlist fix: 288 passed, 1 skipped;
-`node --check static/app.js` passed. A new hosted Windows run is required for the
-post-`a4f7b9d` fix. Even after that run, PR #18 is **not ready for final review or
-merge** until the representative complete-posting extraction audit and the
-candidate-specific 15-posting SWE shortlist audit are completed.
+`node --check static/app.js` passed. Post-fix Windows run #32, including the
+version upgrade and compatible rollback, passed. PR #18 is still **not ready for
+final review or merge** until the representative complete-posting extraction
+audit and the candidate-specific 15-posting SWE shortlist audit are completed.
