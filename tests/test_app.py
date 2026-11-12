@@ -2336,6 +2336,34 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(row["workplace_postal_code"], "L6A 1P4")
         self.assertEqual(row["workplace_precision"], "street address")
 
+    def test_jobspy_extracts_flattened_workplace_list_and_canadian_suffixes(self):
+        description = (
+            "Work locations: 70 Playfair Ave., Toronto, ON M6B 2P9; "
+            "340 Falstaff Ave., Toronto, ON M6L 3E7; "
+            "12 Learning Terrace, Toronto, ON M4P 1A1."
+        )
+        alternatives = jobspy_source.extract_workplace_alternatives({}, description)
+        self.assertEqual(
+            [(item["address"], item["postal_code"]) for item in alternatives],
+            [
+                ("70 Playfair Ave., Toronto, ON M6B 2P9", "M6B 2P9"),
+                ("340 Falstaff Ave., Toronto, ON M6L 3E7", "M6L 3E7"),
+                ("12 Learning Terrace, Toronto, ON M4P 1A1", "M4P 1A1"),
+            ],
+        )
+
+    def test_jobspy_does_not_promote_nearby_corporate_address_in_workplace_list(self):
+        description = (
+            "Corporate mailing address: 100 Queen Street West, Toronto, ON M5H 2N2. "
+            "Work locations: 70 Playfair Avenue, Toronto, ON M6B 2P9; "
+            "340 Falstaff Avenue, Toronto, ON M6L 3E7."
+        )
+        alternatives = jobspy_source.extract_workplace_alternatives({}, description)
+        self.assertEqual(
+            [item["postal_code"] for item in alternatives],
+            ["M6B 2P9", "M6L 3E7"],
+        )
+
     def test_jobspy_does_not_use_employer_mailing_address_as_workplace(self):
         row = jobspy_source.normalize_jobspy_row(
             {"title": "Developer", "location": "Toronto, ON", "description": "Work remotely in Canada. Corporate mailing address: 9350 Keele St, Maple, ON L6A 1P4."},

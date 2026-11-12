@@ -469,7 +469,9 @@ POSTAL_PATTERN = r"[A-Z]\d[A-Z][ -]?\d[A-Z]\d"
 STREET_PATTERN = re.compile(
     r"\b\d{1,6}\s+[A-Z0-9][A-Za-z0-9.'-]*(?:\s+[A-Za-z0-9.'-]+){0,6}\s+"
     r"(?:Street|St\.?|Avenue|Ave\.?|Road|Rd\.?|Drive|Dr\.?|Boulevard|Blvd\.?|Way|"
-    r"Parkway|Pkwy\.?|Crescent|Cres\.?|Court|Ct\.?|Lane|Ln\.?|Trail|Highway|Hwy\.?)\b",
+    r"Parkway|Pkwy\.?|Crescent|Cres\.?|Court|Ct\.?|Lane|Ln\.?|Trail|Highway|Hwy\.?|"
+    r"Terrace|Ter\.?|Place|Pl\.?|Square|Sq\.?|Circle|Cir\.?|Gate|Gardens?|Garden|"
+    r"Manor|Mews|Path|Row|Quay)\b",
     re.I,
 )
 WORKPLACE_CUE = re.compile(
@@ -516,12 +518,16 @@ def extract_workplace_alternatives(row: dict[str, Any], description: str) -> lis
             "assignment_status": "confirmed",
         })
     matches = list(STREET_PATTERN.finditer(description or ""))
-    multi_context = len(matches) > 1 and bool(WORKPLACE_CUE.search(description or ""))
     for index, match in enumerate(matches):
         context = (description or "")[max(0, match.start() - 180):match.start()]
-        if NON_WORKPLACE_CUE.search(context[-100:]):
+        # Provider/PDF descriptions often flatten a workplace list onto one
+        # line.  Evaluate each address against its nearby evidence instead of
+        # allowing an unrelated cue elsewhere in the posting to authorize all
+        # street-shaped numbers.
+        nearby_context = (description or "")[max(0, match.start() - 240):min(len(description or ""), match.end() + 80)]
+        if NON_WORKPLACE_CUE.search(nearby_context[-150:]):
             continue
-        if not multi_context and not WORKPLACE_CUE.search(context):
+        if not WORKPLACE_CUE.search(context):
             continue
         address, evidence = _address_evidence(description, match, matches[index + 1].start() if index + 1 < len(matches) else None)
         postal_match = re.search(POSTAL_PATTERN, address, re.I)
