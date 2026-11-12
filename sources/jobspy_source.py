@@ -575,7 +575,8 @@ def extract_workplace_location(row: dict[str, Any], description: str, provider_l
 SECTION_HEADINGS = [
     ("required", r"what\s+you\s+need\s+to\s+succeed|what\s+we(?:'re|\s+are|’re)\s+looking\s+for|"
                  r"required\s+qualifications?|minimum\s+qualifications?|requirements?|what\s+you\s+bring|"
-                 r"who\s+you\s+are|your\s+background|core\s+skills(?:\s+and\s+experience)?"),
+                 r"who\s+you\s+are|your\s+background|core\s+skills(?:\s+and\s+experience)?|"
+                 r"skills\s*(?:,\s*|and\s+)?experience\s*(?:&|and)\s*requirements?"),
     ("preferred", r"preferred\s+qualifications?|preferred|nice\s+to\s+have|bonus|assets?"),
     ("unclassified", r"technologies\s+that\s+we\s+use(?:\s*\([^)]*\))?|our\s+core\s+stack\s+includes|"
                      r"why\s+join\s+us|perks?\s*(?:&|and)\s*benefits?|about\s+(?:us|the\s+company)|"
@@ -586,8 +587,18 @@ SECTION_HEADINGS = [
 def _section_markers(description: str) -> list[tuple[int, str, str]]:
     markers = []
     for importance, pattern in SECTION_HEADINGS:
-        for match in re.finditer(rf"\b(?:{pattern})\b\s*: ?", description or "", re.I):
-            markers.append((match.start(), importance, clean(match.group(0)).rstrip(": ")))
+        # ATS HTML frequently drops both heading tags and the colon, leaving
+        # strings such as "What you need to succeed - Git" or
+        # "Preferred qualifications Kubernetes".  Require a sentence/line
+        # boundary before a heading so ordinary prose is not promoted, while
+        # accepting colon, bullet, line, and flattened title-to-value joins.
+        heading_pattern = (
+            rf"(?im)(?:^|(?<=[.!?]))\s*(?P<heading>{pattern})\b\s*:??"
+            rf"(?=$|[\n:•*-]|\s+[A-Z0-9])"
+        )
+        for match in re.finditer(heading_pattern, description or ""):
+            heading = clean(match.group("heading"))
+            markers.append((match.start("heading"), importance, heading))
     return sorted(markers)
 
 

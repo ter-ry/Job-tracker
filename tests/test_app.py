@@ -3355,6 +3355,36 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(set(compatibility["required_unverified"]), {"agentic coding tools", "agile project management tools", "git"})
         self.assertNotEqual(compatibility["decision"], "Strong technical match")
 
+    def test_swe_requirement_headings_survive_collapsed_ats_markup_without_colons(self):
+        # Some ATS converters emit heading text and bullets as one paragraph,
+        # dropping both HTML heading tags and the colon after the heading.
+        posting = (
+            "Technologies that we use (that you'll be exposed to) React, PostgreSQL, AWS. "
+            "What you need to succeed\n"
+            "- Python\n- React\n"
+            "Preferred qualifications\n"
+            "- Kubernetes"
+        )
+        required, preferred = jobspy_source.extract_keyword_requirements(posting)
+        self.assertEqual(set(required.split(", ")), {"python", "react"})
+        self.assertEqual(preferred, "kubernetes")
+
+        terms = app_module._qualification_terms({"title": "Software Engineer", "job_description": posting})
+        by_name = {item["normalized"]: item for item in terms}
+        self.assertEqual(by_name["python"]["importance"], "required")
+        self.assertEqual(by_name["react"]["importance"], "required")
+        self.assertEqual(by_name["kubernetes"]["importance"], "preferred")
+
+        fit = app_module.build_qualification_fit(
+            {"title": "Software Engineer", "job_description": posting},
+            evidence_profile={"resume_text": "Built Python and React applications."},
+        )
+        states = {item["requirement"].lower(): item["state"] for item in fit["technical_compatibility"]["items"]}
+        self.assertEqual(states["python"], "Demonstrated")
+        self.assertEqual(states["react"], "Demonstrated")
+        self.assertEqual(states["kubernetes"], "Unverified")
+        self.assertEqual(fit["technical_compatibility"]["decision"], "Strong technical match")
+
     def test_complete_swe_evidence_extracts_credential_benefits_and_arrangement(self):
         rose = (
             "What you need to succeed: Bachelor’s degree in Computer or Software Engineering, or a related field. "
