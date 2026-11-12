@@ -1466,6 +1466,27 @@ function normalizedPipelineSalary(job) {
   return value * (toCad[currency] || 1);
 }
 
+function jobArrangement(job) {
+  return String(job?.work_arrangement || job?.remote_type || "Unknown").trim() || "Unknown";
+}
+
+function isRemoteJob(job) {
+  return jobArrangement(job).toLowerCase().includes("remote");
+}
+
+function jobLocationLabel(job) {
+  const location = String(job?.location || "Location not listed");
+  return isRemoteJob(job) ? `${location} (geographic eligibility region)` : location;
+}
+
+function qualificationEvidenceLabel(job) {
+  if (Boolean(job?.discovery_profile_independent)) return "Posting evidence only; no résumé was used";
+  const confidence = String(job?.qualification_evidence_confidence || "").toLowerCase();
+  const status = String(job?.qualification_match_status || "").toLowerCase();
+  if (confidence === "low" || status === "partial_evidence") return "Technical qualification strength is separate from Canadian eligibility. Qualification evidence incomplete — verify résumé evidence";
+  return "Technical qualification strength is separate from Canadian eligibility. Qualification match is based on stored résumé evidence";
+}
+
 function pipelineSortValue(job, mode) {
   if (mode === "qualification") return Number(job.qualification_fit_score ?? -1);
   if (mode === "priority") return Number(job.application_priority_score ?? -1);
@@ -1544,7 +1565,7 @@ function renderPipelineDashboard(jobs) {
     const statusActions = `<div class="pipeline-actions" aria-label="Job actions">${openPosting}<button class="button small ghost" type="button" data-pipeline-action="applied" data-job-id="${job.id}" ${applied ? "disabled" : ""}>${applied ? "Applied" : "Mark Applied"}</button><button class="button small ghost" type="button" data-pipeline-action="save" data-job-id="${job.id}" ${applied ? "disabled" : ""}>Save for later</button><button class="button small ghost" type="button" data-pipeline-action="skip" data-job-id="${job.id}">Skip</button><button type="button" data-job-id="${job.id}" class="button small ghost pipeline-action">View details</button></div>`;
     const scoreLabel = profileFree ? "Job Opportunity Score" : "Qualification Match";
     const scoreMeta = profileFree ? "Posting evidence only" : `Application Priority ${applicationPriority} · Job Priority ${jobPriority}`;
-    return `<article class="pipeline-card" data-job-id="${job.id}"><div><h3>${escapeHtml(job.title || "Untitled role")}</h3><p>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location not listed")}</p><p class="pipeline-subline">${escapeHtml(categoryLabel)}${profileFree ? "" : ` · ${escapeHtml(job.qualification_fit_label || "Qualification fit")}`}</p></div><div class="pipeline-score"><strong>${score}%</strong><span>${scoreLabel}</span><small>${scoreMeta}</small></div>${statusActions}</article>`;
+    return `<article class="pipeline-card" data-job-id="${job.id}"><div><h3>${escapeHtml(job.title || "Untitled role")}</h3><p>${escapeHtml(job.company || "Unknown company")} · <strong>${escapeHtml(jobArrangement(job))}</strong> · ${escapeHtml(jobLocationLabel(job))}</p><p class="pipeline-subline">${escapeHtml(categoryLabel)}${profileFree ? "" : ` · ${escapeHtml(job.qualification_fit_label || "Qualification fit")}`}</p></div><div class="pipeline-score"><strong>${score}%</strong><span>${scoreLabel}</span><small>${escapeHtml(profileFree ? scoreMeta : `${scoreMeta} · ${qualificationEvidenceLabel(job)}`)}</small></div>${statusActions}</article>`;
   }).join("");
   cards.querySelectorAll(".pipeline-card").forEach((card) => card.addEventListener("click", (event) => {
     if (event.target.closest("button, a")) return;
@@ -1621,7 +1642,10 @@ function openPipelineJobDetails(id) {
   const advancedActions = state.advancedFeatures ? `<button class="button ghost" type="button" data-prepare-job="${job.id}">Prepare application</button>` : "";
   const detailScoreLabel = profileFree ? "Job Opportunity Score" : "Qualification Match";
   const detailScore = profileFree ? Number(job.opportunity_score ?? job.application_priority_score ?? 0) : Number(job.qualification_fit_score ?? job.fit_score ?? 0);
-  panel.innerHTML = `<div class="pipeline-detail-header"><div><span class="eyebrow">Job details</span><h3 id="pipeline-detail-title">${escapeHtml(job.title || "Untitled role")}</h3><p>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location not listed")}</p></div><button class="button ghost small" type="button" data-close-job-details>Close</button></div>${primaryActions}<div class="pipeline-detail-grid"><div><strong>${detailScoreLabel}</strong><p class="pipeline-detail-score">${detailScore}%</p><p class="muted">${profileFree ? "Based on posting evidence; no résumé was used." : "Technical qualification strength is separate from Canadian eligibility."}</p><ul>${reasons}</ul><div class="experience-summary">${renderExperienceSummary(job)}</div><p class="muted">Source evidence: ${escapeHtml(job.qualification_evidence_source || "Not available")}</p></div><div><strong>Salary</strong><p>${escapeHtml(job.salary || "Not listed")}</p><strong>Distance</strong><p>${escapeHtml(job.distance_note || (job.distance_km && Number(job.distance_km) < 9999 ? `${job.distance_km} km straight-line` : "Unavailable"))}</p><strong>Canada eligibility</strong><p>${escapeHtml(job.canadian_eligibility || "unknown")}</p><strong>Posting status</strong><p>${escapeHtml(job.posting_availability || "unverified")}</p><strong>Posting date</strong><p>${escapeHtml(job.posted_date || "Not listed")}</p><strong>Deadline</strong><p>${escapeHtml(job.deadline || "Not listed")}</p></div></div><details open><summary>Requirements and responsibilities</summary><pre>${escapeHtml(requirements || "No structured requirements were stored.")}</pre></details><details><summary>Full job description</summary><pre>${escapeHtml(job.job_description || "No job description was stored.")}</pre></details><p class="pipeline-detail-links">${job.url ? `<a href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Original posting</a>` : "Original posting unavailable"}${job.application_url && job.application_url !== job.url ? ` · <a href="${escapeAttribute(job.application_url)}" target="_blank" rel="noreferrer">Application page</a>` : ""}</p><div class="actions">${advancedActions}<button class="button ghost" type="button" data-edit-job="${job.id}">Edit job</button></div>`;
+  const locationDetail = isRemoteJob(job)
+    ? `<strong>Eligibility region</strong><p>${escapeHtml(jobLocationLabel(job))}</p>`
+    : `<strong>Workplace</strong><p>${escapeHtml(job.workplace_address || job.workplace_postal_code || job.location || "Location unavailable")}</p><strong>Distance</strong><p>${escapeHtml(job.distance_note || (job.distance_km && Number(job.distance_km) < 9999 ? `${job.distance_km} km straight-line` : "Unavailable"))}</p>`;
+  panel.innerHTML = `<div class="pipeline-detail-header"><div><span class="eyebrow">Job details</span><h3 id="pipeline-detail-title">${escapeHtml(job.title || "Untitled role")}</h3><p>${escapeHtml(job.company || "Unknown company")} · <strong>${escapeHtml(jobArrangement(job))}</strong> · ${escapeHtml(jobLocationLabel(job))}</p></div><button class="button ghost small" type="button" data-close-job-details>Close</button></div>${primaryActions}<div class="pipeline-detail-grid"><div><strong>${detailScoreLabel}</strong><p class="pipeline-detail-score">${detailScore}%</p><p class="muted">${escapeHtml(qualificationEvidenceLabel(job))}</p><ul>${reasons}</ul><div class="experience-summary">${renderExperienceSummary(job)}</div><p class="muted">Source evidence: ${escapeHtml(job.qualification_evidence_source || "Not available")}</p></div><div><strong>Salary</strong><p>${escapeHtml(job.salary || "Not listed")}</p>${locationDetail}<strong>Canada eligibility</strong><p>${escapeHtml(job.canadian_eligibility || "unknown")}</p><strong>Posting status</strong><p>${escapeHtml(job.posting_availability || "unverified")}</p><strong>Posting date</strong><p>${escapeHtml(job.posted_date || "Not listed")}</p><strong>Deadline</strong><p>${escapeHtml(job.deadline || "Not listed")}</p></div></div><details open><summary>Requirements and responsibilities</summary><pre>${escapeHtml(requirements || "No structured requirements were stored.")}</pre></details><details><summary>Full job description</summary><pre>${escapeHtml(job.job_description || "No job description was stored.")}</pre></details><p class="pipeline-detail-links">${job.url ? `<a href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Original posting</a>` : "Original posting unavailable"}${job.application_url && job.application_url !== job.url ? ` · <a href="${escapeAttribute(job.application_url)}" target="_blank" rel="noreferrer">Application page</a>` : ""}</p><div class="actions">${advancedActions}<button class="button ghost" type="button" data-edit-job="${job.id}">Edit job</button></div>`;
   panel.setAttribute("role", "dialog");
   panel.setAttribute("aria-modal", "true");
   panel.setAttribute("aria-labelledby", "pipeline-detail-title");
@@ -1666,9 +1690,8 @@ function renderMapLinks(job) {
     }).join("");
   }
   const driving = googleMapsUrl(job, "driving", alternatives[0] || null);
-  const transit = googleMapsUrl(job, "transit", alternatives[0] || null);
   if (!driving) return "";
-  return `<span class="map-links" aria-label="Map directions"><a class="button ghost small" href="${escapeAttribute(driving)}" target="_blank" rel="noreferrer">Driving directions</a><a class="button ghost small" href="${escapeAttribute(transit)}" target="_blank" rel="noreferrer">Transit directions</a></span>`;
+  return `<span class="map-links" aria-label="Map directions"><a class="button ghost small" href="${escapeAttribute(driving)}" target="_blank" rel="noreferrer">Driving directions</a></span>`;
 }
 
 function renderWorkplaceAlternatives(job) {

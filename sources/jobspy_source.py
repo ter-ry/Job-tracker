@@ -403,14 +403,52 @@ def number_or_none(value: Any) -> float | None:
 
 
 def salary_range_text(min_amount: float | None, max_amount: float | None, interval: str) -> str:
-    left = f"${int(min_amount):,}" if min_amount is not None else ""
-    right = f"${int(max_amount):,}" if max_amount is not None else ""
+    def format_amount(value: float | None) -> str:
+        if value is None:
+            return ""
+        # JobSpy numeric values do not carry formatting metadata.  Keep cents
+        # visible so 100772.50 cannot be presented as a truncated integer.
+        return f"${value:,.2f}"
+
+    left = format_amount(min_amount)
+    right = format_amount(max_amount)
     amount = f"{left}-{right}" if left and right else left or right
     return f"{amount} {interval}".strip()
 
 
+def _provider_remote_classification(row: dict[str, Any]) -> str:
+    """Return a source-declared arrangement before reading free-form prose."""
+    values = [row.get("remote_type"), row.get("work_arrangement"), row.get("remote_work_model")]
+    for value in values:
+        if isinstance(value, dict):
+            value = " ".join(clean(value.get(key)) for key in ("type", "text", "label", "name"))
+        lowered = clean(value).lower().replace("_", "-")
+        if not lowered:
+            continue
+        if "hybrid" in lowered:
+            return "Hybrid"
+        if "remote" in lowered or lowered in {"telecommute", "work from home"}:
+            return "Remote"
+        if "on-site" in lowered or "onsite" in lowered or "in-person" in lowered:
+            return "On-site"
+    explicit = clean(row.get("is_remote")).lower()
+    if explicit in {"true", "1", "yes"}:
+        return "Remote"
+    if explicit in {"false", "0", "no"}:
+        return "On-site"
+    return ""
+
+
 def infer_remote_type(row: dict[str, Any]) -> str:
-    explicit = row.get("is_remote")
+    provider_classification = _provider_remote_classification(row)
+    source_arrangement = any(row.get(key) not in (None, "") for key in ("remote_type", "work_arrangement", "remote_work_model"))
+    if provider_classification and source_arrangement:
+        # JobSpy's source classification is stronger than incidental prose in
+        # a full description.  For example, Indeed can label a posting Remote
+        # while the description discusses hybrid scheduling in a generic or
+        # stale paragraph.  Keep the source value and expose the conflict via
+        # remote_classification_conflict().
+        return provider_classification
     location = clean(row.get("location")).lower()
     description = clean(row.get("description")).lower()
     title = clean(row.get("title")).lower()
@@ -418,23 +456,21 @@ def infer_remote_type(row: dict[str, Any]) -> str:
     text = " ".join([location, title, provider_arrangement, description])
     negative = bool(re.search(r"\b(?:not|no)\s+remote\b|remote\s*(?::|-)?\s*(?:no|false)\b|work\s+remotely\s*(?::|-)?\s*no\b|work\s+location\s*:\s*in\s+person\b|on[- ]site\s+only", text))
     positive = bool(re.search(r"\b(?:fully|100%|work(?:ing)?|position|role|job)\s+(?:is\s+)?remote\b|\bremote\s+(?:position|role|work|job|in\s+canada)\b|\bwork\s+from\s+home\b", text))
-    explicit = clean(explicit).lower()
+    explicit = clean(row.get("is_remote")).lower()
     if negative and explicit in {"true", "1", "yes"}:
         return "Unknown"
     if positive and explicit in {"false", "0", "no"}:
         return "Unknown"
     if negative:
         return "On-site"
+    if isinstance(row.get("is_remote"), bool):
+        return "Remote" if row.get("is_remote") else "On-site"
+    if explicit in {"true", "1", "yes"}:
+        return "Remote"
+    if explicit in {"false", "0", "no"}:
+        return "On-site"
     if "hybrid" in text or provider_arrangement == "hybrid":
         return "Hybrid"
-    if isinstance(row.get("is_remote"), bool):
-        if row.get("is_remote"):
-            return "Remote"
-        return "On-site"
-    elif explicit in {"true", "1", "yes"}:
-        return "Remote"
-    elif explicit in {"false", "0", "no"}:
-        return "On-site"
     if "on-site" in text or "onsite" in text:
         return "On-site"
     if extract_workplace_alternatives(row, description) and re.search(
@@ -457,10 +493,18 @@ def remote_classification_conflict(row: dict[str, Any]) -> str:
     content = " ".join([location, title, arrangement, description])
     negative = bool(re.search(r"\b(?:not|no)\s+remote\b|remote\s*(?::|-)?\s*(?:no|false)\b|work\s+remotely\s*(?::|-)?\s*no\b|work\s+location\s*:\s*in\s+person\b|on[- ]site\s+only", content))
     positive = bool(re.search(r"\b(?:fully|100%|work(?:ing)?|position|role|job)\s+(?:is\s+)?remote\b|\bremote\s+(?:position|role|work|job|in\s+canada)\b|\bwork\s+from\s+home\b", content))
-    explicit = clean(row.get("is_remote")).lower()
-    if negative and explicit in {"true", "1", "yes"}:
+    explicit = _provider_remote_classification(row)
+    description_hybrid = bool(re.search(r"\bhybrid\b", description))
+    description_remote = bool(re.search(r"\bremote\b", description))
+    if explicit == "Remote" and description_hybrid:
+        return "provider_remote_conflicts_with_description_hybrid_evidence"
+    if explicit == "Hybrid" and description_remote and not description_hybrid:
+        return "provider_hybrid_conflicts_with_description_remote_evidence"
+    if explicit == "On-site" and description_remote and not description_hybrid:
+        return "provider_on_site_conflicts_with_description_remote_evidence"
+    if negative and explicit == "Remote":
         return "provider_remote_conflicts_with_explicit_on_site_evidence"
-    if positive and explicit in {"false", "0", "no"}:
+    if positive and explicit == "On-site":
         return "provider_on_site_conflicts_with_explicit_remote_evidence"
     return ""
 
@@ -570,11 +614,30 @@ def extract_workplace_location(row: dict[str, Any], description: str, provider_l
             "precision": clean(item.get("precision")), "confidence": int(item.get("confidence") or 0),
             "alternatives": alternatives,
         }
+    postal_match = re.search(POSTAL_PATTERN, description or "", re.I)
+    if postal_match:
+        context_start = max(0, postal_match.start() - 180)
+        context = clean((description or "")[context_start:postal_match.end()])
+        if re.search(r"\b(?:work\s+location|location|commute|relocate|hybrid(?:\s+remote)?\s+in|based\s+in|located\s+in)\b", context, re.I):
+            postal = postal_match.group(0).upper().replace("-", " ")
+            evidence_start = max(0, description.rfind("\n", context_start, postal_match.start()) + 1)
+            evidence = clean(description[evidence_start:postal_match.end()]).strip(" -•;|")
+            display = provider_location
+            if postal.lower() not in display.lower():
+                display = f"{display}, {postal}" if display else postal
+            return {
+                "display_location": display, "address": display, "postal_code": postal,
+                "evidence": evidence or context, "evidence_source": "description advertised postal code",
+                "precision": "postal code", "confidence": 88, "alternatives": [],
+            }
     postal = clean(row.get("postal_code") or row.get("zip_code") or row.get("workplace_postal_code"))
+    if not postal:
+        provider_postal = re.search(POSTAL_PATTERN, provider_location or "", re.I)
+        postal = provider_postal.group(0).upper().replace("-", " ") if provider_postal else ""
     return {
         "display_location": provider_location, "address": "", "postal_code": postal,
-        "evidence": "", "evidence_source": "", "precision": "city" if provider_location else "unknown",
-        "confidence": 65 if provider_location else 0, "alternatives": [],
+        "evidence": "", "evidence_source": "", "precision": "postal code" if postal else ("city" if provider_location else "unknown"),
+        "confidence": 88 if postal else (65 if provider_location else 0), "alternatives": [],
     }
 
 

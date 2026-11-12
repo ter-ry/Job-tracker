@@ -2380,6 +2380,55 @@ class JobAssistantTest(unittest.TestCase):
             "provider_remote_conflicts_with_explicit_on_site_evidence",
         )
 
+    def test_indeed_remote_classification_wins_over_hybrid_prose_and_preserves_salary(self):
+        row = jobspy_source.normalize_jobspy_row(
+            {
+                "title": "Full-Stack Developer - Toronto, ON M5T 1X5",
+                "location": "Toronto, ON M5T 1X5",
+                "is_remote": True,
+                "remote_work_model": {"type": "REMOTE_ALWAYS", "text": "Remote"},
+                "min_amount": 100772.50,
+                "max_amount": 136337.50,
+                "interval": "yearly",
+                "description": "This is a Hybrid position. See #LI-Hybrid.",
+            },
+            fallback_source="indeed",
+        )
+        self.assertEqual(row["remote_type"], "Remote")
+        self.assertEqual(row["remote_classification_conflict"], "provider_remote_conflicts_with_description_hybrid_evidence")
+        self.assertEqual(row["workplace_postal_code"], "M5T 1X5")
+        self.assertEqual(row["salary_text"], "$100,772.50-$136,337.50 yearly")
+        salary = app_module.determine_salary(row)
+        self.assertEqual(salary["salary_advertised_min"], 100772.50)
+        self.assertEqual(salary["salary_advertised_max"], 136337.50)
+        self.assertIn("100,772.50", salary["salary_text"])
+        self.assertIn("136,337.50", salary["salary_text"])
+
+    def test_indeed_hybrid_description_recovers_postal_code_without_street_guess(self):
+        row = jobspy_source.normalize_jobspy_row(
+            {
+                "title": "Full Stack Developer (ASP.NET / Blazor / MAUI)",
+                "location": "Mississauga, ON",
+                "remote_work_model": {"type": "REMOTE_HYBRID", "text": "Hybrid work"},
+                "salary": "From $23 an hour",
+                "description": "Work Location: Hybrid remote in Mississauga, ON L5L 5Y1.",
+            },
+            fallback_source="indeed",
+        )
+        self.assertEqual(row["remote_type"], "Hybrid")
+        self.assertEqual(row["workplace_postal_code"], "L5L 5Y1")
+        self.assertEqual(row["workplace_precision"], "postal code")
+        self.assertEqual(row["workplace_address"], "Mississauga, ON, L5L 5Y1")
+        self.assertNotIn("Street", row["workplace_address"])
+        self.assertEqual(row["salary_text"], "From $23 an hour")
+
+    def test_job_tracker_directions_and_remote_labels_are_conservative(self):
+        frontend = Path("static/app.js").read_text(encoding="utf-8")
+        self.assertIn("geographic eligibility region", frontend)
+        self.assertIn("Driving directions", frontend)
+        self.assertNotIn("Transit directions", frontend)
+        self.assertIn("Qualification evidence incomplete", frontend)
+
     def test_salary_parser_preserves_from_and_rejects_truncated_structured_range(self):
         maple = app_module.determine_salary({"salary_text": "From $31.00 per hour"})
         self.assertEqual(maple["salary_interval"], "hourly")

@@ -2436,7 +2436,20 @@ def create_app() -> Flask:
             ordered = sorted(jobs, key=lambda item: (rank.get(text((item.get("technical_compatibility") or {}).get("decision")), 4), -int(item.get("application_priority_score") or 0)))
             if as_bool(payload.get("strict_technical")):
                 ordered = [item for item in ordered if not (item.get("technical_compatibility") or {}).get("required_no_experience")]
-            shortlist_jobs = ordered[:clamp_int_default(payload.get("shortlist_size"), 15, 1, 100)]
+            # Keep the default application shortlist focused on early-career
+            # roles. Senior/lead/management and high-experience roles remain
+            # in the full result set behind Show all.
+            senior_levels = {"senior", "lead", "manager", "director"}
+            primary = []
+            for item in ordered:
+                analysis = item.get("qualification_fit_seniority") or {}
+                level = text(analysis.get("detected_level") or item.get("seniority_level")).lower().replace("-", "_")
+                required = analysis.get("required_experience") or {}
+                minimum_years = required.get("minimum") if isinstance(required, dict) else None
+                is_senior = level in senior_levels or bool(analysis.get("management_role")) or bool(analysis.get("leadership_expectations")) or (minimum_years is not None and float(minimum_years) >= 5)
+                if not is_senior:
+                    primary.append(item)
+            shortlist_jobs = primary[:clamp_int_default(payload.get("shortlist_size"), 15, 1, 100)]
         finish_discovery_run(
             manual_run_id,
             status="completed" if not fetched.get("errors") else "completed_with_errors",
@@ -6899,7 +6912,9 @@ def missing_salary() -> dict[str, Any]:
 
 def salary_range_label(minimum: float, maximum: float, interval: str, currency: str) -> str:
     def format_amount(value: float) -> str:
-        return f"{value:,.2f}".rstrip("0").rstrip(".")
+        # Preserve decimal precision from structured source values.  A value
+        # such as 100772.50 must not become an apparently truncated integer.
+        return f"{value:,.2f}"
 
     left = f"{currency} ${format_amount(minimum)}"
     right = f"{currency} ${format_amount(maximum)}"
