@@ -3195,6 +3195,27 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(states["kubernetes"], "Unverified")
         self.assertIn("Unverified", result["technical_compatibility"]["explanation"])
 
+    def test_unclassified_technologies_cannot_be_a_strong_match(self):
+        # A live Rose Rocket junior posting labels its stack as technologies
+        # the hire will be exposed to, while its actual success criteria are
+        # non-stack requirements.  An empty required-technology set must not
+        # make all([]) turn missing résumé evidence into a strong match.
+        result = app_module.build_qualification_fit(
+            {
+                "title": "Junior Software Engineer",
+                "required_skills": "React, SQL, AWS",
+                "job_description": (
+                    "Technologies that we use (that you'll be exposed to): React, PostgreSQL, AWS. "
+                    "What you need to succeed: Proficiency with Git and version control best practices."
+                ),
+            },
+            evidence_profile={"resume_text": ""},
+        )
+        compatibility = result["technical_compatibility"]
+        self.assertFalse(compatibility["required_demonstrated"])
+        self.assertFalse(compatibility["required_unverified"])
+        self.assertEqual(compatibility["decision"], "Possible / stretch — evidence incomplete")
+
     def test_opportunity_score_compares_advertised_pay_and_distance(self):
         base = {
             "occupation_match_type": "exact", "title_match_score": 100,

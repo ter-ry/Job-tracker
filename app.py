@@ -9952,7 +9952,7 @@ def _technical_compatibility(assessed: list[dict[str, Any]], profile: dict[str, 
     unverified = [item["requirement"] for item in required if item["state"] == "Unverified"]
     if confirmed_gaps:
         decision = "Significant gaps"
-    elif not items or (required and unverified):
+    elif not required or unverified:
         decision = "Possible / stretch — evidence incomplete"
     else:
         decision = "Strong technical match" if all(item["state"] == "Demonstrated" for item in required) else "Possible / stretch"
