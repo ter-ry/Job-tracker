@@ -27,6 +27,7 @@ const state = {
   advancedFeatures: (() => { try { return localStorage.getItem("jobTracker.advancedFeatures") === "true"; } catch (_) { return false; } })(),
   pendingAppliedJobs: new Set(),
   tailoring: { draftId: null, jobId: null, profileId: null, resumeId: null, data: null, selectedParagraph: null, selectedKeyword: null, aiImproveJobId: null },
+  discoveryWorkflow: "software",
 };
 
 const jobFields = [
@@ -130,6 +131,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("job-form").addEventListener("submit", saveJob);
   document.getElementById("profile-form").addEventListener("submit", saveProfile);
   document.getElementById("discovery-form").addEventListener("submit", searchDiscovery);
+  document.getElementById("discovery-workflow")?.addEventListener("change", () => applyDiscoveryWorkflow(value("discovery-workflow"), { reset: true }));
   document.getElementById("saved-search-form").addEventListener("submit", saveSavedSearch);
   document.getElementById("new-saved-search").addEventListener("click", () => toggleSavedSearchForm(true));
   document.getElementById("cancel-saved-search").addEventListener("click", () => toggleSavedSearchForm(false));
@@ -176,7 +178,8 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("discovery-filter-toggle").addEventListener("click", toggleDiscoveryFilters);
   document.getElementById("discovery-clear-filters").addEventListener("click", clearDiscoveryFilters);
   document.getElementById("discovery-show-all").addEventListener("click", showAllFetchedDiscoveryJobs);
-  setDiscoverySection("pipeline");
+  document.getElementById("discovery-filter-show-all")?.addEventListener("click", showAllFetchedDiscoveryJobs);
+  setDiscoverySection("find");
   applyAdvancedFeaturesVisibility();
   ["search", "status-filter", "fit-filter", "role-filter", "remote-filter", "risk-filter", "sort-by"].forEach((id) => {
     document.getElementById(id).addEventListener("input", renderJobs);
@@ -274,7 +277,7 @@ function toggleAdvancedFeatures() {
 }
 
 function setDiscoverySection(view) {
-  const selected = ["pipeline", "find", "saved"].includes(view) ? view : "pipeline";
+  const selected = ["pipeline", "find", "saved"].includes(view) ? view : "find";
   document.querySelectorAll("[data-discovery-view]").forEach((button) => {
     const active = button.dataset.discoveryView === selected;
     button.classList.toggle("active", active);
@@ -320,7 +323,8 @@ async function loadAll() {
     renderOllamaHealth({ status: "loading", summary: "Checking local AI status…" });
     renderEvidenceLibrary(evidence);
     renderJobs();
-    await restoreLatestDiscoverySearch();
+    // Keep the initial beta screen clean. Persisted search history is retained,
+    // but a prior applicant's cached results are never shown automatically.
     renderShortlist();
     // These package/memory surfaces are unrelated to the initial Discovery view.
     // Load them after the useful page is painted instead of blocking category access.
@@ -1426,7 +1430,7 @@ function switchTab(event) {
   const target = event.currentTarget.dataset.tab;
   document.querySelectorAll(".tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === target));
   document.querySelectorAll(".tab-panel").forEach((panel) => panel.classList.toggle("active", panel.id === target));
-  if (target === "discovery") setDiscoverySection("pipeline");
+  if (target === "discovery") setDiscoverySection("find");
 }
 
 async function focusPreparationPackage(itemId) {
@@ -2439,15 +2443,53 @@ async function saveEditedVersion(kind, elementId) {
   }
 }
 
-function applyDiscoverySearchDefaults() {
-  setValue("discovery-search-mode", "title");
+function clearVisibleDiscoveryResults() {
+  state.discoveryResults = [];
+  state.discoveryAllResults = [];
+  state.discoverySearchKey = "";
+  state.discoverySearchCriteria = {};
+  state.discoveryMeta = {};
+  setDiscoveryControlsEnabled(false);
+  const target = document.getElementById("discovery-results");
+  if (target) {
+    target.classList.add("empty");
+    target.textContent = "Search results will appear here.";
+  }
+  const status = document.getElementById("discovery-status");
+  if (status) status.textContent = "";
+}
+
+function applyDiscoveryWorkflow(workflow = "software", { reset = false } = {}) {
+  const selected = workflow === "ece" ? "ece" : "software";
+  state.discoveryWorkflow = selected;
+  setValue("discovery-workflow", selected);
+  setValue("discovery-search-mode", selected === "software" ? "shortlist" : "title");
   setValue("discovery-title-match-mode", "related");
+  setValue("discovery-keywords", selected === "software" ? "software developer; junior software engineer" : "Registered Early Childhood Educator; RECE");
+  setValue("discovery-distance", "");
+  setValue("discovery-remote-preference", "");
+  setValue("discovery-location", "");
+  setValue("discovery-shortlist-size", value("discovery-total-cap") || 25);
+  setChecked("discovery-strict-technical", selected === "software");
+  const help = document.getElementById("discovery-profile-help");
+  if (help) help.textContent = selected === "software"
+    ? "The selected SWE résumé is used for technical matching."
+    : "The applicant is kept on the search record; ECE matching does not require a résumé.";
+  if (reset) {
+    clearDiscoveryFilters();
+    clearVisibleDiscoveryResults();
+  }
+}
+
+function applyDiscoverySearchDefaults() {
+  applyDiscoveryWorkflow("software");
   setValue("discovery-search-depth", "standard");
   setValue("discovery-date-window", "14d");
   setValue("discovery-sort-mode", "best_match");
   setValue("discovery-distance", "");
   setValue("discovery-per-source-cap", 100);
-  setValue("discovery-total-cap", 200);
+  setValue("discovery-total-cap", 25);
+  setValue("discovery-shortlist-size", 25);
   setChecked("discovery-bypass-cache", false);
 }
 
@@ -2464,8 +2506,9 @@ function syncDiscoveryDepthDefaults() {
 }
 
 function discoverySearchCriteriaFromControls() {
+  const workflow = value("discovery-workflow") || state.discoveryWorkflow || "software";
   return {
-    search_mode: value("discovery-search-mode") || "title",
+    search_mode: workflow === "software" ? "shortlist" : "title",
     title_match_mode: value("discovery-title-match-mode") || "related",
     keywords: value("discovery-keywords"),
     location: value("discovery-location"),
@@ -2478,13 +2521,19 @@ function discoverySearchCriteriaFromControls() {
     per_source_cap: value("discovery-per-source-cap") || 100,
     total_cap: value("discovery-total-cap") || 200,
     bypass_cache: checked("discovery-bypass-cache"),
-    candidate_profile_id: value("discovery-profile"),
-    shortlist_size: value("discovery-shortlist-size") || 15,
-    strict_technical: checked("discovery-strict-technical"),
+    // Software shortlist scoring needs the selected résumé. ECE title search
+    // deliberately stays résumé-independent; the chosen applicant remains
+    // the active UI context for subsequent application actions.
+    candidate_profile_id: workflow === "software" ? value("discovery-profile") : "",
+    shortlist_size: Number(value("discovery-total-cap") || 25),
+    strict_technical: workflow === "software" ? checked("discovery-strict-technical") : false,
+    workflow,
   };
 }
 
 function applyDiscoverySearchCriteriaToControls(criteria = {}) {
+  const workflow = criteria.workflow || (criteria.search_mode === "shortlist" ? "software" : "ece");
+  applyDiscoveryWorkflow(workflow);
   setValue("discovery-search-mode", criteria.search_mode || "title");
   setValue("discovery-title-match-mode", criteria.title_match_mode || "related");
   setValue("discovery-keywords", criteria.keywords || "");
@@ -2520,7 +2569,7 @@ async function restoreLatestDiscoverySearch() {
 }
 
 function setDiscoveryControlsEnabled(enabled) {
-  ["discovery-sort-mode", "discovery-filter-toggle", "discovery-clear-filters", "discovery-show-all", "discovery-view-cards", "discovery-view-table"].forEach((id) => {
+  ["discovery-sort-mode", "discovery-filter-toggle", "discovery-clear-filters", "discovery-show-all", "discovery-filter-show-all", "discovery-view-cards", "discovery-view-table"].forEach((id) => {
     const element = document.getElementById(id);
     if (element) element.disabled = !enabled;
   });
@@ -2659,6 +2708,11 @@ async function searchDiscovery(event) {
   const button = document.getElementById("discovery-submit");
   const status = document.getElementById("discovery-status");
   const criteria = discoverySearchCriteriaFromControls();
+  if (!criteria.candidate_profile_id) {
+    status.textContent = "Choose an applicant in Profiles before searching.";
+    toast("Choose an applicant before searching.");
+    return;
+  }
   button.disabled = true;
   const startedAt = Date.now();
   const sourceText = criteria.enabled_sources.map(sourceLabel).join(", ");
@@ -3031,15 +3085,14 @@ function renderDiscoveryCards(jobs) {
 function renderDiscoveryTable(jobs) {
   if (!jobs.length) return "<p>No live jobs are available from the selected sources.</p>";
   const headers = [
-    ["title", "Title"],
-    ["company", "Company"],
-    ["location", "Location"],
+    ["title", "Job"],
+    ["location", "Workplace"],
+    ["work_arrangement", "Arrangement"],
     ["distance", "Distance"],
     ["salary", "Salary"],
-    ["posted_date", "Posted date"],
-    ["work_arrangement", "Work arrangement"],
-    ["application_priority_score", "Application Priority"],
+    ["seniority", "Experience / match"],
     ["source", "Source"],
+    ["actions", "Actions"],
   ];
   return `
     <div class="table-wrap discovery-table-wrap">
@@ -3066,48 +3119,67 @@ function discoveryJobKey(job) {
 }
 
 function renderDiscoveryRow(job) {
-  const applicationUrl = job.application_url && job.application_url !== job.url ? job.application_url : "";
+  const postingUrl = job.application_url || job.url || "";
   const key = escapeAttribute(discoveryJobKey(job));
   return `
     <tr>
       <td>
         <strong>${escapeHtml(job.title || "Untitled role")}</strong>
-        ${renderExperienceSummary(job)}
-        ${renderDiscoveryWhy(job)}
+        <br><span class="muted">${escapeHtml(job.company || "Unknown company")}</span>
       </td>
-      <td>${escapeHtml(job.company || "Unknown company")}</td>
-      <td>${escapeHtml(job.location || "Location unavailable")}<br><span class="muted">${escapeHtml(job.normalized_location || "")}</span>${renderWorkplaceAlternatives(job)}</td>
-      <td>${escapeHtml(distanceBadge(job))}</td>
-      <td>${escapeHtml(job.salary || "Salary unavailable")}</td>
-      <td>${escapeHtml(job.posted_date || "Unknown")}</td>
+      <td>${escapeHtml(resultWorkplaceLabel(job))}${renderWorkplaceAlternatives(job)}${renderBenefits(job)}</td>
       <td>${escapeHtml(job.work_arrangement || job.remote_type || "Unknown")}</td>
-      <td><strong>${Number(job.discovery_profile_independent || 0) ? "Job Opportunity Score" : "Application Priority"}</strong><br>${scorePill(job.opportunity_score || job.application_priority_score || 0)}<br><span class="muted">${Number(job.discovery_profile_independent || 0) ? "Posting-evidence score" : `Qualification ${scorePill(job.qualification_match_score ?? job.qualification_fit_score ?? 0)}`}</span></td>
-      <td>${escapeHtml(job.source || "JobSpy")}</td>
-    </tr>
-    <tr>
-      <td colspan="9">
-        <div class="row-actions">
-          <button class="button small" type="button" data-discovery-action="save" data-job-key="${key}">Save for later</button>
-          <button class="button small ghost" type="button" data-discovery-action="applied" data-job-key="${key}">Mark Applied</button>
-          <button class="button small ghost" type="button" data-discovery-action="hide" data-job-key="${key}">Skip</button>
-          ${job.url ? `<a class="button small ghost" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open job</a>` : ""}
-          ${renderMapLinks(job)}
-          ${applicationUrl ? `<a class="button small ghost" href="${escapeAttribute(applicationUrl)}" target="_blank" rel="noreferrer">Application</a>` : ""}
-        </div>
-      </td>
+      <td>${escapeHtml(resultDistanceLabel(job))}</td>
+      <td>${escapeHtml(job.salary || "Salary unavailable")}</td>
+      <td>${renderExperienceSummary(job)}<br>${escapeHtml(resultMatchLabel(job))}</td>
+      <td>${escapeHtml(job.source || "JobSpy")}<br><span class="muted">${escapeHtml(job.posted_date || "Date unknown")}</span></td>
+      <td><div class="row-actions compact-actions">
+        <button class="button small" type="button" data-discovery-action="save" data-job-key="${key}">Save</button>
+        <button class="button small ghost" type="button" data-discovery-action="applied" data-job-key="${key}">Applied</button>
+        ${postingUrl ? `<a class="button small ghost" href="${escapeAttribute(postingUrl)}" target="_blank" rel="noreferrer">Open job</a>` : ""}
+        ${renderMapLinks(job)}
+      </div></td>
     </tr>
   `;
 }
 
+function resultWorkplaceLabel(job) {
+  if (isRemoteJob(job)) return `Remote · eligibility: ${jobLocationLabel(job) || "hiring region not listed"}`;
+  const precision = String(job.location_precision || "").toLowerCase();
+  const precise = job.workplace_address || job.workplace_postal_code || (["street address", "postal code", "house"].some((value) => precision.includes(value)) ? job.normalized_location : "");
+  return precise || `Exact workplace unknown · ${job.location || "Location unavailable"}`;
+}
+
+function resultDistanceLabel(job) {
+  if (isRemoteJob(job)) return "N/A";
+  if (job.city_estimate_km !== undefined && job.city_estimate_km !== null) return `Approx. ${Number(job.city_estimate_km)} km (postal origin)`;
+  if (Number(job.distance_km) < 9999 && job.distance_label !== "unknown") {
+    const precision = String(job.location_precision || "").toLowerCase();
+    return precision.includes("postal") ? `Approx. ${Number(job.distance_km)} km (postal centroid)` : `${Number(job.distance_km)} km straight-line`;
+  }
+  return "Exact workplace unknown";
+}
+
+function resultMatchLabel(job) {
+  if (Number(job.discovery_profile_independent || 0)) return `Title/seniority: ${job.qualification_fit_label || job.discovery_result_category || "Review"}`;
+  const compatibility = job.technical_compatibility || {};
+  return `Technical match: ${compatibility.decision || job.qualification_fit_label || "Review"}`;
+}
+
+function renderBenefits(job) {
+  const benefits = Array.isArray(job.benefits) ? job.benefits.map((item) => item.value || item.evidence).filter(Boolean) : [];
+  return benefits.length ? `<details class="result-details"><summary>Benefits</summary><span>${escapeHtml(benefits.join(" · "))}</span></details>` : "";
+}
+
 function renderDiscoveryCard(job) {
-  const applicationUrl = job.application_url && job.application_url !== job.url ? job.application_url : "";
+  const postingUrl = job.application_url || job.url || "";
   const key = escapeAttribute(discoveryJobKey(job));
   const warnings = job.warnings?.length
     ? `<div class="warning-list">${job.warnings.map((warning) => `<span>${escapeHtml(warning)}</span>`).join("")}</div>`
     : "";
   const savedStatus = String(job.saved_job_status || job.status || "").toLowerCase();
   const alreadySaved = Boolean(job.already_saved || savedStatus);
-  const buttonLabel = alreadySaved && savedStatus !== "shortlisted" ? "Add to shortlist again" : alreadySaved ? "Shortlisted" : "Save to shortlist";
+  const buttonLabel = alreadySaved ? "Saved" : "Save";
   const buttonDisabled = alreadySaved && savedStatus === "shortlisted" ? "disabled" : "";
   const saved = alreadySaved ? `<span class="risk low">${escapeHtml(job.saved_job_status || job.status || "Saved")}</span>` : "";
   return `
@@ -3115,9 +3187,9 @@ function renderDiscoveryCard(job) {
       <div class="discovery-card-main">
         <div>
           <h3>${escapeHtml(job.title || "Untitled role")}</h3>
-          <p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(job.location || "Location unavailable")}</p>
+          <p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(resultWorkplaceLabel(job))}</p>
           <p class="muted">${escapeHtml(job.source || "JobSpy")} · ${escapeHtml(job.work_arrangement || job.remote_type || "Remote unspecified")} · ${escapeHtml(displaySalary(job))} · Posted ${escapeHtml(job.posted_date || "unknown")}</p>
-          <p class="muted">Normalized location: ${escapeHtml(job.normalized_location || "Unavailable")} · ${escapeHtml(distanceBadge(job))}</p>
+          <p class="muted">${escapeHtml(resultDistanceLabel(job))}</p>
           <div class="badge-row">
             ${badge("Distance", distanceBadge(job))}
             ${badge("Salary", displaySalary(job))}
@@ -3127,6 +3199,7 @@ function renderDiscoveryCard(job) {
             ${badge("Posted", job.posted_date || "Unknown")}
             ${badge("Work", job.work_arrangement || job.remote_type || "Unknown")}
           </div>
+          ${renderBenefits(job)}
         </div>
         <div><strong>${Number(job.discovery_profile_independent || 0) ? "Job Opportunity Score" : "Application Priority"}</strong><br>${scorePill(job.opportunity_score || job.application_priority_score || 0)}<br><span class="muted">${Number(job.discovery_profile_independent || 0) ? "Posting-evidence score" : `Qualification ${scorePill(job.qualification_match_score ?? job.qualification_fit_score ?? 0)}`}</span>${saved}</div>
       </div>
@@ -3137,11 +3210,9 @@ function renderDiscoveryCard(job) {
       ${renderDiscoveryWhy(job)}
       <div class="row-actions">
         <button class="button small" type="button" data-discovery-action="save" data-job-key="${key}" ${buttonDisabled}>${buttonLabel}</button>
-        <button class="button small ghost" type="button" data-discovery-action="applied" data-job-key="${key}">Mark Applied</button>
-        <button class="button small ghost" type="button" data-discovery-action="hide" data-job-key="${key}">Skip</button>
-        ${job.url ? `<a class="button small ghost" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open job</a>` : ""}
+        <button class="button small ghost" type="button" data-discovery-action="applied" data-job-key="${key}">Applied</button>
+        ${postingUrl ? `<a class="button small ghost" href="${escapeAttribute(postingUrl)}" target="_blank" rel="noreferrer">Open job</a>` : ""}
         ${renderMapLinks(job)}
-        ${applicationUrl ? `<a class="button small ghost" href="${escapeAttribute(applicationUrl)}" target="_blank" rel="noreferrer">Application</a>` : ""}
       </div>
     </section>
   `;
