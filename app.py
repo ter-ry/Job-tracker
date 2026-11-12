@@ -2281,8 +2281,7 @@ def create_app() -> Flask:
         fetched = fetch_discovery_jobs_for_search(search, country_indeed=text(payload.get("country_indeed")) or "Canada")
 
         raw_jobs = fetched.get("jobs", [])
-        existing_keys = existing_job_dedupe_keys()
-        seen_keys: set[str] = set()
+        seen_jobs: list[dict[str, Any]] = []
         jobs: list[dict[str, Any]] = []
         duplicates_in_search = 0
         already_saved_matches = 0
@@ -2332,19 +2331,17 @@ def create_app() -> Flask:
             clean["warnings"] = discovery_warning_reasons(clean, keywords, search["location"])
             clean["already_saved"] = False
             clean["duplicate_in_search"] = False
-            keys = dedupe_keys(clean, clean.get("source_job_id"))
-            if keys & seen_keys:
+            if any(dedupe_match(clean, seen) for seen in seen_jobs):
                 clean["duplicate_in_search"] = True
                 duplicates_in_search += 1
                 continue
-            if keys & existing_keys:
+            existing_match = find_existing_job_match(clean)
+            if existing_match is not None:
                 clean["already_saved"] = True
                 already_saved_matches += 1
-                existing_match = find_existing_job_match(clean)
-                if existing_match is not None:
-                    clean["saved_job_id"] = int(existing_match["id"])
-                    clean["saved_job_status"] = text(existing_match["status"])
-            seen_keys.update(keys)
+                clean["saved_job_id"] = int(existing_match["id"])
+                clean["saved_job_status"] = text(existing_match["status"])
+            seen_jobs.append(clean)
             jobs.append(clean)
 
         source_counts = {source: 0 for source in DISCOVERY_SOURCES}
@@ -3153,8 +3150,7 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         origin = {"input": search["distance_origin_input"], "normalized": search["distance_origin_input"], "provider": origin_lookup.get("provider", ""), "status": origin_lookup.get("status") or "unresolved", "precision": "unknown", "error": origin_lookup.get("error") or "The requested private distance origin could not be resolved.", "failure_reasons": origin_lookup.get("failure_reasons", [])}
     search["keywords"] = keywords
     fetched = fetch_discovery_jobs_for_search(search, country_indeed="Canada")
-    existing_keys = existing_job_dedupe_keys()
-    seen_keys: set[str] = set()
+    seen_jobs: list[dict[str, Any]] = []
     jobs: list[dict[str, Any]] = []
     duplicates_in_search = 0
     already_saved_matches = 0
@@ -3204,19 +3200,16 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
             clean["filtered_reason"] = "Posting seniority does not match the saved-search seniority preference."
             filtered += 1
             continue
-        keys = dedupe_keys(clean, clean.get("source_job_id"))
-        if keys & seen_keys:
+        if any(dedupe_match(clean, seen) for seen in seen_jobs):
             duplicates_in_search += 1
             continue
-        clean["already_saved"] = bool(keys & existing_keys)
-        if clean["already_saved"]:
+        existing_match = find_existing_job_match(clean)
+        clean["already_saved"] = existing_match is not None
+        if existing_match is not None:
             already_saved_matches += 1
-        if clean["already_saved"]:
-            existing_match = find_existing_job_match(clean)
-            if existing_match is not None:
-                clean["saved_job_id"] = int(existing_match["id"])
-                clean["saved_job_status"] = text(existing_match["status"])
-        seen_keys.update(keys)
+            clean["saved_job_id"] = int(existing_match["id"])
+            clean["saved_job_status"] = text(existing_match["status"])
+        seen_jobs.append(clean)
         jobs.append(clean)
     capped_count = max(0, len(jobs) - search["total_cap"])
     jobs = sort_discovery_jobs(jobs, "application_priority_score", "desc", "", "asc", "remote_after_local", "last")[: search["total_cap"]]
@@ -6521,6 +6514,7 @@ def build_preparation_pdf_preview(item_id: int, kind: str, source: Path, content
 
 def dedupe_keys(job: dict[str, Any], source_job_id: Any = "") -> set[str]:
     keys = set()
+    source_id = normalize_dedupe_text(source_job_id)
     for field in ["url", "application_url"]:
         canonical = canonical_url(text(job.get(field)))
         if canonical:
@@ -6534,11 +6528,27 @@ def dedupe_keys(job: dict[str, Any], source_job_id: Any = "") -> set[str]:
     )
     if composite.replace("|", ""):
         keys.add(f"ctl:{composite}")
-    source_id = normalize_dedupe_text(source_job_id)
     source = normalize_dedupe_text(job.get("source"))
     if source_id:
         keys.add(f"source:{source}:{source_id}")
     return keys
+
+
+def dedupe_match(first: dict[str, Any], second: dict[str, Any]) -> bool:
+    """Match vacancies without merging distinct IDs from one provider."""
+    first_urls = {canonical_url(text(first.get(field))) for field in ("url", "application_url")}
+    second_urls = {canonical_url(text(second.get(field))) for field in ("url", "application_url")}
+    if (first_urls - {""}) & (second_urls - {""}):
+        return True
+    first_id = normalize_dedupe_text(first.get("source_job_id"))
+    second_id = normalize_dedupe_text(second.get("source_job_id"))
+    first_source = normalize_dedupe_text(first.get("source"))
+    second_source = normalize_dedupe_text(second.get("source"))
+    if first_id and second_id and first_source and first_source == second_source:
+        return first_id == second_id
+    return bool(dedupe_keys(first, first_id) & dedupe_keys(second, second_id) & {
+        key for key in dedupe_keys(first, first_id) if key.startswith("ctl:")
+    })
 
 
 def canonical_url(value: str) -> str:
