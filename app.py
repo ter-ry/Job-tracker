@@ -58,7 +58,15 @@ from grounding import (
 from semantic_matching import MODEL_DOWNLOAD_SIZE, MODEL_NAME, analyze_resume_match, extract_resume_evidence
 from seniority import DETECTED_LEVELS, SENIORITY_LEVELS, analyze_job_seniority, explicit_professional_years, score_seniority_fit
 from ollama_client import OllamaConfig, build_ollama_health_report, ollama_profile_defaults, request_json_completion
-from sources.jobspy_source import fetch_jobspy_jobs
+from sources.jobspy_source import (
+    arrangement_evidence,
+    extract_explicit_benefits,
+    extract_explicit_credentials,
+    extract_keyword_requirements,
+    extract_workplace_alternatives,
+    fetch_jobspy_jobs,
+    requirement_phrase_evidence,
+)
 from tailoring import generate_tailored_resume_draft
 from tailoring_pipeline import (
     build_cover_letter_paragraphs,
@@ -104,7 +112,7 @@ TAILORING_AI_JOB_RETENTION_SECONDS = 600
 # Keep derived résumé matching in a bounded process-local cache.  The key includes
 # all job/profile inputs that affect the result, so edits or profile changes cannot
 # reuse stale qualification evidence after a restart or within a running process.
-QUALIFICATION_CACHE_VERSION = "discovery-qualification-v2"
+QUALIFICATION_CACHE_VERSION = "discovery-qualification-v3"
 QUALIFICATION_CACHE_LIMIT = 512
 _QUALIFICATION_CACHE: dict[str, dict[str, Any]] = {}
 _RESUME_EVIDENCE_CACHE: dict[str, list[dict[str, Any]]] = {}
@@ -135,7 +143,7 @@ DISCOVERY_DATE_WINDOWS = {
 # Keep the public diagnostics field stable for existing API clients.  The
 # database itself is now tracked independently by the migration runner.
 APP_SCHEMA_VERSION = 1
-CURRENT_DB_SCHEMA_VERSION = 13
+CURRENT_DB_SCHEMA_VERSION = 14
 DISCOVERY_DEBUG_SNAPSHOT_LIMIT = 25
 GEOCODING_FAILURE_CACHE_SECONDS = 15 * 60
 DISCOVERY_TASK_NAME = "Job Tracker Discovery"
@@ -436,6 +444,10 @@ JOB_COLUMNS = {
     "workplace_evidence_source": "TEXT NOT NULL DEFAULT ''",
     "workplace_precision": "TEXT NOT NULL DEFAULT ''",
     "workplace_confidence": "INTEGER NOT NULL DEFAULT 0",
+    "workplace_alternatives_json": "TEXT NOT NULL DEFAULT '[]'",
+    "credentials_json": "TEXT NOT NULL DEFAULT '[]'",
+    "benefits_json": "TEXT NOT NULL DEFAULT '[]'",
+    "arrangement_evidence": "TEXT NOT NULL DEFAULT ''",
     "remote_classification_conflict": "TEXT NOT NULL DEFAULT ''",
     "provider_raw_json": "TEXT NOT NULL DEFAULT '{}'",
     "provider_title": "TEXT NOT NULL DEFAULT ''",
@@ -2557,10 +2569,12 @@ def create_app() -> Flask:
                 get_db().execute(
                     """UPDATE jobs SET distance_km = ?, distance_confidence = ?, distance_origin_label = ?,
                        distance_origin_precision = ?, distance_origin_status = ?, distance_type = ?,
-                       commute_status = ?, commute_source = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+                       commute_status = ?, commute_source = ?, workplace_alternatives_json = ?,
+                       updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
                     [job.get("distance_km", 9999), job.get("distance_confidence", 0), job.get("distance_origin_label", ""),
                      job.get("distance_origin_precision", ""), job.get("distance_origin_status", ""), job.get("distance_type", "unknown"),
-                     job.get("commute_status", "unavailable"), job.get("commute_source", ""), job_id],
+                     job.get("commute_status", "unavailable"), job.get("commute_source", ""),
+                     dumps_json(job.get("workplace_alternatives") or []), job_id],
                 )
                 updated += 1
         get_db().commit()
@@ -3331,6 +3345,10 @@ def jobspy_result_to_job_payload(job: dict[str, Any]) -> dict[str, Any]:
         "workplace_evidence_source": text(job.get("workplace_evidence_source")),
         "workplace_precision": text(job.get("workplace_precision")),
         "workplace_confidence": clamp_int(job.get("workplace_confidence"), 0, 100),
+        "workplace_alternatives_json": dumps_json(job.get("workplace_alternatives") or []),
+        "credentials_json": dumps_json(job.get("credentials") or []),
+        "benefits_json": dumps_json(job.get("benefits") or []),
+        "arrangement_evidence": text(job.get("arrangement_evidence")),
         "remote_classification_conflict": text(job.get("remote_classification_conflict")),
         "provider_raw_json": dumps_json(raw_provider, sort_keys=True, default=str),
         "provider_title": title,
@@ -7770,6 +7788,64 @@ def geocoding_result_matches_query(raw_value: str, normalized_query: str, geocod
     return city in display or city in normalize_space(normalized_query).lower()
 
 
+def workplace_alternatives_for_job(job: dict[str, Any]) -> list[dict[str, Any]]:
+    value = job.get("workplace_alternatives", job.get("workplace_alternatives_json"))
+    alternatives = parse_json_array(value) if not isinstance(value, list) else [dict(item) for item in value if isinstance(item, dict)]
+    if not alternatives and text(job.get("workplace_address")):
+        alternatives = [{
+            "address": text(job.get("workplace_address")),
+            "postal_code": text(job.get("workplace_postal_code")),
+            "precision": text(job.get("workplace_precision")) or "street address",
+            "confidence": clamp_int(job.get("workplace_confidence"), 0, 100),
+            "evidence": text(job.get("workplace_evidence")) or text(job.get("workplace_address")),
+            "evidence_source": text(job.get("workplace_evidence_source")) or "legacy single workplace",
+            "assignment_status": "confirmed",
+        }]
+    return alternatives
+
+
+def geocode_workplace_alternative(
+    alternative: dict[str, Any], profile: dict[str, str], origin: dict[str, Any],
+    provider: GeocodingProvider, *, use_cache: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    enriched = dict(alternative)
+    lookups = list(dict.fromkeys(filter(None, [text(enriched.get("address")), text(enriched.get("postal_code"))])))
+    geocode: dict[str, Any] = {}
+    for lookup in lookups:
+        candidate = geocode_location_value(lookup, lookup_type="job", profile=profile, provider=provider, use_cache=use_cache)
+        if candidate.get("ok") and geocode_matches_canadian_location(lookup, candidate):
+            geocode = candidate
+            break
+        if not geocode:
+            geocode = candidate
+    verified = bool(
+        geocode.get("ok")
+        and text(enriched.get("precision")) == "street address"
+        and text(geocode.get("precision")).lower() not in {"", "city", "region", "province", "country"}
+    )
+    enriched.update({
+        "normalized_address": text(geocode.get("normalized_query")) if verified else "",
+        "latitude": geocode.get("latitude") if verified else "",
+        "longitude": geocode.get("longitude") if verified else "",
+        "geocode_provider": text(geocode.get("provider")),
+        "geocode_precision": text(geocode.get("precision")),
+        "geocode_confidence": clamp_int(geocode.get("confidence"), 0, 100),
+        "geocode_status": text(geocode.get("status")) or ("verified" if verified else "unverified"),
+        "coordinates_verified": verified,
+    })
+    if verified:
+        distance = location_distance_snapshot(origin, text(enriched.get("address")), "On-site", "remote_after_local", geocode)
+        enriched.update({
+            "distance_km": distance["distance_km"],
+            "distance_label": distance["distance_label"],
+            "distance_note": distance.get("distance_note", ""),
+            "distance_origin_label": distance.get("origin_label", ""),
+        })
+    else:
+        enriched.update({"distance_km": 9999, "distance_label": "unknown", "distance_note": "Distance unavailable"})
+    return enriched, geocode
+
+
 def geocode_discovery_job(
     job: dict[str, Any],
     profile: dict[str, str],
@@ -7778,6 +7854,55 @@ def geocode_discovery_job(
     use_cache: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     provider = provider or get_geocoding_provider()
+    alternatives = workplace_alternatives_for_job(job)
+    if len(alternatives) > 1:
+        enriched_alternatives = []
+        geocodes = []
+        for alternative in alternatives:
+            enriched, alternative_geocode = geocode_workplace_alternative(
+                alternative, profile, origin, provider, use_cache=use_cache,
+            )
+            enriched["assignment_status"] = "advertised_alternative"
+            enriched_alternatives.append(enriched)
+            geocodes.append(alternative_geocode)
+        job["workplace_alternatives"] = enriched_alternatives
+        job["workplace_alternatives_json"] = dumps_json(enriched_alternatives)
+        job["workplace_address"] = ""
+        job["workplace_postal_code"] = ""
+        job["workplace_precision"] = "multiple alternatives"
+        job["location_original"] = text(job.get("location"))
+        job["normalized_location"] = f"{len(enriched_alternatives)} advertised workplace alternatives"
+        job["location_provider"] = "multiple"
+        job["location_confidence"] = min((clamp_int(item.get("geocode_confidence"), 0, 100) for item in enriched_alternatives), default=0)
+        job["location_precision"] = "multiple street addresses"
+        job["location_geocoded_at"] = datetime.now().isoformat(timespec="seconds")
+        job["location_geocoding_error"] = "; ".join(
+            text(item.get("error")) for item in geocodes if item and not item.get("ok") and text(item.get("error"))
+        )
+        job["location_cached"] = bool(geocodes) and all(bool(item.get("cached")) for item in geocodes if item)
+        job["location_geocode_status"] = "multiple_alternatives"
+        job["location_latitude"] = ""
+        job["location_longitude"] = ""
+        # Never substitute the closest option for an assigned workplace.
+        job["distance_km"] = 9999
+        job["city_estimate_km"] = None
+        job["distance_confidence"] = 0
+        job["distance_type"] = "multiple_alternatives"
+        job["commute_status"] = "unassigned_workplace"
+        job["commute_source"] = ""
+        job["distance_label"] = "multiple_alternatives"
+        job["distance_note"] = "Multiple advertised workplace alternatives; assigned site not confirmed."
+        job["distance_origin_label"] = text(origin.get("normalized"))
+        job["distance_origin_precision"] = text(origin.get("precision"))
+        job["distance_origin_status"] = text(origin.get("status"))
+        job["distance_cached"] = job["location_cached"]
+        return job, {
+            "ok": any(bool(item.get("coordinates_verified")) for item in enriched_alternatives),
+            "status": "multiple_alternatives", "provider": "multiple",
+            "alternative_count": len(enriched_alternatives),
+            "verified_count": sum(bool(item.get("coordinates_verified")) for item in enriched_alternatives),
+            "cached": job["location_cached"], "error": job["location_geocoding_error"],
+        }
     raw_location = text(job.get("location"))
     provider_location = text(job.get("provider_location"))
     workplace_address = text(job.get("workplace_address"))
@@ -7829,6 +7954,10 @@ def geocode_discovery_job(
     job["distance_origin_precision"] = text(origin.get("precision"))
     job["distance_origin_status"] = text(origin.get("status"))
     job["distance_cached"] = bool(geocode.get("cached"))
+    if len(alternatives) == 1:
+        enriched, _ = geocode_workplace_alternative(alternatives[0], profile, origin, provider, use_cache=use_cache)
+        job["workplace_alternatives"] = [enriched]
+        job["workplace_alternatives_json"] = dumps_json([enriched])
     return job, geocode
 
 
@@ -9579,6 +9708,29 @@ def normalize_job_payload(payload: dict[str, Any]) -> dict[str, Any]:
         existing=payload_for_extraction,
     )
     clean = {column: text(payload_for_extraction.get(column, extracted.get(column, ""))) for column in JOB_COLUMNS}
+    alternatives_value = payload.get("workplace_alternatives", payload.get("workplace_alternatives_json", extracted.get("workplace_alternatives_json", "[]")))
+    alternatives = parse_json_array(alternatives_value) if not isinstance(alternatives_value, list) else [item for item in alternatives_value if isinstance(item, dict)]
+    if not alternatives:
+        alternatives = extract_workplace_alternatives(payload_for_extraction, supplied_description)
+    credentials_value = payload.get("credentials", payload.get("credentials_json", extracted.get("credentials_json", "[]")))
+    credentials = parse_json_array(credentials_value) if not isinstance(credentials_value, list) else [item for item in credentials_value if isinstance(item, dict)]
+    if not credentials:
+        credentials = extract_explicit_credentials(supplied_description)
+    benefits_value = payload.get("benefits", payload.get("benefits_json", extracted.get("benefits_json", "[]")))
+    benefits = parse_json_array(benefits_value) if not isinstance(benefits_value, list) else [item for item in benefits_value if isinstance(item, dict)]
+    if not benefits:
+        benefits = extract_explicit_benefits(supplied_description)
+    clean["workplace_alternatives_json"] = dumps_json(alternatives)
+    clean["credentials_json"] = dumps_json(credentials)
+    clean["benefits_json"] = dumps_json(benefits)
+    if len(alternatives) > 1:
+        # Multiple advertised possibilities are not an assigned workplace.
+        clean["workplace_address"] = ""
+        clean["workplace_postal_code"] = ""
+        clean["workplace_evidence"] = ""
+        clean["workplace_evidence_source"] = ""
+        clean["workplace_precision"] = "multiple alternatives"
+        clean["workplace_confidence"] = "95"
     clean["date_added"] = text(payload.get("date_added")) or today
     clean["status"] = clean["status"] if clean["status"] in STATUSES else "Saved"
     if text(payload.get("discovery_first_seen_at")) and not text(payload.get("status")):
@@ -9725,6 +9877,20 @@ def job_to_dict(
     data["score_breakdown"] = parse_json_object(data.get("score_breakdown"))
     data["opportunity_score_reasons"] = parse_json_values(data.get("opportunity_score_reasons"))
     data["data_quality_flags"] = parse_json_values(data.get("data_quality_flags"))
+    data["workplace_alternatives"] = parse_json_array(data.get("workplace_alternatives_json"))
+    if not data["workplace_alternatives"] and text(data.get("workplace_address")):
+        data["workplace_alternatives"] = [{
+            "address": text(data.get("workplace_address")),
+            "postal_code": text(data.get("workplace_postal_code")),
+            "precision": text(data.get("workplace_precision")) or "street address",
+            "confidence": clamp_int(data.get("workplace_confidence"), 0, 100),
+            "evidence": text(data.get("workplace_evidence")) or text(data.get("workplace_address")),
+            "evidence_source": text(data.get("workplace_evidence_source")) or "legacy single workplace",
+            "assignment_status": "confirmed",
+        }]
+    data["workplace_assignment_status"] = "alternatives_unassigned" if len(data["workplace_alternatives"]) > 1 else "confirmed" if data["workplace_alternatives"] else "unavailable"
+    data["credentials"] = parse_json_array(data.get("credentials_json"))
+    data["benefits"] = parse_json_array(data.get("benefits_json"))
     if "profile_updated_at" in data and data.get("profile_updated_at"):
         profile_row = query_db("SELECT updated_at FROM profile WHERE id = 1", one=True)
         current_profile_updated = text(profile_row["updated_at"]) if profile_row else ""
@@ -9768,6 +9934,8 @@ def classify_job_description_completeness(value: Any) -> str:
 
 
 QUALIFICATION_ALIASES = {
+    "git": {"git", "version control"},
+    "version control": {"git", "version control"},
     "nodejs": {"nodejs", "node.js"},
     "node.js": {"nodejs", "node.js"},
     "java script": {"java script", "javascript"},
@@ -9784,14 +9952,21 @@ QUALIFICATION_ALIASES = {
 }
 
 QUALIFICATION_TECHNICAL_TERMS = [
-    *TECHNICAL_TERMS,
+    *(term for term in TECHNICAL_TERMS if term not in {"engineering", "version control"}),
     "c++", "c#", "go", "golang", "django", "graphql", "grpc", "websocket", "nestjs",
     "docker", "kubernetes", "linux", "systems", "systems programming", "system design",
     "architecture", "programming", "scripting", "observability", "troubleshooting",
     "networking", "integrations", "frameworks", "web applications", "databases",
     "data processing", "rbac", "cloud infrastructure", "multithreaded", "full-stack", "full stack",
     "full-stack development", "full-stack software development", "full-stack engineering", "software development",
+    "redux", "ai api/model experience", "agentic coding tools", "agile project management tools",
 ]
+
+QUALIFICATION_EVIDENCE_ALIASES = {
+    "ai api/model experience": ("ai apis/models", "ai apis", "ai models"),
+    "agentic coding tools": ("ai coding agents", "agentic coding tool", "claude code", "cursor"),
+    "agile project management tools": ("agile project management tools",),
+}
 
 
 def _qualification_key(value: Any) -> str:
@@ -9806,6 +9981,9 @@ def _qualification_phrase_present(content: str, phrase: str) -> bool:
 
 def _description_requirement_importance(description: str, term: str) -> str:
     """Classify a term using its nearest explicit qualifications section."""
+    classified, evidence = requirement_phrase_evidence(description, QUALIFICATION_EVIDENCE_ALIASES.get(term, (term,)))
+    if evidence:
+        return classified
     lowered = description.lower()
     index = lowered.find(term.lower())
     if index < 0:
@@ -9832,7 +10010,7 @@ def _qualification_terms(job: dict[str, Any]) -> list[dict[str, Any]]:
     terms: list[dict[str, Any]] = []
     seen: set[str] = set()
 
-    def add(value: str, importance: str, category: str, source: str) -> None:
+    def add(value: str, importance: str, category: str, source: str, source_evidence: str = "") -> None:
         value = normalize_space(value).strip(" -*•")
         if len(value) < 3 or len(value) > 120:
             return
@@ -9840,21 +10018,25 @@ def _qualification_terms(job: dict[str, Any]) -> list[dict[str, Any]]:
         if key in seen:
             return
         seen.add(key)
-        terms.append({"requirement": value, "normalized": key, "importance": importance, "category": category, "source": source})
+        terms.append({
+            "requirement": value, "normalized": key, "importance": importance,
+            "category": category, "source": source, "source_evidence": source_evidence,
+        })
 
     has_required_section = bool(re.search(r"(?:^|\n)\s*(?:required(?: qualifications?)?|requirements?|minimum qualifications?|must have|what you bring|what we're looking for|what we are looking for|what you’re looking for|who you are|your background|core skills(?: and experience)?|education and experience)\s*(?::|$)", description, re.I | re.M))
     for field, importance, category in (("required_skills", "required" if (not description or has_required_section) else "unclassified", "technical"), ("preferred_skills", "preferred", "technical"), ("responsibilities", "unclassified", "experience")):
         for part in re.split(r"[,;\n]+|(?<=[.!?])\s+", text(job.get(field))):
-            add(part, importance, category, field)
+            classified, evidence = requirement_phrase_evidence(description, QUALIFICATION_EVIDENCE_ALIASES.get(_qualification_key(part), (part,)))
+            resolved_importance = classified if evidence and field == "required_skills" else importance
+            add(part, resolved_importance, category, field, evidence)
 
-    lowered = content.lower()
     for term in sorted(QUALIFICATION_TECHNICAL_TERMS, key=len, reverse=True):
-        if _qualification_phrase_present(lowered, term):
-            importance = _description_requirement_importance(description, term)
-            add(term, importance, "technical", "job description")
+        importance, evidence = requirement_phrase_evidence(description, QUALIFICATION_EVIDENCE_ALIASES.get(term, (term,)))
+        if evidence:
+            add(term, importance, "technical", "job description", evidence)
 
     for match in re.finditer(r"\b\d+\+?\s*(?:to\s*\d+\+?\s*)?(?:years?|yrs?)\b[^.\n]{0,80}", content, re.I):
-        add(match.group(0), "required", "experience", "experience requirement")
+        add(match.group(0), "required", "experience", "experience requirement", normalize_space(match.group(0)))
     return terms
 
 
@@ -10226,7 +10408,8 @@ def opportunity_salary_component(job: dict[str, Any], salary: dict[str, Any]) ->
 
 
 def opportunity_benefits_component(job: dict[str, Any]) -> tuple[int, str]:
-    benefits = normalize_space(text(job.get("benefits")))
+    structured = job.get("benefits") if isinstance(job.get("benefits"), list) else parse_json_array(job.get("benefits_json"))
+    benefits = normalize_space(" ".join(text(item.get("value") or item.get("evidence")) for item in structured if isinstance(item, dict)))
     description = normalize_space(text(job.get("job_description")))
     evidence = benefits or description
     terms = re.findall(r"\b(?:health|dental|vision|medical|rrsp|pension|paid vacation|paid time off|benefits|wellness|insurance)\b", evidence.lower())
@@ -10390,9 +10573,13 @@ def extract_job_details(content: str, source: str = "", existing: dict[str, Any]
     company = text(existing.get("company")) or guess_company(lines)
     location = text(existing.get("location")) or guess_location(compact)
     salary = text(existing.get("salary")) or guess_salary(compact)
+    workplace_alternatives = extract_workplace_alternatives(existing, content)
     remote_type = text(existing.get("remote_type")) or guess_remote_type(compact)
+    if not remote_type and workplace_alternatives and re.search(r"\b(?:work\s+locations?|work\s+at|float\s+(?:between|across|among)|centres?|sites?)\b", compact, re.I):
+        remote_type = "On-site"
     role_type = text(existing.get("role_type")) or guess_role_type_for_job(title, compact)
     seniority = text(existing.get("seniority_level")) or guess_seniority(f"{title} {compact}")
+    extracted_required, extracted_preferred = extract_keyword_requirements(content)
     skills = keyword_hits(compact, REWARD_KEYWORDS)
     required = extract_section(content, ["requirements", "required qualifications", "what you bring"])
     preferred = extract_section(content, ["preferred", "nice to have", "bonus"])
@@ -10403,13 +10590,17 @@ def extract_job_details(content: str, source: str = "", existing: dict[str, Any]
         "location": location,
         "remote_type": remote_type,
         "salary": salary,
-        "required_skills": ", ".join(skills) if not required else trim(required, 1200),
-        "preferred_skills": trim(preferred, 1200),
+        "required_skills": extracted_required or (trim(required, 1200) if required else ", ".join(skills)),
+        "preferred_skills": extracted_preferred or trim(preferred, 1200),
         "responsibilities": trim(responsibilities, 1600),
         "seniority_level": seniority,
         "application_url": text(existing.get("application_url")) or text(existing.get("url")),
         "source": source or text(existing.get("source")),
         "role_type": role_type,
+        "workplace_alternatives_json": dumps_json(workplace_alternatives),
+        "credentials_json": dumps_json(extract_explicit_credentials(content)),
+        "benefits_json": dumps_json(extract_explicit_benefits(content)),
+        "arrangement_evidence": arrangement_evidence(existing, content, remote_type, workplace_alternatives),
     }
 
 

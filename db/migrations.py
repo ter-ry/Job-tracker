@@ -6,6 +6,7 @@ that data intact while making schema changes explicit and auditable.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Callable
 
@@ -267,6 +268,50 @@ def _migration_013_workplace_evidence(db: sqlite3.Connection) -> None:
         if name not in existing:
             db.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
 
+
+def _migration_014_structured_posting_evidence(db: sqlite3.Connection) -> None:
+    """Preserve multi-site workplaces and explicit posting evidence."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'jobs'").fetchone():
+        return
+    columns = {
+        "workplace_alternatives_json": "TEXT NOT NULL DEFAULT '[]'",
+        "credentials_json": "TEXT NOT NULL DEFAULT '[]'",
+        "benefits_json": "TEXT NOT NULL DEFAULT '[]'",
+        "arrangement_evidence": "TEXT NOT NULL DEFAULT ''",
+    }
+    existing = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
+    for name, definition in columns.items():
+        if name not in existing:
+            db.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
+    existing = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
+    legacy_fields = {
+        "workplace_address", "workplace_postal_code", "workplace_evidence",
+        "workplace_evidence_source", "workplace_precision", "workplace_confidence",
+    }
+    if legacy_fields <= existing:
+        rows = db.execute(
+            """SELECT id, workplace_address, workplace_postal_code, workplace_evidence,
+                      workplace_evidence_source, workplace_precision, workplace_confidence,
+                      workplace_alternatives_json
+                 FROM jobs"""
+        ).fetchall()
+        for row in rows:
+            if str(row[7] or "").strip() not in {"", "[]"} or not str(row[1] or "").strip():
+                continue
+            alternative = {
+                "address": str(row[1] or "").strip(),
+                "postal_code": str(row[2] or "").strip(),
+                "precision": str(row[5] or "street address").strip(),
+                "confidence": int(row[6] or 0),
+                "evidence": str(row[3] or row[1] or "").strip(),
+                "evidence_source": str(row[4] or "legacy single workplace").strip(),
+                "assignment_status": "confirmed",
+            }
+            db.execute(
+                "UPDATE jobs SET workplace_alternatives_json = ? WHERE id = ?",
+                [json.dumps([alternative], ensure_ascii=False), int(row[0])],
+            )
+
 MIGRATIONS: tuple[tuple[int, str, Migration], ...] = (
     (1, "legacy baseline", _migration_001_baseline),
     (2, "candidate document profiles", _migration_002_candidate_documents),
@@ -281,6 +326,7 @@ MIGRATIONS: tuple[tuple[int, str, Migration], ...] = (
     (11, "versioned tailoring drafts", _migration_011_versioned_tailoring_drafts),
     (12, "discovery status semantics", _migration_012_discovery_status_semantics),
     (13, "workplace evidence", _migration_013_workplace_evidence),
+    (14, "structured posting evidence", _migration_014_structured_posting_evidence),
 )
 
 

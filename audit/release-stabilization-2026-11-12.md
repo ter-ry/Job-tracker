@@ -131,3 +131,72 @@ Targeted Linux regressions after the shortlist fix: 288 passed, 1 skipped;
 version upgrade and compatible rollback, passed. PR #18 is still **not ready for
 final review or merge** until the representative complete-posting extraction
 audit and the candidate-specific 15-posting SWE shortlist audit are completed.
+
+## Accuracy-stabilization follow-up
+
+This follow-up distinguishes live employer retrieval from supplied-snapshot
+validation. PolicyMe and Rose Rocket were retrieved again from their original
+ATS pages on 2026-11-12 (HTTP 200). The complete ECE PDFs were not present in
+the task workspace and their hosts still could not be retrieved through the
+cloud proxy. The Villa regression uses the two exact, independently documented
+address/postal pairs above. It is not represented as a fresh replay of the
+complete PDF. No Mothercraft address was reconstructed from memory.
+
+### Before/after structured extraction
+
+Correctness counts only extracted, adjudicable facts. Coverage counts correctly
+extracted independently labelled facts. `N/A` remains appropriate when the
+complete source snapshot needed to adjudicate a field is unavailable.
+
+| Scope / field | Before correctness | Before coverage | After correctness | After coverage |
+| --- | ---: | ---: | ---: | ---: |
+| ECE street workplace alternatives | N/A (0 extracted) | 0/7 | 2/2 | 2/7 |
+| ECE workplace postal codes | N/A (0 extracted) | 0/2 | 2/2 | 2/2 |
+| ECE per-site straight-line distance | N/A (0 calculated) | 0/2 verified sites | 2/2 | 2/2 verified sites |
+| ECE arrangement / credentials / benefits | N/A | 0/2 postings | N/A — complete PDFs unavailable | Unresolved |
+| SWE mandatory technologies/capabilities | N/A (0 mandatory) | 0/9 | 9/9 labelled values | 9/9 |
+| SWE exposed-stack non-requirements | 0 false positives | 2/2 postings retained only in text | 6/6 checked values not promoted | 6/6 checked values |
+| SWE source-stated credential | N/A (0 extracted) | 0/1 | 1/1 | 1/1 |
+| SWE advertised benefits | N/A (0 extracted) | 0/2 postings | 2/2 posting-level checks | 2/2 postings |
+| SWE arrangement evidence | 2/2 provider pass-through | 2/2 | 2/2 with stored source/provider evidence | 2/2 |
+
+PolicyMe now yields the six adjudicated mandatory values Python, React, Redux,
+PostgreSQL, AWS, and AI API/model experience. Its explicit full-stack capability
+is also retained with a source snippet but is reported separately from the
+nine-value independent label set. Rose Rocket yields the three adjudicated
+mandatory capabilities agentic coding tools, agile project-management tools,
+and Git. NodeJS/NestJS/TypeScript, React, PostgreSQL, AWS, Docker, and Kubernetes
+remain unclassified because the posting says the hire will be exposed to them.
+An empty résumé leaves the three mandatory Rose Rocket capabilities
+`Unverified` and cannot produce `Strong technical match`.
+
+### Representation and distance behavior
+
+Schema 14 adds JSON evidence fields for workplace alternatives, credentials,
+benefits, and arrangement evidence. A migration converts an existing singular
+workplace to one `confirmed` alternative without changing the legacy columns.
+When more than one workplace is advertised, the singular assigned-workplace
+fields remain empty, every alternative retains its own evidence and precision,
+and the UI states that the assigned site is not confirmed. Each verified
+address receives its own coordinate and straight-line distance; the application
+does not substitute the closest option as the applicant's workplace.
+
+Using the independently verified coordinates already recorded in this report,
+the application regression produces 9 km for 70 Playfair Avenue and 11 km for
+340 Falstaff Avenue from the M5H 2N2 postal centroid. The underlying independent
+measurements remain 8.823 km and 10.865 km. The top-level distance stays unknown
+because no assigned site is known.
+
+### Remaining acceptance gates
+
+- Reattach the complete Villa Charities and Mothercraft posting snapshots
+  securely to re-run all seven workplace alternatives and the ECE arrangement,
+  credential, and benefit labels end to end. In particular, the five
+  Mothercraft alternatives cannot be audited from the current workspace.
+- Supply the private candidate résumé and at least 15 independently labelled,
+  complete early-career SWE snapshots for candidate-specific precision, false
+  positive, and false negative measurement. The résumé must remain outside git.
+- Unit and hosted Windows results for this follow-up must be recorded from the
+  exact final commit before this document can support a release-readiness claim.
+
+PR #18 therefore remains a draft and is not yet ready for final review or merge.

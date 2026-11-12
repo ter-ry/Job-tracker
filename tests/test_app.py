@@ -1546,6 +1546,36 @@ class JobAssistantTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "backup could not be created"):
                     app_module.init_db()
 
+    def test_schema_14_backfills_legacy_single_workplace_without_changing_assignment(self):
+        connection = sqlite3.connect(app_module.DB_PATH)
+        connection.execute(
+            """CREATE TABLE jobs (
+                   id INTEGER PRIMARY KEY, workplace_address TEXT NOT NULL DEFAULT '',
+                   workplace_postal_code TEXT NOT NULL DEFAULT '', workplace_evidence TEXT NOT NULL DEFAULT '',
+                   workplace_evidence_source TEXT NOT NULL DEFAULT '', workplace_precision TEXT NOT NULL DEFAULT '',
+                   workplace_confidence INTEGER NOT NULL DEFAULT 0
+               )"""
+        )
+        connection.execute(
+            "INSERT INTO jobs VALUES (1, '10 Legacy Road, Toronto, ON M1M 1M1', 'M1M 1M1', '10 Legacy Road', 'legacy', 'street address', 95)"
+        )
+        connection.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+        connection.executemany("INSERT INTO schema_migrations(version, name) VALUES (?, ?)", [(version, f"migration {version}") for version in range(1, 14)])
+        connection.execute("PRAGMA user_version = 13")
+        connection.commit()
+        connection.close()
+        app_module._INITIALIZED_DATABASE_PATH = None
+        app_module._LAST_MIGRATION_BACKUP = None
+        with app_module.app.app_context():
+            app_module.init_db()
+            row = app_module.get_db().execute(
+                "SELECT workplace_alternatives_json FROM jobs WHERE id = 1"
+            ).fetchone()
+            self.assertEqual(app_module.get_db().execute("PRAGMA user_version").fetchone()[0], 14)
+        alternatives = json.loads(row[0])
+        self.assertEqual(alternatives[0]["address"], "10 Legacy Road, Toronto, ON M1M 1M1")
+        self.assertEqual(alternatives[0]["assignment_status"], "confirmed")
+
     def test_pipeline_manual_application_preserves_job_and_allows_date_correction(self):
         created = self.client.post(
             "/api/jobs",
@@ -2661,6 +2691,70 @@ class JobAssistantTest(unittest.TestCase):
         self.assertGreater(refreshed["distance_km"], 0)
         self.assertEqual(refreshed["location_precision"], "postal code")
 
+    def test_multiple_rece_workplaces_survive_extraction_storage_and_display(self):
+        # Source-backed Villa Charities alternatives from the independently
+        # reviewed complete posting snapshot.  This is an evidence excerpt,
+        # not a synthetic address fixture.
+        description = (
+            "Work locations: 70 Playfair Avenue, Toronto, ON M6B 2P9; "
+            "340 Falstaff Avenue, Toronto, ON M6L 3E7. "
+            "The successful candidate may work at either childcare centre."
+        )
+        alternatives = jobspy_source.extract_workplace_alternatives({}, description)
+        self.assertEqual(
+            [(item["address"], item["postal_code"]) for item in alternatives],
+            [
+                ("70 Playfair Avenue, Toronto, ON M6B 2P9", "M6B 2P9"),
+                ("340 Falstaff Avenue, Toronto, ON M6L 3E7", "M6L 3E7"),
+            ],
+        )
+        self.assertTrue(all(item["assignment_status"] == "advertised_alternative" for item in alternatives))
+
+        created = self.client.post(
+            "/api/jobs",
+            json={"company": "Villa Charities", "title": "Registered Early Childhood Educator", "job_description": description},
+        )
+        self.assertEqual(created.status_code, 201, created.get_json())
+        stored = created.get_json()
+        self.assertEqual(len(stored["workplace_alternatives"]), 2)
+        self.assertEqual(stored["workplace_assignment_status"], "alternatives_unassigned")
+        self.assertEqual(stored["workplace_address"], "")
+        source = (Path(app_module.BASE_DIR) / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("Assigned site not confirmed", source)
+        self.assertIn("renderWorkplaceAlternatives(job)", source)
+
+    def test_multiple_rece_workplaces_get_separate_verified_straight_line_distances(self):
+        provider = FakeGeocodingProvider({
+            "70 Playfair Avenue, Toronto, ON M6B 2P9, Canada": {
+                "latitude": 43.7110390, "longitude": -79.4594629,
+                "display_name": "70, Playfair Avenue, Toronto, Ontario, M6B 2P9, Canada",
+                "postal_code": "M6B 2P9", "precision": "house",
+            },
+            "340 Falstaff Avenue, Toronto, ON M6L 3E7, Canada": {
+                "latitude": 43.7205044, "longitude": -79.4822959,
+                "display_name": "340, Falstaff Avenue, Toronto, Ontario, M6L 3E7, Canada",
+                "postal_code": "M6L 3E7", "precision": "house",
+            },
+        })
+        origin = {
+            "normalized": "M5H 2N2", "latitude": 43.6532898, "longitude": -79.3842134,
+            "confidence": 90, "precision": "postal code", "status": "saved",
+        }
+        job = {
+            "remote_type": "On-site", "location": "Toronto, ON",
+            "workplace_alternatives": [
+                {"address": "70 Playfair Avenue, Toronto, ON M6B 2P9", "postal_code": "M6B 2P9", "precision": "street address"},
+                {"address": "340 Falstaff Avenue, Toronto, ON M6L 3E7", "postal_code": "M6L 3E7", "precision": "street address"},
+            ],
+        }
+        enriched, result = app_module.geocode_discovery_job(job, {}, origin, provider, use_cache=False)
+        self.assertEqual(result["status"], "multiple_alternatives")
+        self.assertEqual([item["distance_km"] for item in enriched["workplace_alternatives"]], [9, 11])
+        self.assertTrue(all(item["coordinates_verified"] for item in enriched["workplace_alternatives"]))
+        self.assertEqual(enriched["distance_km"], 9999)
+        self.assertEqual(enriched["distance_label"], "multiple_alternatives")
+        self.assertIn("assigned site not confirmed", enriched["distance_note"].lower())
+
     def test_discovery_task_status_is_read_only_and_scripts_are_present(self):
         response = self.client.get("/api/discovery/task-status")
         self.assertEqual(response.status_code, 200)
@@ -3213,8 +3307,70 @@ class JobAssistantTest(unittest.TestCase):
         )
         compatibility = result["technical_compatibility"]
         self.assertFalse(compatibility["required_demonstrated"])
-        self.assertFalse(compatibility["required_unverified"])
+        self.assertEqual(compatibility["required_unverified"], ["git"])
         self.assertEqual(compatibility["decision"], "Possible / stretch — evidence incomplete")
+
+    def test_complete_swe_evidence_extracts_nine_mandatory_capabilities_without_stack_false_positives(self):
+        # Exact relevant excerpts from the 2026-11-12 employer ATS originals.
+        policyme = (
+            "Our core stack includes Python, React, Redux, PostgreSQL, n8n, LangChain/LangGraph and AWS. "
+            "What we are looking for: Strong full-stack development skills with the ability to work across backend and frontend "
+            "using Python, React, Redux, PostgreSQL, and AWS. Hands-on experience or projects interacting with AI APIs/models."
+        )
+        rose = (
+            "Technologies that we use (that you'll be exposed to): Backend: NodeJS, NestJS, Typescript. "
+            "Frontend: React. Database: PostgreSQL. Infrastructure: AWS, Docker, Kubernetes. "
+            "What you need to succeed: Bachelor’s degree in Computer or Software Engineering, or a related field. "
+            "You build with AI coding agents such as Claude Code or Cursor or any agentic coding tool. "
+            "Experience with agile project management tools (JIRA, Asana, Linear, or equivalent). "
+            "Proficiency with Git and have a solid understanding of version control best practices."
+        )
+        policy_required, _ = jobspy_source.extract_keyword_requirements(policyme)
+        rose_required, _ = jobspy_source.extract_keyword_requirements(rose)
+        self.assertEqual(
+            set(policy_required.split(", ")),
+            {"full-stack development", "python", "react", "redux", "postgresql", "aws", "ai api/model experience"},
+        )
+        self.assertEqual(set(rose_required.split(", ")), {"agentic coding tools", "agile project management tools", "git"})
+        # The independent audit's nine labels exclude the broader full-stack
+        # capability; all nine adjudicated technologies/capabilities are covered.
+        adjudicated = set(policy_required.split(", ")) - {"full-stack development"}
+        adjudicated.update(rose_required.split(", "))
+        self.assertEqual(len(adjudicated), 9)
+
+        rose_terms = app_module._qualification_terms({"title": "Junior Software Engineer", "job_description": rose})
+        by_name = {item["normalized"]: item for item in rose_terms}
+        for name in ("agentic coding tools", "agile project management tools", "git"):
+            self.assertEqual(by_name[name]["importance"], "required")
+            self.assertTrue(by_name[name]["source_evidence"])
+        for exposed in ("react", "postgresql", "aws", "docker", "kubernetes", "nodejs"):
+            if exposed in by_name:
+                self.assertNotEqual(by_name[exposed]["importance"], "required")
+
+        fit = app_module.build_qualification_fit(
+            {"title": "Junior Software Engineer", "job_description": rose},
+            evidence_profile={"resume_text": ""},
+        )
+        compatibility = fit["technical_compatibility"]
+        self.assertEqual(set(compatibility["required_unverified"]), {"agentic coding tools", "agile project management tools", "git"})
+        self.assertNotEqual(compatibility["decision"], "Strong technical match")
+
+    def test_complete_swe_evidence_extracts_credential_benefits_and_arrangement(self):
+        rose = (
+            "What you need to succeed: Bachelor’s degree in Computer or Software Engineering, or a related field. "
+            "Perks & Benefits at Rose Rocket: A comprehensive benefits program and health care spending account. "
+            "Parental leave top-up. Stock option plan. A MacBook and a sweet tech equipment combo. 3 personal days. "
+            "Hybrid structure, where we're in office together on Monday, Tuesday, and Thursdays."
+        )
+        normalized = jobspy_source.normalize_jobspy_row({
+            "title": "Junior Software Engineer", "company": "Rose Rocket", "description": rose,
+            "remote_type": "Hybrid", "location": "Toronto", "job_url": "https://jobs.ashbyhq.com/Rose%20Rocket/example",
+        })
+        self.assertEqual(len(normalized["credentials"]), 1)
+        self.assertIn("Bachelor", normalized["credentials"][0]["value"])
+        self.assertGreaterEqual(len(normalized["benefits"]), 5)
+        self.assertEqual(normalized["remote_type"], "Hybrid")
+        self.assertIn("Provider arrangement: Hybrid", normalized["arrangement_evidence"])
 
     def test_opportunity_score_compares_advertised_pay_and_distance(self):
         base = {

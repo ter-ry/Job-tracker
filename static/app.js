@@ -1642,22 +1642,47 @@ function openPipelineJobDetails(id) {
   if (existingPreparation) renderPipelinePreparationState(job, existingPreparation);
 }
 
-function mapDestination(job) {
-  return String(job?.workplace_address || job?.workplace_postal_code || job?.location || job?.normalized_location || "").trim();
+function workplaceAlternatives(job) {
+  return Array.isArray(job?.workplace_alternatives) ? job.workplace_alternatives.filter((item) => item && (item.address || item.postal_code)) : [];
 }
 
-function googleMapsUrl(job, mode = "driving") {
-  const destination = mapDestination(job);
+function mapDestination(job, alternative = null) {
+  return String(alternative?.address || alternative?.postal_code || job?.workplace_address || job?.workplace_postal_code || job?.location || job?.normalized_location || "").trim();
+}
+
+function googleMapsUrl(job, mode = "driving", alternative = null) {
+  const destination = mapDestination(job, alternative);
   const arrangement = String(job?.work_arrangement || job?.remote_type || "").toLowerCase();
   if (!destination || arrangement.includes("remote")) return "";
   return `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(destination)}&travelmode=${encodeURIComponent(mode)}`;
 }
 
 function renderMapLinks(job) {
-  const driving = googleMapsUrl(job, "driving");
-  const transit = googleMapsUrl(job, "transit");
+  const alternatives = workplaceAlternatives(job);
+  if (alternatives.length > 1) {
+    return alternatives.map((alternative, index) => {
+      const driving = googleMapsUrl(job, "driving", alternative);
+      return driving ? `<a class="button ghost small" href="${escapeAttribute(driving)}" target="_blank" rel="noreferrer">Map workplace ${index + 1}</a>` : "";
+    }).join("");
+  }
+  const driving = googleMapsUrl(job, "driving", alternatives[0] || null);
+  const transit = googleMapsUrl(job, "transit", alternatives[0] || null);
   if (!driving) return "";
   return `<span class="map-links" aria-label="Map directions"><a class="button ghost small" href="${escapeAttribute(driving)}" target="_blank" rel="noreferrer">Driving directions</a><a class="button ghost small" href="${escapeAttribute(transit)}" target="_blank" rel="noreferrer">Transit directions</a></span>`;
+}
+
+function renderWorkplaceAlternatives(job) {
+  const alternatives = workplaceAlternatives(job);
+  if (!alternatives.length) return "";
+  const multiple = alternatives.length > 1;
+  const rows = alternatives.map((item, index) => {
+    const address = [item.address, item.postal_code && !String(item.address || "").includes(item.postal_code) ? item.postal_code : ""].filter(Boolean).join(", ");
+    const precision = item.precision ? ` · ${escapeHtml(item.precision)}` : "";
+    const distance = item.coordinates_verified && Number(item.distance_km) < 9999 ? ` · ${Number(item.distance_km)} km straight-line` : " · distance unavailable";
+    return `<li><strong>${multiple ? `Workplace alternative ${index + 1}` : "Workplace"}:</strong> ${escapeHtml(address || "Address unavailable")}${precision}${distance}</li>`;
+  }).join("");
+  const warning = multiple ? `<p class="warning-text"><strong>Assigned site not confirmed.</strong> These are advertised alternatives, not the applicant's actual workplace.</p>` : "";
+  return `<section class="workplace-alternatives">${warning}<ul>${rows}</ul></section>`;
 }
 
 function renderPipelinePreparationState(_job, item) {
@@ -3028,7 +3053,7 @@ function renderDiscoveryRow(job) {
         ${renderDiscoveryWhy(job)}
       </td>
       <td>${escapeHtml(job.company || "Unknown company")}</td>
-      <td>${escapeHtml(job.location || "Location unavailable")}<br><span class="muted">${escapeHtml(job.normalized_location || "")}</span></td>
+      <td>${escapeHtml(job.location || "Location unavailable")}<br><span class="muted">${escapeHtml(job.normalized_location || "")}</span>${renderWorkplaceAlternatives(job)}</td>
       <td>${escapeHtml(distanceBadge(job))}</td>
       <td>${escapeHtml(job.salary || "Salary unavailable")}</td>
       <td>${escapeHtml(job.posted_date || "Unknown")}</td>
@@ -3083,6 +3108,7 @@ function renderDiscoveryCard(job) {
         <div><strong>${Number(job.discovery_profile_independent || 0) ? "Job Opportunity Score" : "Application Priority"}</strong><br>${scorePill(job.opportunity_score || job.application_priority_score || 0)}<br><span class="muted">${Number(job.discovery_profile_independent || 0) ? "Posting-evidence score" : `Qualification ${scorePill(job.qualification_match_score ?? job.qualification_fit_score ?? 0)}`}</span>${saved}</div>
       </div>
       ${warnings}
+      ${renderWorkplaceAlternatives(job)}
       ${renderExperienceSummary(job)}
       <div class="mini-breakdown">${miniBreakdown(job)}</div>
       ${renderDiscoveryWhy(job)}
@@ -3130,6 +3156,7 @@ function displaySalary(job) {
 
 function distanceBadge(job) {
   if (job.distance_label === "remote") return "Remote";
+  if (job.distance_label === "multiple_alternatives" || workplaceAlternatives(job).length > 1) return "Multiple workplaces · assigned site not confirmed";
   if (job.city_estimate_km !== undefined && job.city_estimate_km !== null) return `Exact workplace unknown · city estimate ${Number(job.city_estimate_km)} km`;
   if (job.distance_km === undefined || job.distance_km === null) return "Unknown";
   if (Number(job.distance_km) >= 9999) return "Unknown";
