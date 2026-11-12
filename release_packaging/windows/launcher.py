@@ -100,14 +100,14 @@ def wait_for_server(timeout: float = 30.0) -> bool:
 
 
 def stop_waitress_server(server: object, server_thread: threading.Thread) -> None:
+    # Closing the listener alone does not wake Waitress while a browser keeps
+    # an accepted keep-alive connection open. Close those channels before
+    # waiting, otherwise launch() can remain blocked on the server thread.
     server.close()
-    server_thread.join(timeout=5)
-    if server_thread.is_alive():
-        # Browsers can keep accepted HTTP connections open after the listener
-        # closes. Waitress will not leave its event loop until those close too.
-        from waitress import wasyncore
+    from waitress import wasyncore
 
-        wasyncore.close_all(server._map)
+    wasyncore.close_all(server._map)
+    server_thread.join(timeout=5)
 
 
 def launch() -> int:
