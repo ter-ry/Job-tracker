@@ -176,7 +176,7 @@ try {
             Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction Stop
             Write-Host "[lifecycle] cleanup removed $root"
         } catch {
-            Write-Warning "Cleanup could not remove $root: $($_.Exception.Message)"
+            Write-Warning "Cleanup could not remove ${root}: $($_.Exception.Message)"
         }
     }
 }
