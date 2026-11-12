@@ -35,6 +35,7 @@ permissions:
 jobs:
   validate:
     name: Validate source and isolated launch
+    timeout-minutes: 25
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -66,6 +67,7 @@ jobs:
   package:
     name: Package Windows installer
     needs: validate
+    timeout-minutes: 35
     runs-on: windows-2022
     permissions:
       contents: read
@@ -127,26 +129,6 @@ jobs:
       - name: Test disposable installer lifecycle
         shell: pwsh
         run: ./scripts/windows_installer_lifecycle.ps1 "${{ steps.installer.outputs.path }}"
-      - name: Download historical Windows installer for version migration test
-        if: github.event_name == 'pull_request'
-        uses: actions/download-artifact@v4
-        with:
-          name: JobTracker-Windows-0.0.0-ci.8
-          run-id: 42742356948
-          github-token: ${{ github.token }}
-          path: build/previous-installer
-      - name: Download historical rollback candidate
-        if: github.event_name == 'pull_request'
-        uses: actions/download-artifact@v4
-        with:
-          name: JobTracker-Windows-0.0.0-ci.29
-          run-id: 43101896965
-          github-token: ${{ github.token }}
-          path: build/rollback-installer
-      - name: Test version upgrade and compatible rollback in disposable AppData
-        if: github.event_name == 'pull_request'
-        shell: pwsh
-        run: ./scripts/windows_version_lifecycle.ps1 "build/previous-installer/JobTracker-Setup-v0.0.0-ci.8.exe" "${{ steps.installer.outputs.path }}" "build/rollback-installer/JobTracker-Setup-v0.0.0-ci.29.exe" "0.0.0-ci.8" "${{ steps.version.outputs.version }}" "0.0.0-ci.29" 13
       - name: Generate SHA-256 checksum
         shell: pwsh
         run: (Get-FileHash "${{ steps.installer.outputs.path }}" -Algorithm SHA256).Hash + "  " + (Split-Path "${{ steps.installer.outputs.path }}" -Leaf) | Out-File -Encoding ascii "${{ steps.installer.outputs.path }}.sha256"
@@ -164,6 +146,48 @@ jobs:
             ${{ steps.installer.outputs.path }}
             ${{ steps.installer.outputs.path }}.sha256
           if-no-files-found: error
+
+  historical:
+    name: Historical upgrade and compatible rollback
+    if: github.event_name == 'pull_request'
+    needs: package
+    timeout-minutes: 35
+    runs-on: windows-2022
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download current private-beta installer artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: JobTracker-Windows-${{ needs.package.outputs.version }}
+          path: build/current-installer
+      - name: Download historical Windows installer for version migration test
+        uses: actions/download-artifact@v4
+        with:
+          name: JobTracker-Windows-0.0.0-ci.8
+          run-id: 42742356948
+          github-token: ${{ github.token }}
+          path: build/previous-installer
+      - name: Download historical rollback candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: JobTracker-Windows-0.0.0-ci.29
+          run-id: 43101896965
+          github-token: ${{ github.token }}
+          path: build/rollback-installer
+      - name: Run historical upgrade and compatible rollback gate
+        shell: pwsh
+        run: |
+          ./scripts/windows_version_lifecycle.ps1 `
+            "build/previous-installer/JobTracker-Setup-v0.0.0-ci.8.exe" `
+            "build/current-installer/JobTracker-Setup-v${{ needs.package.outputs.version }}.exe" `
+            "build/rollback-installer/JobTracker-Setup-v0.0.0-ci.29.exe" `
+            "0.0.0-ci.8" "${{ needs.package.outputs.version }}" "0.0.0-ci.29" 13
 
   publish:
     name: Publish approved tagged release

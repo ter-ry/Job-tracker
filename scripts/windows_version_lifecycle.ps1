@@ -8,6 +8,36 @@ param(
     [Parameter(Mandatory=$true)][int]$RollbackSchemaVersion
 )
 $ErrorActionPreference = 'Stop'
+$script:Phase = 'initialization'
+$script:InstallerTimeoutSeconds = 120
+
+function Set-Phase([string]$name) {
+    $script:Phase = $name
+    Write-Host "[lifecycle] $name"
+}
+
+function Stop-ProcessTree([System.Diagnostics.Process]$process, [string]$reason) {
+    if ($null -eq $process -or $process.HasExited) { return }
+    Write-Warning "Stopping process $($process.Id) after $reason"
+    $killer = Start-Process -FilePath 'taskkill.exe' -ArgumentList @('/PID', $process.Id, '/T', '/F') -PassThru
+    if (!$killer.WaitForExit(10000)) {
+        Write-Warning "taskkill did not finish within 10 seconds for PID $($process.Id)"
+        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+    }
+    if (!$process.HasExited) { $process.WaitForExit(10000) | Out-Null }
+}
+
+function Invoke-Installer([string]$installer, [string]$label) {
+    Set-Phase "install $label"
+    Write-Host "[lifecycle] installer=$installer target=$installDir timeout=${script:InstallerTimeoutSeconds}s"
+    $process = Start-Process -FilePath $installer -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=$installDir") -PassThru
+    if (!$process.WaitForExit($script:InstallerTimeoutSeconds * 1000)) {
+        Stop-ProcessTree $process 'installer timeout'
+        throw "Installer timed out after $($script:InstallerTimeoutSeconds) seconds: $installer"
+    }
+    Write-Host "[lifecycle] installer exit=$($process.ExitCode)"
+    if ($process.ExitCode -ne 0) { throw "Installer failed with exit $($process.ExitCode): $installer" }
+}
 $previousPath = (Resolve-Path $PreviousInstaller).Path
 $currentPath = (Resolve-Path $CurrentInstaller).Path
 $rollbackPath = (Resolve-Path $RollbackInstaller).Path
@@ -34,31 +64,31 @@ $env:JOB_TRACKER_EXIT_TOKEN = [guid]::NewGuid().ToString()
 New-Item -ItemType Directory -Force -Path $installDir, $appData | Out-Null
 $appProcess = $null
 
-function Install-Version([string]$installer) {
-    $process = Start-Process -FilePath $installer -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=$installDir") -Wait -PassThru
-    if ($process.ExitCode -ne 0) { throw "Installer failed with exit $($process.ExitCode): $installer" }
-}
-
 function Start-Version([string]$expectedVersion) {
+    Set-Phase "start $expectedVersion"
     $exe = Join-Path $installDir 'JobTracker.exe'
     if (!(Test-Path $exe)) { throw 'Installed JobTracker.exe is missing' }
     $script:appProcess = Start-Process -FilePath $exe -PassThru
     $deadline = (Get-Date).AddSeconds(60)
     $health = $null
+    $attempts = 0
     do {
+        $attempts++
         if ($script:appProcess.HasExited) { throw "Installed $expectedVersion exited with $($script:appProcess.ExitCode)" }
         try { $health = Invoke-RestMethod "$base/api/health" -TimeoutSec 2; break }
         catch { Start-Sleep -Milliseconds 300 }
     } while ((Get-Date) -lt $deadline)
-    if (!$health) { throw "Installed $expectedVersion did not become healthy" }
+    if (!$health) { throw "Installed $expectedVersion did not become healthy after $attempts probes in 60 seconds" }
     $actual = [IO.Path]::GetFullPath([string]$health.database_path)
     if ($actual -ne [IO.Path]::GetFullPath($dbPath)) { throw "Installed app opened unexpected database: $actual" }
     $version = Invoke-RestMethod "$base/api/version" -TimeoutSec 5
     if ($version.version -ne $expectedVersion) { throw "Expected $expectedVersion, got $($version.version)" }
     if (!(Test-Path $dbPath)) { throw 'Installed app did not create SQLite database' }
+    Write-Host "[lifecycle] healthy version=$($version.version) database=$actual probes=$attempts pid=$($script:appProcess.Id)"
 }
 
 function Stop-Version([bool]$supportsCleanExit) {
+    Set-Phase "stop process $($script:appProcess.Id) clean=$supportsCleanExit"
     if ($supportsCleanExit) {
         $headers = @{ 'X-Job-Tracker-Exit-Token' = $env:JOB_TRACKER_EXIT_TOKEN }
         $result = Invoke-RestMethod "$base/api/app/exit" -Method Post -Headers $headers -TimeoutSec 10
@@ -68,14 +98,14 @@ function Stop-Version([bool]$supportsCleanExit) {
     } else {
         # The historical ci.8 binary has no exit endpoint. Stop only this
         # disposable process after its committed HTTP writes have completed.
-        Stop-Process -Id $script:appProcess.Id -Force
-        $script:appProcess.WaitForExit(10000) | Out-Null
+        Stop-ProcessTree $script:appProcess 'historical binary has no clean-exit endpoint'
         Write-Host 'Historical version required forced stop; clean shutdown is untested for that version.'
     }
     $script:appProcess = $null
 }
 
 function Assert-Job([int]$jobId, [string]$appliedDate) {
+    Set-Phase "verify persisted job $jobId"
     $jobs = Invoke-RestMethod "$base/api/jobs" -TimeoutSec 10
     $retained = @($jobs) | Where-Object { $_.id -eq $jobId }
     if ($retained.Count -ne 1 -or $retained[0].company -ne 'Version Lifecycle Test' -or $retained[0].status -ne 'Applied' -or $retained[0].date_applied -ne $appliedDate) {
@@ -84,23 +114,26 @@ function Assert-Job([int]$jobId, [string]$appliedDate) {
 }
 
 function Get-SchemaVersion {
+    Set-Phase 'inspect SQLite schema'
     $value = & python -c 'import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); print(db.execute("PRAGMA user_version").fetchone()[0]); db.close()' $dbPath
     if ($LASTEXITCODE -ne 0) { throw 'Could not inspect SQLite schema version' }
     return [int]$value
 }
 
 try {
-    Install-Version $previousPath
+    Write-Host "[lifecycle] root=$root install=$installDir appdata=$appData db=$dbPath"
+    Invoke-Installer $previousPath $PreviousVersion
     Start-Version $PreviousVersion
-    $created = Invoke-RestMethod "$base/api/jobs" -Method Post -ContentType 'application/json' -Body '{"company":"Version Lifecycle Test","title":"Disposable job","status":"Saved"}'
+    Set-Phase 'create and apply sentinel job'
+    $created = Invoke-RestMethod "$base/api/jobs" -Method Post -TimeoutSec 10 -ContentType 'application/json' -Body '{"company":"Version Lifecycle Test","title":"Disposable job","status":"Saved"}'
     $jobId = [int]$created.id
-    $applied = Invoke-RestMethod "$base/api/jobs/$jobId/applied" -Method Post -ContentType 'application/json' -Body '{}'
+    $applied = Invoke-RestMethod "$base/api/jobs/$jobId/applied" -Method Post -TimeoutSec 10 -ContentType 'application/json' -Body '{}'
     if ($applied.status -ne 'Applied' -or !$applied.date_applied) { throw 'Old version did not save application status' }
     $appliedDate = [string]$applied.date_applied
     $oldSchema = Get-SchemaVersion
     Stop-Version $false
 
-    Install-Version $currentPath
+    Invoke-Installer $currentPath $CurrentVersion
     Start-Version $CurrentVersion
     Assert-Job $jobId $appliedDate
     $newSchema = Get-SchemaVersion
@@ -115,7 +148,7 @@ try {
     # database rather than safely demonstrating rollback behavior.
     $rollbackTested = $false
     if ($RollbackSchemaVersion -eq $newSchema) {
-        Install-Version $rollbackPath
+        Invoke-Installer $rollbackPath $RollbackVersion
         Start-Version $RollbackVersion
         Assert-Job $jobId $appliedDate
         if ((Get-SchemaVersion) -ne $newSchema) { throw 'Rollback changed the upgraded SQLite schema version' }
@@ -125,7 +158,7 @@ try {
         Write-Host "Compatible rollback skipped: $RollbackVersion declares schema $RollbackSchemaVersion but current uses schema $newSchema."
     }
 
-    Install-Version $currentPath
+    Invoke-Installer $currentPath $CurrentVersion
     Start-Version $CurrentVersion
     Assert-Job $jobId $appliedDate
     if ((Get-SchemaVersion) -ne $newSchema) { throw 'Re-upgrade changed the SQLite schema version' }
@@ -133,9 +166,17 @@ try {
     $rollbackSummary = if ($rollbackTested) { "$RollbackVersion (schema $RollbackSchemaVersion)" } else { "no compatible historical binary" }
     Write-Host "Version lifecycle passed: $PreviousVersion (schema $oldSchema) -> $CurrentVersion (schema $newSchema) -> $rollbackSummary -> $CurrentVersion; saved job and Applied status retained. Unsafe rollback binaries were not started."
 } finally {
-    if ($script:appProcess -and !$script:appProcess.HasExited) { Stop-Process -Id $script:appProcess.Id -Force }
+    Set-Phase "cleanup after $script:Phase"
+    if ($script:appProcess -and !$script:appProcess.HasExited) { Stop-ProcessTree $script:appProcess 'lifecycle cleanup' }
     $env:APPDATA = $originalAppData
     if ($null -eq $originalDataDir) { Remove-Item Env:JOB_TRACKER_DATA_DIR -ErrorAction SilentlyContinue } else { $env:JOB_TRACKER_DATA_DIR = $originalDataDir }
     if ($null -eq $originalExitToken) { Remove-Item Env:JOB_TRACKER_EXIT_TOKEN -ErrorAction SilentlyContinue } else { $env:JOB_TRACKER_EXIT_TOKEN = $originalExitToken }
-    if ($root -and $root.StartsWith($env:RUNNER_TEMP) -and (Test-Path $root)) { Remove-Item -LiteralPath $root -Recurse -Force }
+    if ($root -and $root.StartsWith($env:RUNNER_TEMP) -and (Test-Path $root)) {
+        try {
+            Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction Stop
+            Write-Host "[lifecycle] cleanup removed $root"
+        } catch {
+            Write-Warning "Cleanup could not remove $root: $($_.Exception.Message)"
+        }
+    }
 }
