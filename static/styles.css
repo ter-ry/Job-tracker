@@ -688,7 +688,57 @@ th {
 }
 
 .discovery-table-wrap table {
-  min-width: 1180px;
+  min-width: 0;
+  table-layout: fixed;
+}
+
+.discovery-table-wrap th,
+.discovery-table-wrap td {
+  overflow-wrap: anywhere;
+}
+
+.discovery-table-wrap th:nth-child(1) { width: 16%; }
+.discovery-table-wrap th:nth-child(2) { width: 22%; }
+.discovery-table-wrap th:nth-child(3) { width: 11%; }
+.discovery-table-wrap th:nth-child(4) { width: 11%; }
+.discovery-table-wrap th:nth-child(5) { width: 11%; }
+.discovery-table-wrap th:nth-child(6) { width: 14%; }
+.discovery-table-wrap th:nth-child(7) { width: 8%; }
+.discovery-table-wrap th:nth-child(8) { width: 17%; }
+
+@media (max-width: 760px) {
+  .discovery-table-wrap {
+    overflow-x: visible;
+  }
+
+  .discovery-table-wrap table,
+  .discovery-table-wrap thead,
+  .discovery-table-wrap tbody,
+  .discovery-table-wrap th,
+  .discovery-table-wrap td,
+  .discovery-table-wrap tr {
+    display: block;
+  }
+
+  .discovery-table-wrap thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+  }
+
+  .discovery-table-wrap tr {
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    margin-bottom: 10px;
+    padding: 8px;
+  }
+
+  .discovery-table-wrap td {
+    border: 0;
+    padding: 5px 0;
+  }
 }
 
 .score-breakdown-list {
@@ -1110,6 +1160,33 @@ th {
 
 .muted {
   color: var(--muted);
+}
+
+/* Keep compatibility controls and legacy entry points in the DOM for
+   existing listeners and stored data, without exposing them in the beta UI. */
+.beta-secondary,
+.compatibility-fields {
+  display: none !important;
+}
+
+.beta-search-panel {
+  max-width: 980px;
+  margin-inline: auto;
+}
+
+.compact-actions .button {
+  white-space: nowrap;
+}
+
+.result-details {
+  margin-top: 6px;
+  font-size: 0.8rem;
+}
+
+.result-details summary {
+  cursor: pointer;
+  color: var(--accent-dark);
+  font-weight: 700;
 }
 
 .toast {
