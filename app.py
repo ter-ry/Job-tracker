@@ -31,7 +31,7 @@ import warnings
 
 from docx import Document
 from docx.oxml.ns import qn
-from flask import Flask, Response, g, has_app_context, jsonify, render_template, request, send_file
+from flask import Flask, Response, current_app, g, has_app_context, jsonify, render_template, request, send_file
 
 from grounding import (
     PDF_CORRUPTION_MESSAGE,
@@ -58,7 +58,15 @@ from grounding import (
 from semantic_matching import MODEL_DOWNLOAD_SIZE, MODEL_NAME, analyze_resume_match, extract_resume_evidence
 from seniority import DETECTED_LEVELS, SENIORITY_LEVELS, analyze_job_seniority, explicit_professional_years, score_seniority_fit
 from ollama_client import OllamaConfig, build_ollama_health_report, ollama_profile_defaults, request_json_completion
-from sources.jobspy_source import fetch_jobspy_jobs
+from sources.jobspy_source import (
+    arrangement_evidence,
+    extract_explicit_benefits,
+    extract_explicit_credentials,
+    extract_keyword_requirements,
+    extract_workplace_alternatives,
+    fetch_jobspy_jobs,
+    requirement_phrase_evidence,
+)
 from tailoring import generate_tailored_resume_draft
 from tailoring_pipeline import (
     build_cover_letter_paragraphs,
@@ -74,6 +82,7 @@ from db.migrations import run_migrations
 from profile_store import CandidateProfileStore
 from services.document_generation import DocumentGenerationService
 from resume_layout import compare_docx_layout, export_docx_to_pdf
+from version import APP_NAME, APP_VERSION, GITHUB_REPOSITORY, normalize_semver, semver_key
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -82,10 +91,13 @@ DB_PATH = DATA_DIR / "jobs.sqlite"
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 _DATABASE_INIT_LOCK = threading.RLock()
 _INITIALIZED_DATABASE_PATH: Path | None = None
+_LAST_MIGRATION_BACKUP: Path | None = None
 _ACTIVE_DISCOVERY_SEARCHES: set[str] = set()
 _ACTIVE_DISCOVERY_SEARCHES_LOCK = threading.Lock()
 MAX_FETCH_BYTES = 1_200_000
-DISCOVERY_SOURCES = ["linkedin", "indeed", "google", "zip_recruiter"]
+# Google remains a backend compatibility key for historical diagnostics, but
+# is intentionally not exposed as a selectable source in the UI.
+DISCOVERY_SOURCES = ["linkedin", "indeed", "zip_recruiter", "glassdoor", "google"]
 GENERATED_APPLICATIONS_DIRNAME = "generated_applications"
 SEMANTIC_CACHE_DIRNAME = "semantic_cache"
 RESTORABLE_SHORTLIST_STATUSES = {"Archived", "Rejected", "Saved", "Drafting"}
@@ -102,7 +114,7 @@ TAILORING_AI_JOB_RETENTION_SECONDS = 600
 # Keep derived résumé matching in a bounded process-local cache.  The key includes
 # all job/profile inputs that affect the result, so edits or profile changes cannot
 # reuse stale qualification evidence after a restart or within a running process.
-QUALIFICATION_CACHE_VERSION = "discovery-qualification-v2"
+QUALIFICATION_CACHE_VERSION = "discovery-qualification-v3"
 QUALIFICATION_CACHE_LIMIT = 512
 _QUALIFICATION_CACHE: dict[str, dict[str, Any]] = {}
 _RESUME_EVIDENCE_CACHE: dict[str, list[dict[str, Any]]] = {}
@@ -133,7 +145,7 @@ DISCOVERY_DATE_WINDOWS = {
 # Keep the public diagnostics field stable for existing API clients.  The
 # database itself is now tracked independently by the migration runner.
 APP_SCHEMA_VERSION = 1
-CURRENT_DB_SCHEMA_VERSION = 9
+CURRENT_DB_SCHEMA_VERSION = 14
 DISCOVERY_DEBUG_SNAPSHOT_LIMIT = 25
 GEOCODING_FAILURE_CACHE_SECONDS = 15 * 60
 DISCOVERY_TASK_NAME = "Job Tracker Discovery"
@@ -188,7 +200,7 @@ DISCOVERY_SEARCH_DEPTHS = {
     "thorough": {"per_source_cap": 250, "total_cap": 500, "days": 30},
 }
 
-STATUSES = ["Saved", "shortlisted", "Drafting", "Applied", "Interview", "Offer", "Rejected", "Archived"]
+STATUSES = ["Discovered", "Saved", "shortlisted", "Drafting", "Applied", "Interview", "Offer", "Rejected", "Archived"]
 
 ROLE_TYPES = [
     "full-stack developer",
@@ -226,6 +238,9 @@ def collect_environment_diagnostics() -> dict[str, Any]:
     git_commit = get_git_commit()
     cwd = os.getcwd()
     return {
+        "app_name": APP_NAME,
+        "app_version": APP_VERSION,
+        "repository": GITHUB_REPOSITORY,
         "git_commit": git_commit,
         "active_git_commit": git_commit,
         "python_executable": sys.executable,
@@ -393,6 +408,10 @@ JOB_COLUMNS = {
     "seniority_level": "TEXT NOT NULL DEFAULT ''",
     "distance_km": "INTEGER NOT NULL DEFAULT 0",
     "distance_confidence": "INTEGER NOT NULL DEFAULT 0",
+    "distance_radius_status": "TEXT NOT NULL DEFAULT ''",
+    "distance_origin_label": "TEXT NOT NULL DEFAULT ''",
+    "distance_origin_precision": "TEXT NOT NULL DEFAULT ''",
+    "distance_origin_status": "TEXT NOT NULL DEFAULT ''",
     "required_skills": "TEXT NOT NULL DEFAULT ''",
     "preferred_skills": "TEXT NOT NULL DEFAULT ''",
     "responsibilities": "TEXT NOT NULL DEFAULT ''",
@@ -409,10 +428,32 @@ JOB_COLUMNS = {
     "salary_min": "INTEGER NOT NULL DEFAULT 0",
     "salary_max": "INTEGER NOT NULL DEFAULT 0",
     "salary_interval": "TEXT NOT NULL DEFAULT ''",
+    "salary_advertised_min": "REAL NOT NULL DEFAULT 0",
+    "salary_advertised_max": "REAL NOT NULL DEFAULT 0",
+    "salary_advertised_midpoint": "REAL NOT NULL DEFAULT 0",
+    "salary_annual_min": "INTEGER NOT NULL DEFAULT 0",
+    "salary_annual_max": "INTEGER NOT NULL DEFAULT 0",
+    "salary_annual_midpoint": "INTEGER NOT NULL DEFAULT 0",
     "salary_currency": "TEXT NOT NULL DEFAULT 'CAD'",
     "salary_source": "TEXT NOT NULL DEFAULT 'missing'",
     "salary_confidence": "INTEGER NOT NULL DEFAULT 0",
     "source_job_id": "TEXT NOT NULL DEFAULT ''",
+    "provider_company": "TEXT NOT NULL DEFAULT ''",
+    "provider_location": "TEXT NOT NULL DEFAULT ''",
+    "workplace_address": "TEXT NOT NULL DEFAULT ''",
+    "workplace_postal_code": "TEXT NOT NULL DEFAULT ''",
+    "workplace_evidence": "TEXT NOT NULL DEFAULT ''",
+    "workplace_evidence_source": "TEXT NOT NULL DEFAULT ''",
+    "workplace_precision": "TEXT NOT NULL DEFAULT ''",
+    "workplace_confidence": "INTEGER NOT NULL DEFAULT 0",
+    "workplace_alternatives_json": "TEXT NOT NULL DEFAULT '[]'",
+    "credentials_json": "TEXT NOT NULL DEFAULT '[]'",
+    "benefits_json": "TEXT NOT NULL DEFAULT '[]'",
+    "arrangement_evidence": "TEXT NOT NULL DEFAULT ''",
+    "remote_classification_conflict": "TEXT NOT NULL DEFAULT ''",
+    "provider_raw_json": "TEXT NOT NULL DEFAULT '{}'",
+    "provider_title": "TEXT NOT NULL DEFAULT ''",
+    "data_quality_flags": "TEXT NOT NULL DEFAULT '[]'",
     "posted_date": "TEXT NOT NULL DEFAULT ''",
     "date_shortlisted": "TEXT NOT NULL DEFAULT ''",
     "resume_docx_path": "TEXT NOT NULL DEFAULT ''",
@@ -435,6 +476,8 @@ JOB_COLUMNS = {
     "discovery_salary_filter_status": "TEXT NOT NULL DEFAULT ''",
     "qualification_match_score": "INTEGER NOT NULL DEFAULT 0",
     "application_priority_score": "INTEGER NOT NULL DEFAULT 0",
+    "opportunity_score": "INTEGER NOT NULL DEFAULT 0",
+    "opportunity_score_reasons": "TEXT NOT NULL DEFAULT '[]'",
     "posting_availability": "TEXT NOT NULL DEFAULT 'unverified'",
     "description_source": "TEXT NOT NULL DEFAULT ''",
     "description_fetched_at": "TEXT NOT NULL DEFAULT ''",
@@ -444,6 +487,7 @@ JOB_COLUMNS = {
     "remote_search_eligible": "TEXT NOT NULL DEFAULT ''",
     "discovery_occupation": "TEXT NOT NULL DEFAULT ''",
     "discovery_profile_independent": "INTEGER NOT NULL DEFAULT 0",
+    "candidate_profile_id": "INTEGER NOT NULL DEFAULT 0",
     "discovery_search_mode": "TEXT NOT NULL DEFAULT ''",
     "title_match_mode": "TEXT NOT NULL DEFAULT 'related'",
     "occupation_match_type": "TEXT NOT NULL DEFAULT 'uncertain'",
@@ -553,7 +597,48 @@ def create_app() -> Flask:
 
     @app.get("/")
     def index() -> str:
-        return render_template("index.html", statuses=STATUSES, role_types=ROLE_TYPES)
+        return render_template(
+            "index.html", statuses=STATUSES, role_types=ROLE_TYPES, app_name=APP_NAME,
+            app_version=APP_VERSION, exit_token=os.environ.get("JOB_TRACKER_EXIT_TOKEN", ""),
+        )
+
+    @app.post("/api/app/exit")
+    def exit_app() -> Response:
+        """Stop a packaged local instance after same-origin/token validation."""
+        expected = os.environ.get("JOB_TRACKER_EXIT_TOKEN", "")
+        supplied = request.headers.get("X-Job-Tracker-Exit-Token", "")
+        origin = text(request.headers.get("Origin"))
+        local_origin = not origin or origin.startswith("http://127.0.0.1") or origin.startswith("http://localhost")
+        if not expected or supplied != expected or request.remote_addr not in {"127.0.0.1", "::1"} or not local_origin:
+            return jsonify({"error": "Local application exit is not authorized."}), 403
+        with _ACTIVE_DISCOVERY_SEARCHES_LOCK:
+            if _ACTIVE_DISCOVERY_SEARCHES:
+                return jsonify({"error": "Discovery is still active; wait for it to finish before exiting."}), 409
+        callback = current_app.config.get("JOB_TRACKER_SHUTDOWN")
+        if not callable(callback):
+            return jsonify({"error": "Application shutdown is unavailable in this runtime."}), 503
+        threading.Thread(target=callback, name="job-tracker-shutdown", daemon=True).start()
+        return jsonify({"status": "shutting_down"})
+
+    @app.get("/api/version")
+    def version_info() -> Response:
+        return jsonify({"name": APP_NAME, "version": APP_VERSION, "repository": GITHUB_REPOSITORY})
+
+    @app.get("/api/updates")
+    def check_for_updates() -> Response:
+        """Read-only release check; downloading/installing is a future opt-in flow."""
+        url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
+        try:
+            request = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": APP_NAME})
+            with urllib.request.urlopen(request, timeout=5) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            tag = normalize_semver(text(payload.get("tag_name")))
+            current_key = semver_key(APP_VERSION)
+            latest_key = semver_key(tag)
+            update_available = bool(current_key and latest_key and latest_key > current_key)
+            return jsonify({"current_version": normalize_semver(APP_VERSION) or APP_VERSION, "latest_version": tag, "url": text(payload.get("html_url")), "update_available": update_available})
+        except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+            return jsonify({"current_version": APP_VERSION, "update_available": False, "status": "unavailable", "error": str(exc)}), 502
 
     @app.get("/api/profile")
     def get_profile() -> Response:
@@ -1447,11 +1532,17 @@ def create_app() -> Flask:
 
     @app.post("/api/jobs/<int:job_id>/skip")
     def skip_job(job_id: int) -> Response:
-        if query_db("SELECT id FROM jobs WHERE id = ?", [job_id], one=True) is None:
+        existing = query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)
+        if existing is None:
             return jsonify({"error": "Job not found"}), 404
+        payload = request.get_json(silent=True) or {}
+        requested_profile = clamp_int(payload.get("candidate_profile_id"), 0, 10**9)
+        stored_profile = clamp_int(existing["candidate_profile_id"], 0, 10**9)
+        if stored_profile and requested_profile != stored_profile:
+            return jsonify({"error": "This discovery result belongs to a different applicant profile."}), 409
         get_db().execute("UPDATE jobs SET discovery_state = 'ignored', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
         get_db().commit()
-        return jsonify({"ok": True})
+        return jsonify({"ok": True, "candidate_profile_id": stored_profile or requested_profile})
 
     @app.post("/api/jobs")
     def create_job() -> Response:
@@ -1789,12 +1880,12 @@ def create_app() -> Flask:
             cursor = get_db().execute(
                 """INSERT INTO saved_search_profiles
                    (name, keywords, location, remote_preference, seniority, minimum_salary,
-                    enabled_sources_json, date_window, search_depth, distance, per_source_cap, total_cap, interval_minutes, enabled,
+                    enabled_sources_json, date_window, search_depth, distance, per_source_cap, new_matching_target, total_cap, interval_minutes, enabled,
                     search_mode, title_match_mode,
                     auto_prepare_enabled, auto_prepare_min_priority, auto_prepare_require_canadian,
                     auto_prepare_candidate_profile_id, auto_prepare_resume_id, auto_prepare_cover_letter_template_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["search_depth"], search["distance"], search["per_source_cap"], search["total_cap"], search["interval_minutes"], search["enabled"], search["search_mode"], search["title_match_mode"], search["auto_prepare_enabled"], search["auto_prepare_min_priority"], search["auto_prepare_require_canadian"], search["auto_prepare_candidate_profile_id"], search["auto_prepare_resume_id"], search["auto_prepare_cover_letter_template_id"]],
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["search_depth"], search["distance"], search["per_source_cap"], search["new_matching_target"], search["total_cap"], search["interval_minutes"], search["enabled"], search["search_mode"], search["title_match_mode"], search["auto_prepare_enabled"], search["auto_prepare_min_priority"], search["auto_prepare_require_canadian"], search["auto_prepare_candidate_profile_id"], search["auto_prepare_resume_id"], search["auto_prepare_cover_letter_template_id"]],
             )
             get_db().commit()
         except sqlite3.IntegrityError:
@@ -1814,11 +1905,11 @@ def create_app() -> Flask:
             get_db().execute(
                 """UPDATE saved_search_profiles SET name = ?, keywords = ?, location = ?, remote_preference = ?,
                    seniority = ?, minimum_salary = ?, enabled_sources_json = ?, date_window = ?, search_depth = ?, distance = ?,
-                   per_source_cap = ?, total_cap = ?, interval_minutes = ?, enabled = ?, auto_prepare_enabled = ?, auto_prepare_min_priority = ?,
+                   per_source_cap = ?, new_matching_target = ?, total_cap = ?, interval_minutes = ?, enabled = ?, auto_prepare_enabled = ?, auto_prepare_min_priority = ?,
                    search_mode = ?, title_match_mode = ?,
                    auto_prepare_require_canadian = ?, auto_prepare_candidate_profile_id = ?, auto_prepare_resume_id = ?,
                    auto_prepare_cover_letter_template_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
-                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["search_depth"], search["distance"], search["per_source_cap"], search["total_cap"], search["interval_minutes"], search["enabled"], search["auto_prepare_enabled"], search["auto_prepare_min_priority"], search["search_mode"], search["title_match_mode"], search["auto_prepare_require_canadian"], search["auto_prepare_candidate_profile_id"], search["auto_prepare_resume_id"], search["auto_prepare_cover_letter_template_id"], search_id],
+                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["search_depth"], search["distance"], search["per_source_cap"], search["new_matching_target"], search["total_cap"], search["interval_minutes"], search["enabled"], search["auto_prepare_enabled"], search["auto_prepare_min_priority"], search["search_mode"], search["title_match_mode"], search["auto_prepare_require_canadian"], search["auto_prepare_candidate_profile_id"], search["auto_prepare_resume_id"], search["auto_prepare_cover_letter_template_id"], search_id],
             )
             get_db().commit()
         except sqlite3.IntegrityError:
@@ -1882,9 +1973,31 @@ def create_app() -> Flask:
         row = query_db("SELECT * FROM jobs WHERE id = ? AND discovery_first_seen_at <> ''", [job_id], one=True)
         if row is None:
             return jsonify({"error": "Discovered job not found"}), 404
+        payload = request.get_json(silent=True) or {}
+        requested_profile = clamp_int(payload.get("candidate_profile_id"), 0, 10**9)
+        stored_profile = clamp_int(row["candidate_profile_id"], 0, 10**9)
+        if stored_profile and requested_profile != stored_profile:
+            return jsonify({"error": "This discovery result belongs to a different applicant profile."}), 409
         get_db().execute("UPDATE jobs SET discovery_state = 'ignored', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
         get_db().commit()
-        return jsonify({"ok": True})
+        return jsonify({"ok": True, "candidate_profile_id": stored_profile or requested_profile})
+
+    @app.post("/api/discovery/inbox/<int:job_id>/restore")
+    def restore_discovery_job(job_id: int) -> Response:
+        row = query_db("SELECT * FROM jobs WHERE id = ? AND discovery_first_seen_at <> ''", [job_id], one=True)
+        if row is None:
+            return jsonify({"error": "Discovered job not found"}), 404
+        payload = request.get_json(silent=True) or {}
+        requested_profile = clamp_int(payload.get("candidate_profile_id"), 0, 10**9)
+        stored_profile = clamp_int(row["candidate_profile_id"], 0, 10**9)
+        if stored_profile and requested_profile != stored_profile:
+            return jsonify({"error": "This discovery result belongs to a different applicant profile."}), 409
+        get_db().execute(
+            "UPDATE jobs SET discovery_state = 'new', status = CASE WHEN status IN ('Saved', 'Discovered') THEN 'Discovered' ELSE status END, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            [job_id],
+        )
+        get_db().commit()
+        return jsonify(job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True), include_legacy_details=False))
 
     @app.post("/api/discovery/inbox/<int:job_id>/save")
     def save_discovery_job(job_id: int) -> Response:
@@ -2136,6 +2249,13 @@ def create_app() -> Flask:
             return jsonify({"error": "Discovery search not found"}), 404
         return jsonify(run)
 
+    @app.get("/api/discovery/results/latest")
+    def discovery_results_latest_get() -> Response:
+        run = load_latest_discovery_search_run()
+        if not run:
+            return jsonify({"found": False, "jobs": []})
+        return jsonify({"found": True, **run})
+
     @app.get("/api/discovery/debug/latest")
     def discovery_debug_latest() -> Response:
         latest = load_latest_discovery_debug_run()
@@ -2155,6 +2275,8 @@ def create_app() -> Flask:
             search = discovery_search_config(payload)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
+        if search["search_mode"] == "shortlist" and not text(payload.get("candidate_profile_id")):
+            return jsonify({"error": "Select a candidate résumé profile for the technical shortlist."}), 400
         search_key = discovery_search_signature(payload)
         with _ACTIVE_DISCOVERY_SEARCHES_LOCK:
             if search_key in _ACTIVE_DISCOVERY_SEARCHES:
@@ -2170,7 +2292,7 @@ def create_app() -> Flask:
         provider = get_geocoding_provider()
         origin = profile_home_location(profile)
         try:
-            location_context = resolve_discovery_location_context(search["location"], profile, provider, use_cache=not bypass_cache)
+            location_context = resolve_discovery_location_context(search["location"], profile, provider, use_cache=not bypass_cache, distance_origin_input=search.get("distance_origin_input", ""))
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         search["original_location"] = location_context["original_input"]
@@ -2179,13 +2301,18 @@ def create_app() -> Flask:
         search["discovery_location"] = location_context["discovery_location"]
         search["location_resolution_method"] = location_context["resolution_method"]
         search["location_geocode"] = location_context["lookup"]
+        if location_context.get("distance_origin_lookup", {}).get("ok"):
+            origin_result = location_context["distance_origin_lookup"]
+            origin = {"input": origin_result.get("original_input"), "normalized": origin_result.get("normalized_query"), "latitude": origin_result.get("latitude"), "longitude": origin_result.get("longitude"), "provider": origin_result.get("provider"), "confidence": origin_result.get("confidence"), "precision": origin_result.get("precision"), "geocoded_at": origin_result.get("geocoded_at"), "status": origin_result.get("status"), "error": origin_result.get("error", ""), "cached": origin_result.get("cached", False), "failure_reasons": origin_result.get("failure_reasons", [])}
+        elif search.get("distance_origin_input"):
+            origin_lookup = location_context.get("distance_origin_lookup") or {}
+            origin = {"input": search["distance_origin_input"], "normalized": search["distance_origin_input"], "provider": origin_lookup.get("provider", ""), "status": origin_lookup.get("status") or "unresolved", "precision": "unknown", "error": origin_lookup.get("error") or "The requested private distance origin could not be resolved.", "failure_reasons": origin_lookup.get("failure_reasons", [])}
 
         search["keywords"] = keywords
         fetched = fetch_discovery_jobs_for_search(search, country_indeed=text(payload.get("country_indeed")) or "Canada")
 
         raw_jobs = fetched.get("jobs", [])
-        existing_keys = existing_job_dedupe_keys()
-        seen_keys: set[str] = set()
+        seen_jobs: list[dict[str, Any]] = []
         jobs: list[dict[str, Any]] = []
         duplicates_in_search = 0
         already_saved_matches = 0
@@ -2197,6 +2324,8 @@ def create_app() -> Flask:
         for raw_job in raw_jobs:
             payload_job = jobspy_result_to_job_payload(raw_job)
             clean = normalize_job_payload(payload_job)
+            clean["candidate_profile_id"] = clamp_int(payload.get("applicant_profile_id") or payload.get("candidate_profile_id"), 0, 10**9)
+            clean["benefits"] = parse_json_array(clean.get("benefits_json"))
             clean["discovery_occupation"] = search["occupation"]
             clean["discovery_profile_independent"] = int(search["profile_independent"])
             clean["discovery_search_mode"] = search["search_mode"]
@@ -2218,8 +2347,8 @@ def create_app() -> Flask:
             if clean.get("distance_label") == "unknown":
                 geocoding_unknown += 1
             clean["remote_eligibility"], clean["remote_eligibility_explanation"] = discovery_remote_eligibility(clean)
-            clean = enrich_discovery_job(clean, profile, {"weights": preferences.get("weights", {}), "remote_rule": preferences.get("sort", {}).get("remote_rule")}, evidence_profile=evidence_profile)
-            clean = apply_discovery_search_constraints(clean, search["remote_preference"], search["discovery_location"])
+            clean = enrich_discovery_job(clean, profile, {"weights": preferences.get("weights", {}), "remote_rule": preferences.get("sort", {}).get("remote_rule"), "distance_origin": origin}, evidence_profile=evidence_profile)
+            clean = apply_discovery_search_constraints(clean, search["remote_preference"], search["discovery_location"], search["distance"])
             clean["discovery_remote_preference"] = search["remote_preference"]
             clean["discovery_location_scope"] = search["discovery_location"]
             clean["remote_search_eligible"] = "true" if clean.get("remote_search_eligible") is True else "false" if clean.get("remote_search_eligible") is False else "unknown"
@@ -2235,19 +2364,17 @@ def create_app() -> Flask:
             clean["warnings"] = discovery_warning_reasons(clean, keywords, search["location"])
             clean["already_saved"] = False
             clean["duplicate_in_search"] = False
-            keys = dedupe_keys(clean, clean.get("source_job_id"))
-            if keys & seen_keys:
+            if any(dedupe_match(clean, seen) for seen in seen_jobs):
                 clean["duplicate_in_search"] = True
                 duplicates_in_search += 1
                 continue
-            if keys & existing_keys:
+            existing_match = find_existing_job_match(clean)
+            if existing_match is not None:
                 clean["already_saved"] = True
                 already_saved_matches += 1
-                existing_match = find_existing_job_match(clean)
-                if existing_match is not None:
-                    clean["saved_job_id"] = int(existing_match["id"])
-                    clean["saved_job_status"] = text(existing_match["status"])
-            seen_keys.update(keys)
+                clean["saved_job_id"] = int(existing_match["id"])
+                clean["saved_job_status"] = text(existing_match["status"])
+            seen_jobs.append(clean)
             jobs.append(clean)
 
         source_counts = {source: 0 for source in DISCOVERY_SOURCES}
@@ -2262,6 +2389,9 @@ def create_app() -> Flask:
         for item in jobs:
             category = item.get("discovery_result_category") or "review_required"
             category_counts[category] = category_counts.get(category, 0) + 1
+        excluded_count = category_counts.get("excluded", 0)
+        outside_radius_count = sum(1 for item in jobs if text(item.get("distance_radius_status")) == "outside_radius")
+        unknown_distance_count = sum(1 for item in jobs if text(item.get("distance_radius_status")) == "unknown")
         capped_count = max(0, len(jobs) - search["total_cap"])
         diagnostics = {
             "bypass_cache": bypass_cache,
@@ -2269,19 +2399,32 @@ def create_app() -> Flask:
             "cache_created_at": "",
             "cached_raw_result_count": 0,
             "search_criteria": search,
-            "saved_origin": origin,
+            "saved_origin": {
+                "input": redact_location_input(text(origin.get("input"))),
+                "normalized": redact_location_input(text(origin.get("normalized"))),
+                "provider": text(origin.get("provider")),
+                "status": text(origin.get("status")),
+                "precision": text(origin.get("precision")),
+                "cached": bool(origin.get("cached")),
+            },
             "original_location": search.get("original_location"),
             "normalized_location": search.get("normalized_location"),
             "distance_origin": search.get("distance_origin"),
             "discovery_location": search.get("discovery_location"),
             "location_resolution_method": search.get("location_resolution_method"),
             "origin_geocode_status": origin.get("status"),
+            "origin_geocode_error": text(origin.get("error")),
+            "origin_geocode_failure_reasons": location_context.get("distance_origin_lookup", {}).get("failure_reasons", []),
+            "origin_geocode_provider": text(origin.get("provider")),
+            "origin_input_redacted": redact_location_input(text(search.get("distance_origin_input"))),
             "origin_precision": origin.get("precision"),
             "origin_available": discovery_origin_available(profile),
             "jobs_geocoded_successfully": geocoding_success,
             "jobs_using_cached_coordinates": geocoding_cached,
             "jobs_with_unknown_distance": geocoding_unknown,
-            "jobs_excluded_by_radius": 0,
+            "jobs_excluded_by_radius": outside_radius_count,
+            "outside_radius_count": outside_radius_count,
+            "unknown_distance_count": unknown_distance_count,
             "source_counts": source_counts,
             "source_errors": fetched.get("errors", {}),
             "source_diagnostics": fetched.get("source_diagnostics", {}),
@@ -2316,8 +2459,27 @@ def create_app() -> Flask:
         persisted = persist_discovery_jobs(jobs, None, manual_run_id)
         for item in jobs:
             hydrate_discovery_identity(item)
-        processed_count = sum(1 for item in jobs if item.get("processed_discovery"))
+        processed_items = [item for item in jobs if item.get("processed_discovery")]
+        processed_count = len(processed_items)
+        skipped_count = sum(1 for item in processed_items if text(item.get("discovery_state")) == "ignored")
         jobs = [item for item in jobs if not item.get("processed_discovery")]
+        rank = {"Strong technical match": 0, "Possible / stretch": 1, "Possible / stretch — evidence incomplete": 2, "Significant gaps": 3}
+        # `jobs` is already ordered by the user's saved sort preferences.
+        # Preserve that order while applying the target and seniority gates.
+        ordered = list(jobs)
+        if as_bool(payload.get("strict_technical")):
+            ordered = [item for item in ordered if not (item.get("technical_compatibility") or {}).get("required_no_experience")]
+        requested_target = int(search.get("requested_target") or 25)
+        matching_jobs = [item for item in ordered if item.get("discovery_result_category") == "actionable" and not discovery_is_clear_senior_role(item, search)]
+        senior_review_jobs = [item for item in ordered if item.get("discovery_result_category") == "actionable" and discovery_is_clear_senior_role(item, search)]
+        for item in senior_review_jobs:
+            item["discovery_result_category"] = "review_required"
+            item["discovery_result_reason"] = "Clearly senior or managerial SWE role kept out of the new-match target."
+        review_required_jobs = [item for item in ordered if item.get("discovery_result_category") not in {"actionable", "excluded"}]
+        new_matching_jobs = matching_jobs[:requested_target]
+        # The response is unified: actionable new matches first, followed by a
+        # separately labelled review queue. Excluded jobs never enter it.
+        jobs = new_matching_jobs + review_required_jobs
         finish_discovery_run(
             manual_run_id,
             status="completed" if not fetched.get("errors") else "completed_with_errors",
@@ -2328,10 +2490,25 @@ def create_app() -> Flask:
             outcomes={"source_counts": source_counts, "processed_count": processed_count},
         )
         diagnostics["processed_count"] = processed_count
+        diagnostics["skipped_count"] = skipped_count
+        diagnostics["requested_target"] = requested_target
+        diagnostics["new_matching_count"] = len(new_matching_jobs)
+        diagnostics["review_required_count"] = len(review_required_jobs)
+        diagnostics["unique_jobs_found"] = len(seen_jobs)
+        diagnostics["raw_jobs_inspected"] = len(raw_jobs)
+        diagnostics["search_complete"] = not bool(fetched.get("errors"))
+        diagnostics["target_unmet_reason"] = (
+            "No further matching results were returned by the selected sources."
+            if len(new_matching_jobs) < requested_target and not fetched.get("errors")
+            else "Provider failures, timeouts, or rate limits interrupted the search. Continue search to retry."
+            if len(new_matching_jobs) < requested_target and fetched.get("errors")
+            else ""
+        )
         diagnostics["persisted"] = persisted
         diagnostics["jobs_returned_to_frontend"] = len(jobs)
         diagnostics["post_processing_row_count"] = len(jobs)
-        save_discovery_search_run(search_key, search, diagnostics, raw_jobs)
+        diagnostics["display_jobs"] = jobs
+        save_discovery_search_run(search_key, search, diagnostics, jobs)
         save_discovery_debug_run(
             search_key,
             {"keywords": keywords, **search, "bypass_cache": bypass_cache},
@@ -2341,6 +2518,21 @@ def create_app() -> Flask:
         return jsonify(
             {
                 "jobs": jobs,
+                "technical_shortlist": new_matching_jobs,
+                "matching_jobs": new_matching_jobs,
+                "review_required_jobs": review_required_jobs,
+                "search_progress": {
+                    "raw_jobs_inspected": len(raw_jobs),
+                    "unique_jobs_found": len(seen_jobs),
+                    "previously_processed": processed_count,
+                    "skipped": skipped_count,
+                    "disqualified": excluded_count,
+                    "review_required": len(review_required_jobs),
+                    "new_matching_jobs": len(new_matching_jobs),
+                    "requested_target": requested_target,
+                    "target_unmet_reason": diagnostics["target_unmet_reason"],
+                    "incomplete": bool(fetched.get("errors")),
+                },
                 "errors": fetched.get("errors", {}),
                 "source_counts": source_counts,
                 "total": len(raw_jobs),
@@ -2402,6 +2594,80 @@ def create_app() -> Flask:
                 "total": len(fetched.get("jobs", [])),
             }
         )
+
+    @app.post("/api/discovery/recalculate-distances")
+    def recalculate_discovery_distances() -> Response:
+        """Recompute cached discovery distances without contacting job boards."""
+        payload = request.get_json(silent=True) or {}
+        search_key = text(payload.get("search_key")) or text(request.args.get("search_key"))
+        cached_run = load_discovery_search_run(search_key) if search_key else load_latest_discovery_search_run()
+        if not cached_run:
+            return jsonify({"error": "No cached discovery results are available to re-enrich."}), 404
+        search = dict(cached_run.get("search") or {})
+        profile = load_profile()
+        origin_input = normalize_space(text(payload.get("distance_origin_input") or payload.get("distance_origin")))
+        if not origin_input:
+            origin_input = text(search.get("distance_origin_input")) or text(profile.get("home_location_original") or profile.get("location"))
+        provider = get_geocoding_provider()
+        try:
+            location_context = resolve_discovery_location_context(
+                text(search.get("location")), profile, provider, use_cache=True,
+                distance_origin_input=origin_input,
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        origin_lookup = location_context.get("distance_origin_lookup") or {}
+        if origin_lookup.get("ok"):
+            origin = {
+                "input": origin_lookup.get("original_input"), "normalized": origin_lookup.get("normalized_query"),
+                "latitude": origin_lookup.get("latitude"), "longitude": origin_lookup.get("longitude"),
+                "provider": origin_lookup.get("provider"), "confidence": origin_lookup.get("confidence"),
+                "precision": origin_lookup.get("precision"), "status": origin_lookup.get("status"),
+                "error": origin_lookup.get("error", ""), "cached": origin_lookup.get("cached", False),
+            }
+        else:
+            origin = {"input": origin_input, "normalized": origin_input, "status": "unresolved", "precision": "unknown", "error": origin_lookup.get("error") or "The requested private distance origin could not be resolved.", "failure_reasons": origin_lookup.get("failure_reasons", [])}
+        evidence_profile = resolve_discovery_evidence_profile(search)
+        refreshed_jobs: list[dict[str, Any]] = []
+        updated = 0
+        for cached_job in cached_run.get("jobs") or []:
+            job = dict(cached_job)
+            job, _ = geocode_discovery_job(job, profile, origin, provider, use_cache=True)
+            job = enrich_discovery_job(job, profile, {"remote_rule": "remote_after_local", "distance_origin": origin}, evidence_profile=evidence_profile)
+            refreshed_jobs.append(job)
+            job_id = clamp_int(job.get("id"), 0, 10**9)
+            if job_id:
+                get_db().execute(
+                    """UPDATE jobs SET distance_km = ?, distance_confidence = ?, distance_origin_label = ?,
+                       distance_origin_precision = ?, distance_origin_status = ?, distance_type = ?,
+                       commute_status = ?, commute_source = ?, workplace_alternatives_json = ?,
+                       updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+                    [job.get("distance_km", 9999), job.get("distance_confidence", 0), job.get("distance_origin_label", ""),
+                     job.get("distance_origin_precision", ""), job.get("distance_origin_status", ""), job.get("distance_type", "unknown"),
+                     job.get("commute_status", "unavailable"), job.get("commute_source", ""),
+                     dumps_json(job.get("workplace_alternatives") or []), job_id],
+                )
+                updated += 1
+        get_db().commit()
+        search["distance_origin_input"] = origin_input
+        search["distance_origin"] = normalize_canadian_postal_code(extract_canadian_postal_code(origin_input)) if extract_canadian_postal_code(origin_input) else origin_input
+        diagnostics = dict(cached_run.get("metadata") or {})
+        diagnostics.update({
+            "saved_origin": {"input": redact_location_input(origin.get("input", "")), "normalized": redact_location_input(origin.get("normalized", "")), "provider": origin.get("provider", ""), "status": origin.get("status", ""), "precision": origin.get("precision", ""), "cached": bool(origin.get("cached"))},
+            "origin_geocode_status": origin.get("status", ""),
+            "origin_geocode_error": origin.get("error", ""),
+            "origin_geocode_failure_reasons": origin_lookup.get("failure_reasons", []),
+            "origin_geocode_provider": origin.get("provider", ""),
+            "origin_input_redacted": redact_location_input(origin_input),
+            "jobs_with_unknown_distance": sum(1 for job in refreshed_jobs if job.get("distance_km", 9999) >= 9999),
+            "jobs_geocoded_successfully": sum(1 for job in refreshed_jobs if text(job.get("location_geocode_status")) in {"saved", "cached"}),
+            "jobs_using_cached_coordinates": sum(1 for job in refreshed_jobs if job.get("location_cached")),
+            "recalculated_without_scraping": True,
+            "recalculated_job_count": len(refreshed_jobs),
+        })
+        refreshed_search_key = discovery_search_signature(search)
+        save_discovery_search_run(refreshed_search_key, search, diagnostics, refreshed_jobs)
+        return jsonify({"ok": True, "search_key": refreshed_search_key, "search": search, "jobs": refreshed_jobs, "updated_persisted_jobs": updated, "diagnostics": diagnostics, "scraped": False})
 
     @app.post("/api/generate")
     def generate_materials() -> Response:
@@ -2652,12 +2918,13 @@ def normalize_saved_search_payload(payload: dict[str, Any], existing: dict[str, 
     date_window = normalize_choice(payload.get("date_window", existing.get("date_window")), set(DISCOVERY_DATE_WINDOWS)) or "14d"
     search_depth = normalize_choice(payload.get("search_depth", existing.get("search_depth")), set(DISCOVERY_SEARCH_DEPTHS)) or "standard"
     per_source_cap = clamp_int_default(payload.get("per_source_cap", existing.get("per_source_cap")), 100, 1, 1000)
-    total_cap = clamp_int_default(payload.get("total_cap", existing.get("total_cap")), 200, 1, 5000)
+    new_matching_target = clamp_int_default(payload.get("new_matching_target", existing.get("new_matching_target")), 25, 1, 500)
+    total_cap = clamp_int_default(payload.get("total_cap", existing.get("total_cap")), max(200, new_matching_target * 4), 1, 5000)
     remote_preference = normalize_choice(payload.get("remote_preference", existing.get("remote_preference")), {"", "remote", "hybrid", "on-site"})
     interval_minutes = clamp_int_default(payload.get("interval_minutes", existing.get("interval_minutes")), 360, 15, 10080)
     minimum_salary = clamp_int_default(payload.get("minimum_salary", existing.get("minimum_salary")), 0, 0, 1000000)
     distance = clamp_int_default(payload.get("distance", existing.get("distance")), 50, 0, 1000)
-    search_mode = normalize_choice(payload.get("search_mode", existing.get("search_mode")), {"title", "explore"}) or "title"
+    search_mode = normalize_choice(payload.get("search_mode", existing.get("search_mode")), {"title", "explore", "shortlist"}) or "title"
     title_match_mode = normalize_choice(payload.get("title_match_mode", existing.get("title_match_mode")), {"strict", "related"}) or "related"
     existing_sources = existing.get("enabled_sources")
     if not isinstance(existing_sources, list):
@@ -2685,6 +2952,7 @@ def normalize_saved_search_payload(payload: dict[str, Any], existing: dict[str, 
         "search_depth": search_depth,
         "distance": distance,
         "per_source_cap": per_source_cap,
+        "new_matching_target": new_matching_target,
         "total_cap": total_cap,
         "search_mode": search_mode,
         "title_match_mode": title_match_mode,
@@ -2714,19 +2982,25 @@ def saved_search_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:
 
 
 def saved_search_to_discovery_payload(search: dict[str, Any]) -> dict[str, Any]:
+    selected_profile = search.get("auto_prepare_candidate_profile_id") or ""
     return {
         **search,
-        "candidate_profile_id": search.get("auto_prepare_candidate_profile_id") or "",
+        # A title search may retain an applicant for saved-job ownership and
+        # later preparation without turning that applicant's résumé into
+        # qualification evidence.
+        "candidate_profile_id": selected_profile if search.get("search_mode") == "shortlist" else "",
+        "applicant_profile_id": selected_profile,
         "enabled_sources": search.get("enabled_sources") or ["linkedin", "indeed"],
         "search_depth": search.get("search_depth") or "standard",
         "total_cap": int(search.get("total_cap") or 200),
+        "new_matching_target": int(search.get("new_matching_target") or 25),
         "per_source_cap": int(search.get("per_source_cap") or 100),
     }
 
 
 def resolve_discovery_evidence_profile(payload: dict[str, Any]) -> dict[str, Any]:
     """Resolve the résumé used for discovery scoring, without mixing profiles."""
-    search_mode = normalize_choice(payload.get("search_mode"), {"title", "explore"}) or "title"
+    search_mode = normalize_choice(payload.get("search_mode"), {"title", "explore", "shortlist"}) or "title"
     profile_id = payload.get("candidate_profile_id") or payload.get("auto_prepare_candidate_profile_id")
     if search_mode == "title" and profile_id in (None, "", 0):
         # Title Search is useful before a résumé exists.  An active SWE résumé
@@ -2801,7 +3075,10 @@ def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, ru
             )
             continue
         clean = {column: job.get(column, "") for column in JOB_COLUMNS}
-        clean["status"] = "Saved"
+        # Discovery is not an explicit user save.  Keep the user-facing
+        # Saved state reserved for manual saves while preserving all legacy
+        # records through the migration runner.
+        clean["status"] = "Discovered"
         clean["date_added"] = clean.get("date_added") or date.today().isoformat()
         clean["discovery_first_seen_at"] = now
         clean["discovery_last_seen_at"] = now
@@ -2925,7 +3202,7 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
     evidence_profile = resolve_discovery_evidence_profile(payload)
     provider = get_geocoding_provider()
     origin = profile_home_location(profile)
-    location_context = resolve_discovery_location_context(search["location"], profile, provider, use_cache=True)
+    location_context = resolve_discovery_location_context(search["location"], profile, provider, use_cache=True, distance_origin_input=search.get("distance_origin_input", ""))
     search.update({
         "original_location": location_context["original_input"],
         "normalized_location": location_context["normalized_input"],
@@ -2934,16 +3211,23 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         "location_resolution_method": location_context["resolution_method"],
         "location_geocode": location_context["lookup"],
     })
+    if location_context.get("distance_origin_lookup", {}).get("ok"):
+        origin_result = location_context["distance_origin_lookup"]
+        origin = {"input": origin_result.get("original_input"), "normalized": origin_result.get("normalized_query"), "latitude": origin_result.get("latitude"), "longitude": origin_result.get("longitude"), "provider": origin_result.get("provider"), "confidence": origin_result.get("confidence"), "precision": origin_result.get("precision"), "geocoded_at": origin_result.get("geocoded_at"), "status": origin_result.get("status"), "error": origin_result.get("error", ""), "cached": origin_result.get("cached", False), "failure_reasons": origin_result.get("failure_reasons", [])}
+    elif search.get("distance_origin_input"):
+        origin_lookup = location_context.get("distance_origin_lookup") or {}
+        origin = {"input": search["distance_origin_input"], "normalized": search["distance_origin_input"], "provider": origin_lookup.get("provider", ""), "status": origin_lookup.get("status") or "unresolved", "precision": "unknown", "error": origin_lookup.get("error") or "The requested private distance origin could not be resolved.", "failure_reasons": origin_lookup.get("failure_reasons", [])}
     search["keywords"] = keywords
     fetched = fetch_discovery_jobs_for_search(search, country_indeed="Canada")
-    existing_keys = existing_job_dedupe_keys()
-    seen_keys: set[str] = set()
+    seen_jobs: list[dict[str, Any]] = []
     jobs: list[dict[str, Any]] = []
     duplicates_in_search = 0
     already_saved_matches = 0
     filtered = 0
     for raw_job in fetched.get("jobs", []):
         clean = normalize_job_payload(jobspy_result_to_job_payload(raw_job))
+        clean["candidate_profile_id"] = clamp_int(payload.get("applicant_profile_id") or payload.get("candidate_profile_id"), 0, 10**9)
+        clean["benefits"] = parse_json_array(clean.get("benefits_json"))
         clean["discovery_occupation"] = search["occupation"]
         clean["discovery_profile_independent"] = int(search["profile_independent"])
         clean["discovery_search_mode"] = search["search_mode"]
@@ -2957,8 +3241,8 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
             clean["title_match_score"] = 50
         clean, _ = geocode_discovery_job(clean, profile, origin, provider, use_cache=True)
         clean["remote_eligibility"], clean["remote_eligibility_explanation"] = discovery_remote_eligibility(clean)
-        clean = enrich_discovery_job(clean, profile, {"remote_rule": "remote_after_local"}, evidence_profile=evidence_profile)
-        clean = apply_discovery_search_constraints(clean, search["remote_preference"], search["discovery_location"])
+        clean = enrich_discovery_job(clean, profile, {"remote_rule": "remote_after_local", "distance_origin": origin}, evidence_profile=evidence_profile)
+        clean = apply_discovery_search_constraints(clean, search["remote_preference"], search["discovery_location"], search["distance"])
         clean["discovery_remote_preference"] = search["remote_preference"]
         clean["discovery_location_scope"] = search["discovery_location"]
         clean["remote_search_eligible"] = "true" if clean.get("remote_search_eligible") is True else "false" if clean.get("remote_search_eligible") is False else "unknown"
@@ -2978,7 +3262,7 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         clean["discovery_salary_filter_status"] = "not_configured" if not minimum_salary else ("known" if reliable_salary else "unknown")
         if minimum_salary and not reliable_salary:
             clean["warnings"].append("Compensation is missing or estimated; retained for review.")
-        if minimum_salary and reliable_salary and int(clean.get("salary_max") or 0) < minimum_salary:
+        if minimum_salary and reliable_salary and int(normalize_salary_snapshot(clean).get("salary_annual_max") or 0) < minimum_salary:
             clean["filtered_reason"] = f"Known salary is below the saved-search minimum of ${minimum_salary:,}."
             filtered += 1
             continue
@@ -2987,23 +3271,30 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
             clean["filtered_reason"] = "Posting seniority does not match the saved-search seniority preference."
             filtered += 1
             continue
-        keys = dedupe_keys(clean, clean.get("source_job_id"))
-        if keys & seen_keys:
+        if any(dedupe_match(clean, seen) for seen in seen_jobs):
             duplicates_in_search += 1
             continue
-        clean["already_saved"] = bool(keys & existing_keys)
-        if clean["already_saved"]:
+        existing_match = find_existing_job_match(clean)
+        clean["already_saved"] = existing_match is not None
+        if existing_match is not None:
             already_saved_matches += 1
-        if clean["already_saved"]:
-            existing_match = find_existing_job_match(clean)
-            if existing_match is not None:
-                clean["saved_job_id"] = int(existing_match["id"])
-                clean["saved_job_status"] = text(existing_match["status"])
-        seen_keys.update(keys)
+            clean["saved_job_id"] = int(existing_match["id"])
+            clean["saved_job_status"] = text(existing_match["status"])
+        seen_jobs.append(clean)
         jobs.append(clean)
     capped_count = max(0, len(jobs) - search["total_cap"])
     jobs = sort_discovery_jobs(jobs, "application_priority_score", "desc", "", "asc", "remote_after_local", "last")[: search["total_cap"]]
     persisted = persist_discovery_jobs(jobs, search_id, run_id)
+    requested_target = int(search.get("requested_target") or 25)
+    ordered = list(jobs)
+    matching_jobs = [item for item in ordered if item.get("discovery_result_category") == "actionable" and not discovery_is_clear_senior_role(item, search)][:requested_target]
+    senior_review_jobs = [item for item in ordered if item.get("discovery_result_category") == "actionable" and discovery_is_clear_senior_role(item, search)]
+    for item in senior_review_jobs:
+        item["discovery_result_category"] = "review_required"
+        item["discovery_result_reason"] = "Clearly senior or managerial SWE role kept out of the new-match target."
+    review_required_jobs = [item for item in ordered if item.get("discovery_result_category") not in {"actionable", "excluded"}]
+    excluded_jobs = [item for item in ordered if item.get("discovery_result_category") == "excluded"]
+    jobs = matching_jobs + review_required_jobs
     auto_preparation_queued = enqueue_auto_preparation(search, persisted.get("new_job_ids", [])) if search_id else 0
     search_key = discovery_search_signature(payload)
     metadata = {
@@ -3018,17 +3309,52 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         "excluded_count": filtered,
         "capped_count": capped_count,
         "visible_count": len(jobs),
+        "requested_target": requested_target,
+        "raw_jobs_inspected": len(fetched.get("jobs", [])),
+        "unique_jobs_found": len(seen_jobs),
+        "previously_processed": int(persisted.get("duplicate") or 0),
+        "skipped_count": sum(1 for item in jobs if text(item.get("discovery_state")) == "ignored"),
+        "disqualified_count": len(excluded_jobs),
+        "review_required_count": len(review_required_jobs),
+        "new_matching_count": len(matching_jobs),
+        "target_unmet_reason": (
+            "No further matching results were returned by the selected sources."
+            if len(matching_jobs) < requested_target and not fetched.get("errors")
+            else "Provider failures, timeouts, or rate limits interrupted the search. Continue search to retry."
+            if len(matching_jobs) < requested_target and fetched.get("errors")
+            else ""
+        ),
         "raw_jobs_returned": len(fetched.get("jobs", [])),
         "displayed_jobs": len(jobs),
+        "display_jobs": jobs,
         "filtered_by_saved_search": filtered,
         "persisted": persisted,
         "auto_preparation_queued": auto_preparation_queued,
         "filtered": filtered,
+        "origin_geocode_status": origin.get("status"),
+        "origin_geocode_error": text(origin.get("error")),
+        "origin_geocode_failure_reasons": origin.get("failure_reasons", []),
+        "origin_geocode_provider": text(origin.get("provider")),
+        "origin_input_redacted": redact_location_input(text(search.get("distance_origin_input"))),
     }
-    save_discovery_search_run(search_key, search, metadata, fetched.get("jobs", []))
+    save_discovery_search_run(search_key, search, metadata, jobs)
     save_discovery_debug_run(search_key, {**payload, "search_id": search_id}, metadata, fetched.get("source_snapshots", {}))
     return {
         "jobs": jobs,
+        "matching_jobs": matching_jobs,
+        "review_required_jobs": review_required_jobs,
+        "search_progress": {
+            "raw_jobs_inspected": len(fetched.get("jobs", [])),
+            "unique_jobs_found": len(seen_jobs),
+            "previously_processed": int(persisted.get("duplicate") or 0),
+            "skipped": sum(1 for item in jobs if text(item.get("discovery_state")) == "ignored"),
+            "disqualified": len(excluded_jobs),
+            "review_required": len(review_required_jobs),
+            "new_matching_jobs": len(matching_jobs),
+            "requested_target": requested_target,
+            "target_unmet_reason": metadata["target_unmet_reason"],
+            "incomplete": bool(fetched.get("errors")),
+        },
         "errors": fetched.get("errors", {}),
         "source_counts": fetched.get("source_counts", {}),
         "source_diagnostics": fetched.get("source_diagnostics", {}),
@@ -3124,10 +3450,26 @@ def jobspy_result_to_job_payload(job: dict[str, Any]) -> dict[str, Any]:
         }
     )
     salary_listed = salary["salary_source"] not in {"estimated", "missing"}
+    raw_provider = job.get("raw") if isinstance(job.get("raw"), dict) else {}
     return {
         "company": text(job.get("company")) or "Unknown company",
+        "provider_company": text(job.get("company")),
+        "provider_location": text(job.get("provider_location") or job.get("location")),
+        "workplace_address": text(job.get("workplace_address")),
+        "workplace_postal_code": text(job.get("workplace_postal_code")),
+        "workplace_evidence": text(job.get("workplace_evidence")),
+        "workplace_evidence_source": text(job.get("workplace_evidence_source")),
+        "workplace_precision": text(job.get("workplace_precision")),
+        "workplace_confidence": clamp_int(job.get("workplace_confidence"), 0, 100),
+        "workplace_alternatives_json": dumps_json(job.get("workplace_alternatives") or []),
+        "credentials_json": dumps_json(job.get("credentials") or []),
+        "benefits_json": dumps_json(job.get("benefits") or []),
+        "arrangement_evidence": text(job.get("arrangement_evidence")),
+        "remote_classification_conflict": text(job.get("remote_classification_conflict")),
+        "provider_raw_json": dumps_json(raw_provider, sort_keys=True, default=str),
+        "provider_title": title,
         "title": title or "Untitled role",
-        "location": text(job.get("location")),
+        "location": text(job.get("location")) or text(job.get("provider_location")),
         "url": text(job.get("job_url")),
         "application_url": text(job.get("application_url")) or text(job.get("job_url")),
         "source": source.title() if source else "JobSpy",
@@ -3135,7 +3477,13 @@ def jobspy_result_to_job_payload(job: dict[str, Any]) -> dict[str, Any]:
         "salary_original_text": salary_text or salary["salary_text"],
         "salary_min": salary["salary_min"],
         "salary_max": salary["salary_max"],
-        "salary_midpoint": int(round((salary["salary_min"] + salary["salary_max"]) / 2)) if salary["salary_min"] or salary["salary_max"] else 0,
+        "salary_midpoint": salary.get("salary_midpoint", 0),
+        "salary_advertised_min": salary.get("salary_advertised_min", salary.get("salary_min", 0)),
+        "salary_advertised_max": salary.get("salary_advertised_max", salary.get("salary_max", 0)),
+        "salary_advertised_midpoint": salary.get("salary_advertised_midpoint", salary.get("salary_midpoint", 0)),
+        "salary_annual_min": salary.get("salary_annual_min", 0),
+        "salary_annual_max": salary.get("salary_annual_max", 0),
+        "salary_annual_midpoint": salary.get("salary_annual_midpoint", 0),
         "salary_interval": salary["salary_interval"],
         "salary_currency": salary["salary_currency"],
         "salary_source": salary["salary_source"],
@@ -3186,13 +3534,27 @@ def discovery_warning_reasons(job: dict[str, Any], keywords: str, requested_loca
     senior_terms = ["senior", "staff", "principal", "director", "architect", "lead", "manager"]
     if any(re.search(rf"\b{re.escape(term)}\b", content) for term in senior_terms) and not any(term in query for term in senior_terms):
         warnings.append("Seniority may be above the requested search.")
-    if any(term in content for term in ["unpaid", "commission only", "commission-only"]):
+    if explicit_unpaid_evidence(job):
         warnings.append("Compensation appears unpaid or commission-only.")
     if obvious_unrelated_role(content, query):
         warnings.append("Role appears unrelated to the requested keywords.")
     if requested_location and outside_requested_location(job, requested_location):
         warnings.append("Location may be outside the requested area.")
     return warnings
+
+
+def explicit_unpaid_evidence(job: dict[str, Any]) -> bool:
+    """Require wording that applies unpaid status to the position itself."""
+    description = normalize_space(text(job.get("job_description"))).lower()
+    return bool(re.search(
+        r"\b(?:unpaid|volunteer|no\s+compensation|without\s+pay|commission[- ]only)\b"
+        r"[^.\n]{0,80}\b(?:position|role|job|internship|placement|work)\b",
+        description,
+    ) or re.search(
+        r"\b(?:position|role|job|internship|placement|work)\b[^.\n]{0,80}"
+        r"\b(?:unpaid|volunteer|no\s+compensation|without\s+pay|commission[- ]only)\b",
+        description,
+    ))
 
 
 def obvious_unrelated_role(content: str, query: str) -> bool:
@@ -3204,6 +3566,13 @@ def obvious_unrelated_role(content: str, query: str) -> bool:
 def outside_requested_location(job: dict[str, Any], requested_location: str) -> bool:
     remote_type = text(job.get("remote_type")).lower()
     if "remote" in remote_type:
+        return False
+    # A verified workplace distance is stronger evidence than a city-name
+    # mismatch (for example, Toronto versus North York). Radius enforcement
+    # is handled separately by apply_discovery_search_constraints().
+    distance_km = clamp_int(job.get("distance_km"), 0, 9999)
+    distance_confidence = clamp_int(job.get("distance_confidence"), 0, 100)
+    if distance_km < 9999 and distance_confidence >= 70 and text(job.get("distance_type")).lower() in {"straight_line", "approximate", ""}:
         return False
     requested_parts = [part for part in re.split(r"[\s,]+", requested_location.lower()) if len(part) >= 4]
     location = text(job.get("location")).lower()
@@ -3220,15 +3589,14 @@ def existing_job_dedupe_keys() -> set[str]:
 
 
 def find_existing_job_match(job: dict[str, Any]) -> sqlite3.Row | None:
-    keys = dedupe_keys(job, job.get("source_job_id"))
     rows = query_db("SELECT * FROM jobs")
     for row in rows:
         existing = job_to_dict(row)
-        if text(existing.get("status")) == "shortlisted" and keys & dedupe_keys(existing, existing.get("source_job_id")):
+        if text(existing.get("status")) == "shortlisted" and dedupe_match(job, existing):
             return row
     for row in rows:
         existing = job_to_dict(row)
-        if keys & dedupe_keys(existing, existing.get("source_job_id")):
+        if dedupe_match(job, existing):
             return row
     return None
 
@@ -6255,6 +6623,7 @@ def build_preparation_pdf_preview(item_id: int, kind: str, source: Path, content
 
 def dedupe_keys(job: dict[str, Any], source_job_id: Any = "") -> set[str]:
     keys = set()
+    source_id = normalize_dedupe_text(source_job_id)
     for field in ["url", "application_url"]:
         canonical = canonical_url(text(job.get(field)))
         if canonical:
@@ -6268,11 +6637,31 @@ def dedupe_keys(job: dict[str, Any], source_job_id: Any = "") -> set[str]:
     )
     if composite.replace("|", ""):
         keys.add(f"ctl:{composite}")
-    source_id = normalize_dedupe_text(source_job_id)
     source = normalize_dedupe_text(job.get("source"))
     if source_id:
         keys.add(f"source:{source}:{source_id}")
     return keys
+
+
+def dedupe_match(first: dict[str, Any], second: dict[str, Any]) -> bool:
+    """Match vacancies without merging distinct IDs from one provider."""
+    first_profile = clamp_int(first.get("candidate_profile_id"), 0, 10**9)
+    second_profile = clamp_int(second.get("candidate_profile_id"), 0, 10**9)
+    if first_profile and second_profile and first_profile != second_profile:
+        return False
+    first_urls = {canonical_url(text(first.get(field))) for field in ("url", "application_url")}
+    second_urls = {canonical_url(text(second.get(field))) for field in ("url", "application_url")}
+    if (first_urls - {""}) & (second_urls - {""}):
+        return True
+    first_id = normalize_dedupe_text(first.get("source_job_id"))
+    second_id = normalize_dedupe_text(second.get("source_job_id"))
+    first_source = normalize_dedupe_text(first.get("source"))
+    second_source = normalize_dedupe_text(second.get("source"))
+    if first_id and second_id and first_source and first_source == second_source:
+        return first_id == second_id
+    return bool(dedupe_keys(first, first_id) & dedupe_keys(second, second_id) & {
+        key for key in dedupe_keys(first, first_id) if key.startswith("ctl:")
+    })
 
 
 def canonical_url(value: str) -> str:
@@ -6311,7 +6700,22 @@ def normalize_dedupe_location(value: Any) -> str:
 def determine_salary(job: dict[str, Any]) -> dict[str, Any]:
     structured = structured_salary(job)
     if structured["salary_source"] != "missing":
-        return structured
+        # JobSpy often supplies numeric fields alongside the original text.
+        # Keep a meaningful qualifier such as "From" instead of presenting a
+        # floor as a guaranteed range.
+        original = text(job.get("salary_text") or job.get("salary"))
+        qualifier = re.match(r"\s*(from|starting(?:\s+at)?|up\s+to)\b", original, re.I)
+        if qualifier:
+            structured["salary_text"] = f"{qualifier.group(1).title()} {structured['salary_text']}"
+            structured["salary_original_text"] = original
+            structured["salary_evidence_text"] = original
+        description_salary = parse_salary_text(text(job.get("job_description")))
+        if salary_evidence_conflicts(structured, description_salary):
+            structured["salary_ambiguity"] = "; ".join(filter(None, (
+                structured.get("salary_ambiguity", ""),
+                "structured provider salary conflicts with description evidence; verify source",
+            )))
+        return annualize_using_posted_weekly_hours(structured, text(job.get("job_description")))
 
     salary_text = text(job.get("salary_text") or job.get("salary"))
     if salary_text and not looks_like_estimate(salary_text):
@@ -6319,13 +6723,17 @@ def determine_salary(job: dict[str, Any]) -> dict[str, Any]:
         if parsed["salary_source"] != "missing":
             parsed["salary_source"] = "jobspy_text"
             parsed["salary_confidence"] = max(parsed["salary_confidence"], 82)
-            return parsed
+            parsed["salary_original_text"] = salary_text
+            parsed["salary_text"] = normalized_salary_display(parsed, salary_text)
+            return annualize_using_posted_weekly_hours(parsed, text(job.get("job_description")))
 
     parsed_description = parse_salary_text(text(job.get("job_description")))
     if parsed_description["salary_source"] != "missing":
         parsed_description["salary_source"] = "description"
         parsed_description["salary_confidence"] = max(parsed_description["salary_confidence"], 72)
-        return parsed_description
+        parsed_description["salary_original_text"] = parsed_description.get("salary_evidence_text", "")
+        parsed_description["salary_text"] = normalized_salary_display(parsed_description, parsed_description.get("salary_evidence_text", ""))
+        return annualize_using_posted_weekly_hours(parsed_description, text(job.get("job_description")))
 
     # Missing compensation must remain missing.  A market estimate is not an
     # advertised salary and must never influence a recommendation as if it
@@ -6333,29 +6741,92 @@ def determine_salary(job: dict[str, Any]) -> dict[str, Any]:
     return missing_salary()
 
 
+def annualize_using_posted_weekly_hours(salary: dict[str, Any], description: str) -> dict[str, Any]:
+    """Use a stated weekly schedule rather than silently assuming 40 hours."""
+    if salary.get("salary_interval") != "hourly":
+        return salary
+    hours = {
+        float(value)
+        for value in re.findall(r"\b(\d{1,2}(?:\.\d+)?)\s*(?:hours?|hrs?)\s*(?:per|/)\s*week\b", description, re.I)
+        if 1 <= float(value) <= 80
+    }
+    if len(hours) != 1:
+        salary["salary_annual_min"] = 0
+        salary["salary_annual_max"] = 0
+        salary["salary_annual_midpoint"] = 0
+        note = "weekly hours not stated; annual equivalent unavailable"
+        salary["salary_ambiguity"] = "; ".join(filter(None, (salary.get("salary_ambiguity", ""), note)))
+        return salary
+    weekly_hours = hours.pop()
+    annual_min = float(salary.get("salary_advertised_min") or 0) * weekly_hours * 52
+    annual_max = float(salary.get("salary_advertised_max") or 0) * weekly_hours * 52
+    salary["salary_annual_min"] = int(round(annual_min))
+    salary["salary_annual_max"] = int(round(annual_max))
+    salary["salary_annual_midpoint"] = int(round((annual_min + annual_max) / 2)) if annual_min and annual_max else 0
+    note = f"Annualized using advertised {weekly_hours:g} hours/week"
+    previous = salary.get("salary_ambiguity", "").replace("weekly hours not stated; annual equivalent unavailable", "").strip("; ")
+    salary["salary_ambiguity"] = "; ".join(filter(None, (previous, note)))
+    return salary
+
+
 def structured_salary(job: dict[str, Any]) -> dict[str, Any]:
-    minimum = money_number(job.get("salary_min") or job.get("min_amount"))
-    maximum = money_number(job.get("salary_max") or job.get("max_amount"))
-    interval = normalize_salary_interval(text(job.get("salary_interval") or job.get("interval")))
+    # Discovery payloads retain exact advertised decimals separately from
+    # legacy integer salary_min/max. Do not round a posted hourly wage again
+    # when normalizing it for persistence.
+    advertised_min = money_number(job.get("salary_advertised_min"))
+    advertised_max = money_number(job.get("salary_advertised_max"))
+    minimum = advertised_min if advertised_min is not None and advertised_min > 0 else money_number(job.get("salary_min") or job.get("min_amount"))
+    maximum = advertised_max if advertised_max is not None and advertised_max > 0 else money_number(job.get("salary_max") or job.get("max_amount"))
+    raw_interval = text(job.get("salary_interval") or job.get("interval"))
+    interval = normalize_salary_interval(raw_interval)
     currency = normalize_currency(text(job.get("salary_currency") or job.get("currency")))
     if minimum is None and maximum is None:
         return missing_salary()
-    if maximum is None:
+    qualifier = salary_qualifier(text(job.get("salary_text") or job.get("salary")))
+    # A provider can supply one numeric amount for an explicitly lower- or
+    # upper-bounded offer.  Keep the unknown endpoint as zero in the existing
+    # nullable-by-convention columns instead of manufacturing a fixed salary.
+    if qualifier == "lower" and (minimum is not None or maximum is not None) and not (minimum is not None and maximum is not None):
+        minimum = minimum if minimum is not None else maximum
+        maximum = None
+    elif qualifier == "upper" and (minimum is not None or maximum is not None) and not (minimum is not None and maximum is not None):
+        maximum = maximum if maximum is not None else minimum
+        minimum = None
+    elif maximum is None:
         maximum = minimum
-    if minimum is None:
+    elif minimum is None:
         minimum = maximum
+    # A few providers truncate the upper bound (for example 60,000 and 63)
+    # while still labelling the pair as annual salary. Never turn that into a
+    # misleading advertised range; let the original text parser decide whether
+    # a complete authoritative range is available.
+    if minimum is not None and maximum is not None and maximum < minimum and maximum < minimum * 0.5:
+        return missing_salary()
+    # Amount magnitude is not evidence of pay cadence. Keep a source that
+    # omits its unit reviewable instead of silently treating it as annual.
     annual_min, annual_max = annualize_salary(minimum or 0, maximum or 0, interval)
     original = salary_range_label(minimum or 0, maximum or 0, interval, currency)
+    midpoint = ((minimum + maximum) / 2) if minimum is not None and maximum is not None else 0
+    bound_note = "only lower bound advertised" if qualifier == "lower" and maximum is None else (
+        "only upper bound advertised" if qualifier == "upper" and minimum is None else ""
+    )
     return {
-        "salary_min": int(annual_min),
-        "salary_max": int(annual_max),
-        "salary_interval": interval or "yearly",
+        "salary_min": int(round(minimum or 0)),
+        "salary_max": int(round(maximum or 0)),
+        "salary_midpoint": int(round(midpoint)),
+        "salary_advertised_min": minimum or 0,
+        "salary_advertised_max": maximum or 0,
+        "salary_advertised_midpoint": midpoint,
+        "salary_annual_min": int(round(annual_min)),
+        "salary_annual_max": int(round(annual_max)),
+        "salary_annual_midpoint": int(round((annual_min + annual_max) / 2)) if annual_min and annual_max else 0,
+        "salary_interval": interval,
         "salary_currency": currency,
         "salary_text": original,
         "salary_source": "structured",
         "salary_confidence": 95,
         "salary_evidence_text": original,
-        "salary_ambiguity": "",
+        "salary_ambiguity": bound_note or ("" if raw_interval or interval in {"hourly", "yearly"} else "cadence not explicit; verify advertised unit"),
     }
 
 
@@ -6365,35 +6836,60 @@ def parse_salary_text(value: str) -> dict[str, Any]:
         return missing_salary()
     ranges = split_salary_contexts(content)
     best = missing_salary()
+    best_score = -1
     for context in ranges:
         if false_salary_context(context):
             continue
         currency = normalize_currency(context)
-        interval = infer_salary_interval(context)
+        match = salary_number_match(context)
         numbers = salary_numbers(context)
         if not numbers:
             continue
+        qualifier = salary_qualifier(context, match.start() if match else None)
+        candidate_score = salary_candidate_score(context, numbers, qualifier)
+        if candidate_score <= 0:
+            continue
         minimum = numbers[0]
         maximum = numbers[1] if len(numbers) > 1 else numbers[0]
-        if "up to" in context.lower() and len(numbers) == 1:
+        if len(numbers) > 1 and maximum < minimum:
+            # A truncated upper endpoint (for example $60,000-$63/year)
+            # cannot be repaired from the posting without inventing digits.
+            continue
+        if qualifier == "upper" and len(numbers) == 1:
             minimum = 0
-        if "from" in context.lower() and len(numbers) == 1:
-            maximum = numbers[0]
+        if qualifier == "lower" and len(numbers) == 1:
+            maximum = 0
+        explicit_interval = infer_salary_interval(context)
+        interval = explicit_interval
         if not plausible_base_salary(minimum, maximum, interval):
             continue
         annual_min, annual_max = annualize_salary(minimum, maximum, interval)
-        best = {
-            "salary_min": int(annual_min),
-            "salary_max": int(annual_max),
+        candidate = {
+            "salary_min": int(round(minimum)),
+            "salary_max": int(round(maximum)),
+            "salary_midpoint": int(round((minimum + maximum) / 2)) if minimum and maximum else 0,
+            "salary_advertised_min": minimum,
+            "salary_advertised_max": maximum,
+            "salary_advertised_midpoint": (minimum + maximum) / 2 if minimum and maximum else 0,
+            "salary_annual_min": int(round(annual_min)),
+            "salary_annual_max": int(round(annual_max)),
+            "salary_annual_midpoint": int(round((annual_min + annual_max) / 2)) if annual_min and annual_max else 0,
             "salary_interval": interval,
             "salary_currency": currency,
             "salary_text": context.strip(" .;"),
             "salary_source": "description",
             "salary_confidence": 70,
             "salary_evidence_text": context.strip(" .;"),
-            "salary_ambiguity": "",
+            "salary_ambiguity": (
+                "only lower bound advertised" if qualifier == "lower" and not maximum else
+                "only upper bound advertised" if qualifier == "upper" and not minimum else
+                "weekly hours not stated; annual equivalent unavailable" if interval == "hourly" else
+                "" if explicit_interval else "cadence inferred from magnitude; verify advertised unit" if interval else "cadence not explicit; verify advertised unit"
+            ),
         }
-        break
+        if candidate_score > best_score:
+            best = candidate
+            best_score = candidate_score
     return best
 
 
@@ -6408,13 +6904,65 @@ def split_salary_contexts(content: str) -> list[str]:
 
 
 def salary_numbers(context: str) -> list[float]:
-    number = r"(?:\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)(?:k)?"
-    pattern = rf"(?:CAD|USD|CA)?\s*\$?\s*({number})(?:\s*(?:-|to|–|—)\s*(?:CAD|USD|CA)?\s*\$?\s*({number}))?"
-    match = re.search(pattern, context, re.I)
+    match = salary_number_match(context)
     if not match:
         return []
     numbers = [money_number(part) for part in match.groups() if part]
     return [number for number in numbers if number is not None]
+
+
+def salary_number_match(context: str) -> re.Match[str] | None:
+    # The decimal suffix belongs to both comma-separated and plain numbers.
+    # Previously `$100,772.50–$136,337.50` stopped at `100,772`, silently
+    # discarding both decimal precision and the upper endpoint.
+    number = r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:k)?"
+    pattern = rf"(?:CAD|USD|CA)?\s*\$?\s*({number})(?:\s*(?:-|to|–|—)\s*(?:CAD|USD|CA)?\s*\$?\s*({number}))?"
+    return re.search(pattern, context, re.I)
+
+
+def salary_qualifier(value: str, amount_start: int | None = None) -> str:
+    """Return a source-declared one-sided salary qualifier, if any."""
+    prefix = text(value)
+    if amount_start is not None:
+        prefix = prefix[max(0, amount_start - 40):amount_start]
+    if re.search(r"\b(?:from|starting(?:\s+at)?)\s*$", prefix, re.I):
+        return "lower"
+    if re.search(r"\bup\s+to\s*$", prefix, re.I):
+        return "upper"
+    return ""
+
+
+def salary_candidate_score(context: str, numbers: list[float], qualifier: str) -> int:
+    """Prefer actual compensation evidence over incidental dollar figures."""
+    lowered = context.lower()
+    score = 0
+    if re.search(r"\b(?:salary|compensation|base\s+pay|pay|wage)\b", lowered):
+        score += 5
+    if len(numbers) > 1:
+        score += 4
+    if infer_salary_interval(context):
+        score += 3
+    if re.search(r"\b(?:cad|usd)\b|(?:ca|us)?\$", context, re.I):
+        score += 2
+    if qualifier:
+        score += 2
+    return score
+
+
+def salary_evidence_conflicts(structured: dict[str, Any], description: dict[str, Any]) -> bool:
+    """Keep structured provider pay authoritative while making disagreement reviewable."""
+    if description.get("salary_source") == "missing":
+        return False
+    for key in ("salary_advertised_min", "salary_advertised_max"):
+        description_value = float(description.get(key) or 0)
+        if description_value and float(structured.get(key) or 0) != description_value:
+            return True
+    if description.get("salary_interval") and structured.get("salary_interval") != description.get("salary_interval"):
+        return True
+    evidence = text(description.get("salary_evidence_text"))
+    if re.search(r"\b(?:CAD|USD)\b|(?:CA|US)\$", evidence, re.I) and structured.get("salary_currency") != description.get("salary_currency"):
+        return True
+    return False
 
 
 def money_number(value: Any) -> float | None:
@@ -6437,9 +6985,20 @@ def infer_salary_interval(context: str) -> str:
         return "weekly"
     if "month" in lowered:
         return "monthly"
+    if re.search(r"\b(?:year|yearly|annual|annually|yr)\b|/yr\b", lowered):
+        return "yearly"
     if "contract" in lowered or "day rate" in lowered:
         return "contract"
-    return "yearly"
+    return ""
+
+
+def infer_salary_interval_from_magnitude(minimum: float, maximum: float) -> str:
+    high = max(minimum, maximum)
+    if 20 <= high <= 40:
+        return "hourly"
+    if 40_000 <= high <= 500_000:
+        return "yearly"
+    return ""
 
 
 def normalize_salary_interval(value: str) -> str:
@@ -6452,7 +7011,7 @@ def normalize_salary_interval(value: str) -> str:
         return "monthly"
     if "contract" in lowered:
         return "contract"
-    return "yearly" if lowered or not value else ""
+    return "yearly" if lowered else ""
 
 
 def normalize_currency(value: str) -> str:
@@ -6463,18 +7022,24 @@ def normalize_currency(value: str) -> str:
 
 
 def annualize_salary(minimum: float, maximum: float, interval: str) -> tuple[float, float]:
+    # An hourly pay rate has no defensible annual equivalent unless the source
+    # also states the weekly schedule.  That schedule-aware conversion happens
+    # in annualize_using_posted_weekly_hours().
+    if interval in {"", "hourly"}:
+        return 0, 0
     multiplier = {
-        "hourly": 40 * 52,
         "weekly": 52,
         "monthly": 12,
         "contract": 1,
         "yearly": 1,
-    }.get(interval or "yearly", 1)
+    }.get(interval, 0)
     return minimum * multiplier, maximum * multiplier
 
 
 def plausible_base_salary(minimum: float, maximum: float, interval: str) -> bool:
     high = max(minimum, maximum)
+    if not interval:
+        return 15 <= high <= 1_000_000
     if interval == "hourly":
         return 15 <= high <= 250
     if interval == "weekly":
@@ -6486,8 +7051,17 @@ def plausible_base_salary(minimum: float, maximum: float, interval: str) -> bool
 
 def false_salary_context(context: str) -> bool:
     lowered = context.lower()
+    # Company-market figures (for example "$700+ billion trucking market")
+    # are neither candidate compensation nor a defensible salary fallback.
+    if re.search(r"\$\s*[\d,.]+\s*\+?\s*(?:billion|million)\b", lowered):
+        return True
     blocked = ["bonus", "signing", "benefit", "allowance", "expense", "revenue", "budget", "equity", "stock", "rrsp", "401k"]
-    return any(term in lowered for term in blocked) and not any(term in lowered for term in ["salary", "compensation range", "pay range"])
+    if not any(term in lowered for term in blocked):
+        return False
+    # A sentence can mention benefits after a real base-pay statement. Keep
+    # that evidence, while still rejecting standalone benefit amounts.
+    explicit_pay = re.search(r"\b(?:salary|compensation|base\s+pay|pay|wage)\b", lowered)
+    return not explicit_pay
 
 
 def looks_like_estimate(value: str) -> bool:
@@ -6524,6 +7098,13 @@ def estimate_market_salary(job: dict[str, Any]) -> dict[str, Any]:
     return {
         "salary_min": int(minimum),
         "salary_max": int(maximum),
+        "salary_midpoint": int(round((minimum + maximum) / 2)),
+        "salary_advertised_min": minimum,
+        "salary_advertised_max": maximum,
+        "salary_advertised_midpoint": (minimum + maximum) / 2,
+        "salary_annual_min": int(minimum),
+        "salary_annual_max": int(maximum),
+        "salary_annual_midpoint": int(round((minimum + maximum) / 2)),
         "salary_interval": "yearly",
         "salary_currency": "CAD",
         "salary_text": f"Estimated market range: CAD ${minimum:,}-${maximum:,} per year",
@@ -6536,6 +7117,13 @@ def missing_salary() -> dict[str, Any]:
     return {
         "salary_min": 0,
         "salary_max": 0,
+        "salary_midpoint": 0,
+        "salary_advertised_min": 0,
+        "salary_advertised_max": 0,
+        "salary_advertised_midpoint": 0,
+        "salary_annual_min": 0,
+        "salary_annual_max": 0,
+        "salary_annual_midpoint": 0,
         "salary_interval": "",
         "salary_currency": "CAD",
         "salary_text": "",
@@ -6547,16 +7135,35 @@ def missing_salary() -> dict[str, Any]:
 
 
 def salary_range_label(minimum: float, maximum: float, interval: str, currency: str) -> str:
-    left = f"{currency} ${int(minimum):,}"
-    right = f"{currency} ${int(maximum):,}"
+    def format_amount(value: float) -> str:
+        # Preserve decimal precision from structured source values.  A value
+        # such as 100772.50 must not become an apparently truncated integer.
+        return f"{value:,.2f}"
+
+    left = f"{currency} ${format_amount(minimum)}" if minimum else ""
+    right = f"{currency} ${format_amount(maximum)}" if maximum else ""
     cadence = {
-        "hourly": "an hour",
+        "hourly": "/hour",
         "weekly": "per week",
         "monthly": "per month",
         "contract": "contract",
         "yearly": "per year",
-    }.get(interval or "yearly", "per year")
-    return f"{left}-{right} {cadence}" if minimum != maximum else f"{left} {cadence}"
+    }.get(interval, "unit unspecified")
+    separator = "" if cadence.startswith("/") else " "
+    if left and right:
+        return f"{left}-{right}{separator}{cadence}" if minimum != maximum else f"{left}{separator}{cadence}"
+    return f"{left or right}{separator}{cadence}".strip()
+
+
+def normalized_salary_display(parsed: dict[str, Any], original: str) -> str:
+    label = salary_range_label(
+        float(parsed.get("salary_advertised_min") or 0),
+        float(parsed.get("salary_advertised_max") or 0),
+        text(parsed.get("salary_interval")),
+        text(parsed.get("salary_currency") or "CAD"),
+    )
+    qualifier = re.match(r"\s*(from|starting(?:\s+at)?|up\s+to)\b", text(original), re.I)
+    return f"{qualifier.group(1).title()} {label}" if qualifier else label
 
 
 DISCOVERY_CITY_COORDS = {
@@ -6591,6 +7198,7 @@ def discovery_search_signature(payload: dict[str, Any]) -> str:
     relevant = {
         "keywords": search["keywords"],
         "location": search["location"],
+        "distance_origin_input": search.get("distance_origin_input", ""),
         "distance": search["distance"],
         "enabled_sources": search["enabled_sources"],
         "remote_preference": search["remote_preference"],
@@ -6598,9 +7206,11 @@ def discovery_search_signature(payload: dict[str, Any]) -> str:
         "date_window": search["date_window"],
         "per_source_cap": search["per_source_cap"],
         "total_cap": search["total_cap"],
+        "requested_target": search.get("requested_target", 25),
         "search_mode": search["search_mode"],
         "title_match_mode": search["title_match_mode"],
         "candidate_profile_id": text(payload.get("candidate_profile_id") or payload.get("auto_prepare_candidate_profile_id")),
+        "applicant_profile_id": text(payload.get("applicant_profile_id")),
         "resume_id": text(payload.get("resume_id") or payload.get("auto_prepare_resume_id")),
     }
     return grounding_hash(dumps_json(relevant, sort_keys=True))
@@ -6709,11 +7319,20 @@ def discovery_search_config(payload: dict[str, Any]) -> dict[str, Any]:
     preset = DISCOVERY_SEARCH_DEPTHS[depth]
     date_window = normalize_choice(payload.get("date_window"), set(DISCOVERY_DATE_WINDOWS)) or f"{preset['days']}d"
     per_source_cap = clamp_int_default(payload.get("per_source_cap"), preset["per_source_cap"], 1, 1000)
-    total_cap = clamp_int_default(payload.get("total_cap"), preset["total_cap"], 1, 5000)
-    distance = clamp_int_default(payload.get("distance"), 50, 0, 1000)
-    search_mode = normalize_choice(payload.get("search_mode"), {"title", "explore"}) or "title"
-    title_match_mode = normalize_choice(payload.get("title_match_mode"), {"strict", "related"}) or "related"
     enabled_sources = normalize_discovery_sources(payload.get("enabled_sources"))
+    explicit_target = payload.get("new_matching_target", payload.get("shortlist_size"))
+    requested_target = clamp_int_default(explicit_target, 25, 1, 500)
+    # total_cap is an internal provider inspection budget.  The public target
+    # is deliberately separate so a user asking for 25 new matches does not
+    # accidentally receive only 25 raw provider rows.
+    default_fetch_budget = (
+        max(preset["total_cap"], requested_target * max(4, len(enabled_sources)))
+        if explicit_target not in (None, "") else preset["total_cap"]
+    )
+    total_cap = clamp_int_default(payload.get("total_cap"), default_fetch_budget, 1, 5000)
+    distance = clamp_int_default(payload.get("distance"), 50, 0, 1000)
+    search_mode = normalize_choice(payload.get("search_mode"), {"title", "explore", "shortlist"}) or "title"
+    title_match_mode = normalize_choice(payload.get("title_match_mode"), {"strict", "related"}) or "related"
     validate_discovery_budget(total_cap, enabled_sources)
     # total_cap is the user's aggregate fetch/display budget.  JobSpy applies
     # results_wanted per provider, so divide that budget across enabled
@@ -6730,18 +7349,21 @@ def discovery_search_config(payload: dict[str, Any]) -> dict[str, Any]:
         "hours_old": None if date_window == "any" else DISCOVERY_DATE_WINDOWS.get(date_window, preset["days"]) * 24,
         "per_source_cap": per_source_cap,
         "total_cap": total_cap,
+        "requested_target": requested_target,
         "request_per_source_cap": request_per_source_cap,
         "aggregate_request_budget": request_per_source_cap * len(enabled_sources),
         "enabled_source_count": len(enabled_sources),
         "remote_preference": normalize_choice(payload.get("remote_preference"), {"remote", "hybrid", "on-site"}),
         "keywords": text(payload.get("keywords")),
         "location": text(payload.get("location")),
+        "distance_origin_input": normalize_space(text(payload.get("distance_origin") or payload.get("distance_origin_input"))),
         "distance": distance,
         "enabled_sources": enabled_sources,
         "search_mode": search_mode,
         "title_match_mode": title_match_mode,
         "occupation": occupation_for_keywords(text(payload.get("keywords"))),
-        "profile_independent": search_mode == "title" and not text(payload.get("candidate_profile_id") or payload.get("auto_prepare_candidate_profile_id")),
+        "applicant_profile_id": clamp_int(payload.get("applicant_profile_id"), 0, 10**9),
+        "profile_independent": search_mode == "title" and not text(payload.get("candidate_profile_id")),
     }
 
 
@@ -6780,16 +7402,23 @@ def load_discovery_search_run(search_key: str) -> dict[str, Any]:
     if row is None:
         return {}
     raw_jobs = parse_json_array(row["raw_jobs_json"])
+    metadata = parse_json_object(row["metadata_json"])
+    jobs = metadata.get("display_jobs") if isinstance(metadata.get("display_jobs"), list) else raw_jobs
     return {
         "search_key": search_key,
         "search": parse_json_object(row["search_json"]),
-        "metadata": parse_json_object(row["metadata_json"]),
-        "jobs": raw_jobs,
+        "metadata": metadata,
+        "jobs": jobs,
         "cache_hit": True,
         "cache_created_at": text(row["created_at"]),
         "cache_updated_at": text(row["updated_at"]),
-        "cached_raw_result_count": len(raw_jobs),
+        "cached_raw_result_count": int(metadata.get("raw_jobs_returned") or len(raw_jobs)),
     }
+
+
+def load_latest_discovery_search_run() -> dict[str, Any]:
+    row = query_db("SELECT search_key FROM discovery_search_runs ORDER BY updated_at DESC, created_at DESC LIMIT 1", one=True)
+    return load_discovery_search_run(text(row["search_key"])) if row else {}
 
 
 def save_discovery_debug_run(search_key: str, request_json: dict[str, Any], metadata_json: dict[str, Any], source_snapshot_json: dict[str, Any]) -> None:
@@ -7074,8 +7703,76 @@ class NominatimGeocodingProvider(GeocodingProvider):
             "latitude": float(match.get("lat")),
             "longitude": float(match.get("lon")),
             "display_name": text(match.get("display_name")),
+            "postal_code": text((match.get("address") or {}).get("postcode")) if isinstance(match.get("address"), dict) else "",
+            "match_level": text(match.get("type") or match.get("category")),
             "raw": match,
         }
+
+
+class GeocoderCaProvider(GeocodingProvider):
+    """Optional Canadian postal/address resolver selected by configuration.
+
+    The service is deliberately opt-in.  It is useful when the public
+    Nominatim instance does not return a postal-code match, but callers must
+    still respect the provider's current terms, rate limits, and any required
+    account/token.  No credentials are embedded in the application.
+    """
+
+    name = "geocoder.ca"
+
+    def geocode(self, query: str, *, country: str = "Canada") -> dict[str, Any]:
+        # geocoder.ca's current JSON endpoint is XML mode with json=1. The
+        # older geoit=json form serves the HTML map page and cannot be parsed.
+        params = {"locate": query, "geoit": "XML", "json": "1", "standard": "1"}
+        token = text(os.environ.get("JOB_TRACKER_GEOCODER_CA_TOKEN"))
+        if token:
+            params["auth"] = token
+        url = f"https://geocoder.ca/?{urlencode(params)}"
+        request_obj = urllib.request.Request(url, headers={"User-Agent": "Job Tracker/1.0 (local geocoding)"})
+        with urllib.request.urlopen(request_obj, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("No geocoding match found")
+        latitude = payload.get("latt") or payload.get("lat") or payload.get("latitude")
+        longitude = payload.get("longt") or payload.get("lon") or payload.get("longitude")
+        if latitude in [None, ""] or longitude in [None, ""]:
+            if text(payload.get("error")):
+                raise ValueError(text(payload.get("error")))
+            raise ValueError("No geocoding match found")
+        return {
+            "latitude": float(latitude),
+            "longitude": float(longitude),
+            "display_name": text(payload.get("standardized") or payload.get("address") or query),
+            "raw": payload,
+            "postal_code": text(payload.get("postal") or payload.get("postalcode") or payload.get("postcode")),
+            "match_level": text(payload.get("matchlevel") or payload.get("match_level")),
+        }
+
+
+class CanadianPostalAwareProvider(GeocodingProvider):
+    """Use a Canadian postal resolver for postal inputs, with Nominatim fallback.
+
+    geocoder.ca is an optional, no-subscription public service. It is used only
+    for postal-bearing queries so city/address lookups retain the existing
+    Nominatim behavior. Users can still explicitly select either provider.
+    """
+
+    name = "geocoder.ca+nominatim"
+
+    def __init__(self) -> None:
+        self.canadian = GeocoderCaProvider()
+        self.nominatim = NominatimGeocodingProvider()
+
+    def geocode(self, query: str, *, country: str = "Canada") -> dict[str, Any]:
+        if extract_canadian_postal_code(query):
+            try:
+                return self.canadian.geocode(query, country=country)
+            except Exception as first_error:
+                try:
+                    return self.nominatim.geocode(query, country=country)
+                except Exception:
+                    raise first_error
+        return self.nominatim.geocode(query, country=country)
 
 
 class DisabledGeocodingProvider(GeocodingProvider):
@@ -7086,9 +7783,46 @@ class DisabledGeocodingProvider(GeocodingProvider):
 
 
 def get_geocoding_provider() -> GeocodingProvider:
-    if text(os.environ.get("JOB_TRACKER_GEOCODING_PROVIDER")).lower() in {"none", "disabled", "off"}:
+    configured = text(os.environ.get("JOB_TRACKER_GEOCODING_PROVIDER")).lower().replace("_", ".")
+    if configured in {"none", "disabled", "off"}:
         return DisabledGeocodingProvider()
+    if configured == "geocoder.ca":
+        return GeocoderCaProvider()
+    if configured in {"nominatim", "osm"}:
+        return NominatimGeocodingProvider()
+    # geocoder.ca requires registration and eligibility for its free tier.
+    # An explicit installation setting is the consent boundary.
     return NominatimGeocodingProvider()
+
+
+def classify_geocoding_exception(exc: Exception) -> tuple[str, str]:
+    """Return a stable, user-safe diagnostic category and message."""
+    if isinstance(exc, urllib.error.HTTPError):
+        if exc.code == 403:
+            return "http_403", "The geocoding provider denied this request (HTTP 403)."
+        if exc.code == 429:
+            return "rate_limited", "The geocoding provider is temporarily rate limited (HTTP 429)."
+        return f"http_{exc.code}", f"The geocoding provider returned HTTP {exc.code}."
+    if isinstance(exc, urllib.error.URLError):
+        return "network_error", "The geocoding provider could not be reached."
+    if isinstance(exc, TimeoutError) or "timed out" in str(exc).lower():
+        return "network_error", "The geocoding provider request timed out."
+    if isinstance(exc, ValueError) and "no geocoding match" in str(exc).lower():
+        return "no_match", "The geocoding provider found no Canadian match."
+    if isinstance(exc, ValueError) and "did not match" in str(exc).lower():
+        return "rejected_result", "The geocoding result was rejected because it did not match the requested Canadian location."
+    if isinstance(exc, RuntimeError) and "disabled" in str(exc).lower():
+        return "provider_disabled", "Geocoding is disabled in this installation."
+    return "provider_error", "The geocoding provider returned an unusable result."
+
+
+def redact_location_input(value: str) -> str:
+    """Keep diagnostics useful without echoing a complete private postal code."""
+    raw = normalize_space(value)
+    postal = extract_canadian_postal_code(raw)
+    if postal:
+        return f"Canadian postal code ending {postal[-3:]}"
+    return raw[:80]
 
 
 def geocode_location_value(
@@ -7119,6 +7853,25 @@ def geocode_location_value(
             "cached": False,
         }
 
+    if looks_like_invalid_postal_code(raw):
+        return {
+            "ok": False,
+            "status": "invalid_input",
+            "original_input": raw,
+            "normalized_query": raw,
+            "latitude": "",
+            "longitude": "",
+            "provider": provider.name,
+            "confidence": 0,
+            "precision": "",
+            "geocoded_at": datetime.now().isoformat(timespec="seconds"),
+            "error": "The Canadian postal code format is invalid.",
+            "failure_reasons": ["invalid_input"],
+            "attempt_count": 0,
+            "used_fallback": False,
+            "cached": False,
+        }
+
     candidates = build_location_lookup_candidates(raw, profile)
     if not candidates:
         return {
@@ -7138,9 +7891,14 @@ def geocode_location_value(
         }
 
     errors: list[str] = []
+    failure_reasons: list[str] = []
     for candidate in candidates:
         cache_key = geocoding_cache_key(lookup_type, candidate["query"], candidate["normalized_query"])
-        cached = load_geocoding_cache(cache_key) if use_cache else None
+        try:
+            cached = load_geocoding_cache(cache_key) if use_cache else None
+        except Exception:
+            cached = None
+            failure_reasons.append("cache_failure")
         if cached is not None:
             cached_result = dict(cached["result"])
             cached_result.update(
@@ -7157,7 +7915,10 @@ def geocode_location_value(
                 return cached_result
             if cached_result.get("ok"):
                 cached_result = {**cached_result, "ok": False, "status": "invalid_cached_result", "error": "Cached geocoding coordinates did not match the requested location."}
+                failure_reasons.append("invalid_cached_result")
             errors.append(text(cached_result.get("error")) or "Cached geocoding failure.")
+            if not cached_result.get("ok"):
+                failure_reasons.append(text(cached_result.get("status")) or "provider_error")
             if cached_result.get("status") == "rate_limited":
                 break
             if not cached.get("success"):
@@ -7182,51 +7943,40 @@ def geocode_location_value(
                 "error": "",
                 "used_fallback": bool(candidate["used_postal_fallback"]),
                 "display_name": text(lookup.get("display_name")),
+                "postal_code": text(lookup.get("postal_code") or lookup.get("postcode") or lookup.get("postalcode")),
+                "match_level": text(lookup.get("match_level") or lookup.get("matchlevel")),
+                "raw": lookup.get("raw") if isinstance(lookup.get("raw"), dict) else {},
                 "cached": False,
             }
             if not geocoding_result_matches_query(raw, candidate["normalized_query"], result):
                 raise ValueError("Geocoding result did not match the requested Canadian location.")
             if use_cache:
-                save_geocoding_cache(cache_key, lookup_type, candidate["query"], candidate["normalized_query"], provider.name, result, True)
+                try:
+                    save_geocoding_cache(cache_key, lookup_type, candidate["query"], candidate["normalized_query"], provider.name, result, True)
+                except Exception:
+                    failure_reasons.append("cache_failure")
             return result
-        except urllib.error.HTTPError as exc:
-            rate_limited = exc.code == 429
-            error_message = "The location service is temporarily rate limited." if rate_limited else f"HTTP {exc.code}: geocoding unavailable."
+        except Exception as exc:
+            status, error_message = classify_geocoding_exception(exc)
             failure = {
-                "ok": False, "status": "rate_limited" if rate_limited else "failed", "original_input": raw,
+                "ok": False, "status": status, "original_input": raw,
                 "normalized_query": candidate["normalized_query"], "latitude": "", "longitude": "",
                 "provider": provider.name, "confidence": 0, "precision": candidate["precision"],
                 "geocoded_at": datetime.now().isoformat(timespec="seconds"), "error": error_message,
                 "used_fallback": bool(candidate["used_postal_fallback"]), "cached": False,
             }
             if use_cache:
-                save_geocoding_cache(cache_key, lookup_type, candidate["query"], candidate["normalized_query"], provider.name, failure, False)
+                try:
+                    save_geocoding_cache(cache_key, lookup_type, candidate["query"], candidate["normalized_query"], provider.name, failure, False)
+                except Exception:
+                    failure_reasons.append("cache_failure")
             errors.append(error_message)
-            if rate_limited:
+            failure_reasons.append(status)
+            if status == "rate_limited":
                 break
-        except Exception as exc:
-            error_message = f"{type(exc).__name__}: {exc}"
-            failure = {
-                "ok": False,
-                "status": "failed",
-                "original_input": raw,
-                "normalized_query": candidate["normalized_query"],
-                "latitude": "",
-                "longitude": "",
-                "provider": provider.name,
-                "confidence": 0,
-                "precision": candidate["precision"],
-                "geocoded_at": datetime.now().isoformat(timespec="seconds"),
-                "error": error_message,
-                "used_fallback": bool(candidate["used_postal_fallback"]),
-                "cached": False,
-            }
-            if use_cache:
-                save_geocoding_cache(cache_key, lookup_type, candidate["query"], candidate["normalized_query"], provider.name, failure, False)
-            errors.append(error_message)
     return {
         "ok": False,
-        "status": "rate_limited" if any("rate limited" in error.lower() for error in errors) else "failed",
+        "status": "rate_limited" if "rate_limited" in failure_reasons else (failure_reasons[-1] if failure_reasons else "failed"),
         "original_input": raw,
         "normalized_query": candidates[-1]["normalized_query"],
         "latitude": "",
@@ -7235,7 +7985,9 @@ def geocode_location_value(
         "confidence": 0,
         "precision": candidates[-1]["precision"],
         "geocoded_at": datetime.now().isoformat(timespec="seconds"),
-        "error": "The location service is temporarily rate limited." if any("rate limited" in error.lower() for error in errors) else ("Location enrichment is unavailable; distance remains unknown." if errors else "Location could not be geocoded."),
+        "error": errors[-1] if errors else "Location could not be geocoded.",
+        "failure_reasons": list(dict.fromkeys(failure_reasons)),
+        "attempt_count": len(candidates),
         "used_fallback": bool(candidates[-1]["used_postal_fallback"]),
         "cached": False,
     }
@@ -7246,6 +7998,25 @@ def geocode_matches_canadian_location(raw_location: str, geocode: dict[str, Any]
     raw = normalize_space(raw_location).lower()
     expected_code = province_code_from_text(raw)
     postal = extract_canadian_postal_code(raw)
+    returned_postal = extract_canadian_postal_code(
+        " ".join(
+            text(value)
+            for value in (
+                geocode.get("postal_code"),
+                geocode.get("postcode"),
+                geocode.get("postalcode"),
+                (geocode.get("raw") or {}).get("postal_code") if isinstance(geocode.get("raw"), dict) else "",
+                (geocode.get("raw") or {}).get("postalcode") if isinstance(geocode.get("raw"), dict) else "",
+                (geocode.get("raw") or {}).get("postcode") if isinstance(geocode.get("raw"), dict) else "",
+                (geocode.get("raw") or {}).get("address", {}).get("postcode") if isinstance((geocode.get("raw") or {}).get("address"), dict) else "",
+            )
+        )
+    )
+    if postal and returned_postal:
+        return postal == returned_postal
+    if postal:
+        # A postal-level result for another code is not evidence for this one.
+        return False
     if postal and postal[0] == "M":
         expected_code = "ON"
     if expected_code:
@@ -7271,6 +8042,64 @@ def geocoding_result_matches_query(raw_value: str, normalized_query: str, geocod
     return city in display or city in normalize_space(normalized_query).lower()
 
 
+def workplace_alternatives_for_job(job: dict[str, Any]) -> list[dict[str, Any]]:
+    value = job.get("workplace_alternatives", job.get("workplace_alternatives_json"))
+    alternatives = parse_json_array(value) if not isinstance(value, list) else [dict(item) for item in value if isinstance(item, dict)]
+    if not alternatives and text(job.get("workplace_address")):
+        alternatives = [{
+            "address": text(job.get("workplace_address")),
+            "postal_code": text(job.get("workplace_postal_code")),
+            "precision": text(job.get("workplace_precision")) or "street address",
+            "confidence": clamp_int(job.get("workplace_confidence"), 0, 100),
+            "evidence": text(job.get("workplace_evidence")) or text(job.get("workplace_address")),
+            "evidence_source": text(job.get("workplace_evidence_source")) or "legacy single workplace",
+            "assignment_status": "confirmed",
+        }]
+    return alternatives
+
+
+def geocode_workplace_alternative(
+    alternative: dict[str, Any], profile: dict[str, str], origin: dict[str, Any],
+    provider: GeocodingProvider, *, use_cache: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    enriched = dict(alternative)
+    lookups = list(dict.fromkeys(filter(None, [text(enriched.get("address")), text(enriched.get("postal_code"))])))
+    geocode: dict[str, Any] = {}
+    for lookup in lookups:
+        candidate = geocode_location_value(lookup, lookup_type="job", profile=profile, provider=provider, use_cache=use_cache)
+        if candidate.get("ok") and geocode_matches_canadian_location(lookup, candidate):
+            geocode = candidate
+            break
+        if not geocode:
+            geocode = candidate
+    verified = bool(
+        geocode.get("ok")
+        and text(enriched.get("precision")) == "street address"
+        and text(geocode.get("precision")).lower() not in {"", "city", "region", "province", "country"}
+    )
+    enriched.update({
+        "normalized_address": text(geocode.get("normalized_query")) if verified else "",
+        "latitude": geocode.get("latitude") if verified else "",
+        "longitude": geocode.get("longitude") if verified else "",
+        "geocode_provider": text(geocode.get("provider")),
+        "geocode_precision": text(geocode.get("precision")),
+        "geocode_confidence": clamp_int(geocode.get("confidence"), 0, 100),
+        "geocode_status": text(geocode.get("status")) or ("verified" if verified else "unverified"),
+        "coordinates_verified": verified,
+    })
+    if verified:
+        distance = location_distance_snapshot(origin, text(enriched.get("address")), "On-site", "remote_after_local", geocode)
+        enriched.update({
+            "distance_km": distance["distance_km"],
+            "distance_label": distance["distance_label"],
+            "distance_note": distance.get("distance_note", ""),
+            "distance_origin_label": distance.get("origin_label", ""),
+        })
+    else:
+        enriched.update({"distance_km": 9999, "distance_label": "unknown", "distance_note": "Distance unavailable"})
+    return enriched, geocode
+
+
 def geocode_discovery_job(
     job: dict[str, Any],
     profile: dict[str, str],
@@ -7279,9 +8108,81 @@ def geocode_discovery_job(
     use_cache: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     provider = provider or get_geocoding_provider()
+    alternatives = workplace_alternatives_for_job(job)
+    if len(alternatives) > 1:
+        enriched_alternatives = []
+        geocodes = []
+        for alternative in alternatives:
+            enriched, alternative_geocode = geocode_workplace_alternative(
+                alternative, profile, origin, provider, use_cache=use_cache,
+            )
+            enriched["assignment_status"] = "advertised_alternative"
+            enriched_alternatives.append(enriched)
+            geocodes.append(alternative_geocode)
+        job["workplace_alternatives"] = enriched_alternatives
+        job["workplace_alternatives_json"] = dumps_json(enriched_alternatives)
+        job["workplace_address"] = ""
+        job["workplace_postal_code"] = ""
+        job["workplace_precision"] = "multiple alternatives"
+        job["location_original"] = text(job.get("location"))
+        job["normalized_location"] = f"{len(enriched_alternatives)} advertised workplace alternatives"
+        job["location_provider"] = "multiple"
+        job["location_confidence"] = min((clamp_int(item.get("geocode_confidence"), 0, 100) for item in enriched_alternatives), default=0)
+        job["location_precision"] = "multiple street addresses"
+        job["location_geocoded_at"] = datetime.now().isoformat(timespec="seconds")
+        job["location_geocoding_error"] = "; ".join(
+            text(item.get("error")) for item in geocodes if item and not item.get("ok") and text(item.get("error"))
+        )
+        job["location_cached"] = bool(geocodes) and all(bool(item.get("cached")) for item in geocodes if item)
+        job["location_geocode_status"] = "multiple_alternatives"
+        job["location_latitude"] = ""
+        job["location_longitude"] = ""
+        # Never substitute the closest option for an assigned workplace.
+        job["distance_km"] = 9999
+        job["city_estimate_km"] = None
+        job["distance_confidence"] = 0
+        job["distance_type"] = "multiple_alternatives"
+        job["commute_status"] = "unassigned_workplace"
+        job["commute_source"] = ""
+        job["distance_label"] = "multiple_alternatives"
+        job["distance_note"] = "Multiple advertised workplace alternatives; assigned site not confirmed."
+        job["distance_origin_label"] = text(origin.get("normalized"))
+        job["distance_origin_precision"] = text(origin.get("precision"))
+        job["distance_origin_status"] = text(origin.get("status"))
+        job["distance_cached"] = job["location_cached"]
+        return job, {
+            "ok": any(bool(item.get("coordinates_verified")) for item in enriched_alternatives),
+            "status": "multiple_alternatives", "provider": "multiple",
+            "alternative_count": len(enriched_alternatives),
+            "verified_count": sum(bool(item.get("coordinates_verified")) for item in enriched_alternatives),
+            "cached": job["location_cached"], "error": job["location_geocoding_error"],
+        }
     raw_location = text(job.get("location"))
-    geocode = geocode_location_value(raw_location, lookup_type="job", profile=profile, provider=provider, use_cache=use_cache)
-    if geocode.get("ok") and not geocode_matches_canadian_location(raw_location, geocode):
+    provider_location = text(job.get("provider_location"))
+    workplace_address = text(job.get("workplace_address"))
+    workplace_postal = text(job.get("workplace_postal_code"))
+    lookup_values: list[tuple[str, str]] = []
+    for label, value in (
+        ("street address", workplace_address),
+        ("postal code", workplace_postal),
+        ("provider location", provider_location),
+        ("posting location", raw_location),
+    ):
+        if value and value not in {item[1] for item in lookup_values}:
+            lookup_values.append((label, value))
+    geocode = {}
+    geocode_lookup_value = ""
+    attempts: list[str] = []
+    for label, lookup in lookup_values or [("posting location", raw_location)]:
+        candidate = geocode_location_value(lookup, lookup_type="job", profile=profile, provider=provider, use_cache=use_cache)
+        attempts.append(f"{label}: {lookup} -> {text(candidate.get('status')) or ('ok' if candidate.get('ok') else 'failed')}")
+        if candidate.get("ok") and geocode_matches_canadian_location(lookup, candidate):
+            geocode = candidate
+            geocode_lookup_value = lookup
+            break
+        if not geocode:
+            geocode = candidate
+    if geocode.get("ok") and geocode_lookup_value and not geocode_matches_canadian_location(geocode_lookup_value, geocode):
         geocode = {**geocode, "ok": False, "status": "invalid_location", "latitude": "", "longitude": "", "error": "Geocoding result did not match the posting's Canadian province or country."}
     job["location_original"] = raw_location
     job["normalized_location"] = text(geocode.get("normalized_query")) or raw_location
@@ -7289,13 +8190,14 @@ def geocode_discovery_job(
     job["location_confidence"] = clamp_int(geocode.get("confidence"), 0, 100)
     job["location_precision"] = text(geocode.get("precision"))
     job["location_geocoded_at"] = text(geocode.get("geocoded_at"))
-    job["location_geocoding_error"] = text(geocode.get("error"))
+    job["location_geocoding_error"] = "; ".join(attempts) if attempts and not geocode.get("ok") else text(geocode.get("error"))
     job["location_cached"] = bool(geocode.get("cached"))
     job["location_geocode_status"] = text(geocode.get("status"))
     job["location_latitude"] = geocode.get("latitude")
     job["location_longitude"] = geocode.get("longitude")
     distance = location_distance_snapshot(origin, raw_location, text(job.get("remote_type")), "remote_after_local", geocode)
     job["distance_km"] = distance["distance_km"]
+    job["city_estimate_km"] = distance.get("city_estimate_km")
     job["distance_confidence"] = distance["confidence"]
     job["distance_type"] = "remote" if distance["distance_label"] == "remote" else "straight_line" if distance["distance_label"] == "approximate" else "unknown"
     job["commute_status"] = "not_applicable" if distance["distance_label"] == "remote" else "unavailable"
@@ -7303,7 +8205,13 @@ def geocode_discovery_job(
     job["distance_label"] = distance["distance_label"]
     job["distance_note"] = distance.get("distance_note", "")
     job["distance_origin_label"] = distance.get("origin_label", "")
+    job["distance_origin_precision"] = text(origin.get("precision"))
+    job["distance_origin_status"] = text(origin.get("status"))
     job["distance_cached"] = bool(geocode.get("cached"))
+    if len(alternatives) == 1:
+        enriched, _ = geocode_workplace_alternative(alternatives[0], profile, origin, provider, use_cache=use_cache)
+        job["workplace_alternatives"] = [enriched]
+        job["workplace_alternatives_json"] = dumps_json([enriched])
     return job, geocode
 
 
@@ -7472,6 +8380,7 @@ def resolve_discovery_location_context(
     profile: dict[str, str] | None = None,
     provider: GeocodingProvider | None = None,
     use_cache: bool = True,
+    distance_origin_input: str = "",
 ) -> dict[str, Any]:
     profile = profile or {}
     provider = provider or get_geocoding_provider()
@@ -7479,13 +8388,15 @@ def resolve_discovery_location_context(
     normalized_input = normalize_space(original_input)
     postal = extract_canadian_postal_code(original_input)
     normalized_postal = normalize_canadian_postal_code(postal) if postal else ""
-    distance_origin = normalized_postal or normalized_input
+    private_origin = normalize_space(distance_origin_input)
+    distance_origin = normalize_canadian_postal_code(extract_canadian_postal_code(private_origin)) if extract_canadian_postal_code(private_origin) else private_origin or normalized_postal or normalized_input
+    distance_origin_lookup = geocode_location_value(private_origin, lookup_type="distance_origin", profile=profile, provider=provider, use_cache=use_cache) if private_origin else {}
     lookup_input = normalized_postal or normalized_input
     if is_countrywide_search_location(normalized_input):
         return {
             "original_input": original_input,
             "normalized_input": "Canada",
-            "distance_origin": "Canada",
+            "distance_origin": distance_origin or "Canada",
             "discovery_location": "Canada",
             "resolution_method": "countrywide_scope",
             "lookup": {
@@ -7502,6 +8413,7 @@ def resolve_discovery_location_context(
                 "error": "Country-wide search does not require a single distance origin.",
                 "cached": False,
             },
+            "distance_origin_lookup": distance_origin_lookup,
         }
     lookup_result: dict[str, Any]
     postal_fallback_location = ""
@@ -7565,6 +8477,7 @@ def resolve_discovery_location_context(
         "discovery_location": discovery_location,
         "resolution_method": resolution_method,
         "lookup": lookup_result,
+        "distance_origin_lookup": distance_origin_lookup,
     }
 
 
@@ -7585,16 +8498,18 @@ def is_countrywide_search_location(location: str) -> bool:
 def fetch_discovery_jobs_for_search(search: dict[str, Any], *, country_indeed: str = "Canada") -> dict[str, Any]:
     started = time.monotonic()
     locations = discovery_query_locations(search.get("discovery_location") or search.get("location"))
-    per_region = max(1, (int(search["request_per_source_cap"]) + len(locations) - 1) // len(locations))
+    queries = [normalize_space(part) for part in re.split(r"[\n;]+", text(search.get("keywords"))) if normalize_space(part)]
+    queries = list(dict.fromkeys(queries))[:7]
+    per_region = max(1, int(search["request_per_source_cap"]) // (len(locations) * len(queries)))
     merged: list[dict[str, Any]] = []
     seen: set[str] = set()
     combined: dict[str, Any] = {"jobs": [], "errors": {}, "source_counts": {}, "source_diagnostics": {}, "source_snapshots": {}}
-    for location in locations:
+    for location, keyword_query in ((location, query) for location in locations for query in queries):
         if time.monotonic() - started >= DISCOVERY_OVERALL_TIMEOUT_SECONDS:
             combined["errors"]["overall"] = f"Discovery timed out after {DISCOVERY_OVERALL_TIMEOUT_SECONDS}s before all locations completed."
             break
         result = fetch_jobspy_jobs(
-            keywords=search["keywords"], location=location, distance=search["distance"],
+            keywords=keyword_query, location=location, distance=search["distance"],
             remote_preference=search["remote_preference"], job_type=None,
             results_wanted=per_region, hours_old=search["hours_old"],
             enabled_sources=search["enabled_sources"], country_indeed=country_indeed,
@@ -7624,6 +8539,7 @@ def fetch_discovery_jobs_for_search(search: dict[str, Any], *, country_indeed: s
             current["region_queries"] = locations
             current["success"] = bool(current.get("success") or diagnostic.get("success"))
     combined["jobs"] = merged
+    combined["keyword_queries"] = queries
     combined["countrywide_region_queries"] = locations if len(locations) > 1 else []
     return combined
 
@@ -7674,6 +8590,15 @@ def location_distance_snapshot(
     confidence = min(clamp_int(origin.get("confidence"), 0, 100), clamp_int(job_record.get("confidence"), 0, 100))
     if "city" in {origin_precision, job_precision}:
         confidence = min(confidence or 75, 78)
+        origin_label = text(origin.get("normalized")) or text(origin.get("input"))
+        return {
+            "distance_km": 9999,
+            "city_estimate_km": distance_km,
+            "confidence": confidence or 70,
+            "distance_label": "unknown",
+            "distance_note": "Exact workplace unknown; city-centre distance is an estimate and is not used for radius eligibility.",
+            "origin_label": origin_label,
+        }
     if "street address" in {origin_precision, job_precision} or "postal code" in {origin_precision, job_precision}:
         confidence = max(confidence, 85)
     distance_label = "approximate"
@@ -7681,7 +8606,7 @@ def location_distance_snapshot(
     distance_note = f"Approx. distance from {origin_label or 'saved origin'}"
     if origin_precision == "city" and origin_label:
         distance_note = f"Approx. distance from {origin_label} city centre"
-    return {"distance_km": distance_km, "confidence": confidence or 70, "distance_label": distance_label, "distance_note": distance_note, "origin_label": origin_label}
+    return {"distance_km": distance_km, "city_estimate_km": None, "confidence": confidence or 70, "distance_label": distance_label, "distance_note": distance_note, "origin_label": origin_label}
 
 
 def haversine_distance_km(origin: tuple[float, float], destination: tuple[float, float]) -> int:
@@ -7727,14 +8652,30 @@ def normalize_salary_snapshot(job: dict[str, Any]) -> dict[str, Any]:
     salary_min = clamp_int(job.get("salary_min"), 0, 1_000_000)
     salary_max = clamp_int(job.get("salary_max"), 0, 1_000_000)
     salary_midpoint = clamp_int(job.get("salary_midpoint"), 0, 1_000_000)
-    if not salary_midpoint and (salary_min or salary_max):
+    advertised_min = float(job.get("salary_advertised_min") or salary_min or 0)
+    advertised_max = float(job.get("salary_advertised_max") or salary_max or 0)
+    advertised_midpoint = float(job.get("salary_advertised_midpoint") or 0)
+    if not advertised_midpoint and advertised_min and advertised_max:
+        advertised_midpoint = (advertised_min + advertised_max) / 2
+    if not salary_midpoint and salary_min and salary_max:
         salary_midpoint = int(round((salary_min + salary_max) / 2))
+    interval = text(job.get("salary_interval"))
+    annual_min = clamp_int(job.get("salary_annual_min"), 0, 1_000_000)
+    annual_max = clamp_int(job.get("salary_annual_max"), 0, 1_000_000)
+    if not annual_min and (salary_min or salary_max):
+        annual_min, annual_max = annualize_salary(salary_min, salary_max, interval)
     return {
         "salary_original_text": text(job.get("salary_original_text") or job.get("salary") or job.get("salary_text")),
         "salary_min": salary_min,
         "salary_max": salary_max,
         "salary_midpoint": salary_midpoint,
-        "salary_interval": text(job.get("salary_interval")),
+        "salary_advertised_min": advertised_min,
+        "salary_advertised_max": advertised_max,
+        "salary_advertised_midpoint": advertised_midpoint,
+        "salary_annual_min": int(round(annual_min)),
+        "salary_annual_max": int(round(annual_max)),
+        "salary_annual_midpoint": int(round((annual_min + annual_max) / 2)) if annual_min and annual_max else 0,
+        "salary_interval": interval,
         "salary_currency": text(job.get("salary_currency")) or "CAD",
         "salary_source": text(job.get("salary_source")) or "missing",
         "salary_confidence": clamp_int(job.get("salary_confidence"), 0, 100),
@@ -7743,14 +8684,15 @@ def normalize_salary_snapshot(job: dict[str, Any]) -> dict[str, Any]:
 
 
 def discovery_salary_score(job: dict[str, Any], profile: dict[str, str]) -> int:
-    salary_min = clamp_int(job.get("salary_min"), 0, 1_000_000)
-    salary_max = clamp_int(job.get("salary_max"), 0, 1_000_000)
+    snapshot = normalize_salary_snapshot(job)
+    salary_min = snapshot["salary_annual_min"]
+    salary_max = snapshot["salary_annual_max"]
     source = text(job.get("salary_source"))
     confidence = clamp_int(job.get("salary_confidence"), 0, 100)
     if not salary_max:
         return 45 if text(job.get("salary")) else 38
     target = desired_min_salary(profile)
-    midpoint = clamp_int(job.get("salary_midpoint"), 0, 1_000_000) or int(round((salary_min + salary_max) / 2))
+    midpoint = snapshot["salary_annual_midpoint"] or int(round((salary_min + salary_max) / 2))
     score = 50
     if midpoint >= target:
         score += 22
@@ -7865,7 +8807,7 @@ def discovery_score_breakdown(job: dict[str, Any], profile: dict[str, str], sett
     seniority_fit = clamp_int(score_seniority_fit(resume_profile, analyze_job_seniority(job)).get("score", 0), 0, 100)
     salary_snapshot = normalize_salary_snapshot(job)
     salary_score = discovery_salary_score({**job, **salary_snapshot}, profile)
-    origin = profile_home_location(profile)
+    origin = settings.get("distance_origin") if isinstance(settings.get("distance_origin"), dict) else profile_home_location(profile)
     distance_rule = normalize_choice(settings.get("remote_rule") or settings.get("remote_distance_rule"), DISCOVERY_REMOTE_DISTANCE_RULES) or "remote_after_local"
     job_location_record = {
         "latitude": job.get("location_latitude"),
@@ -7877,7 +8819,7 @@ def discovery_score_breakdown(job: dict[str, Any], profile: dict[str, str], sett
     }
     distance_snapshot = location_distance_snapshot(origin, text(job.get("location")), text(job.get("remote_type")), distance_rule, job_location_record)
     distance_score = discovery_distance_score(distance_snapshot["distance_km"], text(job.get("remote_type")), distance_rule)
-    unknown_location_penalty = 4 if distance_snapshot["distance_km"] >= 9999 and not "remote" in text(job.get("remote_type")).lower() else 0
+    unknown_location_penalty = 4 if distance_snapshot["distance_km"] >= 9999 and not "remote" in text(job.get("remote_type")).lower() and not text(job.get("location")) else 0
     recency_score = discovery_recency_score(job)
     source_score = discovery_source_quality_score(job)
     data_quality_score, missing_fields = discovery_completion_score(job)
@@ -7911,7 +8853,9 @@ def discovery_score_breakdown(job: dict[str, Any], profile: dict[str, str], sett
     if penalty_terms:
         penalties.append({"label": "Excluded keywords", "items": penalty_terms, "points": excluded_penalty})
     if unknown_location_penalty:
-        penalties.append({"label": "Unknown location", "items": ["location unknown"], "points": 4})
+        penalties.append({"label": "Workplace location missing", "items": ["workplace location unknown"], "points": 4})
+    elif distance_snapshot["distance_km"] >= 9999 and text(job.get("location")) and "remote" not in text(job.get("remote_type")).lower():
+        distance_snapshot["distance_note"] = "Workplace location is known; distance unavailable because no usable origin or geocode is available."
     return {
         "overall_score": clamp_int(total, 0, 100),
         "components": components,
@@ -7949,6 +8893,7 @@ def enrich_discovery_job(job: dict[str, Any], profile: dict[str, str], settings:
         "distance_km": scoring["distance"]["distance_km"],
         "distance_confidence": scoring["distance"]["confidence"],
         "distance_label": scoring["distance"]["distance_label"],
+        "city_estimate_km": scoring["distance"].get("city_estimate_km"),
         "overall_score": scoring["overall_score"],
         "qualification_fit_score": qualification.get("qualification_fit_score", 0),
         "qualification_match_score": qualification.get("qualification_match_score", 0),
@@ -7959,6 +8904,7 @@ def enrich_discovery_job(job: dict[str, Any], profile: dict[str, str], settings:
         "qualification_fit_matched_requirements": qualification.get("qualification_fit_matched_requirements", []),
         "qualification_fit_partial_requirements": qualification.get("qualification_fit_partial_requirements", []),
         "qualification_requirements": qualification.get("qualification_requirements", []),
+        "technical_compatibility": qualification.get("technical_compatibility", {}),
         "experience_requirements": qualification.get("experience_requirements", {}),
         "qualification_evidence_profile_id": qualification.get("qualification_evidence_profile_id", ""),
         "qualification_evidence_profile_name": qualification.get("qualification_evidence_profile_name", "Active Profile"),
@@ -7966,6 +8912,8 @@ def enrich_discovery_job(job: dict[str, Any], profile: dict[str, str], settings:
         "qualification_components": qualification.get("qualification_components", {}),
         "qualification_fit_seniority": qualification.get("qualification_fit_seniority", {}),
         "application_priority_reasons": qualification.get("application_priority_reasons", []),
+        "opportunity_score": qualification.get("opportunity_score", 0),
+        "opportunity_score_reasons": qualification.get("opportunity_score_reasons", []),
         "match_score": scoring["skill_match"],
         "score_breakdown": {
             "overall_score": scoring["overall_score"],
@@ -8006,15 +8954,29 @@ def enrich_discovery_job(job: dict[str, Any], profile: dict[str, str], settings:
     return enriched
 
 
-def apply_discovery_search_constraints(job: dict[str, Any], remote_preference: str, search_location: str = "") -> dict[str, Any]:
+def apply_discovery_search_constraints(job: dict[str, Any], remote_preference: str, search_location: str = "", max_distance_km: int = 0) -> dict[str, Any]:
     """Apply work-arrangement and requested-location constraints before ranking."""
     preference = normalize_space(text(remote_preference)).lower()
     if preference != "remote":
-        if search_location and outside_requested_location(job, search_location):
+        # An unverified/postal-only location mismatch is not evidence that a
+        # job is outside the requested area. Keep it reviewable until the
+        # workplace distance is actually established.
+        job_location = normalize_space(text(job.get("location")))
+        postal_only = bool(re.fullmatch(r"[A-Z]\d[A-Z]\s?\d[A-Z]\d", job_location, re.IGNORECASE))
+        if search_location and (int(job.get("distance_km") or 9999) < 9999 or not postal_only) and outside_requested_location(job, search_location):
             job["location_search_eligible"] = False
             job["application_priority_score"] = 0
             job.setdefault("application_priority_reasons", []).append("Excluded because the confirmed job location is outside the requested hybrid/on-site search area.")
+        elif max_distance_km and "remote" not in text(job.get("remote_type")).lower() and clamp_int(job.get("distance_km"), 0, 9999) >= 9999:
+            job["distance_radius_status"] = "unknown"
+            job["location_search_eligible"] = None
+            job["application_priority_score"] = min(int(job.get("application_priority_score") or 0), 49)
+        elif max_distance_km and "remote" not in text(job.get("remote_type")).lower() and int(job.get("distance_km") or 0) > max_distance_km:
+            job["distance_radius_status"] = "outside_radius"
+            job["location_search_eligible"] = False
+            job["application_priority_score"] = 0
         else:
+            job["distance_radius_status"] = "within_radius" if max_distance_km else "not_checked"
             job["location_search_eligible"] = True if search_location else None
         return job
     job["location_search_eligible"] = True
@@ -8046,6 +9008,10 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
     if normalize_space(text(remote_preference)).lower() != "remote":
         if text(job.get("posting_availability")).lower() == "confirmed_closed":
             return "excluded", "Posting is confirmed closed."
+        if text(job.get("distance_radius_status")).lower() == "outside_radius":
+            return "excluded", "Confirmed workplace distance is outside the requested radius."
+        if text(job.get("distance_radius_status")).lower() == "unknown":
+            return "review_required", "Workplace distance could not be verified against the requested radius."
         if job.get("location_search_eligible") is False or text(job.get("location_search_eligible")).lower() == "false":
             return "excluded", "Confirmed job location is outside the requested search area."
         if search_mode == "title":
@@ -8059,6 +9025,8 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
         return "actionable", "No remote-only restriction applies."
     if text(job.get("remote_search_eligible")).lower() == "false" or text(job.get("remote_eligibility")).lower() in {"restricted", "confirmed_ineligible"} or text(job.get("ontario_eligibility")).lower() == "confirmed_ineligible" or text(job.get("posting_availability")).lower() == "confirmed_closed":
         return "excluded", "Confirmed onsite, hybrid, ineligible, or closed posting."
+    if text(job.get("distance_radius_status")).lower() == "unknown":
+        return "review_required", "Remote eligibility or workplace distance requires review."
     if text(job.get("remote_search_eligible")).lower() == "true" and text(job.get("remote_eligibility")).lower() == "canadian_eligible" and "remote" in text(job.get("remote_type")).lower():
         if search_mode == "title":
             return title_search_result_category(job)
@@ -8085,11 +9053,26 @@ def title_search_result_category(job: dict[str, Any]) -> tuple[str, str]:
     return "actionable", "The advertised title matches the requested occupation and no hard seniority blocker was found."
 
 
+def discovery_is_clear_senior_role(job: dict[str, Any], search: dict[str, Any]) -> bool:
+    """Keep clearly senior SWE roles out of the requested new-match target."""
+    if search.get("search_mode") != "shortlist" or search.get("occupation") != "software developer":
+        return False
+    analysis = job.get("qualification_fit_seniority") or {}
+    level = text(analysis.get("detected_level") or job.get("seniority_level")).lower().replace("-", "_")
+    required = analysis.get("required_experience") or {}
+    minimum = required.get("minimum") if isinstance(required, dict) else None
+    try:
+        high_experience = minimum is not None and float(minimum) >= 5
+    except (TypeError, ValueError):
+        high_experience = False
+    return level in {"senior", "lead", "manager", "director"} or bool(analysis.get("management_role")) or bool(analysis.get("leadership_expectations")) or high_experience
+
+
 def discovery_sort_value(job: dict[str, Any], field: str, direction: str = "desc", remote_rule: str = "remote_after_local", unknown_salary_position: str = "last") -> tuple[Any, ...]:
     field = normalize_space(field or "overall_score")
     direction = "asc" if str(direction).lower() == "asc" else "desc"
     salary_known = 1 if int(job.get("salary_listed") or 0) else 0
-    salary_value = clamp_int(job.get("salary_midpoint") or job.get("salary_max") or job.get("salary_min"), 0, 1_000_000)
+    salary_value = clamp_int(job.get("salary_annual_midpoint") or job.get("salary_midpoint") or job.get("salary_max") or job.get("salary_min"), 0, 1_000_000)
     distance_value = clamp_int(job.get("distance_km"), 0, 9999)
     remote_label = discovery_work_arrangement_label(text(job.get("remote_type")))
     if field == "salary":
@@ -8209,7 +9192,7 @@ def discovery_preferences_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 def apply_discovery_filters(job: dict[str, Any], filters: dict[str, Any]) -> bool:
     filters = filters or {}
-    if clamp_int_default(filters.get("salary_min"), 0, 0, 1_000_000) and clamp_int(job.get("salary_max"), 0, 1_000_000) < clamp_int_default(filters.get("salary_min"), 0, 0, 1_000_000):
+    if clamp_int_default(filters.get("salary_min"), 0, 0, 1_000_000) and int(normalize_salary_snapshot(job).get("salary_annual_max") or 0) < clamp_int_default(filters.get("salary_min"), 0, 0, 1_000_000):
         return False
     if clamp_int_default(filters.get("max_distance"), 0, 0, 10_000) and clamp_int(job.get("distance_km"), 0, 9999) > clamp_int_default(filters.get("max_distance"), 0, 0, 10_000):
         return False
@@ -8268,8 +9251,18 @@ def get_db() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    global _INITIALIZED_DATABASE_PATH
+    global _INITIALIZED_DATABASE_PATH, _LAST_MIGRATION_BACKUP
+    if _INITIALIZED_DATABASE_PATH != DB_PATH.resolve():
+        _LAST_MIGRATION_BACKUP = None
+    database_existed = DB_PATH.exists()
     db = get_db()
+    existing_version = int(db.execute("PRAGMA user_version").fetchone()[0] or 0)
+    existing_job_columns = {row["name"] for row in db.execute("PRAGMA table_info(jobs)")}
+    additive_job_migration_needed = bool(existing_job_columns) and any(column not in existing_job_columns for column in JOB_COLUMNS)
+    if database_existed and (existing_version < CURRENT_DB_SCHEMA_VERSION or additive_job_migration_needed) and _LAST_MIGRATION_BACKUP is None:
+        _LAST_MIGRATION_BACKUP = backup_database_before_migration()
+        if _LAST_MIGRATION_BACKUP is None:
+            raise RuntimeError("Database migration aborted: a consistent pre-migration backup could not be created.")
     # WAL lets refresh/read requests proceed while discovery commits.  This is
     # intentionally performed only during guarded initialization rather than
     # on every request, where changing journal mode would itself be a lock
@@ -8416,6 +9409,7 @@ def init_db() -> None:
             search_depth TEXT NOT NULL DEFAULT 'standard',
             distance INTEGER NOT NULL DEFAULT 50,
             per_source_cap INTEGER NOT NULL DEFAULT 100,
+                   new_matching_target INTEGER NOT NULL DEFAULT 25,
             total_cap INTEGER NOT NULL DEFAULT 500,
             interval_minutes INTEGER NOT NULL DEFAULT 360,
             enabled INTEGER NOT NULL DEFAULT 0,
@@ -8492,6 +9486,7 @@ def init_db() -> None:
             "search_depth": "TEXT NOT NULL DEFAULT 'standard'",
             "distance": "INTEGER NOT NULL DEFAULT 50",
             "per_source_cap": "INTEGER NOT NULL DEFAULT 100",
+            "new_matching_target": "INTEGER NOT NULL DEFAULT 25",
             "total_cap": "INTEGER NOT NULL DEFAULT 500",
             "interval_minutes": "INTEGER NOT NULL DEFAULT 360",
             "enabled": "INTEGER NOT NULL DEFAULT 0",
@@ -8568,10 +9563,43 @@ def init_db() -> None:
             "success": "INTEGER NOT NULL DEFAULT 0",
         },
     )
+    repair_malformed_saved_salaries()
     run_migrations(db)
     db.execute(f"PRAGMA user_version = {CURRENT_DB_SCHEMA_VERSION}")
     db.commit()
     _INITIALIZED_DATABASE_PATH = DB_PATH.resolve()
+
+
+def backup_database_before_migration() -> Path | None:
+    """Create a consistent SQLite backup before an in-place schema upgrade."""
+    if not DB_PATH.exists():
+        return None
+    backup_dir = DATA_DIR / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    target = backup_dir / f"jobs-before-migration-{stamp}.sqlite"
+    temporary = target.with_suffix(".sqlite.tmp")
+    source = destination = None
+    try:
+        source = sqlite3.connect(f"file:{DB_PATH.resolve()}?mode=ro", uri=True)
+        destination = sqlite3.connect(temporary)
+        with destination:
+            source.backup(destination)
+        destination.close()
+        destination = None
+        temporary.replace(target)
+        return target
+    except (OSError, sqlite3.Error):
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+    finally:
+        if source is not None:
+            source.close()
+        if destination is not None:
+            destination.close()
 
 
 def ensure_columns(table: str, columns: dict[str, str]) -> None:
@@ -8580,6 +9608,33 @@ def ensure_columns(table: str, columns: dict[str, str]) -> None:
     for name, definition in columns.items():
         if name not in existing:
             db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+
+def repair_malformed_saved_salaries() -> None:
+    """Repair only clearly annualized hourly records using stored evidence."""
+    rows = query_db(
+        """SELECT id, salary, salary_original_text, salary_evidence_text, job_description,
+                  salary_min, salary_max, salary_interval
+           FROM jobs WHERE lower(salary_interval) = 'hourly'
+             AND (salary_min > 1000 OR salary_max > 1000)"""
+    )
+    for row in rows:
+        evidence = text(row["salary_evidence_text"] or row["salary_original_text"] or row["salary"] or row["job_description"])
+        parsed = parse_salary_text(evidence)
+        if parsed["salary_interval"] != "hourly":
+            continue
+        get_db().execute(
+            """UPDATE jobs SET salary = ?, salary_min = ?, salary_max = ?, salary_midpoint = ?,
+                 salary_advertised_min = ?, salary_advertised_max = ?, salary_advertised_midpoint = ?,
+                 salary_annual_min = ?, salary_annual_max = ?, salary_annual_midpoint = ?,
+                 salary_evidence_text = ?, salary_ambiguity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+            [
+                parsed["salary_text"], parsed["salary_min"], parsed["salary_max"], parsed["salary_midpoint"],
+                parsed["salary_advertised_min"], parsed["salary_advertised_max"], parsed["salary_advertised_midpoint"],
+                parsed["salary_annual_min"], parsed["salary_annual_max"], parsed["salary_annual_midpoint"],
+                parsed["salary_evidence_text"], parsed["salary_ambiguity"], row["id"],
+            ],
+        )
 
 
 def query_db(query: str, args: list[Any] | None = None, one: bool = False) -> Any:
@@ -8931,15 +9986,48 @@ def normalize_job_payload(payload: dict[str, Any]) -> dict[str, Any]:
         existing=payload_for_extraction,
     )
     clean = {column: text(payload_for_extraction.get(column, extracted.get(column, ""))) for column in JOB_COLUMNS}
+    clean["candidate_profile_id"] = str(clamp_int(payload.get("candidate_profile_id"), 0, 10**9))
+    alternatives_value = payload.get("workplace_alternatives", payload.get("workplace_alternatives_json", extracted.get("workplace_alternatives_json", "[]")))
+    alternatives = parse_json_array(alternatives_value) if not isinstance(alternatives_value, list) else [item for item in alternatives_value if isinstance(item, dict)]
+    if not alternatives:
+        alternatives = extract_workplace_alternatives(payload_for_extraction, supplied_description)
+    credentials_value = payload.get("credentials", payload.get("credentials_json", extracted.get("credentials_json", "[]")))
+    credentials = parse_json_array(credentials_value) if not isinstance(credentials_value, list) else [item for item in credentials_value if isinstance(item, dict)]
+    if not credentials:
+        credentials = extract_explicit_credentials(supplied_description)
+    benefits_value = payload.get("benefits", payload.get("benefits_json", extracted.get("benefits_json", "[]")))
+    benefits = parse_json_array(benefits_value) if not isinstance(benefits_value, list) else [item for item in benefits_value if isinstance(item, dict)]
+    if not benefits:
+        benefits = extract_explicit_benefits(supplied_description)
+    clean["workplace_alternatives_json"] = dumps_json(alternatives)
+    clean["credentials_json"] = dumps_json(credentials)
+    clean["benefits_json"] = dumps_json(benefits)
+    if len(alternatives) > 1:
+        # Multiple advertised possibilities are not an assigned workplace.
+        clean["workplace_address"] = ""
+        clean["workplace_postal_code"] = ""
+        clean["workplace_evidence"] = ""
+        clean["workplace_evidence_source"] = ""
+        clean["workplace_precision"] = "multiple alternatives"
+        clean["workplace_confidence"] = "95"
     clean["date_added"] = text(payload.get("date_added")) or today
     clean["status"] = clean["status"] if clean["status"] in STATUSES else "Saved"
+    if text(payload.get("discovery_first_seen_at")) and not text(payload.get("status")):
+        clean["status"] = "Discovered"
+    quality_flags = []
+    if text(clean.get("provider_company")) and normalize_space(text(clean.get("provider_company"))).lower() != normalize_space(text(clean.get("company"))).lower():
+        quality_flags.append("provider/company mismatch")
+    if text(clean.get("provider_location")) and normalize_space(text(clean.get("provider_location"))).lower() != normalize_space(text(clean.get("location"))).lower():
+        quality_flags.append("provider/location mismatch")
+    if text(clean.get("provider_title")) and normalize_space(text(clean.get("provider_title"))).lower() != normalize_space(text(clean.get("title"))).lower():
+        quality_flags.append("provider/title mismatch")
+    clean["data_quality_flags"] = dumps_json(quality_flags)
     clean["fit_score"] = clamp_int(payload.get("fit_score"), 0, 100)
     salary = determine_salary({**payload, **extracted, **clean})
-    for field in ["salary_min", "salary_max", "salary_interval", "salary_currency", "salary_source", "salary_confidence", "salary_evidence_text", "salary_ambiguity"]:
+    for field in ["salary_min", "salary_max", "salary_midpoint", "salary_advertised_min", "salary_advertised_max", "salary_advertised_midpoint", "salary_annual_min", "salary_annual_max", "salary_annual_midpoint", "salary_interval", "salary_currency", "salary_source", "salary_confidence", "salary_evidence_text", "salary_ambiguity"]:
         clean[field] = salary[field]
     clean["salary"] = salary["salary_text"]
     clean["salary_original_text"] = text(payload.get("salary_original_text") or payload.get("salary") or salary["salary_text"])
-    clean["salary_midpoint"] = int(round((clean["salary_min"] + clean["salary_max"]) / 2)) if clean["salary_min"] or clean["salary_max"] else 0
     clean["salary_listed"] = 0 if clean["salary_source"] in {"estimated", "missing"} else 1
 
     scoring = score_job(
@@ -9052,6 +10140,7 @@ def job_to_dict(
     if row is None:
         return {}
     data = dict(row)
+    data["record_origin"] = "discovered" if text(data.get("discovery_first_seen_at")) else "manual"
     data["description_completeness"] = classify_job_description_completeness(data.get("job_description"))
     data["work_arrangement"] = discovery_work_arrangement_label(text(data.get("remote_type")))
     legacy_eligibility = text(data.get("remote_eligibility")).lower()
@@ -9065,6 +10154,22 @@ def job_to_dict(
     data["discovery_result_category"], data["discovery_result_reason"] = discovery_result_category(data, text(data.get("discovery_remote_preference")))
     data["recommendation_eligible"] = data["discovery_result_category"] == "actionable"
     data["score_breakdown"] = parse_json_object(data.get("score_breakdown"))
+    data["opportunity_score_reasons"] = parse_json_values(data.get("opportunity_score_reasons"))
+    data["data_quality_flags"] = parse_json_values(data.get("data_quality_flags"))
+    data["workplace_alternatives"] = parse_json_array(data.get("workplace_alternatives_json"))
+    if not data["workplace_alternatives"] and text(data.get("workplace_address")):
+        data["workplace_alternatives"] = [{
+            "address": text(data.get("workplace_address")),
+            "postal_code": text(data.get("workplace_postal_code")),
+            "precision": text(data.get("workplace_precision")) or "street address",
+            "confidence": clamp_int(data.get("workplace_confidence"), 0, 100),
+            "evidence": text(data.get("workplace_evidence")) or text(data.get("workplace_address")),
+            "evidence_source": text(data.get("workplace_evidence_source")) or "legacy single workplace",
+            "assignment_status": "confirmed",
+        }]
+    data["workplace_assignment_status"] = "alternatives_unassigned" if len(data["workplace_alternatives"]) > 1 else "confirmed" if data["workplace_alternatives"] else "unavailable"
+    data["credentials"] = parse_json_array(data.get("credentials_json"))
+    data["benefits"] = parse_json_array(data.get("benefits_json"))
     if "profile_updated_at" in data and data.get("profile_updated_at"):
         profile_row = query_db("SELECT updated_at FROM profile WHERE id = 1", one=True)
         current_profile_updated = text(profile_row["updated_at"]) if profile_row else ""
@@ -9108,6 +10213,8 @@ def classify_job_description_completeness(value: Any) -> str:
 
 
 QUALIFICATION_ALIASES = {
+    "git": {"git", "version control"},
+    "version control": {"git", "version control"},
     "nodejs": {"nodejs", "node.js"},
     "node.js": {"nodejs", "node.js"},
     "java script": {"java script", "javascript"},
@@ -9124,14 +10231,21 @@ QUALIFICATION_ALIASES = {
 }
 
 QUALIFICATION_TECHNICAL_TERMS = [
-    *TECHNICAL_TERMS,
+    *(term for term in TECHNICAL_TERMS if term not in {"engineering", "version control"}),
     "c++", "c#", "go", "golang", "django", "graphql", "grpc", "websocket", "nestjs",
     "docker", "kubernetes", "linux", "systems", "systems programming", "system design",
     "architecture", "programming", "scripting", "observability", "troubleshooting",
     "networking", "integrations", "frameworks", "web applications", "databases",
     "data processing", "rbac", "cloud infrastructure", "multithreaded", "full-stack", "full stack",
     "full-stack development", "full-stack software development", "full-stack engineering", "software development",
+    "redux", "ai api/model experience", "agentic coding tools", "agile project management tools",
 ]
+
+QUALIFICATION_EVIDENCE_ALIASES = {
+    "ai api/model experience": ("ai apis/models", "ai apis", "ai models"),
+    "agentic coding tools": ("ai coding agents", "agentic coding tool", "claude code", "cursor"),
+    "agile project management tools": ("agile project management tools",),
+}
 
 
 def _qualification_key(value: Any) -> str:
@@ -9146,6 +10260,9 @@ def _qualification_phrase_present(content: str, phrase: str) -> bool:
 
 def _description_requirement_importance(description: str, term: str) -> str:
     """Classify a term using its nearest explicit qualifications section."""
+    classified, evidence = requirement_phrase_evidence(description, QUALIFICATION_EVIDENCE_ALIASES.get(term, (term,)))
+    if evidence:
+        return classified
     lowered = description.lower()
     index = lowered.find(term.lower())
     if index < 0:
@@ -9172,7 +10289,7 @@ def _qualification_terms(job: dict[str, Any]) -> list[dict[str, Any]]:
     terms: list[dict[str, Any]] = []
     seen: set[str] = set()
 
-    def add(value: str, importance: str, category: str, source: str) -> None:
+    def add(value: str, importance: str, category: str, source: str, source_evidence: str = "") -> None:
         value = normalize_space(value).strip(" -*•")
         if len(value) < 3 or len(value) > 120:
             return
@@ -9180,21 +10297,25 @@ def _qualification_terms(job: dict[str, Any]) -> list[dict[str, Any]]:
         if key in seen:
             return
         seen.add(key)
-        terms.append({"requirement": value, "normalized": key, "importance": importance, "category": category, "source": source})
+        terms.append({
+            "requirement": value, "normalized": key, "importance": importance,
+            "category": category, "source": source, "source_evidence": source_evidence,
+        })
 
     has_required_section = bool(re.search(r"(?:^|\n)\s*(?:required(?: qualifications?)?|requirements?|minimum qualifications?|must have|what you bring|what we're looking for|what we are looking for|what you’re looking for|who you are|your background|core skills(?: and experience)?|education and experience)\s*(?::|$)", description, re.I | re.M))
     for field, importance, category in (("required_skills", "required" if (not description or has_required_section) else "unclassified", "technical"), ("preferred_skills", "preferred", "technical"), ("responsibilities", "unclassified", "experience")):
         for part in re.split(r"[,;\n]+|(?<=[.!?])\s+", text(job.get(field))):
-            add(part, importance, category, field)
+            classified, evidence = requirement_phrase_evidence(description, QUALIFICATION_EVIDENCE_ALIASES.get(_qualification_key(part), (part,)))
+            resolved_importance = classified if evidence and field == "required_skills" else importance
+            add(part, resolved_importance, category, field, evidence)
 
-    lowered = content.lower()
     for term in sorted(QUALIFICATION_TECHNICAL_TERMS, key=len, reverse=True):
-        if _qualification_phrase_present(lowered, term):
-            importance = _description_requirement_importance(description, term)
-            add(term, importance, "technical", "job description")
+        importance, evidence = requirement_phrase_evidence(description, QUALIFICATION_EVIDENCE_ALIASES.get(term, (term,)))
+        if evidence:
+            add(term, importance, "technical", "job description", evidence)
 
     for match in re.finditer(r"\b\d+\+?\s*(?:to\s*\d+\+?\s*)?(?:years?|yrs?)\b[^.\n]{0,80}", content, re.I):
-        add(match.group(0), "required", "experience", "experience requirement")
+        add(match.group(0), "required", "experience", "experience requirement", normalize_space(match.group(0)))
     return terms
 
 
@@ -9246,6 +10367,66 @@ def _evidence_match(requirement: str, evidence: dict[str, Any]) -> tuple[str, st
     return result
 
 
+def _technical_compatibility(assessed: list[dict[str, Any]], profile: dict[str, Any]) -> dict[str, Any]:
+    """Present conservative résumé-assisted technical evidence states.
+
+    A missing résumé match is intentionally Unverified.  It becomes No
+    experience only after an explicit negative skill confirmation has been
+    recorded for the selected candidate profile.
+    """
+    confirmations: dict[str, str] = {}
+    profile_id = profile.get("_candidate_profile_id") or profile.get("id")
+    if profile_id and has_app_context():
+        try:
+            rows = query_db(
+                "SELECT normalized_keyword, status FROM keyword_memory WHERE candidate_profile_id = ? AND confirmation_source = 'skill_confirmation'",
+                [int(profile_id)],
+            )
+            confirmations = {normalize_keyword(text(row["normalized_keyword"])): text(row["status"]) for row in rows}
+        except Exception:
+            confirmations = {}
+    items = []
+    for item in assessed:
+        if item.get("category") != "technical":
+            continue
+        normalized = normalize_keyword(text(item.get("normalized") or item.get("requirement")))
+        confirmation = confirmations.get(normalized) or confirmations.get(normalize_keyword(text(item.get("requirement"))))
+        if confirmation == "no":
+            state = "No experience"
+        elif item.get("status") == "matched":
+            state = "Demonstrated"
+        elif item.get("status") == "partial":
+            state = "Familiar" if confirmation == "yes" else "Unverified"
+        elif confirmation == "yes":
+            state = "Familiar"
+        else:
+            state = "Unverified"
+        items.append({
+            "requirement": item.get("requirement", ""),
+            "importance": item.get("importance", "unclassified"),
+            "state": state,
+            "evidence": item.get("evidence_text", ""),
+            "evidence_source": item.get("evidence_source", ""),
+        })
+    required = [item for item in items if item["importance"] == "required"]
+    confirmed_gaps = [item["requirement"] for item in required if item["state"] == "No experience"]
+    unverified = [item["requirement"] for item in required if item["state"] == "Unverified"]
+    if confirmed_gaps:
+        decision = "Significant gaps"
+    elif not required or unverified:
+        decision = "Possible / stretch — evidence incomplete"
+    else:
+        decision = "Strong technical match" if all(item["state"] == "Demonstrated" for item in required) else "Possible / stretch"
+    return {
+        "decision": decision,
+        "items": items,
+        "required_demonstrated": [item["requirement"] for item in required if item["state"] == "Demonstrated"],
+        "required_unverified": unverified,
+        "required_no_experience": confirmed_gaps,
+        "explanation": "Missing résumé evidence is Unverified; only an explicit skill confirmation marks No experience.",
+    }
+
+
 def _application_priority(
     job: dict[str, Any],
     qualification_score: int | None,
@@ -9292,6 +10473,8 @@ def _application_priority(
 
 def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any] | None = None) -> dict[str, Any]:
     """Calculate transparent Qualification Match without changing Job Priority."""
+    if as_bool(job.get("discovery_profile_independent")):
+        return build_job_opportunity_fit(job)
     try:
         profile = {} if as_bool(job.get("discovery_profile_independent")) else (evidence_profile if evidence_profile is not None else load_profile())
         inventory = _cached_qualification_terms(job)
@@ -9316,6 +10499,7 @@ def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any
             **{key: value for key, value in best.items() if key != "evidence"},
             "evidence_text": text((best.get("evidence") or {}).get("text")),
             "evidence_source": text((best.get("evidence") or {}).get("source_section")),
+            "evidence_type": text((best.get("evidence") or {}).get("evidence_type")),
         })
 
     required = [item for item in assessed if item["importance"] == "required"]
@@ -9354,6 +10538,7 @@ def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any
     matched = [item for item in assessed if item["status"] == "matched"]
     partial = [item for item in assessed if item["status"] == "partial"]
     missing = [item for item in assessed if item["status"] == "missing"]
+    technical_compatibility = _technical_compatibility(assessed, profile)
     reasons = [
         f"Mandatory qualifications: {mandatory_score}% evidence coverage." if mandatory_score is not None else "Mandatory qualifications: unavailable; no clearly classified mandatory requirements were extracted.",
         f"Technical skills and tools: {technical_score}% evidence coverage." if technical_score is not None else "Technical skills and tools: unavailable from the stored posting.",
@@ -9369,6 +10554,11 @@ def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any
     if non_target_role:
         reasons.append("The advertised role family is outside the selected software-developer targets and requires review before applying.")
     priority, priority_reasons = _application_priority(job, score, profile, seniority)
+    if technical_compatibility["required_no_experience"]:
+        priority = min(priority, 39)
+        priority_reasons.append(
+            "Confirmed missing core technology: " + ", ".join(technical_compatibility["required_no_experience"][:5]) + "."
+        )
     label = "Review required — non-target role family" if non_target_role else "Insufficient requirement evidence" if insufficient_mandatory_evidence else "Stretch opportunity" if stretch or score < 60 else "Strong qualification match" if score >= 75 else "Review qualification fit"
     return {
         "qualification_match_status": "assessed" if mandatory_score is not None else "partial_evidence",
@@ -9381,6 +10571,7 @@ def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any
         "qualification_fit_missing_requirements": [item["requirement"] for item in missing],
         "qualification_fit_partial_requirements": [item["requirement"] for item in partial],
         "qualification_requirements": assessed,
+        "technical_compatibility": technical_compatibility,
         "experience_requirements": {
             "required": analysis.get("required_experience"),
             "preferred": analysis.get("preferred_experience"),
@@ -9403,6 +10594,120 @@ def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any
         "application_priority_score": priority,
         "application_priority_reasons": priority_reasons,
     }
+
+
+def build_job_opportunity_fit(job: dict[str, Any]) -> dict[str, Any]:
+    """Rank title searches from posting evidence without résumé/profile evidence."""
+    title_score = clamp_int(job.get("title_match_score"), 0, 100)
+    title_type = text(job.get("occupation_match_type")).lower()
+    title_component = title_score if title_score else {"exact": 100, "related": 72}.get(title_type, 35)
+    salary = normalize_salary_snapshot(job)
+    salary_component, salary_reason = opportunity_salary_component(job, salary)
+    distance = clamp_int(job.get("distance_km"), 0, 9999)
+    distance_known = distance < 9999 and (text(job.get("distance_type")).lower() in {"straight_line", "approximate", ""})
+    distance_component = max(20, 100 - min(distance * 2, 80)) if distance_known else 60
+    arrangement = text(job.get("work_arrangement") or job.get("remote_type")).lower()
+    arrangement_component = 90 if arrangement in {"remote", "hybrid"} else 72 if arrangement in {"onsite", "on-site"} else 60
+    eligibility = text(job.get("remote_eligibility")).lower()
+    eligibility_component = 95 if eligibility in {"canadian_eligible", "eligible"} else 45 if eligibility in {"restricted", "confirmed_ineligible"} else 60
+    benefits_component, benefits_reason = opportunity_benefits_component(job)
+    freshness_component, freshness_reason = opportunity_freshness_component(job)
+    score = round(
+        title_component * 0.55
+        + salary_component * 0.18
+        + distance_component * 0.08
+        + arrangement_component * 0.07
+        + eligibility_component * 0.07
+        + benefits_component * 0.03
+        + freshness_component * 0.02
+    )
+    unpaid = explicit_unpaid_evidence(job)
+    if unpaid:
+        score = min(score, 20)
+    reasons = [
+        f"Title relevance: {title_component}/100 ({title_type or 'unclassified'} match; strongest factor).",
+        salary_reason,
+        f"Distance: {distance_component}/100 ({distance} km straight-line)." if distance_known else "Distance: unavailable; neutral score used.",
+        f"Work arrangement: {arrangement or 'unspecified'}.",
+        f"Eligibility evidence: {eligibility or 'unknown'}.",
+        benefits_reason,
+        freshness_reason,
+    ]
+    if unpaid:
+        reasons.append("The posting explicitly describes the role as unpaid or volunteer; recommendation score capped.")
+    if title_type not in {"exact", "related"}:
+        score = min(score, 49)
+    if eligibility in {"restricted", "confirmed_ineligible"}:
+        score = 0
+    return {
+        "qualification_match_status": "not_applicable",
+        "qualification_fit_score": 0,
+        "qualification_match_score": 0,
+        "qualification_fit_label": "Not assessed — title search",
+        "qualification_evidence_confidence": "not_applicable",
+        "qualification_fit_reasons": ["Résumé qualification is optional and was not used.", *reasons],
+        "qualification_fit_missing_requirements": [],
+        "qualification_fit_matched_requirements": [],
+        "qualification_fit_partial_requirements": [],
+        "qualification_requirements": [],
+        "experience_requirements": {
+            "required": analyze_job_seniority(job).get("required_experience"),
+            "preferred": analyze_job_seniority(job).get("preferred_experience"),
+            "ambiguous": analyze_job_seniority(job).get("ambiguous_experience", []),
+            "candidate_years_status": "not applicable — no résumé selected",
+            "fit_status": "not assessed",
+        },
+        "qualification_components": {},
+        "qualification_evidence_profile_id": "",
+        "qualification_evidence_profile_name": "No résumé selected — title search",
+        "qualification_evidence_source": "No résumé selected; job opportunity evidence only",
+        "qualification_fit_seniority": analyze_job_seniority(job),
+        "application_priority_score": score,
+        "application_priority_reasons": reasons,
+        "opportunity_score": score,
+        "opportunity_score_reasons": reasons,
+    }
+
+
+def opportunity_salary_component(job: dict[str, Any], salary: dict[str, Any]) -> tuple[int, str]:
+    if explicit_unpaid_evidence(job):
+        return 10, "Advertised compensation: explicitly unpaid; lowest component used."
+    annual_midpoint = float(salary.get("salary_annual_midpoint") or 0)
+    source = text(salary.get("salary_source")).lower()
+    currency = text(salary.get("salary_currency") or "CAD").upper()
+    if annual_midpoint <= 0 or source in {"missing", "estimated"}:
+        return 55, "Advertised compensation: unspecified; neutral component used."
+    if currency != "CAD":
+        return 55, f"Advertised compensation: {currency} {salary.get('salary_interval') or 'unit'}; currency conversion unavailable, neutral component used."
+    component = round(max(35, min(90, 35 + ((annual_midpoint - 40_000) / 80_000) * 55)))
+    advertised = salary.get("salary_original_text") or salary.get("salary_text") or salary_range_label(
+        float(salary.get("salary_advertised_min") or 0), float(salary.get("salary_advertised_max") or 0), text(salary.get("salary_interval")), currency,
+    )
+    return component, f"Advertised compensation: {advertised}; annual comparison value ${round(annual_midpoint):,}/year ({component}/100)."
+
+
+def opportunity_benefits_component(job: dict[str, Any]) -> tuple[int, str]:
+    structured = job.get("benefits") if isinstance(job.get("benefits"), list) else parse_json_array(job.get("benefits_json"))
+    benefits = normalize_space(" ".join(text(item.get("value") or item.get("evidence")) for item in structured if isinstance(item, dict)))
+    description = normalize_space(text(job.get("job_description")))
+    evidence = benefits or description
+    terms = re.findall(r"\b(?:health|dental|vision|medical|rrsp|pension|paid vacation|paid time off|benefits|wellness|insurance)\b", evidence.lower())
+    if terms:
+        return 78, "Benefits: advertised evidence found (" + ", ".join(sorted(set(terms))[:4]) + ")."
+    return 60, "Benefits: not specified; neutral component used rather than treating it as no benefits."
+
+
+def opportunity_freshness_component(job: dict[str, Any]) -> tuple[int, str]:
+    raw = text(job.get("posted_date"))
+    if not raw:
+        return 60, "Posting freshness: date unavailable; neutral component used."
+    try:
+        posted = datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
+        days_old = max(0, (date.today() - posted).days)
+    except (TypeError, ValueError):
+        return 60, "Posting freshness: date could not be interpreted; neutral component used."
+    component = 95 if days_old <= 3 else 82 if days_old <= 7 else 68 if days_old <= 14 else 52 if days_old <= 30 else 40
+    return component, f"Posting freshness: {days_old} day(s) old ({component}/100)."
 
 
 def load_tailoring_changes(job_id: int) -> dict[str, Any]:
@@ -9513,6 +10818,16 @@ def parse_json_array(value: Any) -> list[dict[str, Any]]:
         return []
 
 
+def parse_json_values(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    try:
+        parsed = json.loads(value or "[]")
+        return parsed if isinstance(parsed, list) else []
+    except (TypeError, json.JSONDecodeError):
+        return []
+
+
 def tokenize(content: str) -> set[str]:
     return set(re.findall(r"[a-z0-9+#.-]+", content.lower()))
 
@@ -9537,9 +10852,13 @@ def extract_job_details(content: str, source: str = "", existing: dict[str, Any]
     company = text(existing.get("company")) or guess_company(lines)
     location = text(existing.get("location")) or guess_location(compact)
     salary = text(existing.get("salary")) or guess_salary(compact)
+    workplace_alternatives = extract_workplace_alternatives(existing, content)
     remote_type = text(existing.get("remote_type")) or guess_remote_type(compact)
+    if not remote_type and workplace_alternatives and re.search(r"\b(?:work\s+locations?|work\s+at|float\s+(?:between|across|among)|centres?|sites?)\b", compact, re.I):
+        remote_type = "On-site"
     role_type = text(existing.get("role_type")) or guess_role_type_for_job(title, compact)
     seniority = text(existing.get("seniority_level")) or guess_seniority(f"{title} {compact}")
+    extracted_required, extracted_preferred = extract_keyword_requirements(content)
     skills = keyword_hits(compact, REWARD_KEYWORDS)
     required = extract_section(content, ["requirements", "required qualifications", "what you bring"])
     preferred = extract_section(content, ["preferred", "nice to have", "bonus"])
@@ -9550,13 +10869,17 @@ def extract_job_details(content: str, source: str = "", existing: dict[str, Any]
         "location": location,
         "remote_type": remote_type,
         "salary": salary,
-        "required_skills": ", ".join(skills) if not required else trim(required, 1200),
-        "preferred_skills": trim(preferred, 1200),
+        "required_skills": extracted_required or (trim(required, 1200) if required else ", ".join(skills)),
+        "preferred_skills": extracted_preferred or trim(preferred, 1200),
         "responsibilities": trim(responsibilities, 1600),
         "seniority_level": seniority,
         "application_url": text(existing.get("application_url")) or text(existing.get("url")),
         "source": source or text(existing.get("source")),
         "role_type": role_type,
+        "workplace_alternatives_json": dumps_json(workplace_alternatives),
+        "credentials_json": dumps_json(extract_explicit_credentials(content)),
+        "benefits_json": dumps_json(extract_explicit_benefits(content)),
+        "arrangement_evidence": arrangement_evidence(existing, content, remote_type, workplace_alternatives),
     }
 
 
@@ -10849,7 +12172,7 @@ def build_dashboard(jobs: list[dict[str, Any]]) -> dict[str, Any]:
         "rejection_rate": round(len(rejected) / len(applied) * 100, 1) if applied else 0,
         "missing_salary": sum(1 for job in jobs if not job["salary"]),
         "high_coding_risk": sum(1 for job in jobs if int(job["coding_risk_score"] or 100) < 60),
-        "pending": sum(1 for job in jobs if job["status"] in {"Saved", "Drafting", "Applied", "Interview"}),
+        "pending": sum(1 for job in jobs if job["status"] in {"Discovered", "Saved", "Drafting", "Applied", "Interview"}),
     }
 
 

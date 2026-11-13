@@ -14,6 +14,7 @@ JOBSPY_SOURCE_NAMES = {
     "indeed": "indeed",
     "google": "google",
     "zip_recruiter": "zip_recruiter",
+    "glassdoor": "glassdoor",
 }
 
 
@@ -127,7 +128,9 @@ def fetch_jobspy_jobs(
             "request_params": {
                 "keywords": keywords,
                 "location": location,
-                "distance": distance,
+                "distance": round(float(distance or 0) * 0.621371) if distance is not None else None,
+                "distance_km": distance,
+                "distance_unit": "miles",
                 "job_type": job_type,
                 "remote_preference": remote_preference,
                 "results_wanted": results_wanted,
@@ -168,7 +171,8 @@ def fetch_jobspy_jobs(
                     "search_term": keywords,
                     "google_search_term": f"{keywords} jobs near {location}",
                     "location": location,
-                    "distance": distance,
+                    # JobSpy expects miles; the application accepts kilometres.
+                    "distance": round(float(distance or 0) * 0.621371) if distance is not None else None,
                     "is_remote": (remote_preference or "").lower() == "remote",
                     "job_type": job_type or None,
                     "results_wanted": results_wanted,
@@ -308,6 +312,18 @@ def normalize_jobspy_row(row: dict[str, Any], fallback_source: str = "") -> dict
     city = clean(row.get("city"))
     state = clean(row.get("state") or row.get("state_province"))
     description = clean(row.get("description"))
+    remote_type = infer_remote_type(row)
+    workplace_row = row
+    # A provider location can be a legitimate advertised street address, but
+    # a geographic label on a remote posting is not a workplace.  Keep the
+    # provider's explicit workplace fields available while avoiding an
+    # inferred commute destination from a remote location label.
+    if remote_type == "Remote" and not any(clean(row.get(key)) for key in ("workplace_address", "address", "street_address", "office_address", "office_location")):
+        workplace_row = {key: value for key, value in row.items() if key != "location"}
+    workplace = extract_workplace_location(workplace_row, description, location or ", ".join([part for part in [city, state] if part]))
+    required_skills, preferred_skills = extract_keyword_requirements(description)
+    credentials = extract_explicit_credentials(description)
+    benefits = extract_explicit_benefits(description)
     raw_status = clean(row.get("status") or row.get("posting_status")).lower()
     if row.get("is_closed") is True or raw_status in {"closed", "expired", "removed"}:
         posting_availability = "confirmed_closed"
@@ -322,10 +338,20 @@ def normalize_jobspy_row(row: dict[str, Any], fallback_source: str = "") -> dict
         "source_job_id": clean(row.get("id") or row.get("job_id")),
         "title": clean(row.get("title")),
         "company": clean(row.get("company")),
-        "location": location or ", ".join([part for part in [city, state] if part]),
+        "location": workplace["display_location"] or location or ", ".join([part for part in [city, state] if part]),
+        "provider_location": location or ", ".join([part for part in [city, state] if part]),
+        "workplace_address": workplace["address"],
+        "workplace_postal_code": workplace["postal_code"],
+        "workplace_evidence": workplace["evidence"],
+        "workplace_evidence_source": workplace["evidence_source"],
+        "workplace_precision": workplace["precision"],
+        "workplace_confidence": workplace["confidence"],
+        "workplace_alternatives": workplace["alternatives"],
         "city": city,
         "state_province": state,
-        "remote_type": infer_remote_type(row),
+        "remote_type": remote_type,
+        "arrangement_evidence": arrangement_evidence(row, description, remote_type, workplace["alternatives"]),
+        "remote_classification_conflict": remote_classification_conflict(row),
         "job_type": clean(row.get("job_type")),
         "salary_min": min_amount,
         "salary_max": max_amount,
@@ -342,8 +368,10 @@ def normalize_jobspy_row(row: dict[str, Any], fallback_source: str = "") -> dict
         "posted_date": clean(row.get("date_posted")),
         "company_url": clean(row.get("company_url")),
         "experience_requirement": extract_experience_requirement(description),
-        "required_skills": extract_keyword_text(description),
-        "preferred_skills": "",
+        "required_skills": required_skills,
+        "preferred_skills": preferred_skills,
+        "credentials": credentials,
+        "benefits": benefits,
         "fetched_at": fetched_at,
         "raw": row,
     }
@@ -383,32 +411,439 @@ def number_or_none(value: Any) -> float | None:
 
 
 def salary_range_text(min_amount: float | None, max_amount: float | None, interval: str) -> str:
-    left = f"${int(min_amount):,}" if min_amount is not None else ""
-    right = f"${int(max_amount):,}" if max_amount is not None else ""
+    def format_amount(value: float | None) -> str:
+        if value is None:
+            return ""
+        # JobSpy numeric values do not carry formatting metadata.  Keep cents
+        # visible so 100772.50 cannot be presented as a truncated integer.
+        return f"${value:,.2f}"
+
+    left = format_amount(min_amount)
+    right = format_amount(max_amount)
     amount = f"{left}-{right}" if left and right else left or right
     return f"{amount} {interval}".strip()
 
 
+def _provider_remote_classification(row: dict[str, Any]) -> str:
+    """Return a source-declared arrangement before reading free-form prose."""
+    values = [row.get("remote_type"), row.get("work_arrangement"), row.get("remote_work_model")]
+    for value in values:
+        if isinstance(value, dict):
+            value = " ".join(clean(value.get(key)) for key in ("type", "text", "label", "name"))
+        lowered = clean(value).lower().replace("_", "-")
+        if not lowered:
+            continue
+        if "hybrid" in lowered:
+            return "Hybrid"
+        if "remote" in lowered or lowered in {"telecommute", "work from home"}:
+            return "Remote"
+        if "on-site" in lowered or "onsite" in lowered or "in-person" in lowered:
+            return "On-site"
+    explicit = clean(row.get("is_remote")).lower()
+    if explicit in {"true", "1", "yes"}:
+        return "Remote"
+    if explicit in {"false", "0", "no"}:
+        return "On-site"
+    return ""
+
+
 def infer_remote_type(row: dict[str, Any]) -> str:
-    explicit = row.get("is_remote")
+    provider_classification = _provider_remote_classification(row)
+    source_arrangement = any(row.get(key) not in (None, "") for key in ("remote_type", "work_arrangement", "remote_work_model"))
+    if provider_classification and source_arrangement:
+        # JobSpy's source classification is stronger than incidental prose in
+        # a full description.  For example, Indeed can label a posting Remote
+        # while the description discusses hybrid scheduling in a generic or
+        # stale paragraph.  Keep the source value and expose the conflict via
+        # remote_classification_conflict().
+        return provider_classification
     location = clean(row.get("location")).lower()
     description = clean(row.get("description")).lower()
     title = clean(row.get("title")).lower()
-    text = " ".join([location, title, description])
-    if re.search(r"\b(?:not|no)\s+remote\b|remote\s+(?:work\s+)?(?:is\s+)?not\s+(?:available|offered)", text):
+    provider_arrangement = clean(row.get("remote_type") or row.get("work_arrangement")).lower()
+    text = " ".join([location, title, provider_arrangement, description])
+    negative = bool(re.search(r"\b(?:not|no)\s+remote\b|remote\s*(?::|-)?\s*(?:no|false)\b|work\s+remotely\s*(?::|-)?\s*no\b|work\s+location\s*:\s*in\s+person\b|on[- ]site\s+only", text))
+    positive = bool(re.search(r"\b(?:fully|100%|work(?:ing)?|position|role|job)\s+(?:is\s+)?remote\b|\bremote\s+(?:position|role|work|job|in\s+canada)\b|\bwork\s+from\s+home\b", text))
+    explicit = clean(row.get("is_remote")).lower()
+    if negative and explicit in {"true", "1", "yes"}:
+        return "Unknown"
+    if positive and explicit in {"false", "0", "no"}:
+        return "Unknown"
+    if negative:
         return "On-site"
-    if "hybrid" in text:
+    # A specific hybrid statement in the posting is stronger than JobSpy's
+    # boolean is_remote flag, which is also used for hybrid source records.
+    # Explicit provider work-model fields were handled above and remain the
+    # highest-confidence source classification.
+    if re.search(r"\bhybrid\b", description):
         return "Hybrid"
-    if isinstance(explicit, bool):
-        if explicit:
-            return "Remote"
-    elif clean(explicit).lower() in {"true", "1", "yes"}:
+    if isinstance(row.get("is_remote"), bool):
+        return "Remote" if row.get("is_remote") else "On-site"
+    if explicit in {"true", "1", "yes"}:
         return "Remote"
+    if explicit in {"false", "0", "no"}:
+        return "On-site"
+    if "hybrid" in text or provider_arrangement == "hybrid":
+        return "Hybrid"
     if "on-site" in text or "onsite" in text:
         return "On-site"
-    if re.search(r"\bremote\b", text):
+    if extract_workplace_alternatives(row, description) and re.search(
+        r"\b(?:work\s+locations?|workplaces?|child\s*care\s+centres?|centres?\s+for\s+early\s+development|"
+        r"float\s+(?:between|across|among)|work\s+at\s+(?:the|our|these)|based\s+at)\b",
+        text,
+        re.I,
+    ):
+        return "On-site"
+    if positive:
         return "Remote"
     return "Unknown"
+
+
+def remote_classification_conflict(row: dict[str, Any]) -> str:
+    location = clean(row.get("location")).lower()
+    description = clean(row.get("description")).lower()
+    title = clean(row.get("title")).lower()
+    arrangement = clean(row.get("remote_type") or row.get("work_arrangement")).lower()
+    content = " ".join([location, title, arrangement, description])
+    negative = bool(re.search(r"\b(?:not|no)\s+remote\b|remote\s*(?::|-)?\s*(?:no|false)\b|work\s+remotely\s*(?::|-)?\s*no\b|work\s+location\s*:\s*in\s+person\b|on[- ]site\s+only", content))
+    positive = bool(re.search(r"\b(?:fully|100%|work(?:ing)?|position|role|job)\s+(?:is\s+)?remote\b|\bremote\s+(?:position|role|work|job|in\s+canada)\b|\bwork\s+from\s+home\b", content))
+    explicit = _provider_remote_classification(row)
+    description_hybrid = bool(re.search(r"\bhybrid\b", description))
+    description_remote = bool(re.search(r"\bremote\b", description))
+    if explicit == "Remote" and description_hybrid:
+        return "provider_remote_conflicts_with_description_hybrid_evidence"
+    if explicit == "Hybrid" and description_remote and not description_hybrid:
+        return "provider_hybrid_conflicts_with_description_remote_evidence"
+    if explicit == "On-site" and description_remote and not description_hybrid:
+        return "provider_on_site_conflicts_with_description_remote_evidence"
+    if negative and explicit == "Remote":
+        return "provider_remote_conflicts_with_explicit_on_site_evidence"
+    if positive and explicit == "On-site":
+        return "provider_on_site_conflicts_with_explicit_remote_evidence"
+    return ""
+
+
+POSTAL_PATTERN = r"[A-Z]\d[A-Z][ -]?\d[A-Z]\d"
+STREET_PATTERN = re.compile(
+    r"\b\d{1,6}\s+[A-Z0-9][A-Za-z0-9.'-]*(?:\s+[A-Za-z0-9.'-]+){0,6}\s+"
+    r"(?:Street|St\.?|Avenue|Ave\.?|Road|Rd\.?|Drive|Dr\.?|Boulevard|Blvd\.?|Way|"
+    r"Parkway|Pkwy\.?|Crescent|Cres\.?|Court|Ct\.?|Lane|Ln\.?|Trail|Highway|Hwy\.?|"
+    r"Terrace|Ter\.?|Place|Pl\.?|Square|Sq\.?|Circle|Cir\.?|Gate|Gardens?|Garden|"
+    r"Manor|Mews|Path|Row|Quay)\b",
+    re.I,
+)
+WORKPLACE_CUE = re.compile(
+    r"\b(?:work(?:place|\s+locations?)?|job\s+locations?|locations?|sites?|centres?|centers?|office|"
+    r"based|located|report(?:ing)?\s+to|float\s+(?:between|across|among)|work\s+at)\b",
+    re.I,
+)
+NON_WORKPLACE_CUE = re.compile(r"\b(?:headquarters|corporate|mailing|registered)\s+(?:address|office)?\b", re.I)
+
+
+def _address_evidence(description: str, match: re.Match[str], next_start: int | None = None) -> tuple[str, str]:
+    end_limit = min(len(description), next_start if next_start is not None else match.end() + 120)
+    tail = description[match.end():end_limit]
+    postal = re.search(POSTAL_PATTERN, tail, re.I)
+    end = match.end() + postal.end() if postal else match.end()
+    start = match.start()
+    line_start = max(description.rfind("\n", 0, start) + 1, description.rfind("|", 0, start) + 1)
+    line_end_candidates = [value for value in (description.find("\n", end), description.find("|", end)) if value >= 0]
+    line_end = min(line_end_candidates) if line_end_candidates else end
+    evidence = clean(description[line_start:max(end, line_end)]).strip(" -•;|")
+    if len(evidence) > 260:
+        evidence = clean(description[max(line_start, start - 80):end])
+    address = clean(description[start:end]).strip(" ,;-")
+    return address, evidence or address
+
+
+def extract_workplace_alternatives(row: dict[str, Any], description: str) -> list[dict[str, Any]]:
+    """Return every explicit advertised workplace without choosing an assigned site."""
+    supplied = row.get("workplace_alternatives")
+    if isinstance(supplied, list):
+        return [dict(item) for item in supplied if isinstance(item, dict) and clean(item.get("address") or item.get("postal_code"))]
+    raw_fields = [(key, clean(row.get(key))) for key in ("workplace_address", "address", "street_address", "office_address", "office_location", "location")]
+    field_key, field_value = next(
+        ((key, value) for key, value in raw_fields if value and (key != "location" or STREET_PATTERN.search(value) or re.search(POSTAL_PATTERN, value, re.I))),
+        ("", ""),
+    )
+    candidates: list[dict[str, Any]] = []
+    if field_value:
+        postal_match = re.search(POSTAL_PATTERN, field_value, re.I)
+        candidates.append({
+            "address": field_value,
+            "postal_code": postal_match.group(0).upper() if postal_match else clean(row.get("postal_code") or row.get("zip_code")),
+            "precision": "street address" if STREET_PATTERN.search(field_value) else "postal code" if postal_match else "city",
+            "confidence": 95 if STREET_PATTERN.search(field_value) else 88 if postal_match else 65,
+            "evidence": field_value,
+            "evidence_source": "provider location" if field_key == "location" else "provider field",
+            "assignment_status": "confirmed",
+        })
+    matches = list(STREET_PATTERN.finditer(description or ""))
+    for index, match in enumerate(matches):
+        context = (description or "")[max(0, match.start() - 180):match.start()]
+        # Provider/PDF descriptions often flatten a workplace list onto one
+        # line.  Evaluate each address against its nearby evidence instead of
+        # allowing an unrelated cue elsewhere in the posting to authorize all
+        # street-shaped numbers.
+        nearby_context = (description or "")[max(0, match.start() - 240):min(len(description or ""), match.end() + 80)]
+        if NON_WORKPLACE_CUE.search(nearby_context[-150:]):
+            continue
+        if not WORKPLACE_CUE.search(context):
+            continue
+        address, evidence = _address_evidence(description, match, matches[index + 1].start() if index + 1 < len(matches) else None)
+        postal_match = re.search(POSTAL_PATTERN, address, re.I)
+        canonical = clean(STREET_PATTERN.search(address).group(0) if STREET_PATTERN.search(address) else address).lower()
+        if any(clean(item.get("address")).lower().startswith(canonical) or canonical.startswith(clean(item.get("address")).lower()) for item in candidates):
+            continue
+        candidates.append({
+            "address": address,
+            "postal_code": postal_match.group(0).upper() if postal_match else "",
+            "precision": "street address",
+            "confidence": 95,
+            "evidence": evidence,
+            "evidence_source": "description advertised workplace",
+            "assignment_status": "advertised_alternative" if len(matches) > 1 else "confirmed",
+        })
+    if len(candidates) > 1:
+        for item in candidates:
+            item["assignment_status"] = "advertised_alternative"
+    return candidates
+
+
+def extract_workplace_location(row: dict[str, Any], description: str, provider_location: str) -> dict[str, Any]:
+    """Preserve alternatives and populate legacy fields only for one confirmed site."""
+    alternatives = extract_workplace_alternatives(row, description)
+    if len(alternatives) > 1:
+        return {
+            "display_location": provider_location or f"{len(alternatives)} advertised workplace alternatives",
+            "address": "", "postal_code": "", "evidence": "", "evidence_source": "",
+            "precision": "multiple alternatives", "confidence": 95, "alternatives": alternatives,
+        }
+    if alternatives:
+        item = alternatives[0]
+        legacy_address_match = STREET_PATTERN.search(clean(item.get("address")))
+        explicitly_labelled = bool(re.match(r"\s*(?:work\s+)?location\s*:", clean(item.get("evidence")), re.I))
+        preserve_provider_value = clean(item.get("evidence_source")) == "provider location"
+        legacy_address = clean(item.get("address")) if explicitly_labelled or preserve_provider_value else clean(legacy_address_match.group(0)) if legacy_address_match else clean(item.get("address"))
+        return {
+            "display_location": clean(item.get("address")) or provider_location,
+            "address": legacy_address, "postal_code": clean(item.get("postal_code")),
+            "evidence": clean(item.get("evidence")), "evidence_source": clean(item.get("evidence_source")),
+            "precision": clean(item.get("precision")), "confidence": int(item.get("confidence") or 0),
+            "alternatives": alternatives,
+        }
+    postal_match = re.search(POSTAL_PATTERN, description or "", re.I)
+    if postal_match:
+        context_start = max(0, postal_match.start() - 180)
+        context = clean((description or "")[context_start:postal_match.end()])
+        if re.search(r"\b(?:work\s+location|location|commute|relocate|hybrid(?:\s+remote)?\s+in|based\s+in|located\s+in)\b", context, re.I):
+            postal = postal_match.group(0).upper().replace("-", " ")
+            evidence_start = max(0, description.rfind("\n", context_start, postal_match.start()) + 1)
+            evidence = clean(description[evidence_start:postal_match.end()]).strip(" -•;|")
+            display = provider_location
+            if postal.lower() not in display.lower():
+                display = f"{display}, {postal}" if display else postal
+            return {
+                "display_location": display, "address": display, "postal_code": postal,
+                "evidence": evidence or context, "evidence_source": "description advertised postal code",
+                "precision": "postal code", "confidence": 88, "alternatives": [],
+            }
+    postal = clean(row.get("postal_code") or row.get("zip_code") or row.get("workplace_postal_code"))
+    if not postal:
+        provider_postal = re.search(POSTAL_PATTERN, provider_location or "", re.I)
+        postal = provider_postal.group(0).upper().replace("-", " ") if provider_postal else ""
+    return {
+        "display_location": provider_location, "address": "", "postal_code": postal,
+        "evidence": "", "evidence_source": "", "precision": "postal code" if postal else ("city" if provider_location else "unknown"),
+        "confidence": 88 if postal else (65 if provider_location else 0), "alternatives": [],
+    }
+
+
+SECTION_HEADINGS = [
+    ("required", r"what\s+you\s+need\s+to\s+succeed|what\s+we(?:'re|\s+are|’re)\s+looking\s+for|"
+                 r"required\s+qualifications?|minimum\s+qualifications?|requirements?|what\s+you\s+bring|"
+                 r"who\s+you\s+are|your\s+background|core\s+skills(?:\s+and\s+experience)?|"
+                 r"skills\s*(?:,\s*|and\s+)?experience\s*(?:&|and)\s*requirements?"),
+    ("preferred", r"preferred\s+qualifications?|preferred|nice\s+to\s+have|bonus|assets?"),
+    ("unclassified", r"technologies\s+that\s+we\s+use(?:\s*\([^)]*\))?|our\s+core\s+stack\s+includes|"
+                     r"why\s+join\s+us|perks?\s*(?:&|and)\s*benefits?|about\s+(?:us|the\s+company)|"
+                     r"equal\s+employment\s+opportunity|additional\s+notes"),
+]
+
+
+def _section_markers(description: str) -> list[tuple[int, str, str]]:
+    markers = []
+    for importance, pattern in SECTION_HEADINGS:
+        # ATS HTML frequently drops both heading tags and the colon, leaving
+        # strings such as "What you need to succeed - Git" or
+        # "Preferred qualifications Kubernetes".  Require a sentence/line
+        # boundary before a heading so ordinary prose is not promoted, while
+        # accepting colon, bullet, line, and flattened title-to-value joins.
+        heading_pattern = (
+            rf"(?im)(?:^|(?<=[.!?]))\s*(?P<heading>{pattern})\b\s*:??"
+            rf"(?=$|[\n:•*-]|\s+[A-Z0-9])"
+        )
+        for match in re.finditer(heading_pattern, description or ""):
+            heading = clean(match.group("heading"))
+            markers.append((match.start("heading"), importance, heading))
+    return sorted(markers)
+
+
+def requirement_phrase_evidence(description: str, phrases: tuple[str, ...]) -> tuple[str, str]:
+    """Classify all phrase occurrences; explicit required evidence wins."""
+    markers = _section_markers(description)
+    observations: list[tuple[str, str]] = []
+    for phrase in phrases:
+        pattern = r"(?<![a-z0-9])" + r"\s+".join(re.escape(part) for part in phrase.split()) + r"(?![a-z0-9])"
+        for match in re.finditer(pattern, description or "", re.I):
+            preceding = [item for item in markers if item[0] < match.start()]
+            importance = preceding[-1][1] if preceding else "unclassified"
+            context = clean((description or "")[max(0, match.start() - 170):min(len(description), match.end() + 170)])
+            # Provider HTML is often flattened.  Keep wording overrides inside
+            # the current section so an earlier "you'll be exposed to" stack
+            # cannot leak across a later required-section heading.
+            section_start = preceding[-1][0] if preceding else 0
+            before = clean((description or "")[max(section_start, match.start() - 170):match.start()]).lower()
+            if re.search(r"\b(?:preferred|nice\s+to\s+have|bonus|asset)\b", before):
+                importance = "preferred"
+            elif re.search(r"\b(?:not\s+required|you\s+will\s+be\s+exposed\s+to|technologies\s+that\s+we\s+use)\b", before):
+                importance = "unclassified"
+            elif re.search(r"\b(?:must|required|proficien(?:t|cy)|strong\s+[^.]{0,70}\s+skills?|hands-on\s+experience|experience\s+(?:with|using)|you\s+build\s+with)\b", before):
+                importance = "required"
+            observations.append((importance, context))
+    for wanted in ("required", "preferred", "unclassified"):
+        evidence = next((snippet for importance, snippet in observations if importance == wanted), "")
+        if evidence:
+            return wanted, evidence
+    return "unclassified", ""
+
+
+KEYWORD_CAPABILITIES = [
+    ("full-stack development", ("full-stack development", "full stack development")),
+    ("python", ("python",)), ("react", ("react",)), ("redux", ("redux",)),
+    ("postgresql", ("postgresql", "postgres")), ("aws", ("aws",)),
+    ("ai api/model experience", ("ai apis/models", "ai apis", "ai models")),
+    ("agentic coding tools", ("ai coding agents", "agentic coding tool", "claude code", "cursor")),
+    ("agile project management tools", ("agile project management tools",)),
+    ("git", ("git",)), ("typescript", ("typescript",)), ("nodejs", ("nodejs", "node.js")),
+    ("nestjs", ("nestjs",)), ("javascript", ("javascript",)), ("java", ("java",)),
+    ("go", ("golang",)), ("c++", ("c++",)), ("c#", ("c#",)),
+    ("kubernetes", ("kubernetes",)), ("docker", ("docker",)), ("sql", ("sql",)),
+    ("api", ("apis", "api")),
+]
+
+
+def extract_keyword_requirements(description: str) -> tuple[str, str]:
+    required, preferred = [], []
+    for canonical, phrases in KEYWORD_CAPABILITIES:
+        importance, evidence = requirement_phrase_evidence(description, phrases)
+        if not evidence:
+            continue
+        target = required if importance == "required" else preferred if importance == "preferred" else None
+        if target is not None and canonical not in target:
+            target.append(canonical)
+    # An explicit AI-API capability is not also a generic API requirement.
+    if "ai api/model experience" in required and "api" in required:
+        required.remove("api")
+    if "ai api/model experience" in preferred and "api" in preferred:
+        preferred.remove("api")
+    return ", ".join(required), ", ".join(preferred)
+
+
+def _evidence_records(description: str, patterns: list[tuple[str, str]]) -> list[dict[str, Any]]:
+    records = []
+    for category, pattern in patterns:
+        for match in re.finditer(pattern, description or "", re.I):
+            value = clean(match.group(0)).strip(" .;•-")
+            if value and value.lower() not in {clean(item["value"]).lower() for item in records}:
+                records.append({"value": value, "category": category, "evidence": value, "confidence": 90})
+    return records
+
+
+def extract_explicit_credentials(description: str) -> list[dict[str, Any]]:
+    return _evidence_records(description, [
+        ("education", r"\b(?:bachelor(?:’|')?s?|master(?:’|')?s?)\s+degree\b[^.;\n]{0,110}"),
+        ("education", r"\b(?:diploma|degree)\s+in\s+early\s+childhood\s+education\b[^.;\n]{0,90}"),
+        ("registration", r"\b(?:registered|registration|good\s+standing)\s+with\s+(?:the\s+)?(?:Ontario\s+)?College\s+of\s+(?:Early\s+Childhood\s+Educators|ECE)\b[^.;\n]{0,90}"),
+        ("safety", r"\b(?:standard\s+)?first\s+aid(?:\s+and|/|\s*,\s*)\s*CPR(?:\s+(?:level\s+)?[A-C])?\b"),
+    ])
+
+
+def extract_explicit_benefits(description: str) -> list[dict[str, Any]]:
+    """Extract only employee perks, retaining a nearby source excerpt.
+
+    A bare word such as ``dental`` is not a benefit: employer marketing can
+    discuss dental-insurance products or technology.  Each candidate therefore
+    needs an employment-perk context (or a benefit heading immediately before
+    it) before it becomes structured data.
+    """
+    patterns = [
+        ("time off", r"\b(?:generous\s+)?PTO(?:\s*[-:]\s*\d+\s+vacation\s+days)?\b"),
+        ("time off", r"\bpaid\s+time\s+off\b"),
+        ("time off", r"\b(?:\d+|one|two|three|four|five|six)\s+weeks?\s+of\s+vacation\b"),
+        ("time off", r"\b(?:winter|company|office|paid)\s+holidays?\s+(?:office\s+)?closure\b"),
+        ("health", r"\bdental\s+(?:and\s+)?vision\s+(?:benefits?|coverage|plan)\b|\bvision\s+(?:and\s+)?dental\s+(?:benefits?|coverage|plan)\b|\b(?:health\s+and\s+)?dental\s+(?:benefits?|coverage|plan)\b|\bextended\s+health(?:\s+benefits?)?\b"),
+        ("health", r"\bdental\b|\bvision\b"),
+        ("development", r"\btuition\s+reimbursement\b|\btuition\s+assistance\b"),
+        ("family", r"\bon[- ]site\s+(?:childcare|child\s+care)\b|\bon[- ]site\s+daycare\b"),
+        ("health", r"\bcomprehensive\s+benefits(?:\s+plan|\s+program)?\b[^.;\n]{0,100}"),
+        ("health", r"\bhealth\s+care\s+spending\s+account\b"),
+        ("family", r"\bparental\s+leave\s+top-up\b"),
+        ("equity", r"\bstock\s+options?(?:\s+plan)?\b"),
+        ("development", r"\b(?:learning\s+and\s+development|L&D|professional\s+development)\s+budget\b"),
+        ("development", r"\bAI\s+tooling\s+budget\b"),
+        ("equipment", r"\bMacBook\b[^.;\n]{0,90}\bequipment\b"),
+        ("time off", r"\b\d+\s+personal\s+days\b"),
+    ]
+    records: list[dict[str, Any]] = []
+    for category, pattern in patterns:
+        for match in re.finditer(pattern, description or "", re.I):
+            excerpt = benefit_source_excerpt(description, match.start(), match.end())
+            if not excerpt:
+                continue
+            value = clean(match.group(0)).strip(" .;•-")
+            existing_values = [clean(item["value"]).lower() for item in records]
+            if value and not any(value.lower() == existing or value.lower() in existing for existing in existing_values):
+                records.append({"value": value, "category": category, "evidence": excerpt, "confidence": 90})
+    return records
+
+
+def benefit_source_excerpt(description: str, start: int, end: int) -> str:
+    """Return a bounded employee-benefit sentence or an empty string."""
+    text_value = description or ""
+    sentence_start = max(text_value.rfind(".", 0, start), text_value.rfind("\n", 0, start), text_value.rfind(";", 0, start)) + 1
+    sentence_end_candidates = [index for index in (text_value.find(".", end), text_value.find("\n", end), text_value.find(";", end)) if index >= 0]
+    sentence_end = min(sentence_end_candidates) if sentence_end_candidates else min(len(text_value), end + 180)
+    sentence = clean(text_value[sentence_start:sentence_end]).strip(" •-:")
+    nearby_heading = clean(text_value[max(0, start - 240):start])
+    context = f"{nearby_heading} {sentence}".lower()
+    product_context = re.search(r"\b(?:our|the)\s+(?:product|product suite|platform|technology|service)s?\b|\binsurance\s+(?:product|policy|solution)\b", sentence, re.I)
+    benefit_context = re.search(
+        r"\b(?:benefits?|perks?|why\s+join|we\s+(?:offer|provide|cover)|employees?|team members?|vacation|pto|parental|stock\s+option|spending\s+account|personal\s+days|holiday\s+closure|budget|equipment)\b",
+        context,
+    )
+    if product_context and not re.search(r"\b(?:employee|employment|perks?|benefits?\s+(?:plan|program|include))\b", context):
+        return ""
+    if not benefit_context:
+        return ""
+    return sentence[:240]
+
+
+def arrangement_evidence(row: dict[str, Any], description: str, remote_type: str, alternatives: list[dict[str, Any]]) -> str:
+    explicit = clean(row.get("remote_type") or row.get("work_arrangement"))
+    if explicit:
+        return f"Provider arrangement: {explicit}"
+    patterns = {
+        "Hybrid": r"\bhybrid\b[^.;\n]{0,150}",
+        "Remote": r"\b(?:fully|100%)?\s*remote\b[^.;\n]{0,150}|\bwork\s+from\s+home\b[^.;\n]{0,120}",
+        "On-site": r"\b(?:on[- ]site|in[- ]person|work\s+at\s+(?:the|our|these)|float\s+(?:between|across|among))\b[^.;\n]{0,150}",
+    }
+    match = re.search(patterns.get(remote_type, r"$^"), description or "", re.I)
+    if match:
+        return clean(match.group(0))
+    if remote_type == "On-site" and alternatives:
+        return "Posting explicitly advertises physical workplace alternatives."
+    return ""
 
 
 def extract_experience_requirement(description: str) -> str:

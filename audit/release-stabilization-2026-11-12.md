@@ -1,0 +1,204 @@
+# PR #18 release-stabilization audit — 2026-11-12
+
+This is a release-gate report, not a claim that all acceptance work is complete.
+No production data, release, tag, or merge was created. PR #18 remained a draft.
+
+## Complete-posting evidence and scoring rules
+
+Correctness is the number of correct extracted values divided by adjudicable
+extracted values. Coverage is the number of correctly extracted source-stated
+values divided by adjudicable source-stated values. A field with no extraction
+has no correctness score; it does not receive a vacuous 100%. Canonical identity
+values supplied from the original page are reported as pass-through checks, not
+as provider-discovery accuracy.
+
+The three complete ECE PDFs and their limited replay were independently reviewed
+in `limited-complete-posting-check-2026-11-11.md`. On 2026-11-12 the cloud proxy
+returned `CONNECT 403` for each original PDF host:
+
+- `wp.villacharities.com`
+- `mothercraft.ca`
+- `professionallearninghub.ca`
+
+The earlier complete snapshots therefore could not be re-retrieved. They remain
+historical evidence, not a new live-opening pass. Fresh complete originals for
+[PolicyMe](https://jobs.lever.co/policyme/30e81807-adb5-44a9-baad-4beb75913694)
+and [Rose Rocket](https://jobs.ashbyhq.com/Rose%20Rocket/5ae4082e-4c3e-416f-a063-b00398e71542)
+both returned HTTP 200 and complete JobPosting descriptions on 2026-11-12.
+
+## Field-level results
+
+### Three complete ECE PDFs (historical snapshots)
+
+| Field | Correctness | Coverage | Result |
+| --- | ---: | ---: | --- |
+| Advertised hourly salary endpoints/cadence | 3/3 | 3/3 | Exact source ranges retained |
+| Annualized salary with source-stated weekly hours | 1/1 | 1/1 | Mothercraft's 35-hour schedule produced CAD 44,535–51,615 |
+| Explicit numeric experience | 1/1 | 1/1 | Mothercraft's 1–2 years retained; Villa's 50-year organization history excluded |
+| Street workplace address | N/A (0 extracted) | 0/7 | Seven stated alternatives cannot be represented by the current single-address field |
+| Workplace postal code | N/A (0 extracted) | 0/2 | Both Villa postal codes were omitted |
+| Arrangement | N/A (0 extracted) | 0/2 | Physical-attendance evidence remained `Unknown` in the scoped replay |
+| Benefits | N/A (0 extracted) | 0/2 postings | Source text retained, but no structured benefit values exist |
+| Title, employer, canonical application URL | Not evaluated | Not evaluated | These were supplied to the scoped description replay |
+
+### Two fresh, complete early-career SWE originals
+
+| Field | Correctness | Coverage | Result |
+| --- | ---: | ---: | --- |
+| Title | 2/2 pass-through | 2/2 | Exact employer-page title retained |
+| Employer | 2/2 pass-through | 2/2 | Exact hiring organization retained |
+| Canonical original URL | 2/2 pass-through | 2/2 | Both stored URLs opened the original HTTP 200 posting |
+| Advertised annual salary endpoints/currency | 2/2 | 2/2 | PolicyMe CAD 80,000–110,000; Rose Rocket CAD 72,000–88,000 |
+| City/country location | 2/2 pass-through | 2/2 | Canada and Toronto retained |
+| Remote/hybrid arrangement | 2/2 structured-source pass-through | 2/2 | PolicyMe Remote; Rose Rocket Hybrid |
+| Street address/postal code | 0 false-present values | N/A (none source-stated) | No address was fabricated |
+| Numeric experience | 0 false-present values | N/A (none source-stated) | No numeric minimum was invented |
+| Source-stated credential | N/A (0 extracted) | 0/1 | Rose Rocket's degree requirement remained only in description text |
+| Mandatory technologies/capabilities | N/A (0 classified mandatory) | 0/9 adjudicated values | PolicyMe's required stack/AI capability and Rose Rocket's Git/agentic/agile requirements remained unclassified |
+| Benefits | N/A (0 extracted) | 0/2 postings | Both pages advertise benefits, retained only in description text |
+
+The two-posting sample is useful defect evidence but is too small for a release
+accuracy claim. It also shows why correctness and coverage must remain separate:
+returning no structured credential, benefit, or mandatory-technology values
+avoids fabrication but has zero extraction coverage.
+
+## Address and straight-line distance verification
+
+The Villa Charities snapshot identifies two distinct childcare workplaces:
+70 Playfair Avenue, Toronto, ON M6B 2P9 and 340 Falstaff Avenue, Toronto, ON
+M6L 3E7. Nominatim independently returned the matching house number, street,
+and postal code for each on 2026-11-12:
+
+| Address | Coordinate | Precision evidence |
+| --- | --- | --- |
+| 70 Playfair Avenue, M6B 2P9 | 43.7110390, -79.4594629 | house 70, Playfair Avenue, M6B 2P9 |
+| 340 Falstaff Avenue, M6L 3E7 | 43.7205044, -79.4822959 | house 340, Falstaff Avenue, M6L 3E7 |
+
+The public Canadian postal-code origin M5H 2N2 resolved to the postal centroid
+43.6532898, -79.3842134. Great-circle distances from that same origin are
+8.823 km and 10.865 km. The application rounds them to 9 km and 11 km. The
+destinations are address-level results; they are not Toronto city-centre
+estimates. The origin is explicitly a postal centroid and is not represented as
+the applicant's private address.
+
+## SWE shortlist validation
+
+The private candidate résumé is not present in the executor, Codex task
+artifacts, or the common private attachment paths. It was not reconstructed
+from repository fixtures. Of the 20 previously recorded original URLs, 12
+currently return complete HTTP 200 postings and eight return HTTP 404; this is
+not a 15-posting active early-career holdout. Consequently TP, FP, FN, TN,
+precision, recall, and candidate-specific unverified technologies remain
+unmeasured.
+
+The fresh Rose Rocket replay did demonstrate one source-independent false
+positive: technical items existed, but none were classified mandatory, so
+`all([])` produced `Strong technical match` even with empty résumé evidence.
+The release-stabilization fix now returns `Possible / stretch — evidence
+incomplete` whenever there is no classified required-technology set. Missing
+résumé evidence remains `Unverified`, never confirmed no experience.
+
+To close this gate, securely supply the candidate résumé and at least 15 complete
+authentic posting snapshots outside the repository, with independent labels
+assigned before Job Tracker output is viewed. Follow
+`complete-posting-acceptance-procedure.md`; do not commit the inputs or applicant
+data.
+
+## Windows version lifecycle (superseded scope clarification)
+
+The detailed, current evidence is in
+`audit/final-release-acceptance-2026-11-13.md`. The former wording in this
+section incorrectly called ci.29 schema-compatible. It is corrected as follows:
+
+1. Historical `0.0.0-ci.8` successfully created a saved job and `Applied`
+   status using schema 9.
+2. The then-current installer migrated that disposable database to schema 14,
+   retained both values, and created a pre-migration backup.
+3. `0.0.0-ci.29` declares schema 13 and is therefore incompatible with schema
+   14. The lifecycle script deliberately skipped starting it against the
+   upgraded database.
+4. The current installer was reinstalled and the schema-14 data was retained.
+
+The success is evidence of schema 9-to-14 migration, preservation, and safe
+refusal of an unsafe rollback. **It is not evidence that current-schema rollback
+was tested.** A compatible historical binary is required for that test. The
+historical ci.8 binary has no clean-exit endpoint and was process-scoped
+force-stopped only after committed writes.
+
+## Release decision
+
+Targeted Linux regressions after the shortlist fix: 288 passed, 1 skipped;
+`node --check static/app.js` passed. The historical Windows gate passed only
+the schema 9-to-14 migration and unsafe-rollback refusal described above; it
+did not run a compatible rollback. PR #18 is still **not ready for final review
+or merge** until the representative complete-posting extraction audit and the
+candidate-specific 15-posting SWE shortlist audit are completed.
+
+## Accuracy-stabilization follow-up
+
+This follow-up distinguishes live employer retrieval from supplied-snapshot
+validation. PolicyMe and Rose Rocket were retrieved again from their original
+ATS pages on 2026-11-12 (HTTP 200). The complete ECE PDFs were not present in
+the task workspace and their hosts still could not be retrieved through the
+cloud proxy. The Villa regression uses the two exact, independently documented
+address/postal pairs above. It is not represented as a fresh replay of the
+complete PDF. No Mothercraft address was reconstructed from memory.
+
+### Before/after structured extraction
+
+Correctness counts only extracted, adjudicable facts. Coverage counts correctly
+extracted independently labelled facts. `N/A` remains appropriate when the
+complete source snapshot needed to adjudicate a field is unavailable.
+
+| Scope / field | Before correctness | Before coverage | After correctness | After coverage |
+| --- | ---: | ---: | ---: | ---: |
+| ECE street workplace alternatives | N/A (0 extracted) | 0/7 | 2/2 | 2/7 |
+| ECE workplace postal codes | N/A (0 extracted) | 0/2 | 2/2 | 2/2 |
+| ECE per-site straight-line distance | N/A (0 calculated) | 0/2 verified sites | 2/2 | 2/2 verified sites |
+| ECE arrangement / credentials / benefits | N/A | 0/2 postings | N/A — complete PDFs unavailable | Unresolved |
+| SWE mandatory technologies/capabilities | N/A (0 mandatory) | 0/9 | 9/9 labelled values | 9/9 |
+| SWE exposed-stack non-requirements | 0 false positives | 2/2 postings retained only in text | 6/6 checked values not promoted | 6/6 checked values |
+| SWE source-stated credential | N/A (0 extracted) | 0/1 | 1/1 | 1/1 |
+| SWE advertised benefits | N/A (0 extracted) | 0/2 postings | 2/2 posting-level checks | 2/2 postings |
+| SWE arrangement evidence | 2/2 provider pass-through | 2/2 | 2/2 with stored source/provider evidence | 2/2 |
+
+PolicyMe now yields the six adjudicated mandatory values Python, React, Redux,
+PostgreSQL, AWS, and AI API/model experience. Its explicit full-stack capability
+is also retained with a source snippet but is reported separately from the
+nine-value independent label set. Rose Rocket yields the three adjudicated
+mandatory capabilities agentic coding tools, agile project-management tools,
+and Git. NodeJS/NestJS/TypeScript, React, PostgreSQL, AWS, Docker, and Kubernetes
+remain unclassified because the posting says the hire will be exposed to them.
+An empty résumé leaves the three mandatory Rose Rocket capabilities
+`Unverified` and cannot produce `Strong technical match`.
+
+### Representation and distance behavior
+
+Schema 14 adds JSON evidence fields for workplace alternatives, credentials,
+benefits, and arrangement evidence. A migration converts an existing singular
+workplace to one `confirmed` alternative without changing the legacy columns.
+When more than one workplace is advertised, the singular assigned-workplace
+fields remain empty, every alternative retains its own evidence and precision,
+and the UI states that the assigned site is not confirmed. Each verified
+address receives its own coordinate and straight-line distance; the application
+does not substitute the closest option as the applicant's workplace.
+
+Using the independently verified coordinates already recorded in this report,
+the application regression produces 9 km for 70 Playfair Avenue and 11 km for
+340 Falstaff Avenue from the M5H 2N2 postal centroid. The underlying independent
+measurements remain 8.823 km and 10.865 km. The top-level distance stays unknown
+because no assigned site is known.
+
+### Remaining acceptance gates
+
+- Reattach the complete Villa Charities and Mothercraft posting snapshots
+  securely to re-run all seven workplace alternatives and the ECE arrangement,
+  credential, and benefit labels end to end. In particular, the five
+  Mothercraft alternatives cannot be audited from the current workspace.
+- Supply the private candidate résumé and at least 15 independently labelled,
+  complete early-career SWE snapshots for candidate-specific precision, false
+  positive, and false negative measurement. The résumé must remain outside git.
+- Unit and hosted Windows results for this follow-up must be recorded from the
+  exact final commit before this document can support a release-readiness claim.
+
+PR #18 therefore remains a draft and is not yet ready for final review or merge.
