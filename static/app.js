@@ -1184,7 +1184,7 @@ async function runSavedSearch(id) {
 
 function discoveryInboxCategory(job) {
   if (String(job.status || "") === "Applied") return "applied";
-  if (String(job.discovery_state || "") === "ignored") return "skipped";
+  if (["ignored", "skipped"].includes(String(job.discovery_state || ""))) return "skipped";
   if (String(job.discovery_state || "") === "saved") return "saved";
   if (String(job.discovery_result_category || "") === "excluded") return "excluded";
   if (String(job.discovery_result_category || "") === "review_required") return "review_required";
@@ -1238,9 +1238,9 @@ function updateInboxLocalJob(id, updates) {
 async function reviewInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/review`, "POST", {}); updateInboxLocalJob(id, { discovery_state: "reviewed" }); } catch (error) { toast(error.message); } }
 async function ignoreInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/ignore`, "POST", { candidate_profile_id: value("discovery-profile") || state.selectedCandidateProfileId || "" }); updateInboxLocalJob(id, { discovery_state: "ignored" }); } catch (error) { toast(error.message); } }
 async function restoreInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/restore`, "POST", { candidate_profile_id: value("discovery-profile") || state.selectedCandidateProfileId || "" }); updateInboxLocalJob(id, { discovery_state: "new", status: "Discovered" }); toast("Job restored to new matches"); } catch (error) { toast(error.message); } }
-async function applyInboxJob(id) { try { const applied = await api.send(`/api/discovery/inbox/${id}/applied`, "POST", {}); toast("Marked applied; the original posting remains in Applied history."); updateInboxLocalJob(id, { status: "Applied", date_applied: applied.date_applied, discovery_state: "applied" }); } catch (error) { toast(error.message); } }
+async function applyInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/applied`, "POST", { applicant_profile_id: value("discovery-profile") || state.selectedCandidateProfileId || "" }); toast("Marked applied for the selected applicant."); updateInboxLocalJob(id, { discovery_state: "applied" }); } catch (error) { toast(error.message); } }
 async function saveInboxJob(id) {
-  try { await api.send(`/api/discovery/inbox/${id}/save`, "POST", {}); toast("Saved for later"); updateInboxLocalJob(id, { status: "Saved", discovery_state: "saved" }); }
+  try { await api.send(`/api/discovery/inbox/${id}/save`, "POST", { applicant_profile_id: value("discovery-profile") || state.selectedCandidateProfileId || "" }); toast("Saved for the selected applicant"); updateInboxLocalJob(id, { discovery_state: "saved" }); }
   catch (error) { toast(error.message); }
 }
 
@@ -2492,7 +2492,7 @@ function applyDiscoverySearchDefaults() {
   setValue("discovery-sort-mode", "best_match");
   setValue("discovery-distance", "");
   setValue("discovery-per-source-cap", 100);
-  setValue("discovery-new-matching-target", 25);
+  setValue("discovery-new-matching-target", 50);
   setChecked("discovery-bypass-cache", false);
 }
 

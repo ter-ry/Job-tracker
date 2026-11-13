@@ -97,7 +97,7 @@ _ACTIVE_DISCOVERY_SEARCHES_LOCK = threading.Lock()
 MAX_FETCH_BYTES = 1_200_000
 # Google remains a backend compatibility key for historical diagnostics, but
 # is intentionally not exposed as a selectable source in the UI.
-DISCOVERY_SOURCES = ["linkedin", "indeed", "zip_recruiter", "glassdoor", "google"]
+DISCOVERY_SOURCES = ["linkedin", "indeed", "zip_recruiter", "glassdoor"]
 GENERATED_APPLICATIONS_DIRNAME = "generated_applications"
 SEMANTIC_CACHE_DIRNAME = "semantic_cache"
 RESTORABLE_SHORTLIST_STATUSES = {"Archived", "Rejected", "Saved", "Drafting"}
@@ -1925,8 +1925,9 @@ def create_app() -> Flask:
     @app.get("/api/discovery/inbox")
     def discovery_inbox() -> Response:
         include_history = as_bool(request.args.get("include_history"))
+        applicant_id = applicant_profile_id(request.args)
         query = "SELECT * FROM jobs WHERE discovery_first_seen_at <> ''"
-        if not include_history:
+        if not include_history and not applicant_id:
             query += " AND discovery_state NOT IN ('ignored', 'saved', 'applied') AND status NOT IN ('Applied', 'shortlisted')"
         query += " ORDER BY discovery_state = 'new' DESC, discovery_last_seen_at DESC, id DESC LIMIT 500"
         rows = query_db(
@@ -1943,9 +1944,15 @@ def create_app() -> Flask:
         jobs = []
         for row in rows:
             item = job_to_dict(row, evidence_profile, include_legacy_details=False, preparation_status=statuses.get(int(row["id"])))
+            state = applicant_discovery_state(int(row["id"]), applicant_id)
+            if state:
+                item["discovery_state"] = state
+                item["applicant_discovery_state"] = state
+            if applicant_id and not include_history and state in {"skipped", "saved", "applied"}:
+                continue
             if text(item.get("status")) == "Applied":
                 category = "applied"
-            elif text(item.get("discovery_state")) == "ignored":
+            elif text(item.get("discovery_state")) in {"ignored", "skipped"}:
                 category = "skipped"
             elif text(item.get("discovery_state")) == "saved":
                 category = "saved"
@@ -1974,13 +1981,13 @@ def create_app() -> Flask:
         if row is None:
             return jsonify({"error": "Discovered job not found"}), 404
         payload = request.get_json(silent=True) or {}
-        requested_profile = clamp_int(payload.get("candidate_profile_id"), 0, 10**9)
-        stored_profile = clamp_int(row["candidate_profile_id"], 0, 10**9)
-        if stored_profile and requested_profile != stored_profile:
-            return jsonify({"error": "This discovery result belongs to a different applicant profile."}), 409
-        get_db().execute("UPDATE jobs SET discovery_state = 'ignored', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
+        profile_id = applicant_profile_id(payload)
+        if profile_id:
+            set_applicant_discovery_state(job_id, profile_id, "skipped")
+        else:
+            get_db().execute("UPDATE jobs SET discovery_state = 'ignored', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
         get_db().commit()
-        return jsonify({"ok": True, "candidate_profile_id": stored_profile or requested_profile})
+        return jsonify({"ok": True, "applicant_profile_id": profile_id})
 
     @app.post("/api/discovery/inbox/<int:job_id>/restore")
     def restore_discovery_job(job_id: int) -> Response:
@@ -1988,14 +1995,11 @@ def create_app() -> Flask:
         if row is None:
             return jsonify({"error": "Discovered job not found"}), 404
         payload = request.get_json(silent=True) or {}
-        requested_profile = clamp_int(payload.get("candidate_profile_id"), 0, 10**9)
-        stored_profile = clamp_int(row["candidate_profile_id"], 0, 10**9)
-        if stored_profile and requested_profile != stored_profile:
-            return jsonify({"error": "This discovery result belongs to a different applicant profile."}), 409
-        get_db().execute(
-            "UPDATE jobs SET discovery_state = 'new', status = CASE WHEN status IN ('Saved', 'Discovered') THEN 'Discovered' ELSE status END, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            [job_id],
-        )
+        profile_id = applicant_profile_id(payload)
+        if profile_id:
+            get_db().execute("DELETE FROM discovery_applicant_states WHERE job_id = ? AND applicant_profile_id = ?", [job_id, profile_id])
+        else:
+            get_db().execute("UPDATE jobs SET discovery_state = 'new', status = CASE WHEN status IN ('Saved', 'Discovered') THEN 'Discovered' ELSE status END, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
         get_db().commit()
         return jsonify(job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True), include_legacy_details=False))
 
@@ -2004,10 +2008,11 @@ def create_app() -> Flask:
         row = query_db("SELECT * FROM jobs WHERE id = ? AND discovery_first_seen_at <> ''", [job_id], one=True)
         if row is None:
             return jsonify({"error": "Discovered job not found"}), 404
-        get_db().execute(
-            "UPDATE jobs SET status = 'Saved', discovery_state = 'saved', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            [job_id],
-        )
+        profile_id = applicant_profile_id(request.get_json(silent=True) or {})
+        if profile_id:
+            set_applicant_discovery_state(job_id, profile_id, "saved")
+        else:
+            get_db().execute("UPDATE jobs SET status = 'Saved', discovery_state = 'saved', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
         get_db().commit()
         return jsonify(job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)))
 
@@ -2017,13 +2022,14 @@ def create_app() -> Flask:
         if row is None:
             return jsonify({"error": "Discovered job not found"}), 404
         payload = request.get_json(silent=True) or {}
+        profile_id = applicant_profile_id(payload)
         applied_date = text(payload.get("date_applied")) or date.today().isoformat()
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", applied_date):
             return jsonify({"error": "date_applied must use YYYY-MM-DD"}), 400
-        get_db().execute(
-            "UPDATE jobs SET status = 'Applied', date_applied = ?, discovery_state = 'applied', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            [applied_date, job_id],
-        )
+        if profile_id:
+            set_applicant_discovery_state(job_id, profile_id, "applied", applied_date)
+        else:
+            get_db().execute("UPDATE jobs SET status = 'Applied', date_applied = ?, discovery_state = 'applied', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [applied_date, job_id])
         get_db().commit()
         return jsonify(job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)))
 
@@ -2457,11 +2463,17 @@ def create_app() -> Flask:
         jobs = jobs[: search["total_cap"]]
         manual_run_id = create_discovery_run(None, "manual")
         persisted = persist_discovery_jobs(jobs, None, manual_run_id)
+        selected_applicant_id = applicant_profile_id(payload)
         for item in jobs:
             hydrate_discovery_identity(item)
+            applicant_state = applicant_discovery_state(int(item.get("id") or 0), selected_applicant_id)
+            if applicant_state:
+                item["applicant_discovery_state"] = applicant_state
+                item["discovery_state"] = applicant_state
+                item["processed_discovery"] = applicant_state in {"skipped", "saved", "applied"}
         processed_items = [item for item in jobs if item.get("processed_discovery")]
         processed_count = len(processed_items)
-        skipped_count = sum(1 for item in processed_items if text(item.get("discovery_state")) == "ignored")
+        skipped_count = sum(1 for item in processed_items if text(item.get("discovery_state")) in {"ignored", "skipped"})
         jobs = [item for item in jobs if not item.get("processed_discovery")]
         rank = {"Strong technical match": 0, "Possible / stretch": 1, "Possible / stretch — evidence incomplete": 2, "Significant gaps": 3}
         # `jobs` is already ordered by the user's saved sort preferences.
@@ -2497,13 +2509,9 @@ def create_app() -> Flask:
         diagnostics["unique_jobs_found"] = len(seen_jobs)
         diagnostics["raw_jobs_inspected"] = len(raw_jobs)
         diagnostics["search_complete"] = not bool(fetched.get("errors"))
-        diagnostics["target_unmet_reason"] = (
-            "No further matching results were returned by the selected sources."
-            if len(new_matching_jobs) < requested_target and not fetched.get("errors")
-            else "Provider failures, timeouts, or rate limits interrupted the search. Continue search to retry."
-            if len(new_matching_jobs) < requested_target and fetched.get("errors")
-            else ""
-        )
+        diagnostics["search_termination_reason"] = "target_reached" if len(new_matching_jobs) >= requested_target else ("provider_blocked_or_unavailable" if fetched.get("errors") else ("verified_provider_exhausted" if fetched.get("providers_exhausted") else "request_budget_reached_resumable"))
+        diagnostics["continuation_available"] = bool(len(new_matching_jobs) < requested_target and not fetched.get("providers_exhausted"))
+        diagnostics["target_unmet_reason"] = "" if len(new_matching_jobs) >= requested_target else ("Provider failures, timeouts, or rate limits interrupted the search; continuation is resumable." if fetched.get("errors") else ("All planned distinct provider query batches returned short or empty results." if fetched.get("providers_exhausted") else "The acquisition budget ended before the target; continue search to inspect additional distinct batches."))
         diagnostics["persisted"] = persisted
         diagnostics["jobs_returned_to_frontend"] = len(jobs)
         diagnostics["post_processing_row_count"] = len(jobs)
@@ -2531,6 +2539,8 @@ def create_app() -> Flask:
                     "new_matching_jobs": len(new_matching_jobs),
                     "requested_target": requested_target,
                     "target_unmet_reason": diagnostics["target_unmet_reason"],
+                    "termination_reason": diagnostics["search_termination_reason"],
+                    "continuation_available": diagnostics["continuation_available"],
                     "incomplete": bool(fetched.get("errors")),
                 },
                 "errors": fetched.get("errors", {}),
@@ -2907,6 +2917,34 @@ def normalize_discovery_sources(value: Any) -> list[str]:
     selected = [text(source).lower() for source in value]
     clean = [source for source in selected if source in DISCOVERY_SOURCES]
     return clean or ["linkedin", "indeed"]
+
+
+def applicant_profile_id(payload: Any = None) -> int:
+    """Return the explicitly selected applicant, never the active default profile."""
+    payload = payload or {}
+    return clamp_int(payload.get("applicant_profile_id") or payload.get("candidate_profile_id"), 0, 10**9)
+
+
+def applicant_discovery_state(job_id: int, profile_id: int) -> str:
+    if not job_id or not profile_id:
+        return ""
+    row = query_db(
+        "SELECT state FROM discovery_applicant_states WHERE job_id = ? AND applicant_profile_id = ?",
+        [job_id, profile_id], one=True,
+    )
+    return text(row["state"]) if row else ""
+
+
+def set_applicant_discovery_state(job_id: int, profile_id: int, state: str, applied_date: str = "") -> None:
+    if not job_id or not profile_id:
+        return
+    get_db().execute(
+        """INSERT INTO discovery_applicant_states (job_id, applicant_profile_id, state, date_applied)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(job_id, applicant_profile_id) DO UPDATE SET
+             state = excluded.state, date_applied = excluded.date_applied, updated_at = CURRENT_TIMESTAMP""",
+        [job_id, profile_id, state, applied_date],
+    )
 
 
 def normalize_saved_search_payload(payload: dict[str, Any], existing: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -7321,7 +7359,7 @@ def discovery_search_config(payload: dict[str, Any]) -> dict[str, Any]:
     per_source_cap = clamp_int_default(payload.get("per_source_cap"), preset["per_source_cap"], 1, 1000)
     enabled_sources = normalize_discovery_sources(payload.get("enabled_sources"))
     explicit_target = payload.get("new_matching_target", payload.get("shortlist_size"))
-    requested_target = clamp_int_default(explicit_target, 25, 1, 500)
+    requested_target = clamp_int_default(explicit_target, 50, 1, 500)
     # total_cap is an internal provider inspection budget.  The public target
     # is deliberately separate so a user asking for 25 new matches does not
     # accidentally receive only 25 raw provider rows.
@@ -8496,18 +8534,39 @@ def is_countrywide_search_location(location: str) -> bool:
 
 
 def fetch_discovery_jobs_for_search(search: dict[str, Any], *, country_indeed: str = "Canada") -> dict[str, Any]:
+    """Acquire distinct provider batches without treating a first page as exhaustion.
+
+    JobSpy has no portable offset/cursor argument across all supported boards.
+    We therefore use a stable, de-duplicated sequence of distinct occupation
+    queries and retain the attempted sequence in diagnostics.  A caller may
+    resume with ``continuation_index``; a partial run is never labelled as a
+    provider exhaustion.
+    """
     started = time.monotonic()
     locations = discovery_query_locations(search.get("discovery_location") or search.get("location"))
-    queries = [normalize_space(part) for part in re.split(r"[\n;]+", text(search.get("keywords"))) if normalize_space(part)]
-    queries = list(dict.fromkeys(queries))[:7]
-    per_region = max(1, int(search["request_per_source_cap"]) // (len(locations) * len(queries)))
+    base_queries = [normalize_space(part) for part in re.split(r"[\n;]+", text(search.get("keywords"))) if normalize_space(part)]
+    variants: list[str] = []
+    progressive = bool(search.get("progressive_acquisition") or "requested_target" in search)
+    for query in base_queries:
+        variants.extend([query, f"{query} junior", f"{query} entry level", f"{query} new grad"] if progressive else [query])
+    queries = list(dict.fromkeys(query for query in variants if query))[:28]
+    continuation_index = clamp_int(search.get("continuation_index"), 0, len(queries))
+    queries = queries[continuation_index:]
+    # Keep the first acquisition page at the user-selected per-source budget;
+    # later distinct queries are progressive continuation, not a silent
+    # reduction of the provider page size.
+    batch_count = max(1, len(locations) * len(base_queries))
+    per_region = max(1, int(search["request_per_source_cap"]) // batch_count)
     merged: list[dict[str, Any]] = []
     seen: set[str] = set()
     combined: dict[str, Any] = {"jobs": [], "errors": {}, "source_counts": {}, "source_diagnostics": {}, "source_snapshots": {}}
+    attempted: list[dict[str, str]] = []
+    all_batches_short_or_empty = True
     for location, keyword_query in ((location, query) for location in locations for query in queries):
         if time.monotonic() - started >= DISCOVERY_OVERALL_TIMEOUT_SECONDS:
             combined["errors"]["overall"] = f"Discovery timed out after {DISCOVERY_OVERALL_TIMEOUT_SECONDS}s before all locations completed."
             break
+        attempted.append({"location": location, "keywords": keyword_query})
         result = fetch_jobspy_jobs(
             keywords=keyword_query, location=location, distance=search["distance"],
             remote_preference=search["remote_preference"], job_type=None,
@@ -8515,6 +8574,12 @@ def fetch_discovery_jobs_for_search(search: dict[str, Any], *, country_indeed: s
             enabled_sources=search["enabled_sources"], country_indeed=country_indeed,
             provider_timeout_seconds=DISCOVERY_PROVIDER_TIMEOUT_SECONDS,
         )
+        if result.get("errors"):
+            # Do not repeatedly hammer a provider that has already reported a
+            # timeout/block/rate-limit in this acquisition run.
+            combined["errors"].update(result.get("errors", {}))
+        if len(result.get("jobs", [])) >= per_region:
+            all_batches_short_or_empty = False
         for raw in result.get("jobs", []):
             key = text(raw.get("source_job_id") or raw.get("job_url") or raw.get("job_url_direct"))
             if not key:
@@ -8538,8 +8603,17 @@ def fetch_discovery_jobs_for_search(search: dict[str, Any], *, country_indeed: s
             current["raw_records_row_count"] = int(current.get("raw_records_row_count") or 0) + int(diagnostic.get("raw_records_row_count") or 0)
             current["region_queries"] = locations
             current["success"] = bool(current.get("success") or diagnostic.get("success"))
+        if result.get("errors"):
+            break
     combined["jobs"] = merged
     combined["keyword_queries"] = queries
+    combined["attempted_query_batches"] = attempted
+    combined["continuation_index"] = continuation_index + len(queries)
+    combined["continuation_available"] = bool(combined.get("errors")) or bool(queries and not all_batches_short_or_empty)
+    # Only every planned distinct query returning a short/empty batch is
+    # evidence of exhaustion.  A timeout, provider error, or request budget is
+    # explicitly resumable instead.
+    combined["providers_exhausted"] = bool(attempted) and not combined.get("errors") and all_batches_short_or_empty and len(attempted) == len(locations) * len(queries)
     combined["countrywide_region_queries"] = locations if len(locations) > 1 else []
     return combined
 
@@ -9367,6 +9441,21 @@ def init_db() -> None:
             "raw_jobs_json": "TEXT NOT NULL DEFAULT '[]'",
         },
     )
+    # Per-applicant discovery actions are deliberately additive.  Global job
+    # rows remain the shared source record so existing history is untouched.
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS discovery_applicant_states (
+            job_id INTEGER NOT NULL,
+            applicant_profile_id INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            date_applied TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (job_id, applicant_profile_id),
+            FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+        )"""
+    )
+    ensure_columns("discovery_applicant_states", {"date_applied": "TEXT NOT NULL DEFAULT ''"})
+    db.execute("CREATE INDEX IF NOT EXISTS discovery_applicant_states_profile_idx ON discovery_applicant_states(applicant_profile_id, state)")
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS discovery_debug_runs (
