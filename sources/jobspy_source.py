@@ -135,12 +135,16 @@ def fetch_jobspy_jobs(
             "date_filtered_removed_count": 0,
             "deduped_row_count": 0,
             "unique_job_count": 0,
+            "duplicate_count": 0,
             "returned_to_frontend_row_count": 0,
             "original_url_count": 0,
+            "description_available_count": 0,
             "description_complete_count": 0,
             "salary_evidence_count": 0,
             "address_evidence_count": 0,
             "state": "disabled",
+            "provider_status": "disabled",
+            "error_classification": "disabled",
             "success": False,
             "error_type": "",
             "error": "",
@@ -190,12 +194,16 @@ def fetch_jobspy_jobs(
             "date_filtered_removed_count": 0,
             "deduped_row_count": 0,
             "unique_job_count": 0,
+            "duplicate_count": 0,
             "returned_to_frontend_row_count": 0,
             "original_url_count": 0,
+            "description_available_count": 0,
             "description_complete_count": 0,
             "salary_evidence_count": 0,
             "address_evidence_count": 0,
             "state": "running",
+            "provider_status": "running",
+            "error_classification": "",
             "success": False,
             "error_type": "",
             "error": "",
@@ -296,6 +304,8 @@ def fetch_jobspy_jobs(
                 {
                     "success": True,
                     "state": "working" if returned_rows else ("partial" if raw_rows else "no_results"),
+                    "provider_status": "working" if returned_rows else ("partial" if raw_rows else "no_results"),
+                    "error_classification": "",
                     "raw_return_type": raw_type,
                     "raw_frame_row_count": frame_row_count(frame),
                     "raw_records_row_count": len(raw_rows),
@@ -305,8 +315,10 @@ def fetch_jobspy_jobs(
                     "date_filtered_row_count": len(returned_rows),
                     "deduped_row_count": len(identities),
                     "unique_job_count": len(identities),
+                    "duplicate_count": max(0, len(normalized_rows) - len(identities)),
                     "returned_to_frontend_row_count": len(returned_rows),
                     "original_url_count": sum(1 for item in normalized_rows if item.get("job_url")),
+                    "description_available_count": description_complete_count,
                     "description_complete_count": description_complete_count,
                     "salary_evidence_count": salary_evidence_count,
                     "address_evidence_count": address_evidence_count,
@@ -327,6 +339,8 @@ def fetch_jobspy_jobs(
                 {
                     "success": False,
                     "state": _provider_failure_state(exc),
+                    "provider_status": _provider_failure_state(exc),
+                    "error_classification": _provider_failure_state(exc),
                     "raw_return_type": "",
                     "raw_frame_row_count": 0,
                     "raw_records_row_count": 0,
@@ -336,8 +350,10 @@ def fetch_jobspy_jobs(
                     "date_filtered_row_count": 0,
                     "deduped_row_count": 0,
                     "unique_job_count": 0,
+                    "duplicate_count": 0,
                     "returned_to_frontend_row_count": 0,
                     "original_url_count": 0,
+                    "description_available_count": 0,
                     "description_complete_count": 0,
                     "salary_evidence_count": 0,
                     "address_evidence_count": 0,
@@ -367,7 +383,9 @@ def normalize_jobspy_row(row: dict[str, Any], fallback_source: str = "") -> dict
     min_amount = number_or_none(row.get("min_amount"))
     max_amount = number_or_none(row.get("max_amount"))
     interval = clean(row.get("interval"))
-    currency = clean(row.get("currency") or row.get("salary_currency")) or "CAD"
+    # JobSpy may omit currency even for a Canadian search.  Keep it unknown;
+    # the search country is not evidence that the advertised pay is CAD.
+    currency = clean(row.get("currency") or row.get("salary_currency"))
     salary_text = clean(row.get("salary"))
     salary_source = "missing"
     confidence = 0
@@ -436,7 +454,9 @@ def normalize_jobspy_row(row: dict[str, Any], fallback_source: str = "") -> dict
         "salary_confidence": confidence,
         "source": source,
         "job_url": job_url,
+        "original_posting_url": job_url,
         "application_url": direct_url,
+        "direct_application_url": direct_url,
         "description": description,
         "posting_availability": posting_availability,
         "posted_date": clean(row.get("date_posted")),
@@ -614,6 +634,43 @@ WORKPLACE_CUE = re.compile(
 NON_WORKPLACE_CUE = re.compile(r"\b(?:headquarters|corporate|mailing|registered)\s+(?:address|office)?\b", re.I)
 
 
+def _structured_workplace_values(row: dict[str, Any]) -> list[dict[str, Any]]:
+    """Read explicit JobPosting-style locations, never employer metadata."""
+    fields = ("job_location", "job_posting_location", "structured_location", "workplace_location", "locations")
+    values: list[dict[str, Any]] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, list):
+            for item in value:
+                visit(item)
+            return
+        if not isinstance(value, dict):
+            return
+        address = value.get("address") if isinstance(value.get("address"), dict) else value
+        street = clean(address.get("streetAddress") or address.get("street_address") or address.get("street"))
+        locality = clean(address.get("addressLocality") or address.get("city") or address.get("locality"))
+        region = clean(address.get("addressRegion") or address.get("state") or address.get("province"))
+        postal = clean(address.get("postalCode") or address.get("postal_code") or address.get("zipCode"))
+        country = clean(address.get("addressCountry") or address.get("country"))
+        if isinstance(country, dict):
+            country = clean(country.get("name") or country.get("value"))
+        parts = [part for part in (street, locality, region, postal) if part]
+        if parts:
+            values.append({
+                "address": ", ".join(parts),
+                "postal_code": postal.upper().replace("-", " "),
+                "precision": "street address" if street else "postal code" if postal else "city",
+                "confidence": 98 if street else 90 if postal else 70,
+                "evidence": ", ".join(parts),
+                "evidence_source": "provider structured JobPosting location",
+                "assignment_status": "confirmed",
+            })
+
+    for field in fields:
+        visit(row.get(field))
+    return values
+
+
 def _address_evidence(description: str, match: re.Match[str], next_start: int | None = None) -> tuple[str, str]:
     end_limit = min(len(description), next_start if next_start is not None else match.end() + 120)
     tail = description[match.end():end_limit]
@@ -635,6 +692,9 @@ def extract_workplace_alternatives(row: dict[str, Any], description: str) -> lis
     supplied = row.get("workplace_alternatives")
     if isinstance(supplied, list):
         return [dict(item) for item in supplied if isinstance(item, dict) and clean(item.get("address") or item.get("postal_code"))]
+    structured = _structured_workplace_values(row)
+    if structured:
+        return structured
     raw_fields = [(key, clean(row.get(key))) for key in ("workplace_address", "address", "street_address", "office_address", "office_location", "location")]
     field_key, field_value = next(
         ((key, value) for key, value in raw_fields if value and (key != "location" or STREET_PATTERN.search(value) or re.search(POSTAL_PATTERN, value, re.I))),
@@ -928,7 +988,10 @@ def extract_experience_requirement(description: str) -> str:
     from seniority import extract_experience_ranges
 
     required, preferred, ambiguous = extract_experience_ranges(description or "")
-    candidates = required or preferred or ambiguous
+    # Ambiguous numeric prose (for example, children's age ranges) must not be
+    # surfaced as a job requirement.  Downstream seniority analysis retains
+    # that evidence separately for review.
+    candidates = required or preferred
     if not candidates:
         return ""
     strongest = max(candidates, key=lambda item: (item.minimum or 0, item.maximum or item.minimum or 0))

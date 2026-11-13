@@ -67,6 +67,8 @@ def test_adapter_records_full_rows_evidence_and_deduplicates_diagnostic_identity
     assert diagnostic["salary_evidence_count"] == 1
     assert diagnostic["address_evidence_count"] == 2
     assert result["jobs"][0]["salary_text"] == "$24.50-$24.50 hourly"
+    assert diagnostic["duplicate_count"] == 1
+    assert diagnostic["provider_status"] == "working"
 
 
 def test_adapter_filters_old_rows_and_reports_no_results_and_timeout_states():
@@ -92,3 +94,36 @@ def test_adapter_filters_old_rows_and_reports_no_results_and_timeout_states():
         keywords="developer", location="Toronto, ON", enabled_sources=["linkedin"], scrape_jobs_func=blocked,
     )
     assert blocked_result["source_diagnostics"]["linkedin"]["state"] == "blocked"
+
+
+def test_normalization_keeps_unknown_currency_and_original_url_contract():
+    from sources.jobspy_source import normalize_jobspy_row
+
+    normalized = normalize_jobspy_row({
+        "title": "Developer",
+        "job_url": "https://provider.example/jobs/123",
+        "job_url_direct": "https://employer.example/careers/123",
+        "min_amount": 22.5,
+        "max_amount": 27.0,
+        "interval": "hourly",
+        "description": "Requirements: 2 years of professional software experience.",
+    }, "indeed")
+    assert normalized["salary_currency"] == ""
+    assert normalized["original_posting_url"] == "https://provider.example/jobs/123"
+    assert normalized["direct_application_url"] == "https://employer.example/careers/123"
+
+
+def test_structured_jobposting_locations_and_ambiguous_age_ranges_are_conservative():
+    from sources.jobspy_source import normalize_jobspy_row
+
+    normalized = normalize_jobspy_row({
+        "title": "Registered Early Childhood Educator",
+        "job_location": [
+            {"address": {"streetAddress": "70 Playfair Avenue", "addressLocality": "Toronto", "addressRegion": "ON", "postalCode": "M6B 2P9"}},
+            {"address": {"streetAddress": "340 Falstaff Avenue", "addressLocality": "Toronto", "addressRegion": "ON", "postalCode": "M6L 3E7"}},
+        ],
+        "description": "We care for children aged 3 to 5 years. Preferred: experience with children.",
+    }, "glassdoor")
+    assert [item["postal_code"] for item in normalized["workplace_alternatives"]] == ["M6B 2P9", "M6L 3E7"]
+    assert normalized["workplace_precision"] == "multiple alternatives"
+    assert normalized["experience_requirement"] == ""
