@@ -953,9 +953,51 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn('applyDiscoveryWorkflow', frontend)
         self.assertIn('prior applicant\'s cached results are never shown automatically', frontend)
         self.assertIn('candidate_profile_id: workflow === "software"', frontend)
+        self.assertIn('applicant_profile_id:', frontend)
         self.assertIn('Exact workplace unknown', frontend)
         self.assertIn('Remote · eligibility', frontend)
+        self.assertIn('verifiedPrecision', frontend)
         self.assertIn('beta-secondary', Path('static/styles.css').read_text(encoding='utf-8'))
+
+    def test_ece_title_search_keeps_applicant_identity_without_resume_scoring(self):
+        profile = self.client.post(
+            "/api/candidate-profiles",
+            json={"name": "ECE Applicant", "identity_mode": "distinct", "applicant_name": "ECE Candidate"},
+        ).get_json()
+        provider = FakeGeocodingProvider({
+            "Toronto, Ontario, Canada": {
+                "latitude": 43.6532, "longitude": -79.3832, "display_name": "Toronto, Ontario, Canada",
+                "ok": True, "status": "saved", "provider": "fake", "confidence": 80,
+                "precision": "city", "normalized_query": "Toronto, ON", "error": "",
+            },
+        })
+        fake = {
+            "jobs": [{
+                "source_job_id": "ece-fixture-1", "title": "Registered Early Childhood Educator", "company": "Lullaboo",
+                "location": "Toronto, ON", "source": "indeed", "job_url": "https://example.test/ece-fixture-1",
+                "description": "Hybrid role. Benefits include PTO, dental and vision.", "salary": "$25.86/hour",
+                "benefits": [{"value": "PTO"}, {"value": "dental"}, {"value": "vision"}],
+            }],
+            "errors": {}, "source_counts": {"indeed": 1}, "source_diagnostics": {}, "source_snapshots": {},
+        }
+        with patch.object(app_module, "get_geocoding_provider", return_value=provider), patch.object(app_module, "fetch_jobspy_jobs", return_value=fake):
+            response = self.client.post(
+                "/api/discovery/jobspy",
+                json={
+                    "keywords": "Registered Early Childhood Educator", "location": "Toronto", "search_mode": "title",
+                    "enabled_sources": ["indeed"], "candidate_profile_id": "", "applicant_profile_id": profile["id"],
+                },
+            )
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        result = response.get_json()["jobs"][0]
+        self.assertEqual(result["candidate_profile_id"], profile["id"])
+        self.assertEqual(result["discovery_profile_independent"], 1)
+        self.assertEqual({item["value"] for item in result["benefits"]}, {"PTO", "dental", "vision"})
+        self.assertEqual(result["salary"], "CAD $25.86/hour")
+        self.assertEqual(self.client.post(f"/api/discovery/inbox/{result['id']}/save", json={}).status_code, 200)
+        applied = self.client.post(f"/api/discovery/inbox/{result['id']}/applied", json={}).get_json()
+        self.assertEqual(applied["status"], "Applied")
+        self.assertEqual(applied["candidate_profile_id"], profile["id"])
 
     def test_candidate_profile_creation_is_committed_and_returned_by_list_endpoint(self):
         response = self.client.post(

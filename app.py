@@ -485,6 +485,7 @@ JOB_COLUMNS = {
     "remote_search_eligible": "TEXT NOT NULL DEFAULT ''",
     "discovery_occupation": "TEXT NOT NULL DEFAULT ''",
     "discovery_profile_independent": "INTEGER NOT NULL DEFAULT 0",
+    "candidate_profile_id": "INTEGER NOT NULL DEFAULT 0",
     "discovery_search_mode": "TEXT NOT NULL DEFAULT ''",
     "title_match_mode": "TEXT NOT NULL DEFAULT 'related'",
     "occupation_match_type": "TEXT NOT NULL DEFAULT 'uncertain'",
@@ -2293,6 +2294,8 @@ def create_app() -> Flask:
         for raw_job in raw_jobs:
             payload_job = jobspy_result_to_job_payload(raw_job)
             clean = normalize_job_payload(payload_job)
+            clean["candidate_profile_id"] = clamp_int(payload.get("applicant_profile_id") or payload.get("candidate_profile_id"), 0, 10**9)
+            clean["benefits"] = parse_json_array(clean.get("benefits_json"))
             clean["discovery_occupation"] = search["occupation"]
             clean["discovery_profile_independent"] = int(search["profile_independent"])
             clean["discovery_search_mode"] = search["search_mode"]
@@ -2919,9 +2922,14 @@ def saved_search_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:
 
 
 def saved_search_to_discovery_payload(search: dict[str, Any]) -> dict[str, Any]:
+    selected_profile = search.get("auto_prepare_candidate_profile_id") or ""
     return {
         **search,
-        "candidate_profile_id": search.get("auto_prepare_candidate_profile_id") or "",
+        # A title search may retain an applicant for saved-job ownership and
+        # later preparation without turning that applicant's résumé into
+        # qualification evidence.
+        "candidate_profile_id": selected_profile if search.get("search_mode") == "shortlist" else "",
+        "applicant_profile_id": selected_profile,
         "enabled_sources": search.get("enabled_sources") or ["linkedin", "indeed"],
         "search_depth": search.get("search_depth") or "standard",
         "total_cap": int(search.get("total_cap") or 200),
@@ -3157,6 +3165,8 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
     filtered = 0
     for raw_job in fetched.get("jobs", []):
         clean = normalize_job_payload(jobspy_result_to_job_payload(raw_job))
+        clean["candidate_profile_id"] = clamp_int(payload.get("applicant_profile_id") or payload.get("candidate_profile_id"), 0, 10**9)
+        clean["benefits"] = parse_json_array(clean.get("benefits_json"))
         clean["discovery_occupation"] = search["occupation"]
         clean["discovery_profile_independent"] = int(search["profile_independent"])
         clean["discovery_search_mode"] = search["search_mode"]
@@ -3479,15 +3489,14 @@ def existing_job_dedupe_keys() -> set[str]:
 
 
 def find_existing_job_match(job: dict[str, Any]) -> sqlite3.Row | None:
-    keys = dedupe_keys(job, job.get("source_job_id"))
     rows = query_db("SELECT * FROM jobs")
     for row in rows:
         existing = job_to_dict(row)
-        if text(existing.get("status")) == "shortlisted" and keys & dedupe_keys(existing, existing.get("source_job_id")):
+        if text(existing.get("status")) == "shortlisted" and dedupe_match(job, existing):
             return row
     for row in rows:
         existing = job_to_dict(row)
-        if keys & dedupe_keys(existing, existing.get("source_job_id")):
+        if dedupe_match(job, existing):
             return row
     return None
 
@@ -6536,6 +6545,10 @@ def dedupe_keys(job: dict[str, Any], source_job_id: Any = "") -> set[str]:
 
 def dedupe_match(first: dict[str, Any], second: dict[str, Any]) -> bool:
     """Match vacancies without merging distinct IDs from one provider."""
+    first_profile = clamp_int(first.get("candidate_profile_id"), 0, 10**9)
+    second_profile = clamp_int(second.get("candidate_profile_id"), 0, 10**9)
+    if first_profile and second_profile and first_profile != second_profile:
+        return False
     first_urls = {canonical_url(text(first.get(field))) for field in ("url", "application_url")}
     second_urls = {canonical_url(text(second.get(field))) for field in ("url", "application_url")}
     if (first_urls - {""}) & (second_urls - {""}):
@@ -6993,6 +7006,7 @@ def discovery_search_signature(payload: dict[str, Any]) -> str:
         "search_mode": search["search_mode"],
         "title_match_mode": search["title_match_mode"],
         "candidate_profile_id": text(payload.get("candidate_profile_id") or payload.get("auto_prepare_candidate_profile_id")),
+        "applicant_profile_id": text(payload.get("applicant_profile_id")),
         "resume_id": text(payload.get("resume_id") or payload.get("auto_prepare_resume_id")),
     }
     return grounding_hash(dumps_json(relevant, sort_keys=True))
@@ -7134,7 +7148,8 @@ def discovery_search_config(payload: dict[str, Any]) -> dict[str, Any]:
         "search_mode": search_mode,
         "title_match_mode": title_match_mode,
         "occupation": occupation_for_keywords(text(payload.get("keywords"))),
-        "profile_independent": search_mode == "title" and not text(payload.get("candidate_profile_id") or payload.get("auto_prepare_candidate_profile_id")),
+        "applicant_profile_id": clamp_int(payload.get("applicant_profile_id"), 0, 10**9),
+        "profile_independent": search_mode == "title" and not text(payload.get("candidate_profile_id")),
     }
 
 
@@ -9008,7 +9023,9 @@ def init_db() -> None:
     database_existed = DB_PATH.exists()
     db = get_db()
     existing_version = int(db.execute("PRAGMA user_version").fetchone()[0] or 0)
-    if database_existed and existing_version < CURRENT_DB_SCHEMA_VERSION and _LAST_MIGRATION_BACKUP is None:
+    existing_job_columns = {row["name"] for row in db.execute("PRAGMA table_info(jobs)")}
+    additive_job_migration_needed = bool(existing_job_columns) and any(column not in existing_job_columns for column in JOB_COLUMNS)
+    if database_existed and (existing_version < CURRENT_DB_SCHEMA_VERSION or additive_job_migration_needed) and _LAST_MIGRATION_BACKUP is None:
         _LAST_MIGRATION_BACKUP = backup_database_before_migration()
         if _LAST_MIGRATION_BACKUP is None:
             raise RuntimeError("Database migration aborted: a consistent pre-migration backup could not be created.")
@@ -9733,6 +9750,7 @@ def normalize_job_payload(payload: dict[str, Any]) -> dict[str, Any]:
         existing=payload_for_extraction,
     )
     clean = {column: text(payload_for_extraction.get(column, extracted.get(column, ""))) for column in JOB_COLUMNS}
+    clean["candidate_profile_id"] = str(clamp_int(payload.get("candidate_profile_id"), 0, 10**9))
     alternatives_value = payload.get("workplace_alternatives", payload.get("workplace_alternatives_json", extracted.get("workplace_alternatives_json", "[]")))
     alternatives = parse_json_array(alternatives_value) if not isinstance(alternatives_value, list) else [item for item in alternatives_value if isinstance(item, dict)]
     if not alternatives:

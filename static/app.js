@@ -1371,7 +1371,7 @@ function renderCandidateProfiles() {
   if (discoveryProfile) {
     discoveryProfile.innerHTML = `<option value="">Use active Profile</option>${state.candidateProfiles.map((profile) => `<option value="${escapeAttribute(profile.id)}">${escapeHtml(profile.name)}</option>`).join("")}`;
     discoveryProfile.value = state.selectedCandidateProfileId;
-    discoveryProfile.onchange = async () => { state.selectedCandidateProfileId = discoveryProfile.value; try { localStorage.setItem("jobTracker.selectedCandidateProfileId", state.selectedCandidateProfileId); } catch (_) { /* storage may be disabled */ } await loadAll(); };
+    discoveryProfile.onchange = async () => { state.selectedCandidateProfileId = discoveryProfile.value; try { localStorage.setItem("jobTracker.selectedCandidateProfileId", state.selectedCandidateProfileId); } catch (_) { /* storage may be disabled */ } clearVisibleDiscoveryResults(); await loadAll(); };
   }
   list.innerHTML = state.candidateProfiles.map((profile) => `
     <article class="candidate-profile-card ${String(profile.id) === state.selectedCandidateProfileId ? "selected" : ""}">
@@ -2522,9 +2522,10 @@ function discoverySearchCriteriaFromControls() {
     total_cap: value("discovery-total-cap") || 200,
     bypass_cache: checked("discovery-bypass-cache"),
     // Software shortlist scoring needs the selected résumé. ECE title search
-    // deliberately stays résumé-independent; the chosen applicant remains
-    // the active UI context for subsequent application actions.
+    // deliberately stays résumé-independent, but retains the selected
+    // applicant ID for durable saved-job/application association.
     candidate_profile_id: workflow === "software" ? value("discovery-profile") : "",
+    applicant_profile_id: value("discovery-profile") || state.selectedCandidateProfileId || "",
     shortlist_size: Number(value("discovery-total-cap") || 25),
     strict_technical: workflow === "software" ? checked("discovery-strict-technical") : false,
     workflow,
@@ -2708,7 +2709,12 @@ async function searchDiscovery(event) {
   const button = document.getElementById("discovery-submit");
   const status = document.getElementById("discovery-status");
   const criteria = discoverySearchCriteriaFromControls();
-  if (!criteria.candidate_profile_id) {
+  if (criteria.workflow === "software" && !criteria.candidate_profile_id) {
+    status.textContent = "Choose an applicant in Profiles before searching.";
+    toast("Choose an applicant before searching.");
+    return;
+  }
+  if (!criteria.applicant_profile_id) {
     status.textContent = "Choose an applicant in Profiles before searching.";
     toast("Choose an applicant before searching.");
     return;
@@ -3152,9 +3158,12 @@ function resultWorkplaceLabel(job) {
 
 function resultDistanceLabel(job) {
   if (isRemoteJob(job)) return "N/A";
-  if (job.city_estimate_km !== undefined && job.city_estimate_km !== null) return `Approx. ${Number(job.city_estimate_km)} km (postal origin)`;
+  const precision = String(job.workplace_precision || job.location_precision || "").toLowerCase();
+  const verifiedPrecision = precision.includes("street") || precision.includes("postal") || precision.includes("house");
+  if (job.city_estimate_km !== undefined && job.city_estimate_km !== null) {
+    return verifiedPrecision ? `Approx. ${Number(job.city_estimate_km)} km (verified ${precision})` : "Exact workplace unknown";
+  }
   if (Number(job.distance_km) < 9999 && job.distance_label !== "unknown") {
-    const precision = String(job.location_precision || "").toLowerCase();
     return precision.includes("postal") ? `Approx. ${Number(job.distance_km)} km (postal centroid)` : `${Number(job.distance_km)} km straight-line`;
   }
   return "Exact workplace unknown";
@@ -3167,7 +3176,9 @@ function resultMatchLabel(job) {
 }
 
 function renderBenefits(job) {
-  const benefits = Array.isArray(job.benefits) ? job.benefits.map((item) => item.value || item.evidence).filter(Boolean) : [];
+  const benefits = Array.isArray(job.benefits)
+    ? job.benefits.map((item) => item.value || item.evidence).filter(Boolean)
+    : [];
   return benefits.length ? `<details class="result-details"><summary>Benefits</summary><span>${escapeHtml(benefits.join(" · "))}</span></details>` : "";
 }
 
@@ -3251,7 +3262,8 @@ function displaySalary(job) {
 function distanceBadge(job) {
   if (job.distance_label === "remote") return "Remote";
   if (job.distance_label === "multiple_alternatives" || workplaceAlternatives(job).length > 1) return "Multiple workplaces · assigned site not confirmed";
-  if (job.city_estimate_km !== undefined && job.city_estimate_km !== null) return `Exact workplace unknown · city estimate ${Number(job.city_estimate_km)} km`;
+  const precision = String(job.workplace_precision || job.location_precision || "").toLowerCase();
+  if (job.city_estimate_km !== undefined && job.city_estimate_km !== null) return precision.includes("street") || precision.includes("postal") || precision.includes("house") ? `Approx. ${Number(job.city_estimate_km)} km (${precision})` : "Exact workplace unknown";
   if (job.distance_km === undefined || job.distance_km === null) return "Unknown";
   if (Number(job.distance_km) >= 9999) return "Unknown";
   return job.distance_note ? `${job.distance_note} · ${Number(job.distance_km)} km (straight-line)` : `${Number(job.distance_km)} km (straight-line)`;
