@@ -1,7 +1,8 @@
 # PR #18 final release acceptance — 2026-11-13
 
-Scope: draft PR #18, exact proposed head
-`a53704bac1ae123d0c07a4ff7e83da909516406e`. This is an evidence record, not
+Scope: draft PR #18. The audited application-fix commit is
+`b4667057ca7ec1d72912d24a423ed2e87266cd7c` (parent
+`a05a6002fd2a50a72bcbc3f474cdd25683b32cad`). This is an evidence record, not
 approval to merge, tag, publish a release, or process real applicant data.
 
 ## CI and installer evidence
@@ -41,8 +42,8 @@ state an adjudicable value; it is not a claim that the employer offers none.
 
 | Posting | Identity and original URL | Salary | Location / address | Benefits | Experience | Credentials | Required vs preferred technologies |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| [PolicyMe — Junior Software Engineer (Remote)](https://jobs.lever.co/policyme/30e81807-adb5-44a9-baad-4beb75913694) | PolicyMe; exact canonical Lever URL | CAD $80,000–$110,000; annual | Remote; Canada eligibility; optional Toronto office, no street/postal stated | 20 vacation days; comprehensive employer-paid plan; L&D and AI-tooling budgets; stock options | no numeric minimum | absent | Required: Python, React, Redux, PostgreSQL, AWS, AI API/model project or hands-on experience, full-stack development. Preferred: none explicitly labelled. Core-stack-only n8n/LangChain/LangGraph are not requirements. |
-| [Rose Rocket — Junior Software Engineer](https://jobs.ashbyhq.com/Rose%20Rocket/5ae4082e-4c3e-416f-a063-b00398e71542) | Rose Rocket; exact canonical Ashby URL | CAD $72,000–$88,000; annual | Hybrid; Toronto; downtown office, no street/postal stated | comprehensive benefits and health spending account; parental top-up; stock options; equipment; 3 weeks vacation + closure + 3 personal days | no numeric minimum | Bachelor’s in Computer/Software Engineering or related | Required: agentic coding tools, agile PM tools, Git/version control. Preferred: none explicitly labelled. NodeJS/NestJS/TypeScript, React/Websockets, PostgreSQL/Redis/DynamoDB/Elasticsearch, AWS/Docker/Kubernetes/GitHub Actions are exposure-only. |
+| [PolicyMe — Junior Software Engineer (Remote)](https://jobs.lever.co/policyme/30e81807-adb5-44a9-baad-4beb75913694) | PolicyMe; exact canonical Lever URL | CAD $80,000–$110,000; cadence not stated in retrieved description | Remote; Canada eligibility; optional Toronto office, no street/postal stated | 20 vacation days; comprehensive employer-paid plan; L&D and AI-tooling budgets; stock options | no numeric minimum | absent | Required: Python, React, Redux, PostgreSQL, AWS, AI API/model project or hands-on experience, full-stack development. Preferred: none explicitly labelled. Core-stack-only n8n/LangChain/LangGraph are not requirements. |
+| [Rose Rocket — Junior Software Engineer](https://jobs.ashbyhq.com/Rose%20Rocket/5ae4082e-4c3e-416f-a063-b00398e71542) | Rose Rocket; exact canonical Ashby URL | CAD $72,000–$88,000; cadence not stated in retrieved description | Hybrid; Toronto; downtown office, no street/postal stated | comprehensive benefits program/HCSA; parental top-up; stock options; equipment; 3 weeks vacation; winter holiday closure; 3 personal days | no numeric minimum | Bachelor’s in Computer/Software Engineering or related | Required: agentic coding tools, agile PM tools, Git/version control. Preferred: none explicitly labelled. NodeJS/NestJS/TypeScript, React/Websockets, PostgreSQL/Redis/DynamoDB/Elasticsearch, AWS/Docker/Kubernetes/GitHub Actions are exposure-only. |
 | [McAfee — Full-Stack Developer](https://ca.indeed.com/viewjob?jk=d2b52a97a6ca1999) | McAfee; exact Indeed URL / `jk=d2b52a97a6ca1999` | CAD $100,772.50–$136,337.50; annual | source header Remote; Toronto, ON M5T 1X5 is eligibility geography, not commute destination | not independently adjudicated in this run | not independently adjudicated in this run | not independently adjudicated in this run; source’s Remote header conflicts with hybrid prose and must remain a visible conflict |
 | [ExaSystems Dev Inc. — Full Stack Developer (ASP.NET / Blazor / MAUI)](https://ca.indeed.com/viewjob?jk=12ff082aaa676235) | ExaSystems Dev Inc.; exact Indeed URL / `jk=12ff082aaa676235` | From CAD $23/hour | Hybrid; Mississauga, ON L5L 5Y1. No street may be invented from city/postal-only location evidence. | not independently adjudicated in this run | not independently adjudicated in this run | not independently adjudicated in this run |
 
@@ -51,7 +52,7 @@ four-posting, field-level sample, not a live discovery-provider accuracy rate.
 No current JobSpy scrape was performed: the replay uses source text and
 source-declared fields without writing a database or applicant data.
 
-## Extraction replay results
+## Extraction replay results — before and after `b466705`
 
 The independent labels above were fixed before this replay. The two ATS pages
 were replayed through `normalize_jobspy_row` with their original JobPosting
@@ -59,24 +60,25 @@ descriptions and source-declared arrangement. The two Indeed facts were also
 covered by the source-field regressions listed below; this was not a fresh
 JobSpy provider request.
 
-| Field | Correctness | Coverage | Result / limitation |
+| Field | Before correctness / coverage | After correctness / coverage | Result / limitation |
 | --- | ---: | ---: | --- |
-| ATS identity and canonical URL | 4/4 pass-through fields | 4/4 | PolicyMe and Rose title/employer/URL values match exactly; the two Indeed identity/URL regressions also pass. This is pass-through integrity, not discovery accuracy. |
-| ATS arrangement and geographic location | 2/2 | 2/2 | PolicyMe remains Remote/Canada eligibility; Rose remains Hybrid/Toronto. Neither gains a street or postal address. |
-| Indeed arrangement/address examples | 2/2 regression cases | 2/2 labelled cases | McAfee's explicit Remote classification wins over hybrid prose and exposes the conflict. Exa remains Hybrid with `L5L 5Y1`; no street is invented. |
-| Salary from direct ATS descriptions | N/A (0 extracted) | 0/2 | `normalize_jobspy_row` does not parse salary prose when the provider omits structured salary fields. PolicyMe and Rose salary text was therefore blank. This is an open coverage defect. |
-| McAfee description-only salary fallback | 0/1 | 0/1 | `parse_salary_text("$100,772.50–$136,337.50 a year")` kept only 100772 and lost the upper endpoint/decimal precision. The structured-source McAfee regression still passes; that does not close this fallback defect. |
-| Exa description-only salary fallback | 1/1 qualifier text preserved | 1/1 value | `From $23/hour` is retained as source text and parses as hourly 23, but no fresh provider capture established the structured-field behavior in this pass. |
-| Required technology / capability labels | 10/10 | 10/10 | PolicyMe: full-stack, Python, React, Redux, PostgreSQL, AWS, AI API/model experience. Rose: agentic tools, agile PM tools, Git. |
-| Preferred versus exposure-only technologies | 6/6 non-promotions checked | 6/6 | Rose's NodeJS/NestJS/TypeScript, React, PostgreSQL, AWS, Docker and Kubernetes remain outside required/preferred lists. |
-| Credentials | 2/2 | 2/2 | PolicyMe correctly has no stated credential; Rose's Bachelor’s requirement is extracted with source evidence. |
-| Numeric experience | 2/2 absence checks | 2/2 | Neither source states a numeric minimum and neither replay invents one. |
-| Benefits | 11/12 extracted values | 11/12 | PolicyMe's PTO, comprehensive plan, stock options, L&D and AI tooling budget are extracted, but a spurious `Dental` match is taken from employer product prose. Rose extracts six listed benefit values but misses its three-week vacation/holiday-closure statement. |
+| ATS identity and canonical URL | 4/4; 4/4 | 4/4; 4/4 | PolicyMe and Rose title/employer/URL values match exactly; the two Indeed identity/URL regressions also pass. This is pass-through integrity, not discovery accuracy. |
+| ATS arrangement and geographic location | 2/2; 2/2 | 2/2; 2/2 | PolicyMe remains Remote/Canada eligibility; Rose remains Hybrid/Toronto. Neither gains a street or postal address. |
+| Indeed arrangement/address examples | 2/2; 2/2 | 2/2; 2/2 | McAfee's explicit Remote classification wins over hybrid prose and exposes the conflict. Exa remains Hybrid with `L5L 5Y1`; no street is invented. |
+| PolicyMe/Rose description salary endpoints | N/A; 0/2 | 2/2; 2/2 | The persistence-path fallback now retains CAD 80,000–110,000 and CAD 72,000–88,000 with source excerpts. Their retrieved descriptions do not state cadence, so it remains blank and no annual value is invented. |
+| McAfee description-only salary fallback | 0/1; 0/1 | 1/1; 1/1 | CAD 100,772.50–136,337.50 per year retains both decimal endpoints and yearly cadence. |
+| Exa description-only salary fallback | 0/1; 0/1 | 1/1; 1/1 | `From CAD $23/hour` retains only the lower endpoint; maximum, midpoint and annual equivalent remain unavailable because weekly hours are unstated. |
+| Required technology / capability labels | 10/10; 10/10 | 10/10; 10/10 | PolicyMe: full-stack, Python, React, Redux, PostgreSQL, AWS, AI API/model experience. Rose: agentic tools, agile PM tools, Git. |
+| Preferred versus exposure-only technologies | 6/6; 6/6 | 6/6; 6/6 | Rose's NodeJS/NestJS/TypeScript, React, PostgreSQL, AWS, Docker and Kubernetes remain outside required/preferred lists. |
+| Credentials | 2/2; 2/2 | 2/2; 2/2 | PolicyMe correctly has no stated credential; Rose's Bachelor’s requirement is extracted with source evidence. |
+| Numeric experience | 2/2; 2/2 | 2/2; 2/2 | Neither source states a numeric minimum and neither replay invents one. |
+| Benefits | 11/12; 11/12 | 12/12; 12/12 | PolicyMe no longer promotes product-copy `Dental`; its five employee benefits retain excerpts. Rose now includes three weeks’ vacation and winter holiday closure, alongside its other five labelled benefits. |
 
 Correctness and coverage are intentionally separate: missing source values are
-not counted as correctness successes. The description-salary and PolicyMe
-benefit false-positive findings leave the authentic-original accuracy gate
-**open**; fixture tests must not be used to close it.
+not counted as correctness successes. The four-posting replay has no remaining
+labelled salary or benefit false positives/omissions. It remains a four-posting
+sample, not a population-level live-discovery accuracy claim; fixtures do not
+close that wider gate.
 
 ## Source-access limitations
 
@@ -109,12 +111,14 @@ Job Tracker predictions are viewed. Neither input may be committed to git.
 
 ## Functional regression evidence
 
-At this head, targeted acceptance tests passed: **11 passed, 279 deselected**.
+At the application-fix commit, targeted ECE/SWE acceptance tests passed:
+**11 passed, 282 deselected**. Salary/benefit/source focused tests passed:
+**19 passed, 274 deselected**.
 They cover ECE title-only search without résumé scoring, selected-profile
 isolation and distinct applicant identity, Save/Applied persistence, source-ID
 deduplication, McAfee remote-conflict handling, Exa postal-code preservation,
 conservative remote directions, source-linked examples, and workplace
-alternatives/distance handling. The entire Python suite passed: **305 passed,
+alternatives/distance handling. The entire Python suite passed: **308 passed,
 1 skipped**. `node --check static/app.js` passed.
 
 These tests establish the ECE functional behavior requested here: title-only
