@@ -2861,6 +2861,23 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(categories["Backend Developer"], "skipped")
         self.assertEqual(self.client.get("/api/discovery/inbox").get_json(), [])
 
+    def test_discovery_skip_is_scoped_to_applicant_and_restorable(self):
+        created = self.client.post("/api/jobs", json={
+            "company": "Shared Employer", "title": "Software Developer", "location": "Toronto",
+            "url": "https://example.test/shared", "source": "linkedin",
+            "discovery_first_seen_at": "2026-11-03T00:00:00", "discovery_last_seen_at": "2026-11-03T00:00:00",
+            "discovery_state": "new",
+        }).get_json()
+        job_id = created["id"]
+        self.assertEqual(self.client.post(f"/api/discovery/inbox/{job_id}/ignore", json={"applicant_profile_id": 11}).status_code, 200)
+        first = self.client.get("/api/discovery/inbox?applicant_profile_id=11").get_json()
+        second = self.client.get("/api/discovery/inbox?applicant_profile_id=22").get_json()
+        self.assertEqual(first, [])
+        self.assertEqual(len(second), 1)
+        self.assertEqual(second[0]["id"], job_id)
+        self.assertEqual(self.client.post(f"/api/discovery/inbox/{job_id}/restore", json={"applicant_profile_id": 11}).status_code, 200)
+        self.assertEqual(len(self.client.get("/api/discovery/inbox?applicant_profile_id=11").get_json()), 1)
+
     def test_live_discovery_persists_save_skip_and_applied_without_generation(self):
         fake = {
             "jobs": [
@@ -6992,27 +7009,27 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(quick["total_cap"], 50)
         self.assertEqual(quick["request_per_source_cap"], 25)
         three = app_module.discovery_search_config({
-            "enabled_sources": ["linkedin", "indeed", "google"],
+            "enabled_sources": ["linkedin", "indeed", "glassdoor"],
             "per_source_cap": 100,
             "total_cap": 20,
         })
         self.assertEqual(three["request_per_source_cap"], 6)
         self.assertLessEqual(three["aggregate_request_budget"], 20)
         minimum = app_module.discovery_search_config({
-            "enabled_sources": ["linkedin", "indeed", "google"],
+            "enabled_sources": ["linkedin", "indeed", "glassdoor"],
             "per_source_cap": 100,
             "total_cap": 3,
         })
         self.assertEqual(minimum["request_per_source_cap"], 1)
         with self.assertRaisesRegex(ValueError, "at least 3"):
             app_module.discovery_search_config({
-                "enabled_sources": ["linkedin", "indeed", "google"],
+                "enabled_sources": ["linkedin", "indeed", "glassdoor"],
                 "total_cap": 2,
             })
 
     def test_manual_search_rejects_aggregate_limit_below_selected_source_count(self):
         response = self.client.post("/api/discovery/jobspy", json={
-            "keywords": "backend", "enabled_sources": ["linkedin", "indeed", "google"], "total_cap": 2,
+            "keywords": "backend", "enabled_sources": ["linkedin", "indeed", "glassdoor"], "total_cap": 2,
         })
         self.assertEqual(response.status_code, 400)
         self.assertIn("at least 3", response.get_json()["error"])
@@ -7024,7 +7041,7 @@ class JobAssistantTest(unittest.TestCase):
             "location": "Toronto",
             "remote_preference": "hybrid",
             "distance": 25,
-            "enabled_sources": ["linkedin", "indeed", "google"],
+            "enabled_sources": ["linkedin", "indeed", "glassdoor"],
             "date_window": "7d",
             "search_depth": "thorough",
             "per_source_cap": 100,
@@ -7047,12 +7064,12 @@ class JobAssistantTest(unittest.TestCase):
 
     def test_saved_search_create_and_edit_reject_invalid_aggregate_budget(self):
         invalid = self.client.post("/api/discovery/searches", json={
-            "name": "Invalid budget", "keywords": "backend", "enabled_sources": ["linkedin", "indeed", "google"], "total_cap": 2,
+            "name": "Invalid budget", "keywords": "backend", "enabled_sources": ["linkedin", "indeed", "glassdoor"], "total_cap": 2,
         })
         self.assertEqual(invalid.status_code, 400)
         self.assertIn("at least 3", invalid.get_json()["error"])
         valid = self.client.post("/api/discovery/searches", json={
-            "name": "Editable budget", "keywords": "backend", "enabled_sources": ["linkedin", "indeed", "google"], "total_cap": 3,
+            "name": "Editable budget", "keywords": "backend", "enabled_sources": ["linkedin", "indeed", "glassdoor"], "total_cap": 3,
         }).get_json()
         invalid_update = self.client.put(f"/api/discovery/searches/{valid['id']}", json={**valid, "total_cap": 2})
         self.assertEqual(invalid_update.status_code, 400)
@@ -7063,7 +7080,7 @@ class JobAssistantTest(unittest.TestCase):
 
     def test_saved_search_run_uses_persisted_fetch_limits_and_reports_snapshot_separately(self):
         search = self.client.post("/api/discovery/searches", json={
-            "name": "Limited saved run", "keywords": "backend", "enabled_sources": ["linkedin", "indeed", "google"],
+            "name": "Limited saved run", "keywords": "backend", "enabled_sources": ["linkedin", "indeed", "glassdoor"],
             "total_cap": 20, "per_source_cap": 100,
         }).get_json()
         fake = {"jobs": [], "errors": {}, "source_counts": {}, "source_diagnostics": {}, "source_snapshots": {}}
@@ -7082,7 +7099,7 @@ class JobAssistantTest(unittest.TestCase):
         with app_module.app.app_context():
             cursor = app_module.get_db().execute(
                 "INSERT INTO saved_search_profiles (name, keywords, enabled_sources_json, total_cap) VALUES (?, ?, ?, ?)",
-                ["Invalid legacy budget", "backend", '["linkedin", "indeed", "google"]', 2],
+                ["Invalid legacy budget", "backend", '["linkedin", "indeed", "glassdoor"]', 2],
             )
             app_module.get_db().commit()
             search_id = cursor.lastrowid
@@ -7094,7 +7111,7 @@ class JobAssistantTest(unittest.TestCase):
         from scripts.discovery_worker import run_due_searches
 
         search = self.client.post("/api/discovery/searches", json={
-            "name": "Worker invalid budget", "keywords": "backend", "enabled_sources": ["linkedin", "indeed", "google"], "total_cap": 3, "enabled": True,
+            "name": "Worker invalid budget", "keywords": "backend", "enabled_sources": ["linkedin", "indeed", "glassdoor"], "total_cap": 3, "enabled": True,
         }).get_json()
         with app_module.app.app_context():
             app_module.get_db().execute("UPDATE saved_search_profiles SET total_cap = 2, next_run_at = '' WHERE id = ?", [search["id"]])

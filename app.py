@@ -95,7 +95,7 @@ _LAST_MIGRATION_BACKUP: Path | None = None
 _ACTIVE_DISCOVERY_SEARCHES: set[str] = set()
 _ACTIVE_DISCOVERY_SEARCHES_LOCK = threading.Lock()
 MAX_FETCH_BYTES = 1_200_000
-DISCOVERY_SOURCES = ["linkedin", "indeed", "google", "zip_recruiter"]
+DISCOVERY_SOURCES = ["linkedin", "indeed", "glassdoor", "zip_recruiter"]
 GENERATED_APPLICATIONS_DIRNAME = "generated_applications"
 SEMANTIC_CACHE_DIRNAME = "semantic_cache"
 RESTORABLE_SHORTLIST_STATUSES = {"Archived", "Rejected", "Saved", "Drafting"}
@@ -1873,11 +1873,11 @@ def create_app() -> Flask:
                 """INSERT INTO saved_search_profiles
                    (name, keywords, location, remote_preference, seniority, minimum_salary,
                     enabled_sources_json, date_window, search_depth, distance, per_source_cap, total_cap, interval_minutes, enabled,
-                    search_mode, title_match_mode,
+                    target_matches, search_mode, title_match_mode,
                     auto_prepare_enabled, auto_prepare_min_priority, auto_prepare_require_canadian,
                     auto_prepare_candidate_profile_id, auto_prepare_resume_id, auto_prepare_cover_letter_template_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["search_depth"], search["distance"], search["per_source_cap"], search["total_cap"], search["interval_minutes"], search["enabled"], search["search_mode"], search["title_match_mode"], search["auto_prepare_enabled"], search["auto_prepare_min_priority"], search["auto_prepare_require_canadian"], search["auto_prepare_candidate_profile_id"], search["auto_prepare_resume_id"], search["auto_prepare_cover_letter_template_id"]],
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["search_depth"], search["distance"], search["per_source_cap"], search["total_cap"], search["interval_minutes"], search["enabled"], search["target_matches"], search["search_mode"], search["title_match_mode"], search["auto_prepare_enabled"], search["auto_prepare_min_priority"], search["auto_prepare_require_canadian"], search["auto_prepare_candidate_profile_id"], search["auto_prepare_resume_id"], search["auto_prepare_cover_letter_template_id"]],
             )
             get_db().commit()
         except sqlite3.IntegrityError:
@@ -1897,11 +1897,11 @@ def create_app() -> Flask:
             get_db().execute(
                 """UPDATE saved_search_profiles SET name = ?, keywords = ?, location = ?, remote_preference = ?,
                    seniority = ?, minimum_salary = ?, enabled_sources_json = ?, date_window = ?, search_depth = ?, distance = ?,
-                   per_source_cap = ?, total_cap = ?, interval_minutes = ?, enabled = ?, auto_prepare_enabled = ?, auto_prepare_min_priority = ?,
+                   per_source_cap = ?, total_cap = ?, target_matches = ?, interval_minutes = ?, enabled = ?, auto_prepare_enabled = ?, auto_prepare_min_priority = ?,
                    search_mode = ?, title_match_mode = ?,
                    auto_prepare_require_canadian = ?, auto_prepare_candidate_profile_id = ?, auto_prepare_resume_id = ?,
                    auto_prepare_cover_letter_template_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
-                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["search_depth"], search["distance"], search["per_source_cap"], search["total_cap"], search["interval_minutes"], search["enabled"], search["auto_prepare_enabled"], search["auto_prepare_min_priority"], search["search_mode"], search["title_match_mode"], search["auto_prepare_require_canadian"], search["auto_prepare_candidate_profile_id"], search["auto_prepare_resume_id"], search["auto_prepare_cover_letter_template_id"], search_id],
+                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["search_depth"], search["distance"], search["per_source_cap"], search["total_cap"], search["target_matches"], search["interval_minutes"], search["enabled"], search["auto_prepare_enabled"], search["auto_prepare_min_priority"], search["search_mode"], search["title_match_mode"], search["auto_prepare_require_canadian"], search["auto_prepare_candidate_profile_id"], search["auto_prepare_resume_id"], search["auto_prepare_cover_letter_template_id"], search_id],
             )
             get_db().commit()
         except sqlite3.IntegrityError:
@@ -1918,7 +1918,8 @@ def create_app() -> Flask:
     def discovery_inbox() -> Response:
         include_history = as_bool(request.args.get("include_history"))
         query = "SELECT * FROM jobs WHERE discovery_first_seen_at <> ''"
-        if not include_history:
+        profile_id = clamp_int(request.args.get("applicant_profile_id"), 0, 10**9)
+        if not include_history and not profile_id:
             query += " AND discovery_state NOT IN ('ignored', 'saved', 'applied') AND status NOT IN ('Applied', 'shortlisted')"
         query += " ORDER BY discovery_state = 'new' DESC, discovery_last_seen_at DESC, id DESC LIMIT 500"
         rows = query_db(
@@ -1934,7 +1935,12 @@ def create_app() -> Flask:
         statuses = _preparation_statuses([int(row["id"]) for row in rows])
         jobs = []
         for row in rows:
+            state = applicant_discovery_state(int(row["id"]), profile_id)
+            if profile_id and not include_history and (state in {"skipped", "saved", "applied"} or text(row["status"]) in {"Applied", "shortlisted"}):
+                continue
             item = job_to_dict(row, evidence_profile, include_legacy_details=False, preparation_status=statuses.get(int(row["id"])))
+            if state:
+                item["discovery_state"] = state
             if text(item.get("status")) == "Applied":
                 category = "applied"
             elif text(item.get("discovery_state")) == "ignored":
@@ -1965,7 +1971,25 @@ def create_app() -> Flask:
         row = query_db("SELECT * FROM jobs WHERE id = ? AND discovery_first_seen_at <> ''", [job_id], one=True)
         if row is None:
             return jsonify({"error": "Discovered job not found"}), 404
-        get_db().execute("UPDATE jobs SET discovery_state = 'ignored', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
+        payload = request.get_json(silent=True) or {}
+        profile_id = applicant_profile_id(payload)
+        if profile_id:
+            set_applicant_discovery_state(job_id, profile_id, "skipped")
+        else:
+            get_db().execute("UPDATE jobs SET discovery_state = 'ignored', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
+        get_db().commit()
+        return jsonify({"ok": True})
+
+    @app.post("/api/discovery/inbox/<int:job_id>/restore")
+    def restore_discovery_job(job_id: int) -> Response:
+        row = query_db("SELECT * FROM jobs WHERE id = ? AND discovery_first_seen_at <> ''", [job_id], one=True)
+        if row is None:
+            return jsonify({"error": "Discovered job not found"}), 404
+        profile_id = applicant_profile_id(request.get_json(silent=True) or {})
+        if profile_id:
+            get_db().execute("DELETE FROM discovery_applicant_states WHERE job_id = ? AND applicant_profile_id = ?", [job_id, profile_id])
+        else:
+            get_db().execute("UPDATE jobs SET discovery_state = 'reviewed', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
         get_db().commit()
         return jsonify({"ok": True})
 
@@ -1974,10 +1998,12 @@ def create_app() -> Flask:
         row = query_db("SELECT * FROM jobs WHERE id = ? AND discovery_first_seen_at <> ''", [job_id], one=True)
         if row is None:
             return jsonify({"error": "Discovered job not found"}), 404
-        get_db().execute(
-            "UPDATE jobs SET status = 'Saved', discovery_state = 'saved', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            [job_id],
-        )
+        payload = request.get_json(silent=True) or {}
+        profile_id = applicant_profile_id(payload)
+        if profile_id:
+            set_applicant_discovery_state(job_id, profile_id, "saved")
+        else:
+            get_db().execute("UPDATE jobs SET status = 'Saved', discovery_state = 'saved', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
         get_db().commit()
         return jsonify(job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)))
 
@@ -1987,13 +2013,14 @@ def create_app() -> Flask:
         if row is None:
             return jsonify({"error": "Discovered job not found"}), 404
         payload = request.get_json(silent=True) or {}
+        profile_id = applicant_profile_id(payload)
         applied_date = text(payload.get("date_applied")) or date.today().isoformat()
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", applied_date):
             return jsonify({"error": "date_applied must use YYYY-MM-DD"}), 400
-        get_db().execute(
-            "UPDATE jobs SET status = 'Applied', date_applied = ?, discovery_state = 'applied', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            [applied_date, job_id],
-        )
+        if profile_id:
+            set_applicant_discovery_state(job_id, profile_id, "applied")
+        else:
+            get_db().execute("UPDATE jobs SET status = 'Applied', date_applied = ?, discovery_state = 'applied', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [applied_date, job_id])
         get_db().commit()
         return jsonify(job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)))
 
@@ -2428,8 +2455,18 @@ def create_app() -> Flask:
         persisted = persist_discovery_jobs(jobs, None, manual_run_id)
         for item in jobs:
             hydrate_discovery_identity(item)
+            state = applicant_discovery_state(int(item.get("id") or 0), applicant_profile_id(payload))
+            if state:
+                item["applicant_discovery_state"] = state
+                if state in {"skipped", "saved", "applied"}:
+                    item["processed_discovery"] = True
         processed_count = sum(1 for item in jobs if item.get("processed_discovery"))
-        jobs = [item for item in jobs if not item.get("processed_discovery")]
+        review_required_jobs = [item for item in jobs if item.get("discovery_result_category") == "review_required" and not item.get("processed_discovery")]
+        qualifying_new_jobs = [item for item in jobs if item.get("discovery_result_category") == "actionable" and not item.get("processed_discovery")]
+        # Keep the legacy jobs list complete for callers that inspect all
+        # returned evidence. The target applies to qualification/termination;
+        # qualifying and review-required subsets are explicit response fields.
+        jobs = [item for item in jobs if not item.get("processed_discovery")][: search["total_cap"]]
         shortlist_jobs: list[dict[str, Any]] = []
         if search["search_mode"] == "shortlist":
             rank = {"Strong technical match": 0, "Possible / stretch": 1, "Possible / stretch — evidence incomplete": 2, "Significant gaps": 3}
@@ -2460,6 +2497,15 @@ def create_app() -> Flask:
             outcomes={"source_counts": source_counts, "processed_count": processed_count},
         )
         diagnostics["processed_count"] = processed_count
+        diagnostics["target_matches"] = search["target_matches"]
+        diagnostics["qualifying_new_count"] = len(qualifying_new_jobs)
+        diagnostics["review_required_count"] = len(review_required_jobs)
+        diagnostics["raw_fetched_count"] = len(raw_jobs)
+        diagnostics["already_processed_count"] = processed_count
+        diagnostics["previously_skipped_count"] = sum(1 for item in jobs if item.get("discovery_state") == "ignored")
+        diagnostics["search_termination_reason"] = "target_reached" if len(qualifying_new_jobs) >= search["target_matches"] else ("provider_failure" if fetched.get("errors") else "sources_exhausted")
+        diagnostics["continuation_available"] = bool(len(qualifying_new_jobs) < search["target_matches"] and not fetched.get("errors"))
+        diagnostics["review_required_jobs"] = review_required_jobs
         diagnostics["persisted"] = persisted
         diagnostics["jobs_returned_to_frontend"] = len(jobs)
         diagnostics["post_processing_row_count"] = len(jobs)
@@ -2474,6 +2520,8 @@ def create_app() -> Flask:
         return jsonify(
             {
                 "jobs": jobs,
+                "qualifying_new_jobs": qualifying_new_jobs[: search["target_matches"]],
+                "review_required_jobs": review_required_jobs,
                 "technical_shortlist": shortlist_jobs,
                 "errors": fetched.get("errors", {}),
                 "source_counts": source_counts,
@@ -2491,6 +2539,14 @@ def create_app() -> Flask:
                 "preferences": preferences,
                 "bypass_cache": bypass_cache,
                 "diagnostics": diagnostics,
+                "target_matches": search["target_matches"],
+                "qualifying_new_count": len(qualifying_new_jobs),
+                "review_required_count": len(review_required_jobs),
+                "raw_fetched_count": len(raw_jobs),
+                "already_processed_count": processed_count,
+                "previously_skipped_count": sum(1 for item in jobs if item.get("discovery_state") == "ignored"),
+                "continuation_available": diagnostics["continuation_available"],
+                "search_termination_reason": diagnostics["search_termination_reason"],
             }
         )
 
@@ -2851,6 +2907,28 @@ def normalize_discovery_sources(value: Any) -> list[str]:
     return clean or ["linkedin", "indeed"]
 
 
+def applicant_profile_id(payload: dict[str, Any] | None = None) -> int:
+    payload = payload or {}
+    return clamp_int(payload.get("applicant_profile_id") or payload.get("candidate_profile_id"), 0, 10**9)
+
+
+def applicant_discovery_state(job_id: int, profile_id: int) -> str:
+    if not profile_id:
+        return ""
+    row = query_db("SELECT state FROM discovery_applicant_states WHERE job_id = ? AND applicant_profile_id = ?", [job_id, profile_id], one=True)
+    return text(row["state"]) if row else ""
+
+
+def set_applicant_discovery_state(job_id: int, profile_id: int, state: str) -> None:
+    if not profile_id:
+        return
+    get_db().execute(
+        """INSERT INTO discovery_applicant_states (job_id, applicant_profile_id, state)
+           VALUES (?, ?, ?) ON CONFLICT(job_id, applicant_profile_id) DO UPDATE SET state = excluded.state, updated_at = CURRENT_TIMESTAMP""",
+        [job_id, profile_id, state],
+    )
+
+
 def normalize_saved_search_payload(payload: dict[str, Any], existing: dict[str, Any] | None = None) -> dict[str, Any]:
     existing = existing or {}
     name = normalize_space(text(payload.get("name", existing.get("name"))))
@@ -2861,6 +2939,7 @@ def normalize_saved_search_payload(payload: dict[str, Any], existing: dict[str, 
     search_depth = normalize_choice(payload.get("search_depth", existing.get("search_depth")), set(DISCOVERY_SEARCH_DEPTHS)) or "standard"
     per_source_cap = clamp_int_default(payload.get("per_source_cap", existing.get("per_source_cap")), 100, 1, 1000)
     total_cap = clamp_int_default(payload.get("total_cap", existing.get("total_cap")), 200, 1, 5000)
+    target_matches = clamp_int_default(payload.get("target_matches", existing.get("target_matches")), 25, 1, 5000)
     remote_preference = normalize_choice(payload.get("remote_preference", existing.get("remote_preference")), {"", "remote", "hybrid", "on-site"})
     interval_minutes = clamp_int_default(payload.get("interval_minutes", existing.get("interval_minutes")), 360, 15, 10080)
     minimum_salary = clamp_int_default(payload.get("minimum_salary", existing.get("minimum_salary")), 0, 0, 1000000)
@@ -2894,6 +2973,7 @@ def normalize_saved_search_payload(payload: dict[str, Any], existing: dict[str, 
         "distance": distance,
         "per_source_cap": per_source_cap,
         "total_cap": total_cap,
+        "target_matches": target_matches,
         "search_mode": search_mode,
         "title_match_mode": title_match_mode,
         "interval_minutes": interval_minutes,
@@ -2933,6 +3013,7 @@ def saved_search_to_discovery_payload(search: dict[str, Any]) -> dict[str, Any]:
         "enabled_sources": search.get("enabled_sources") or ["linkedin", "indeed"],
         "search_depth": search.get("search_depth") or "standard",
         "total_cap": int(search.get("total_cap") or 200),
+        "target_matches": int(search.get("target_matches") or 25),
         "per_source_cap": int(search.get("per_source_cap") or 100),
     }
 
@@ -7106,6 +7187,7 @@ def discovery_search_signature(payload: dict[str, Any]) -> str:
         "date_window": search["date_window"],
         "per_source_cap": search["per_source_cap"],
         "total_cap": search["total_cap"],
+        "target_matches": search["target_matches"],
         "search_mode": search["search_mode"],
         "title_match_mode": search["title_match_mode"],
         "candidate_profile_id": text(payload.get("candidate_profile_id") or payload.get("auto_prepare_candidate_profile_id")),
@@ -7219,6 +7301,7 @@ def discovery_search_config(payload: dict[str, Any]) -> dict[str, Any]:
     date_window = normalize_choice(payload.get("date_window"), set(DISCOVERY_DATE_WINDOWS)) or f"{preset['days']}d"
     per_source_cap = clamp_int_default(payload.get("per_source_cap"), preset["per_source_cap"], 1, 1000)
     total_cap = clamp_int_default(payload.get("total_cap"), preset["total_cap"], 1, 5000)
+    target_matches = clamp_int_default(payload.get("target_matches"), 25, 1, 5000)
     distance = clamp_int_default(payload.get("distance"), 50, 0, 1000)
     search_mode = normalize_choice(payload.get("search_mode"), {"title", "explore", "shortlist"}) or "title"
     title_match_mode = normalize_choice(payload.get("title_match_mode"), {"strict", "related"}) or "related"
@@ -7239,6 +7322,7 @@ def discovery_search_config(payload: dict[str, Any]) -> dict[str, Any]:
         "hours_old": None if date_window == "any" else DISCOVERY_DATE_WINDOWS.get(date_window, preset["days"]) * 24,
         "per_source_cap": per_source_cap,
         "total_cap": total_cap,
+        "target_matches": target_matches,
         "request_per_source_cap": request_per_source_cap,
         "aggregate_request_budget": request_per_source_cap * len(enabled_sources),
         "enabled_source_count": len(enabled_sources),
@@ -9291,10 +9375,22 @@ def init_db() -> None:
     ensure_columns(
         "saved_search_profiles",
         {
+            "target_matches": "INTEGER NOT NULL DEFAULT 25",
             "search_mode": "TEXT NOT NULL DEFAULT 'title'",
             "title_match_mode": "TEXT NOT NULL DEFAULT 'related'",
         },
     )
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS discovery_applicant_states (
+            job_id INTEGER NOT NULL,
+            applicant_profile_id INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (job_id, applicant_profile_id),
+            FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+        )"""
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS discovery_applicant_states_profile_idx ON discovery_applicant_states(applicant_profile_id, state)")
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS discovery_run_history (
@@ -9347,6 +9443,7 @@ def init_db() -> None:
     ensure_columns(
         "saved_search_profiles",
         {
+            "target_matches": "INTEGER NOT NULL DEFAULT 25",
             "seniority": "TEXT NOT NULL DEFAULT ''",
             "minimum_salary": "INTEGER NOT NULL DEFAULT 0",
             "enabled_sources_json": "TEXT NOT NULL DEFAULT '[\"linkedin\", \"indeed\"]'",
