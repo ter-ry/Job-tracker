@@ -2269,7 +2269,7 @@ class JobAssistantTest(unittest.TestCase):
         def fake_scrape_jobs(**kwargs):
             if kwargs["site_name"] == "linkedin":
                 return [
-                    {"title": "Role", "company": "A", "location": "Toronto, ON", "date_posted": "2026-06-19"}
+                    {"title": "Role", "company": "A", "location": "Toronto, ON", "date_posted": datetime.now().isoformat()}
                 ]
             raise RuntimeError("parser error")
 
@@ -2321,8 +2321,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertTrue(result["source_diagnostics"]["indeed"]["attempted"])
         self.assertFalse(result["source_diagnostics"]["indeed"]["success"])
         self.assertIn("parser error", result["source_diagnostics"]["indeed"]["error"])
-        self.assertFalse(result["source_diagnostics"]["google"]["attempted"])
-        self.assertEqual(result["source_diagnostics"]["google"]["skipped_reason"], "disabled")
+        self.assertNotIn("google", result["source_diagnostics"])
 
     def test_jobspy_provider_timeout_is_reported_as_partial_failure(self):
         def stalled_provider(**_kwargs):
