@@ -14,6 +14,7 @@ JOBSPY_SOURCE_NAMES = {
     "indeed": "indeed",
     "google": "google",
     "zip_recruiter": "zip_recruiter",
+    "glassdoor": "glassdoor",
 }
 
 

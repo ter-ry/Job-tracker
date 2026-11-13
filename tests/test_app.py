@@ -7010,6 +7010,25 @@ class JobAssistantTest(unittest.TestCase):
                 "total_cap": 2,
             })
 
+    def test_discovery_search_config_separates_new_match_target_from_fetch_budget(self):
+        config = app_module.discovery_search_config({
+            "keywords": "software developer",
+            "new_matching_target": 25,
+            "enabled_sources": ["linkedin", "indeed", "zip_recruiter", "glassdoor"],
+        })
+        self.assertEqual(config["requested_target"], 25)
+        self.assertGreaterEqual(config["total_cap"], 100)
+        self.assertLessEqual(config["aggregate_request_budget"], config["total_cap"])
+        legacy = app_module.discovery_search_config({"shortlist_size": 7, "enabled_sources": ["linkedin"]})
+        self.assertEqual(legacy["requested_target"], 7)
+
+    def test_clear_senior_swe_roles_are_review_only_for_shortlist(self):
+        search = {"search_mode": "shortlist", "occupation": "software developer"}
+        senior = {"qualification_fit_seniority": {"detected_level": "senior"}}
+        early = {"qualification_fit_seniority": {"detected_level": "junior"}}
+        self.assertTrue(app_module.discovery_is_clear_senior_role(senior, search))
+        self.assertFalse(app_module.discovery_is_clear_senior_role(early, search))
+
     def test_manual_search_rejects_aggregate_limit_below_selected_source_count(self):
         response = self.client.post("/api/discovery/jobspy", json={
             "keywords": "backend", "enabled_sources": ["linkedin", "indeed", "google"], "total_cap": 2,

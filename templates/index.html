@@ -79,7 +79,8 @@
               <label>Minimum salary<input id="saved-search-minimum-salary" type="number" min="0" step="1000"></label>
               <label>Posting recency<select id="saved-search-date-window"><option value="24h">24 hours</option><option value="3d">3 days</option><option value="7d">7 days</option><option value="14d" selected>14 days</option><option value="30d">30 days</option><option value="any">Any</option></select></label>
               <label>Search depth<select id="saved-search-depth"><option value="quick">Quick</option><option value="standard" selected>Standard</option><option value="thorough">Thorough</option></select></label>
-              <label>Aggregate fetch limit<input id="saved-search-total-cap" type="number" min="1" step="1" value="200"></label>
+              <label>Number of new matching jobs<input id="saved-search-new-target" type="number" min="1" max="500" step="1" value="25"><small class="muted">Target for qualifying new jobs; provider inspection continues as needed.</small></label>
+              <input id="saved-search-total-cap" type="hidden" value="200">
               <label>Per-source cap<input id="saved-search-per-source-cap" type="number" min="1" step="1" value="100"></label>
               <label>Interval (minutes)<input id="saved-search-interval" type="number" min="15" step="15" value="360"></label>
               <label class="checkline"><input id="saved-search-enabled" type="checkbox"> Enable scheduled search</label>
@@ -87,7 +88,7 @@
               <p class="muted helper">Automatic preparation applies only to new discovery results. Unknown Canadian eligibility always requires manual confirmation; it is never bypassed by a saved-search setting.</p>
               <label>Minimum Job Priority<input id="saved-search-auto-min-priority" type="number" min="0" max="100" step="1" value="75"></label>
               <label>Résumé profile for scoring and preparation<select id="saved-search-auto-profile"><option value="">Use active Profile</option></select></label>
-              <fieldset class="source-picker"><legend>Sources</legend><label><input type="checkbox" name="saved-search-source" value="linkedin" checked> LinkedIn</label><label><input type="checkbox" name="saved-search-source" value="indeed" checked> Indeed</label><label><input type="checkbox" name="saved-search-source" value="google"> Google Jobs</label><label><input type="checkbox" name="saved-search-source" value="zip_recruiter"> ZipRecruiter</label></fieldset>
+              <fieldset class="source-picker"><legend>Sources</legend><label><input type="checkbox" name="saved-search-source" value="linkedin" checked> LinkedIn</label><label><input type="checkbox" name="saved-search-source" value="indeed" checked> Indeed</label><label><input type="checkbox" name="saved-search-source" value="zip_recruiter"> ZipRecruiter</label><label><input type="checkbox" name="saved-search-source" value="glassdoor"> Glassdoor <small class="muted">experimental</small></label></fieldset>
               <div class="actions"><button class="button" type="submit">Save search</button><button class="button ghost" type="button" id="cancel-saved-search">Cancel</button></div>
             </form>
             <div class="actions compact"><button class="button ghost small" type="button" id="toggle-discovery-scheduler">Enable database scheduler</button><span id="discovery-scheduler-status" class="muted helper"></span></div>
@@ -113,7 +114,7 @@
               </label>
               <label>Job titles<input id="discovery-keywords" required placeholder="software developer; junior software engineer"><small class="muted">Use semicolons for multiple titles.</small></label>
               <label>Search area<input id="discovery-location" placeholder="Toronto, Ontario"></label>
-              <label>Maximum job results<input id="discovery-total-cap" type="number" min="1" max="100" step="1" value="25"></label>
+              <label>Number of new matching jobs<input id="discovery-new-matching-target" type="number" min="1" max="500" step="1" value="25"><small class="muted">Target for qualifying new jobs, not the raw provider-fetch limit.</small></label>
               <label>Distance radius<input id="discovery-distance" type="number" min="0" step="1" placeholder="50 km"></label>
               <label>Remote preference
                 <select id="discovery-remote-preference">
@@ -128,8 +129,8 @@
               <legend>Sources</legend>
               <label><input type="checkbox" name="discovery-source" value="linkedin" checked> LinkedIn</label>
               <label><input type="checkbox" name="discovery-source" value="indeed" checked> Indeed</label>
-              <label><input type="checkbox" name="discovery-source" value="google"> Google Jobs</label>
               <label><input type="checkbox" name="discovery-source" value="zip_recruiter"> ZipRecruiter</label>
+              <label><input type="checkbox" name="discovery-source" value="glassdoor"> Glassdoor <small class="muted">experimental</small></label>
             </fieldset>
             <details class="settings-block beta-secondary">
               <summary>Search options</summary>
@@ -166,12 +167,11 @@
             <div class="compatibility-fields" aria-hidden="true">
               <select id="discovery-search-mode"><option value="shortlist">shortlist</option></select>
               <select id="discovery-title-match-mode"><option value="related">related</option></select>
-              <input id="discovery-distance-origin"><input id="discovery-shortlist-size" value="15"><input id="discovery-strict-technical" type="checkbox">
+              <input id="discovery-distance-origin"><input id="discovery-shortlist-size" value="15"><input id="discovery-total-cap" type="hidden" value="200"><input id="discovery-strict-technical" type="checkbox">
             </div>
           </form>
 
           <section class="panel discovery-results-panel discovery-view-find">
-            <button class="button ghost small" type="button" id="discovery-show-all" hidden>Show all retrieved jobs</button>
             <div class="panel-header discovery-toolbar">
               <div>
                 <h2>Discovery results</h2>

@@ -95,7 +95,9 @@ _LAST_MIGRATION_BACKUP: Path | None = None
 _ACTIVE_DISCOVERY_SEARCHES: set[str] = set()
 _ACTIVE_DISCOVERY_SEARCHES_LOCK = threading.Lock()
 MAX_FETCH_BYTES = 1_200_000
-DISCOVERY_SOURCES = ["linkedin", "indeed", "google", "zip_recruiter"]
+# Google remains a backend compatibility key for historical diagnostics, but
+# is intentionally not exposed as a selectable source in the UI.
+DISCOVERY_SOURCES = ["linkedin", "indeed", "zip_recruiter", "glassdoor", "google"]
 GENERATED_APPLICATIONS_DIRNAME = "generated_applications"
 SEMANTIC_CACHE_DIRNAME = "semantic_cache"
 RESTORABLE_SHORTLIST_STATUSES = {"Archived", "Rejected", "Saved", "Drafting"}
@@ -1530,11 +1532,17 @@ def create_app() -> Flask:
 
     @app.post("/api/jobs/<int:job_id>/skip")
     def skip_job(job_id: int) -> Response:
-        if query_db("SELECT id FROM jobs WHERE id = ?", [job_id], one=True) is None:
+        existing = query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)
+        if existing is None:
             return jsonify({"error": "Job not found"}), 404
+        payload = request.get_json(silent=True) or {}
+        requested_profile = clamp_int(payload.get("candidate_profile_id"), 0, 10**9)
+        stored_profile = clamp_int(existing["candidate_profile_id"], 0, 10**9)
+        if stored_profile and requested_profile != stored_profile:
+            return jsonify({"error": "This discovery result belongs to a different applicant profile."}), 409
         get_db().execute("UPDATE jobs SET discovery_state = 'ignored', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
         get_db().commit()
-        return jsonify({"ok": True})
+        return jsonify({"ok": True, "candidate_profile_id": stored_profile or requested_profile})
 
     @app.post("/api/jobs")
     def create_job() -> Response:
@@ -1872,12 +1880,12 @@ def create_app() -> Flask:
             cursor = get_db().execute(
                 """INSERT INTO saved_search_profiles
                    (name, keywords, location, remote_preference, seniority, minimum_salary,
-                    enabled_sources_json, date_window, search_depth, distance, per_source_cap, total_cap, interval_minutes, enabled,
+                    enabled_sources_json, date_window, search_depth, distance, per_source_cap, new_matching_target, total_cap, interval_minutes, enabled,
                     search_mode, title_match_mode,
                     auto_prepare_enabled, auto_prepare_min_priority, auto_prepare_require_canadian,
                     auto_prepare_candidate_profile_id, auto_prepare_resume_id, auto_prepare_cover_letter_template_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["search_depth"], search["distance"], search["per_source_cap"], search["total_cap"], search["interval_minutes"], search["enabled"], search["search_mode"], search["title_match_mode"], search["auto_prepare_enabled"], search["auto_prepare_min_priority"], search["auto_prepare_require_canadian"], search["auto_prepare_candidate_profile_id"], search["auto_prepare_resume_id"], search["auto_prepare_cover_letter_template_id"]],
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["search_depth"], search["distance"], search["per_source_cap"], search["new_matching_target"], search["total_cap"], search["interval_minutes"], search["enabled"], search["search_mode"], search["title_match_mode"], search["auto_prepare_enabled"], search["auto_prepare_min_priority"], search["auto_prepare_require_canadian"], search["auto_prepare_candidate_profile_id"], search["auto_prepare_resume_id"], search["auto_prepare_cover_letter_template_id"]],
             )
             get_db().commit()
         except sqlite3.IntegrityError:
@@ -1897,11 +1905,11 @@ def create_app() -> Flask:
             get_db().execute(
                 """UPDATE saved_search_profiles SET name = ?, keywords = ?, location = ?, remote_preference = ?,
                    seniority = ?, minimum_salary = ?, enabled_sources_json = ?, date_window = ?, search_depth = ?, distance = ?,
-                   per_source_cap = ?, total_cap = ?, interval_minutes = ?, enabled = ?, auto_prepare_enabled = ?, auto_prepare_min_priority = ?,
+                   per_source_cap = ?, new_matching_target = ?, total_cap = ?, interval_minutes = ?, enabled = ?, auto_prepare_enabled = ?, auto_prepare_min_priority = ?,
                    search_mode = ?, title_match_mode = ?,
                    auto_prepare_require_canadian = ?, auto_prepare_candidate_profile_id = ?, auto_prepare_resume_id = ?,
                    auto_prepare_cover_letter_template_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
-                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["search_depth"], search["distance"], search["per_source_cap"], search["total_cap"], search["interval_minutes"], search["enabled"], search["auto_prepare_enabled"], search["auto_prepare_min_priority"], search["search_mode"], search["title_match_mode"], search["auto_prepare_require_canadian"], search["auto_prepare_candidate_profile_id"], search["auto_prepare_resume_id"], search["auto_prepare_cover_letter_template_id"], search_id],
+                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["search_depth"], search["distance"], search["per_source_cap"], search["new_matching_target"], search["total_cap"], search["interval_minutes"], search["enabled"], search["auto_prepare_enabled"], search["auto_prepare_min_priority"], search["search_mode"], search["title_match_mode"], search["auto_prepare_require_canadian"], search["auto_prepare_candidate_profile_id"], search["auto_prepare_resume_id"], search["auto_prepare_cover_letter_template_id"], search_id],
             )
             get_db().commit()
         except sqlite3.IntegrityError:
@@ -1965,9 +1973,31 @@ def create_app() -> Flask:
         row = query_db("SELECT * FROM jobs WHERE id = ? AND discovery_first_seen_at <> ''", [job_id], one=True)
         if row is None:
             return jsonify({"error": "Discovered job not found"}), 404
+        payload = request.get_json(silent=True) or {}
+        requested_profile = clamp_int(payload.get("candidate_profile_id"), 0, 10**9)
+        stored_profile = clamp_int(row["candidate_profile_id"], 0, 10**9)
+        if stored_profile and requested_profile != stored_profile:
+            return jsonify({"error": "This discovery result belongs to a different applicant profile."}), 409
         get_db().execute("UPDATE jobs SET discovery_state = 'ignored', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
         get_db().commit()
-        return jsonify({"ok": True})
+        return jsonify({"ok": True, "candidate_profile_id": stored_profile or requested_profile})
+
+    @app.post("/api/discovery/inbox/<int:job_id>/restore")
+    def restore_discovery_job(job_id: int) -> Response:
+        row = query_db("SELECT * FROM jobs WHERE id = ? AND discovery_first_seen_at <> ''", [job_id], one=True)
+        if row is None:
+            return jsonify({"error": "Discovered job not found"}), 404
+        payload = request.get_json(silent=True) or {}
+        requested_profile = clamp_int(payload.get("candidate_profile_id"), 0, 10**9)
+        stored_profile = clamp_int(row["candidate_profile_id"], 0, 10**9)
+        if stored_profile and requested_profile != stored_profile:
+            return jsonify({"error": "This discovery result belongs to a different applicant profile."}), 409
+        get_db().execute(
+            "UPDATE jobs SET discovery_state = 'new', status = CASE WHEN status IN ('Saved', 'Discovered') THEN 'Discovered' ELSE status END, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            [job_id],
+        )
+        get_db().commit()
+        return jsonify(job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True), include_legacy_details=False))
 
     @app.post("/api/discovery/inbox/<int:job_id>/save")
     def save_discovery_job(job_id: int) -> Response:
@@ -2359,6 +2389,7 @@ def create_app() -> Flask:
         for item in jobs:
             category = item.get("discovery_result_category") or "review_required"
             category_counts[category] = category_counts.get(category, 0) + 1
+        excluded_count = category_counts.get("excluded", 0)
         outside_radius_count = sum(1 for item in jobs if text(item.get("distance_radius_status")) == "outside_radius")
         unknown_distance_count = sum(1 for item in jobs if text(item.get("distance_radius_status")) == "unknown")
         capped_count = max(0, len(jobs) - search["total_cap"])
@@ -2428,28 +2459,27 @@ def create_app() -> Flask:
         persisted = persist_discovery_jobs(jobs, None, manual_run_id)
         for item in jobs:
             hydrate_discovery_identity(item)
-        processed_count = sum(1 for item in jobs if item.get("processed_discovery"))
+        processed_items = [item for item in jobs if item.get("processed_discovery")]
+        processed_count = len(processed_items)
+        skipped_count = sum(1 for item in processed_items if text(item.get("discovery_state")) == "ignored")
         jobs = [item for item in jobs if not item.get("processed_discovery")]
-        shortlist_jobs: list[dict[str, Any]] = []
-        if search["search_mode"] == "shortlist":
-            rank = {"Strong technical match": 0, "Possible / stretch": 1, "Possible / stretch — evidence incomplete": 2, "Significant gaps": 3}
-            ordered = sorted(jobs, key=lambda item: (rank.get(text((item.get("technical_compatibility") or {}).get("decision")), 4), -int(item.get("application_priority_score") or 0)))
-            if as_bool(payload.get("strict_technical")):
-                ordered = [item for item in ordered if not (item.get("technical_compatibility") or {}).get("required_no_experience")]
-            # Keep the default application shortlist focused on early-career
-            # roles. Senior/lead/management and high-experience roles remain
-            # in the full result set behind Show all.
-            senior_levels = {"senior", "lead", "manager", "director"}
-            primary = []
-            for item in ordered:
-                analysis = item.get("qualification_fit_seniority") or {}
-                level = text(analysis.get("detected_level") or item.get("seniority_level")).lower().replace("-", "_")
-                required = analysis.get("required_experience") or {}
-                minimum_years = required.get("minimum") if isinstance(required, dict) else None
-                is_senior = level in senior_levels or bool(analysis.get("management_role")) or bool(analysis.get("leadership_expectations")) or (minimum_years is not None and float(minimum_years) >= 5)
-                if not is_senior:
-                    primary.append(item)
-            shortlist_jobs = primary[:clamp_int_default(payload.get("shortlist_size"), 15, 1, 100)]
+        rank = {"Strong technical match": 0, "Possible / stretch": 1, "Possible / stretch — evidence incomplete": 2, "Significant gaps": 3}
+        # `jobs` is already ordered by the user's saved sort preferences.
+        # Preserve that order while applying the target and seniority gates.
+        ordered = list(jobs)
+        if as_bool(payload.get("strict_technical")):
+            ordered = [item for item in ordered if not (item.get("technical_compatibility") or {}).get("required_no_experience")]
+        requested_target = int(search.get("requested_target") or 25)
+        matching_jobs = [item for item in ordered if item.get("discovery_result_category") == "actionable" and not discovery_is_clear_senior_role(item, search)]
+        senior_review_jobs = [item for item in ordered if item.get("discovery_result_category") == "actionable" and discovery_is_clear_senior_role(item, search)]
+        for item in senior_review_jobs:
+            item["discovery_result_category"] = "review_required"
+            item["discovery_result_reason"] = "Clearly senior or managerial SWE role kept out of the new-match target."
+        review_required_jobs = [item for item in ordered if item.get("discovery_result_category") not in {"actionable", "excluded"}]
+        new_matching_jobs = matching_jobs[:requested_target]
+        # The response is unified: actionable new matches first, followed by a
+        # separately labelled review queue. Excluded jobs never enter it.
+        jobs = new_matching_jobs + review_required_jobs
         finish_discovery_run(
             manual_run_id,
             status="completed" if not fetched.get("errors") else "completed_with_errors",
@@ -2460,6 +2490,20 @@ def create_app() -> Flask:
             outcomes={"source_counts": source_counts, "processed_count": processed_count},
         )
         diagnostics["processed_count"] = processed_count
+        diagnostics["skipped_count"] = skipped_count
+        diagnostics["requested_target"] = requested_target
+        diagnostics["new_matching_count"] = len(new_matching_jobs)
+        diagnostics["review_required_count"] = len(review_required_jobs)
+        diagnostics["unique_jobs_found"] = len(seen_jobs)
+        diagnostics["raw_jobs_inspected"] = len(raw_jobs)
+        diagnostics["search_complete"] = not bool(fetched.get("errors"))
+        diagnostics["target_unmet_reason"] = (
+            "No further matching results were returned by the selected sources."
+            if len(new_matching_jobs) < requested_target and not fetched.get("errors")
+            else "Provider failures, timeouts, or rate limits interrupted the search. Continue search to retry."
+            if len(new_matching_jobs) < requested_target and fetched.get("errors")
+            else ""
+        )
         diagnostics["persisted"] = persisted
         diagnostics["jobs_returned_to_frontend"] = len(jobs)
         diagnostics["post_processing_row_count"] = len(jobs)
@@ -2474,7 +2518,21 @@ def create_app() -> Flask:
         return jsonify(
             {
                 "jobs": jobs,
-                "technical_shortlist": shortlist_jobs,
+                "technical_shortlist": new_matching_jobs,
+                "matching_jobs": new_matching_jobs,
+                "review_required_jobs": review_required_jobs,
+                "search_progress": {
+                    "raw_jobs_inspected": len(raw_jobs),
+                    "unique_jobs_found": len(seen_jobs),
+                    "previously_processed": processed_count,
+                    "skipped": skipped_count,
+                    "disqualified": excluded_count,
+                    "review_required": len(review_required_jobs),
+                    "new_matching_jobs": len(new_matching_jobs),
+                    "requested_target": requested_target,
+                    "target_unmet_reason": diagnostics["target_unmet_reason"],
+                    "incomplete": bool(fetched.get("errors")),
+                },
                 "errors": fetched.get("errors", {}),
                 "source_counts": source_counts,
                 "total": len(raw_jobs),
@@ -2860,7 +2918,8 @@ def normalize_saved_search_payload(payload: dict[str, Any], existing: dict[str, 
     date_window = normalize_choice(payload.get("date_window", existing.get("date_window")), set(DISCOVERY_DATE_WINDOWS)) or "14d"
     search_depth = normalize_choice(payload.get("search_depth", existing.get("search_depth")), set(DISCOVERY_SEARCH_DEPTHS)) or "standard"
     per_source_cap = clamp_int_default(payload.get("per_source_cap", existing.get("per_source_cap")), 100, 1, 1000)
-    total_cap = clamp_int_default(payload.get("total_cap", existing.get("total_cap")), 200, 1, 5000)
+    new_matching_target = clamp_int_default(payload.get("new_matching_target", existing.get("new_matching_target")), 25, 1, 500)
+    total_cap = clamp_int_default(payload.get("total_cap", existing.get("total_cap")), max(200, new_matching_target * 4), 1, 5000)
     remote_preference = normalize_choice(payload.get("remote_preference", existing.get("remote_preference")), {"", "remote", "hybrid", "on-site"})
     interval_minutes = clamp_int_default(payload.get("interval_minutes", existing.get("interval_minutes")), 360, 15, 10080)
     minimum_salary = clamp_int_default(payload.get("minimum_salary", existing.get("minimum_salary")), 0, 0, 1000000)
@@ -2893,6 +2952,7 @@ def normalize_saved_search_payload(payload: dict[str, Any], existing: dict[str, 
         "search_depth": search_depth,
         "distance": distance,
         "per_source_cap": per_source_cap,
+        "new_matching_target": new_matching_target,
         "total_cap": total_cap,
         "search_mode": search_mode,
         "title_match_mode": title_match_mode,
@@ -2933,6 +2993,7 @@ def saved_search_to_discovery_payload(search: dict[str, Any]) -> dict[str, Any]:
         "enabled_sources": search.get("enabled_sources") or ["linkedin", "indeed"],
         "search_depth": search.get("search_depth") or "standard",
         "total_cap": int(search.get("total_cap") or 200),
+        "new_matching_target": int(search.get("new_matching_target") or 25),
         "per_source_cap": int(search.get("per_source_cap") or 100),
     }
 
@@ -3224,6 +3285,16 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
     capped_count = max(0, len(jobs) - search["total_cap"])
     jobs = sort_discovery_jobs(jobs, "application_priority_score", "desc", "", "asc", "remote_after_local", "last")[: search["total_cap"]]
     persisted = persist_discovery_jobs(jobs, search_id, run_id)
+    requested_target = int(search.get("requested_target") or 25)
+    ordered = list(jobs)
+    matching_jobs = [item for item in ordered if item.get("discovery_result_category") == "actionable" and not discovery_is_clear_senior_role(item, search)][:requested_target]
+    senior_review_jobs = [item for item in ordered if item.get("discovery_result_category") == "actionable" and discovery_is_clear_senior_role(item, search)]
+    for item in senior_review_jobs:
+        item["discovery_result_category"] = "review_required"
+        item["discovery_result_reason"] = "Clearly senior or managerial SWE role kept out of the new-match target."
+    review_required_jobs = [item for item in ordered if item.get("discovery_result_category") not in {"actionable", "excluded"}]
+    excluded_jobs = [item for item in ordered if item.get("discovery_result_category") == "excluded"]
+    jobs = matching_jobs + review_required_jobs
     auto_preparation_queued = enqueue_auto_preparation(search, persisted.get("new_job_ids", [])) if search_id else 0
     search_key = discovery_search_signature(payload)
     metadata = {
@@ -3238,6 +3309,21 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         "excluded_count": filtered,
         "capped_count": capped_count,
         "visible_count": len(jobs),
+        "requested_target": requested_target,
+        "raw_jobs_inspected": len(fetched.get("jobs", [])),
+        "unique_jobs_found": len(seen_jobs),
+        "previously_processed": int(persisted.get("duplicate") or 0),
+        "skipped_count": sum(1 for item in jobs if text(item.get("discovery_state")) == "ignored"),
+        "disqualified_count": len(excluded_jobs),
+        "review_required_count": len(review_required_jobs),
+        "new_matching_count": len(matching_jobs),
+        "target_unmet_reason": (
+            "No further matching results were returned by the selected sources."
+            if len(matching_jobs) < requested_target and not fetched.get("errors")
+            else "Provider failures, timeouts, or rate limits interrupted the search. Continue search to retry."
+            if len(matching_jobs) < requested_target and fetched.get("errors")
+            else ""
+        ),
         "raw_jobs_returned": len(fetched.get("jobs", [])),
         "displayed_jobs": len(jobs),
         "display_jobs": jobs,
@@ -3255,6 +3341,20 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
     save_discovery_debug_run(search_key, {**payload, "search_id": search_id}, metadata, fetched.get("source_snapshots", {}))
     return {
         "jobs": jobs,
+        "matching_jobs": matching_jobs,
+        "review_required_jobs": review_required_jobs,
+        "search_progress": {
+            "raw_jobs_inspected": len(fetched.get("jobs", [])),
+            "unique_jobs_found": len(seen_jobs),
+            "previously_processed": int(persisted.get("duplicate") or 0),
+            "skipped": sum(1 for item in jobs if text(item.get("discovery_state")) == "ignored"),
+            "disqualified": len(excluded_jobs),
+            "review_required": len(review_required_jobs),
+            "new_matching_jobs": len(matching_jobs),
+            "requested_target": requested_target,
+            "target_unmet_reason": metadata["target_unmet_reason"],
+            "incomplete": bool(fetched.get("errors")),
+        },
         "errors": fetched.get("errors", {}),
         "source_counts": fetched.get("source_counts", {}),
         "source_diagnostics": fetched.get("source_diagnostics", {}),
@@ -7106,6 +7206,7 @@ def discovery_search_signature(payload: dict[str, Any]) -> str:
         "date_window": search["date_window"],
         "per_source_cap": search["per_source_cap"],
         "total_cap": search["total_cap"],
+        "requested_target": search.get("requested_target", 25),
         "search_mode": search["search_mode"],
         "title_match_mode": search["title_match_mode"],
         "candidate_profile_id": text(payload.get("candidate_profile_id") or payload.get("auto_prepare_candidate_profile_id")),
@@ -7218,11 +7319,20 @@ def discovery_search_config(payload: dict[str, Any]) -> dict[str, Any]:
     preset = DISCOVERY_SEARCH_DEPTHS[depth]
     date_window = normalize_choice(payload.get("date_window"), set(DISCOVERY_DATE_WINDOWS)) or f"{preset['days']}d"
     per_source_cap = clamp_int_default(payload.get("per_source_cap"), preset["per_source_cap"], 1, 1000)
-    total_cap = clamp_int_default(payload.get("total_cap"), preset["total_cap"], 1, 5000)
+    enabled_sources = normalize_discovery_sources(payload.get("enabled_sources"))
+    explicit_target = payload.get("new_matching_target", payload.get("shortlist_size"))
+    requested_target = clamp_int_default(explicit_target, 25, 1, 500)
+    # total_cap is an internal provider inspection budget.  The public target
+    # is deliberately separate so a user asking for 25 new matches does not
+    # accidentally receive only 25 raw provider rows.
+    default_fetch_budget = (
+        max(preset["total_cap"], requested_target * max(4, len(enabled_sources)))
+        if explicit_target not in (None, "") else preset["total_cap"]
+    )
+    total_cap = clamp_int_default(payload.get("total_cap"), default_fetch_budget, 1, 5000)
     distance = clamp_int_default(payload.get("distance"), 50, 0, 1000)
     search_mode = normalize_choice(payload.get("search_mode"), {"title", "explore", "shortlist"}) or "title"
     title_match_mode = normalize_choice(payload.get("title_match_mode"), {"strict", "related"}) or "related"
-    enabled_sources = normalize_discovery_sources(payload.get("enabled_sources"))
     validate_discovery_budget(total_cap, enabled_sources)
     # total_cap is the user's aggregate fetch/display budget.  JobSpy applies
     # results_wanted per provider, so divide that budget across enabled
@@ -7239,6 +7349,7 @@ def discovery_search_config(payload: dict[str, Any]) -> dict[str, Any]:
         "hours_old": None if date_window == "any" else DISCOVERY_DATE_WINDOWS.get(date_window, preset["days"]) * 24,
         "per_source_cap": per_source_cap,
         "total_cap": total_cap,
+        "requested_target": requested_target,
         "request_per_source_cap": request_per_source_cap,
         "aggregate_request_budget": request_per_source_cap * len(enabled_sources),
         "enabled_source_count": len(enabled_sources),
@@ -8847,7 +8958,12 @@ def apply_discovery_search_constraints(job: dict[str, Any], remote_preference: s
     """Apply work-arrangement and requested-location constraints before ranking."""
     preference = normalize_space(text(remote_preference)).lower()
     if preference != "remote":
-        if search_location and outside_requested_location(job, search_location):
+        # An unverified/postal-only location mismatch is not evidence that a
+        # job is outside the requested area. Keep it reviewable until the
+        # workplace distance is actually established.
+        job_location = normalize_space(text(job.get("location")))
+        postal_only = bool(re.fullmatch(r"[A-Z]\d[A-Z]\s?\d[A-Z]\d", job_location, re.IGNORECASE))
+        if search_location and (int(job.get("distance_km") or 9999) < 9999 or not postal_only) and outside_requested_location(job, search_location):
             job["location_search_eligible"] = False
             job["application_priority_score"] = 0
             job.setdefault("application_priority_reasons", []).append("Excluded because the confirmed job location is outside the requested hybrid/on-site search area.")
@@ -8935,6 +9051,21 @@ def title_search_result_category(job: dict[str, Any]) -> tuple[str, str]:
     if required.get("minimum") is not None and float(required["minimum"]) > 5:
         return "review_required", "The occupation matches, but the required experience is above the default early-career scope."
     return "actionable", "The advertised title matches the requested occupation and no hard seniority blocker was found."
+
+
+def discovery_is_clear_senior_role(job: dict[str, Any], search: dict[str, Any]) -> bool:
+    """Keep clearly senior SWE roles out of the requested new-match target."""
+    if search.get("search_mode") != "shortlist" or search.get("occupation") != "software developer":
+        return False
+    analysis = job.get("qualification_fit_seniority") or {}
+    level = text(analysis.get("detected_level") or job.get("seniority_level")).lower().replace("-", "_")
+    required = analysis.get("required_experience") or {}
+    minimum = required.get("minimum") if isinstance(required, dict) else None
+    try:
+        high_experience = minimum is not None and float(minimum) >= 5
+    except (TypeError, ValueError):
+        high_experience = False
+    return level in {"senior", "lead", "manager", "director"} or bool(analysis.get("management_role")) or bool(analysis.get("leadership_expectations")) or high_experience
 
 
 def discovery_sort_value(job: dict[str, Any], field: str, direction: str = "desc", remote_rule: str = "remote_after_local", unknown_salary_position: str = "last") -> tuple[Any, ...]:
@@ -9278,6 +9409,7 @@ def init_db() -> None:
             search_depth TEXT NOT NULL DEFAULT 'standard',
             distance INTEGER NOT NULL DEFAULT 50,
             per_source_cap INTEGER NOT NULL DEFAULT 100,
+                   new_matching_target INTEGER NOT NULL DEFAULT 25,
             total_cap INTEGER NOT NULL DEFAULT 500,
             interval_minutes INTEGER NOT NULL DEFAULT 360,
             enabled INTEGER NOT NULL DEFAULT 0,
@@ -9354,6 +9486,7 @@ def init_db() -> None:
             "search_depth": "TEXT NOT NULL DEFAULT 'standard'",
             "distance": "INTEGER NOT NULL DEFAULT 50",
             "per_source_cap": "INTEGER NOT NULL DEFAULT 100",
+            "new_matching_target": "INTEGER NOT NULL DEFAULT 25",
             "total_cap": "INTEGER NOT NULL DEFAULT 500",
             "interval_minutes": "INTEGER NOT NULL DEFAULT 360",
             "enabled": "INTEGER NOT NULL DEFAULT 0",
