@@ -4,12 +4,14 @@ Discovery’s default target is 50 qualifying new jobs.  It is not a raw-row
 limit: duplicates, applicant-scoped processed records, excluded records, and
 review-required records do not count toward the target.
 
-JobSpy has no portable cursor for every supported provider.  Discovery uses a
+JobSpy has no portable cursor for every supported provider. Discovery uses a
 recorded sequence of distinct occupation queries rather than repeating the
-first page.  An incomplete target is reported as one of `target_reached`,
-`verified_provider_exhausted`, `provider_blocked_or_unavailable`, or
-`request_budget_reached_resumable`; it is never silently described as
-exhaustion.
+first page. Each run stores attempted and pending `{location, keywords}` query
+batches. A request with `continue_search: true` uses the same search signature
+and skips completed batches. An incomplete target is reported as one of
+`planned_queries_completed`, `provider_blocked_or_unavailable`, or
+`request_budget_reached_resumable`; a short page is never claimed to prove
+total provider exhaustion.
 
 Skip, save, and applied states can be scoped by `applicant_profile_id`.  The
 additive `discovery_applicant_states` table keeps one applicant’s actions from
