@@ -2283,6 +2283,8 @@ def create_app() -> Flask:
             return jsonify({"error": str(exc)}), 400
         if search["search_mode"] == "shortlist" and not text(payload.get("candidate_profile_id")):
             return jsonify({"error": "Select a candidate résumé profile for the technical shortlist."}), 400
+        search["progressive_acquisition"] = True
+        search["continuation_index"] = clamp_int(payload.get("continuation_index"), 0, 1000)
         search_key = discovery_search_signature(payload)
         with _ACTIVE_DISCOVERY_SEARCHES_LOCK:
             if search_key in _ACTIVE_DISCOVERY_SEARCHES:
@@ -2315,7 +2317,13 @@ def create_app() -> Flask:
             origin = {"input": search["distance_origin_input"], "normalized": search["distance_origin_input"], "provider": origin_lookup.get("provider", ""), "status": origin_lookup.get("status") or "unresolved", "precision": "unknown", "error": origin_lookup.get("error") or "The requested private distance origin could not be resolved.", "failure_reasons": origin_lookup.get("failure_reasons", [])}
 
         search["keywords"] = keywords
-        fetched = fetch_discovery_jobs_for_search(search, country_indeed=text(payload.get("country_indeed")) or "Canada")
+        fetched = fetch_discovery_jobs_for_search(
+            search,
+            country_indeed=text(payload.get("country_indeed")) or "Canada",
+            qualifying_predicate=lambda raw: raw_discovery_target_candidate(
+                raw, search, applicant_profile_id(payload)
+            ),
+        )
 
         raw_jobs = fetched.get("jobs", [])
         seen_jobs: list[dict[str, Any]] = []
@@ -2481,7 +2489,7 @@ def create_app() -> Flask:
         ordered = list(jobs)
         if as_bool(payload.get("strict_technical")):
             ordered = [item for item in ordered if not (item.get("technical_compatibility") or {}).get("required_no_experience")]
-        requested_target = int(search.get("requested_target") or 25)
+        requested_target = int(search.get("requested_target") or 50)
         matching_jobs = [item for item in ordered if item.get("discovery_result_category") == "actionable" and not discovery_is_clear_senior_role(item, search)]
         senior_review_jobs = [item for item in ordered if item.get("discovery_result_category") == "actionable" and discovery_is_clear_senior_role(item, search)]
         for item in senior_review_jobs:
@@ -2508,10 +2516,14 @@ def create_app() -> Flask:
         diagnostics["review_required_count"] = len(review_required_jobs)
         diagnostics["unique_jobs_found"] = len(seen_jobs)
         diagnostics["raw_jobs_inspected"] = len(raw_jobs)
+        diagnostics["qualifying_candidates_seen_during_acquisition"] = int(fetched.get("qualifying_candidates_seen") or 0)
+        diagnostics["attempted_query_batches"] = fetched.get("attempted_query_batches", [])
+        diagnostics["continuation_index"] = fetched.get("continuation_index", 0)
+        diagnostics["attempted_queries_exhausted"] = bool(fetched.get("attempted_queries_exhausted"))
         diagnostics["search_complete"] = not bool(fetched.get("errors"))
-        diagnostics["search_termination_reason"] = "target_reached" if len(new_matching_jobs) >= requested_target else ("provider_blocked_or_unavailable" if fetched.get("errors") else ("verified_provider_exhausted" if fetched.get("providers_exhausted") else "request_budget_reached_resumable"))
-        diagnostics["continuation_available"] = bool(len(new_matching_jobs) < requested_target and not fetched.get("providers_exhausted"))
-        diagnostics["target_unmet_reason"] = "" if len(new_matching_jobs) >= requested_target else ("Provider failures, timeouts, or rate limits interrupted the search; continuation is resumable." if fetched.get("errors") else ("All planned distinct provider query batches returned short or empty results." if fetched.get("providers_exhausted") else "The acquisition budget ended before the target; continue search to inspect additional distinct batches."))
+        diagnostics["search_termination_reason"] = "target_reached" if len(new_matching_jobs) >= requested_target else ("provider_blocked_or_unavailable" if fetched.get("errors") else ("no_more_matches_in_attempted_queries" if fetched.get("attempted_queries_exhausted") else "request_budget_reached_resumable"))
+        diagnostics["continuation_available"] = bool(len(new_matching_jobs) < requested_target and fetched.get("continuation_available"))
+        diagnostics["target_unmet_reason"] = "" if len(new_matching_jobs) >= requested_target else ("Provider failures, timeouts, or rate limits interrupted the search; continuation is resumable." if fetched.get("errors") else ("No additional matches were found in the attempted query batches; provider-wide exhaustion was not verified." if fetched.get("attempted_queries_exhausted") else "The acquisition budget ended before the target; continue search to inspect additional distinct batches."))
         diagnostics["persisted"] = persisted
         diagnostics["jobs_returned_to_frontend"] = len(jobs)
         diagnostics["post_processing_row_count"] = len(jobs)
@@ -2541,6 +2553,8 @@ def create_app() -> Flask:
                     "target_unmet_reason": diagnostics["target_unmet_reason"],
                     "termination_reason": diagnostics["search_termination_reason"],
                     "continuation_available": diagnostics["continuation_available"],
+                    "continuation_index": fetched.get("continuation_index", search.get("continuation_index", 0)),
+                    "attempted_query_batches": fetched.get("attempted_query_batches", []),
                     "incomplete": bool(fetched.get("errors")),
                 },
                 "errors": fetched.get("errors", {}),
@@ -2956,7 +2970,7 @@ def normalize_saved_search_payload(payload: dict[str, Any], existing: dict[str, 
     date_window = normalize_choice(payload.get("date_window", existing.get("date_window")), set(DISCOVERY_DATE_WINDOWS)) or "14d"
     search_depth = normalize_choice(payload.get("search_depth", existing.get("search_depth")), set(DISCOVERY_SEARCH_DEPTHS)) or "standard"
     per_source_cap = clamp_int_default(payload.get("per_source_cap", existing.get("per_source_cap")), 100, 1, 1000)
-    new_matching_target = clamp_int_default(payload.get("new_matching_target", existing.get("new_matching_target")), 25, 1, 500)
+    new_matching_target = clamp_int_default(payload.get("new_matching_target", existing.get("new_matching_target")), 50, 1, 500)
     total_cap = clamp_int_default(payload.get("total_cap", existing.get("total_cap")), max(200, new_matching_target * 4), 1, 5000)
     remote_preference = normalize_choice(payload.get("remote_preference", existing.get("remote_preference")), {"", "remote", "hybrid", "on-site"})
     interval_minutes = clamp_int_default(payload.get("interval_minutes", existing.get("interval_minutes")), 360, 15, 10080)
@@ -3031,7 +3045,7 @@ def saved_search_to_discovery_payload(search: dict[str, Any]) -> dict[str, Any]:
         "enabled_sources": search.get("enabled_sources") or ["linkedin", "indeed"],
         "search_depth": search.get("search_depth") or "standard",
         "total_cap": int(search.get("total_cap") or 200),
-        "new_matching_target": int(search.get("new_matching_target") or 25),
+        "new_matching_target": int(search.get("new_matching_target") or 50),
         "per_source_cap": int(search.get("per_source_cap") or 100),
     }
 
@@ -3323,7 +3337,7 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
     capped_count = max(0, len(jobs) - search["total_cap"])
     jobs = sort_discovery_jobs(jobs, "application_priority_score", "desc", "", "asc", "remote_after_local", "last")[: search["total_cap"]]
     persisted = persist_discovery_jobs(jobs, search_id, run_id)
-    requested_target = int(search.get("requested_target") or 25)
+    requested_target = int(search.get("requested_target") or 50)
     ordered = list(jobs)
     matching_jobs = [item for item in ordered if item.get("discovery_result_category") == "actionable" and not discovery_is_clear_senior_role(item, search)][:requested_target]
     senior_review_jobs = [item for item in ordered if item.get("discovery_result_category") == "actionable" and discovery_is_clear_senior_role(item, search)]
@@ -7244,7 +7258,7 @@ def discovery_search_signature(payload: dict[str, Any]) -> str:
         "date_window": search["date_window"],
         "per_source_cap": search["per_source_cap"],
         "total_cap": search["total_cap"],
-        "requested_target": search.get("requested_target", 25),
+        "requested_target": search.get("requested_target", 50),
         "search_mode": search["search_mode"],
         "title_match_mode": search["title_match_mode"],
         "candidate_profile_id": text(payload.get("candidate_profile_id") or payload.get("auto_prepare_candidate_profile_id")),
@@ -8533,7 +8547,33 @@ def is_countrywide_search_location(location: str) -> bool:
     return normalized in {"canada", "canadian", "canada wide", "canada-wide", "nationwide", "nation wide"}
 
 
-def fetch_discovery_jobs_for_search(search: dict[str, Any], *, country_indeed: str = "Canada") -> dict[str, Any]:
+def raw_discovery_target_candidate(raw: dict[str, Any], search: dict[str, Any], applicant_id: int = 0) -> bool:
+    """Cheap, evidence-based predicate used only to pace provider acquisition."""
+    title = text(raw.get("title"))
+    if not title:
+        return False
+    if search.get("search_mode") == "title":
+        match, score = classify_title_match(title, text(search.get("keywords")), text(search.get("title_match_mode")) or "related")
+        if match == "uncertain" or score < 75:
+            return False
+    lowered = title.lower()
+    if search.get("occupation") == "early childhood educator" and re.search(r"\b(?:accounts receivable|accounting|finance|bookkeeper|collections?)\b", lowered):
+        return False
+    if re.search(r"\b(?:senior|sr\.?|lead|principal|staff|director|manager|head of)\b", lowered):
+        return False
+    existing = find_existing_job_match(jobspy_result_to_job_payload(raw))
+    if existing is not None:
+        if applicant_id and applicant_discovery_state(int(existing["id"]), applicant_id) in {"skipped", "saved", "applied"}:
+            return False
+        if text(existing["status"]) in {"Applied", "shortlisted"} or text(existing["discovery_state"]) in {"ignored", "saved", "applied"}:
+            return False
+    return True
+
+
+def fetch_discovery_jobs_for_search(
+    search: dict[str, Any], *, country_indeed: str = "Canada",
+    qualifying_predicate: Any | None = None,
+) -> dict[str, Any]:
     """Acquire distinct provider batches without treating a first page as exhaustion.
 
     JobSpy has no portable offset/cursor argument across all supported boards.
@@ -8562,6 +8602,9 @@ def fetch_discovery_jobs_for_search(search: dict[str, Any], *, country_indeed: s
     combined: dict[str, Any] = {"jobs": [], "errors": {}, "source_counts": {}, "source_diagnostics": {}, "source_snapshots": {}}
     attempted: list[dict[str, str]] = []
     all_batches_short_or_empty = True
+    qualifying_count = 0
+    stopped_at_target = False
+    planned_batch_count = len(locations) * len(queries)
     for location, keyword_query in ((location, query) for location in locations for query in queries):
         if time.monotonic() - started >= DISCOVERY_OVERALL_TIMEOUT_SECONDS:
             combined["errors"]["overall"] = f"Discovery timed out after {DISCOVERY_OVERALL_TIMEOUT_SECONDS}s before all locations completed."
@@ -8589,6 +8632,8 @@ def fetch_discovery_jobs_for_search(search: dict[str, Any], *, country_indeed: s
                 continue
             seen.add(key)
             merged.append(raw)
+            if qualifying_predicate is not None and qualifying_predicate(raw):
+                qualifying_count += 1
         for source, count in result.get("source_counts", {}).items():
             combined["source_counts"][source] = int(combined["source_counts"].get(source, 0)) + int(count or 0)
         combined["errors"].update(result.get("errors", {}))
@@ -8605,15 +8650,21 @@ def fetch_discovery_jobs_for_search(search: dict[str, Any], *, country_indeed: s
             current["success"] = bool(current.get("success") or diagnostic.get("success"))
         if result.get("errors"):
             break
+        if qualifying_predicate is not None and qualifying_count >= int(search.get("requested_target") or 50):
+            stopped_at_target = True
+            break
     combined["jobs"] = merged
     combined["keyword_queries"] = queries
     combined["attempted_query_batches"] = attempted
-    combined["continuation_index"] = continuation_index + len(queries)
-    combined["continuation_available"] = bool(combined.get("errors")) or bool(queries and not all_batches_short_or_empty)
+    completed_query_count = len({batch["keywords"] for batch in attempted})
+    combined["continuation_index"] = continuation_index + completed_query_count
+    combined["qualifying_candidates_seen"] = qualifying_count
+    combined["continuation_available"] = bool(combined.get("errors")) or (not stopped_at_target and len(attempted) < planned_batch_count)
     # Only every planned distinct query returning a short/empty batch is
     # evidence of exhaustion.  A timeout, provider error, or request budget is
     # explicitly resumable instead.
-    combined["providers_exhausted"] = bool(attempted) and not combined.get("errors") and all_batches_short_or_empty and len(attempted) == len(locations) * len(queries)
+    combined["attempted_queries_exhausted"] = bool(attempted) and not combined.get("errors") and not stopped_at_target and len(attempted) == planned_batch_count
+    combined["providers_exhausted"] = False
     combined["countrywide_region_queries"] = locations if len(locations) > 1 else []
     return combined
 
@@ -9498,7 +9549,7 @@ def init_db() -> None:
             search_depth TEXT NOT NULL DEFAULT 'standard',
             distance INTEGER NOT NULL DEFAULT 50,
             per_source_cap INTEGER NOT NULL DEFAULT 100,
-                   new_matching_target INTEGER NOT NULL DEFAULT 25,
+                   new_matching_target INTEGER NOT NULL DEFAULT 50,
             total_cap INTEGER NOT NULL DEFAULT 500,
             interval_minutes INTEGER NOT NULL DEFAULT 360,
             enabled INTEGER NOT NULL DEFAULT 0,
@@ -9575,7 +9626,7 @@ def init_db() -> None:
             "search_depth": "TEXT NOT NULL DEFAULT 'standard'",
             "distance": "INTEGER NOT NULL DEFAULT 50",
             "per_source_cap": "INTEGER NOT NULL DEFAULT 100",
-            "new_matching_target": "INTEGER NOT NULL DEFAULT 25",
+            "new_matching_target": "INTEGER NOT NULL DEFAULT 50",
             "total_cap": "INTEGER NOT NULL DEFAULT 500",
             "interval_minutes": "INTEGER NOT NULL DEFAULT 360",
             "enabled": "INTEGER NOT NULL DEFAULT 0",

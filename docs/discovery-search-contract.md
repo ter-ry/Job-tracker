@@ -7,9 +7,9 @@ review-required records do not count toward the target.
 JobSpy has no portable cursor for every supported provider.  Discovery uses a
 recorded sequence of distinct occupation queries rather than repeating the
 first page.  An incomplete target is reported as one of `target_reached`,
-`verified_provider_exhausted`, `provider_blocked_or_unavailable`, or
-`request_budget_reached_resumable`; it is never silently described as
-exhaustion.
+`no_more_matches_in_attempted_queries`, `provider_blocked_or_unavailable`, or
+`request_budget_reached_resumable`.  The attempted-query result is never
+presented as verified provider-wide exhaustion.
 
 Skip, save, and applied states can be scoped by `applicant_profile_id`.  The
 additive `discovery_applicant_states` table keeps one applicant’s actions from
