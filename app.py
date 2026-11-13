@@ -6609,6 +6609,12 @@ def determine_salary(job: dict[str, Any]) -> dict[str, Any]:
             structured["salary_text"] = f"{qualifier.group(1).title()} {structured['salary_text']}"
             structured["salary_original_text"] = original
             structured["salary_evidence_text"] = original
+        description_salary = parse_salary_text(text(job.get("job_description")))
+        if salary_evidence_conflicts(structured, description_salary):
+            structured["salary_ambiguity"] = "; ".join(filter(None, (
+                structured.get("salary_ambiguity", ""),
+                "structured provider salary conflicts with description evidence; verify source",
+            )))
         return annualize_using_posted_weekly_hours(structured, text(job.get("job_description")))
 
     salary_text = text(job.get("salary_text") or job.get("salary"))
@@ -6645,15 +6651,21 @@ def annualize_using_posted_weekly_hours(salary: dict[str, Any], description: str
         if 1 <= float(value) <= 80
     }
     if len(hours) != 1:
+        salary["salary_annual_min"] = 0
+        salary["salary_annual_max"] = 0
+        salary["salary_annual_midpoint"] = 0
+        note = "weekly hours not stated; annual equivalent unavailable"
+        salary["salary_ambiguity"] = "; ".join(filter(None, (salary.get("salary_ambiguity", ""), note)))
         return salary
     weekly_hours = hours.pop()
     annual_min = float(salary.get("salary_advertised_min") or 0) * weekly_hours * 52
     annual_max = float(salary.get("salary_advertised_max") or 0) * weekly_hours * 52
     salary["salary_annual_min"] = int(round(annual_min))
     salary["salary_annual_max"] = int(round(annual_max))
-    salary["salary_annual_midpoint"] = int(round((annual_min + annual_max) / 2))
+    salary["salary_annual_midpoint"] = int(round((annual_min + annual_max) / 2)) if annual_min and annual_max else 0
     note = f"Annualized using advertised {weekly_hours:g} hours/week"
-    salary["salary_ambiguity"] = "; ".join(filter(None, (salary.get("salary_ambiguity", ""), note)))
+    previous = salary.get("salary_ambiguity", "").replace("weekly hours not stated; annual equivalent unavailable", "").strip("; ")
+    salary["salary_ambiguity"] = "; ".join(filter(None, (previous, note)))
     return salary
 
 
@@ -6670,37 +6682,51 @@ def structured_salary(job: dict[str, Any]) -> dict[str, Any]:
     currency = normalize_currency(text(job.get("salary_currency") or job.get("currency")))
     if minimum is None and maximum is None:
         return missing_salary()
-    if maximum is None:
+    qualifier = salary_qualifier(text(job.get("salary_text") or job.get("salary")))
+    # A provider can supply one numeric amount for an explicitly lower- or
+    # upper-bounded offer.  Keep the unknown endpoint as zero in the existing
+    # nullable-by-convention columns instead of manufacturing a fixed salary.
+    if qualifier == "lower" and (minimum is not None or maximum is not None) and not (minimum is not None and maximum is not None):
+        minimum = minimum if minimum is not None else maximum
+        maximum = None
+    elif qualifier == "upper" and (minimum is not None or maximum is not None) and not (minimum is not None and maximum is not None):
+        maximum = maximum if maximum is not None else minimum
+        minimum = None
+    elif maximum is None:
         maximum = minimum
-    if minimum is None:
+    elif minimum is None:
         minimum = maximum
     # A few providers truncate the upper bound (for example 60,000 and 63)
     # while still labelling the pair as annual salary. Never turn that into a
     # misleading advertised range; let the original text parser decide whether
     # a complete authoritative range is available.
-    if maximum < minimum and maximum < minimum * 0.5:
+    if minimum is not None and maximum is not None and maximum < minimum and maximum < minimum * 0.5:
         return missing_salary()
-    if not raw_interval:
-        interval = infer_salary_interval_from_magnitude(minimum or 0, maximum or 0)
+    # Amount magnitude is not evidence of pay cadence. Keep a source that
+    # omits its unit reviewable instead of silently treating it as annual.
     annual_min, annual_max = annualize_salary(minimum or 0, maximum or 0, interval)
     original = salary_range_label(minimum or 0, maximum or 0, interval, currency)
+    midpoint = ((minimum + maximum) / 2) if minimum is not None and maximum is not None else 0
+    bound_note = "only lower bound advertised" if qualifier == "lower" and maximum is None else (
+        "only upper bound advertised" if qualifier == "upper" and minimum is None else ""
+    )
     return {
         "salary_min": int(round(minimum or 0)),
         "salary_max": int(round(maximum or 0)),
-        "salary_midpoint": int(round(((minimum or 0) + (maximum or 0)) / 2)),
+        "salary_midpoint": int(round(midpoint)),
         "salary_advertised_min": minimum or 0,
         "salary_advertised_max": maximum or 0,
-        "salary_advertised_midpoint": ((minimum or 0) + (maximum or 0)) / 2,
+        "salary_advertised_midpoint": midpoint,
         "salary_annual_min": int(round(annual_min)),
         "salary_annual_max": int(round(annual_max)),
-        "salary_annual_midpoint": int(round((annual_min + annual_max) / 2)),
+        "salary_annual_midpoint": int(round((annual_min + annual_max) / 2)) if annual_min and annual_max else 0,
         "salary_interval": interval,
         "salary_currency": currency,
         "salary_text": original,
         "salary_source": "structured",
         "salary_confidence": 95,
         "salary_evidence_text": original,
-        "salary_ambiguity": "" if raw_interval or interval in {"hourly", "yearly"} else "cadence not explicit; verify advertised unit",
+        "salary_ambiguity": bound_note or ("" if raw_interval or interval in {"hourly", "yearly"} else "cadence not explicit; verify advertised unit"),
     }
 
 
@@ -6710,12 +6736,18 @@ def parse_salary_text(value: str) -> dict[str, Any]:
         return missing_salary()
     ranges = split_salary_contexts(content)
     best = missing_salary()
+    best_score = -1
     for context in ranges:
         if false_salary_context(context):
             continue
         currency = normalize_currency(context)
+        match = salary_number_match(context)
         numbers = salary_numbers(context)
         if not numbers:
+            continue
+        qualifier = salary_qualifier(context, match.start() if match else None)
+        candidate_score = salary_candidate_score(context, numbers, qualifier)
+        if candidate_score <= 0:
             continue
         minimum = numbers[0]
         maximum = numbers[1] if len(numbers) > 1 else numbers[0]
@@ -6723,34 +6755,41 @@ def parse_salary_text(value: str) -> dict[str, Any]:
             # A truncated upper endpoint (for example $60,000-$63/year)
             # cannot be repaired from the posting without inventing digits.
             continue
-        if "up to" in context.lower() and len(numbers) == 1:
+        if qualifier == "upper" and len(numbers) == 1:
             minimum = 0
-        if "from" in context.lower() and len(numbers) == 1:
-            maximum = numbers[0]
+        if qualifier == "lower" and len(numbers) == 1:
+            maximum = 0
         explicit_interval = infer_salary_interval(context)
-        interval = explicit_interval or infer_salary_interval_from_magnitude(minimum, maximum)
+        interval = explicit_interval
         if not plausible_base_salary(minimum, maximum, interval):
             continue
         annual_min, annual_max = annualize_salary(minimum, maximum, interval)
-        best = {
+        candidate = {
             "salary_min": int(round(minimum)),
             "salary_max": int(round(maximum)),
-            "salary_midpoint": int(round((minimum + maximum) / 2)),
+            "salary_midpoint": int(round((minimum + maximum) / 2)) if minimum and maximum else 0,
             "salary_advertised_min": minimum,
             "salary_advertised_max": maximum,
-            "salary_advertised_midpoint": (minimum + maximum) / 2,
+            "salary_advertised_midpoint": (minimum + maximum) / 2 if minimum and maximum else 0,
             "salary_annual_min": int(round(annual_min)),
             "salary_annual_max": int(round(annual_max)),
-            "salary_annual_midpoint": int(round((annual_min + annual_max) / 2)),
+            "salary_annual_midpoint": int(round((annual_min + annual_max) / 2)) if annual_min and annual_max else 0,
             "salary_interval": interval,
             "salary_currency": currency,
             "salary_text": context.strip(" .;"),
             "salary_source": "description",
             "salary_confidence": 70,
             "salary_evidence_text": context.strip(" .;"),
-            "salary_ambiguity": "" if explicit_interval else "cadence inferred from magnitude; verify advertised unit" if interval else "cadence not explicit; verify advertised unit",
+            "salary_ambiguity": (
+                "only lower bound advertised" if qualifier == "lower" and not maximum else
+                "only upper bound advertised" if qualifier == "upper" and not minimum else
+                "weekly hours not stated; annual equivalent unavailable" if interval == "hourly" else
+                "" if explicit_interval else "cadence inferred from magnitude; verify advertised unit" if interval else "cadence not explicit; verify advertised unit"
+            ),
         }
-        break
+        if candidate_score > best_score:
+            best = candidate
+            best_score = candidate_score
     return best
 
 
@@ -6765,13 +6804,65 @@ def split_salary_contexts(content: str) -> list[str]:
 
 
 def salary_numbers(context: str) -> list[float]:
-    number = r"(?:\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)(?:k)?"
-    pattern = rf"(?:CAD|USD|CA)?\s*\$?\s*({number})(?:\s*(?:-|to|–|—)\s*(?:CAD|USD|CA)?\s*\$?\s*({number}))?"
-    match = re.search(pattern, context, re.I)
+    match = salary_number_match(context)
     if not match:
         return []
     numbers = [money_number(part) for part in match.groups() if part]
     return [number for number in numbers if number is not None]
+
+
+def salary_number_match(context: str) -> re.Match[str] | None:
+    # The decimal suffix belongs to both comma-separated and plain numbers.
+    # Previously `$100,772.50–$136,337.50` stopped at `100,772`, silently
+    # discarding both decimal precision and the upper endpoint.
+    number = r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:k)?"
+    pattern = rf"(?:CAD|USD|CA)?\s*\$?\s*({number})(?:\s*(?:-|to|–|—)\s*(?:CAD|USD|CA)?\s*\$?\s*({number}))?"
+    return re.search(pattern, context, re.I)
+
+
+def salary_qualifier(value: str, amount_start: int | None = None) -> str:
+    """Return a source-declared one-sided salary qualifier, if any."""
+    prefix = text(value)
+    if amount_start is not None:
+        prefix = prefix[max(0, amount_start - 40):amount_start]
+    if re.search(r"\b(?:from|starting(?:\s+at)?)\s*$", prefix, re.I):
+        return "lower"
+    if re.search(r"\bup\s+to\s*$", prefix, re.I):
+        return "upper"
+    return ""
+
+
+def salary_candidate_score(context: str, numbers: list[float], qualifier: str) -> int:
+    """Prefer actual compensation evidence over incidental dollar figures."""
+    lowered = context.lower()
+    score = 0
+    if re.search(r"\b(?:salary|compensation|base\s+pay|pay|wage)\b", lowered):
+        score += 5
+    if len(numbers) > 1:
+        score += 4
+    if infer_salary_interval(context):
+        score += 3
+    if re.search(r"\b(?:cad|usd)\b|(?:ca|us)?\$", context, re.I):
+        score += 2
+    if qualifier:
+        score += 2
+    return score
+
+
+def salary_evidence_conflicts(structured: dict[str, Any], description: dict[str, Any]) -> bool:
+    """Keep structured provider pay authoritative while making disagreement reviewable."""
+    if description.get("salary_source") == "missing":
+        return False
+    for key in ("salary_advertised_min", "salary_advertised_max"):
+        description_value = float(description.get(key) or 0)
+        if description_value and float(structured.get(key) or 0) != description_value:
+            return True
+    if description.get("salary_interval") and structured.get("salary_interval") != description.get("salary_interval"):
+        return True
+    evidence = text(description.get("salary_evidence_text"))
+    if re.search(r"\b(?:CAD|USD)\b|(?:CA|US)\$", evidence, re.I) and structured.get("salary_currency") != description.get("salary_currency"):
+        return True
+    return False
 
 
 def money_number(value: Any) -> float | None:
@@ -6831,18 +6922,24 @@ def normalize_currency(value: str) -> str:
 
 
 def annualize_salary(minimum: float, maximum: float, interval: str) -> tuple[float, float]:
+    # An hourly pay rate has no defensible annual equivalent unless the source
+    # also states the weekly schedule.  That schedule-aware conversion happens
+    # in annualize_using_posted_weekly_hours().
+    if interval in {"", "hourly"}:
+        return 0, 0
     multiplier = {
-        "hourly": 40 * 52,
         "weekly": 52,
         "monthly": 12,
         "contract": 1,
         "yearly": 1,
-    }.get(interval or "yearly", 1)
+    }.get(interval, 0)
     return minimum * multiplier, maximum * multiplier
 
 
 def plausible_base_salary(minimum: float, maximum: float, interval: str) -> bool:
     high = max(minimum, maximum)
+    if not interval:
+        return 15 <= high <= 1_000_000
     if interval == "hourly":
         return 15 <= high <= 250
     if interval == "weekly":
@@ -6854,6 +6951,10 @@ def plausible_base_salary(minimum: float, maximum: float, interval: str) -> bool
 
 def false_salary_context(context: str) -> bool:
     lowered = context.lower()
+    # Company-market figures (for example "$700+ billion trucking market")
+    # are neither candidate compensation nor a defensible salary fallback.
+    if re.search(r"\$\s*[\d,.]+\s*\+?\s*(?:billion|million)\b", lowered):
+        return True
     blocked = ["bonus", "signing", "benefit", "allowance", "expense", "revenue", "budget", "equity", "stock", "rrsp", "401k"]
     if not any(term in lowered for term in blocked):
         return False
@@ -6939,8 +7040,8 @@ def salary_range_label(minimum: float, maximum: float, interval: str, currency: 
         # such as 100772.50 must not become an apparently truncated integer.
         return f"{value:,.2f}"
 
-    left = f"{currency} ${format_amount(minimum)}"
-    right = f"{currency} ${format_amount(maximum)}"
+    left = f"{currency} ${format_amount(minimum)}" if minimum else ""
+    right = f"{currency} ${format_amount(maximum)}" if maximum else ""
     cadence = {
         "hourly": "/hour",
         "weekly": "per week",
@@ -6949,7 +7050,9 @@ def salary_range_label(minimum: float, maximum: float, interval: str, currency: 
         "yearly": "per year",
     }.get(interval, "unit unspecified")
     separator = "" if cadence.startswith("/") else " "
-    return f"{left}-{right}{separator}{cadence}" if minimum != maximum else f"{left}{separator}{cadence}"
+    if left and right:
+        return f"{left}-{right}{separator}{cadence}" if minimum != maximum else f"{left}{separator}{cadence}"
+    return f"{left or right}{separator}{cadence}".strip()
 
 
 def normalized_salary_display(parsed: dict[str, Any], original: str) -> str:
@@ -8441,9 +8544,9 @@ def normalize_salary_snapshot(job: dict[str, Any]) -> dict[str, Any]:
     advertised_min = float(job.get("salary_advertised_min") or salary_min or 0)
     advertised_max = float(job.get("salary_advertised_max") or salary_max or 0)
     advertised_midpoint = float(job.get("salary_advertised_midpoint") or 0)
-    if not advertised_midpoint and (advertised_min or advertised_max):
+    if not advertised_midpoint and advertised_min and advertised_max:
         advertised_midpoint = (advertised_min + advertised_max) / 2
-    if not salary_midpoint and (salary_min or salary_max):
+    if not salary_midpoint and salary_min and salary_max:
         salary_midpoint = int(round((salary_min + salary_max) / 2))
     interval = text(job.get("salary_interval"))
     annual_min = clamp_int(job.get("salary_annual_min"), 0, 1_000_000)
@@ -8460,7 +8563,7 @@ def normalize_salary_snapshot(job: dict[str, Any]) -> dict[str, Any]:
         "salary_advertised_midpoint": advertised_midpoint,
         "salary_annual_min": int(round(annual_min)),
         "salary_annual_max": int(round(annual_max)),
-        "salary_annual_midpoint": int(round((annual_min + annual_max) / 2)) if annual_min or annual_max else 0,
+        "salary_annual_midpoint": int(round((annual_min + annual_max) / 2)) if annual_min and annual_max else 0,
         "salary_interval": interval,
         "salary_currency": text(job.get("salary_currency")) or "CAD",
         "salary_source": text(job.get("salary_source")) or "missing",

@@ -769,9 +769,20 @@ def extract_explicit_credentials(description: str) -> list[dict[str, Any]]:
 
 
 def extract_explicit_benefits(description: str) -> list[dict[str, Any]]:
-    return _evidence_records(description, [
-        ("time off", r"\b(?:generous\s+)?PTO\b|\bpaid\s+time\s+off\b|\b\d+\s+weeks?\s+of\s+vacation\b"),
-        ("health", r"\bdental\s+(?:and\s+)?vision\b|\bvision\s+(?:and\s+)?dental\b|\bdental\b|\bvision\b|\bextended\s+health(?:\s+benefits?)?\b"),
+    """Extract only employee perks, retaining a nearby source excerpt.
+
+    A bare word such as ``dental`` is not a benefit: employer marketing can
+    discuss dental-insurance products or technology.  Each candidate therefore
+    needs an employment-perk context (or a benefit heading immediately before
+    it) before it becomes structured data.
+    """
+    patterns = [
+        ("time off", r"\b(?:generous\s+)?PTO(?:\s*[-:]\s*\d+\s+vacation\s+days)?\b"),
+        ("time off", r"\bpaid\s+time\s+off\b"),
+        ("time off", r"\b(?:\d+|one|two|three|four|five|six)\s+weeks?\s+of\s+vacation\b"),
+        ("time off", r"\b(?:winter|company|office|paid)\s+holidays?\s+(?:office\s+)?closure\b"),
+        ("health", r"\bdental\s+(?:and\s+)?vision\s+(?:benefits?|coverage|plan)\b|\bvision\s+(?:and\s+)?dental\s+(?:benefits?|coverage|plan)\b|\b(?:health\s+and\s+)?dental\s+(?:benefits?|coverage|plan)\b|\bextended\s+health(?:\s+benefits?)?\b"),
+        ("health", r"\bdental\b|\bvision\b"),
         ("development", r"\btuition\s+reimbursement\b|\btuition\s+assistance\b"),
         ("family", r"\bon[- ]site\s+(?:childcare|child\s+care)\b|\bon[- ]site\s+daycare\b"),
         ("health", r"\bcomprehensive\s+benefits(?:\s+plan|\s+program)?\b[^.;\n]{0,100}"),
@@ -782,7 +793,39 @@ def extract_explicit_benefits(description: str) -> list[dict[str, Any]]:
         ("development", r"\bAI\s+tooling\s+budget\b"),
         ("equipment", r"\bMacBook\b[^.;\n]{0,90}\bequipment\b"),
         ("time off", r"\b\d+\s+personal\s+days\b"),
-    ])
+    ]
+    records: list[dict[str, Any]] = []
+    for category, pattern in patterns:
+        for match in re.finditer(pattern, description or "", re.I):
+            excerpt = benefit_source_excerpt(description, match.start(), match.end())
+            if not excerpt:
+                continue
+            value = clean(match.group(0)).strip(" .;•-")
+            existing_values = [clean(item["value"]).lower() for item in records]
+            if value and not any(value.lower() == existing or value.lower() in existing for existing in existing_values):
+                records.append({"value": value, "category": category, "evidence": excerpt, "confidence": 90})
+    return records
+
+
+def benefit_source_excerpt(description: str, start: int, end: int) -> str:
+    """Return a bounded employee-benefit sentence or an empty string."""
+    text_value = description or ""
+    sentence_start = max(text_value.rfind(".", 0, start), text_value.rfind("\n", 0, start), text_value.rfind(";", 0, start)) + 1
+    sentence_end_candidates = [index for index in (text_value.find(".", end), text_value.find("\n", end), text_value.find(";", end)) if index >= 0]
+    sentence_end = min(sentence_end_candidates) if sentence_end_candidates else min(len(text_value), end + 180)
+    sentence = clean(text_value[sentence_start:sentence_end]).strip(" •-:")
+    nearby_heading = clean(text_value[max(0, start - 240):start])
+    context = f"{nearby_heading} {sentence}".lower()
+    product_context = re.search(r"\b(?:our|the)\s+(?:product|product suite|platform|technology|service)s?\b|\binsurance\s+(?:product|policy|solution)\b", sentence, re.I)
+    benefit_context = re.search(
+        r"\b(?:benefits?|perks?|why\s+join|we\s+(?:offer|provide|cover)|employees?|team members?|vacation|pto|parental|stock\s+option|spending\s+account|personal\s+days|holiday\s+closure|budget|equipment)\b",
+        context,
+    )
+    if product_context and not re.search(r"\b(?:employee|employment|perks?|benefits?\s+(?:plan|program|include))\b", context):
+        return ""
+    if not benefit_context:
+        return ""
+    return sentence[:240]
 
 
 def arrangement_evidence(row: dict[str, Any], description: str, remote_type: str, alternatives: list[dict[str, Any]]) -> str:

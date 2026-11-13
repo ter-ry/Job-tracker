@@ -2590,7 +2590,9 @@ class JobAssistantTest(unittest.TestCase):
         maple = app_module.determine_salary({"salary_text": "From $31.00 per hour"})
         self.assertEqual(maple["salary_interval"], "hourly")
         self.assertIn("From CAD $31", maple["salary_text"])
-        self.assertEqual(maple["salary_advertised_min"], maple["salary_advertised_max"])
+        self.assertEqual(maple["salary_advertised_min"], 31)
+        self.assertEqual(maple["salary_advertised_max"], 0)
+        self.assertIn("only lower bound", maple["salary_ambiguity"])
 
         truncated = app_module.determine_salary({"salary_min": 60000, "salary_max": 63, "salary_interval": "yearly"})
         self.assertEqual(truncated["salary_source"], "missing")
@@ -2603,6 +2605,78 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(benefits["salary_interval"], "hourly")
         self.assertEqual(benefits["salary_advertised_min"], 20.60)
         self.assertEqual(benefits["salary_advertised_max"], 23.54)
+
+    def test_authentic_source_salary_fallbacks_preserve_endpoints_qualifiers_and_provenance(self):
+        # Independently labelled excerpts from the four originals recorded in
+        # the private-beta acceptance audit. These are parser regressions, not
+        # a live provider fetch or a retained posting snapshot.
+        policyme = jobspy_source.normalize_jobspy_row({
+            "title": "Junior Software Engineer (Remote)", "company": "PolicyMe",
+            "location": "Canada", "remote_type": "Remote",
+            "description": "Compensation: The total target cash compensation for this role is $80,000–$110,000 CAD, based on experience.",
+        }, fallback_source="lever")
+        rose = jobspy_source.normalize_jobspy_row({
+            "title": "Junior Software Engineer", "company": "Rose Rocket", "location": "Toronto",
+            "remote_type": "Hybrid", "description": "The expected salary range for this role is $72,000–$88,000 CAD.",
+        }, fallback_source="ashby")
+        for row, expected in ((policyme, (80000, 110000)), (rose, (72000, 88000))):
+            payload = app_module.jobspy_result_to_job_payload(row)
+            self.assertEqual((payload["salary_advertised_min"], payload["salary_advertised_max"]), expected)
+            self.assertEqual(payload["salary_source"], "description")
+            self.assertTrue(payload["salary_evidence_text"])
+
+        mcafee = app_module.determine_salary({"job_description": "Salary: CAD $100,772.50–$136,337.50 per year."})
+        self.assertEqual((mcafee["salary_advertised_min"], mcafee["salary_advertised_max"]), (100772.50, 136337.50))
+        self.assertEqual(mcafee["salary_interval"], "yearly")
+        self.assertIn("136,337.50", mcafee["salary_text"])
+
+        exa = app_module.determine_salary({"salary_text": "From $23/hour"})
+        self.assertEqual((exa["salary_advertised_min"], exa["salary_advertised_max"]), (23, 0))
+        self.assertEqual(exa["salary_annual_min"], 0)
+        self.assertEqual(exa["salary_annual_max"], 0)
+        self.assertIn("From", exa["salary_text"])
+        snapshot = app_module.normalize_salary_snapshot(exa)
+        self.assertEqual((snapshot["salary_advertised_midpoint"], snapshot["salary_annual_midpoint"]), (0, 0))
+
+    def test_salary_structured_precedence_flags_description_conflict_and_one_sided_bounds(self):
+        structured = app_module.determine_salary({
+            "salary_min": 80000, "salary_max": 110000, "salary_interval": "yearly", "salary_currency": "CAD",
+            "job_description": "Salary range: $70,000-$90,000 per year.",
+        })
+        self.assertEqual((structured["salary_advertised_min"], structured["salary_advertised_max"]), (80000, 110000))
+        self.assertEqual(structured["salary_source"], "structured")
+        self.assertIn("conflicts with description", structured["salary_ambiguity"])
+
+        upper = app_module.determine_salary({"salary_text": "Up to $30/hour"})
+        self.assertEqual((upper["salary_advertised_min"], upper["salary_advertised_max"]), (0, 30))
+        self.assertEqual((upper["salary_annual_min"], upper["salary_annual_max"]), (0, 0))
+        self.assertIn("only upper bound", upper["salary_ambiguity"])
+
+    def test_benefits_require_employee_perk_context_and_keep_source_excerpts(self):
+        policyme = (
+            "Our product suite includes Life Insurance, Critical Illness Insurance, and Health & Dental Insurance. "
+            "Why join us: Generous PTO - 20 vacation days. A comprehensive benefits plan with premiums paid in full by PolicyMe. "
+            "Investment in your professional development, including an L&D budget and AI tooling budget. Access to stock options based on performance."
+        )
+        policyme_benefits = jobspy_source.extract_explicit_benefits(policyme)
+        policyme_values = {item["value"] for item in policyme_benefits}
+        self.assertNotIn("Dental", policyme_values)
+        self.assertIn("Generous PTO - 20 vacation days", policyme_values)
+        self.assertIn("comprehensive benefits plan with premiums paid in full by PolicyMe", policyme_values)
+        self.assertTrue(all(item["evidence"] for item in policyme_benefits))
+
+        rose = (
+            "Perks & Benefits at Rose Rocket: A comprehensive benefits program and health care spending account. "
+            "Parental leave top-up. Stock option plan. A MacBook and a sweet tech equipment combo. "
+            "Start with three weeks of vacation + winter holidays office closure and 3 personal days!"
+        )
+        rose_values = {item["value"] for item in jobspy_source.extract_explicit_benefits(rose)}
+        self.assertIn("three weeks of vacation", rose_values)
+        self.assertIn("winter holidays office closure", rose_values)
+        self.assertIn("3 personal days", rose_values)
+
+        marketing = "Our platform's dental-insurance product and vision technology help customers manage benefits."
+        self.assertEqual(jobspy_source.extract_explicit_benefits(marketing), [])
 
     def test_jobspy_converts_application_kilometres_to_provider_miles(self):
         captured = []
@@ -3021,8 +3095,8 @@ class JobAssistantTest(unittest.TestCase):
         location = {"original_input": "Toronto", "normalized_input": "Toronto", "distance_origin": "Toronto", "discovery_location": "Toronto, ON", "resolution_method": "test", "lookup": {}}
         fake = {
             "jobs": [
-                {"source_job_id": "below", "title": "Software Developer", "company": "Below", "location": "Toronto", "source": "linkedin", "job_url": "https://example.com/below", "salary_min": 50000, "salary_max": 60000, "description": "Python"},
-                {"source_job_id": "above", "title": "Software Developer", "company": "Above", "location": "Toronto", "source": "linkedin", "job_url": "https://example.com/above", "salary_min": 90000, "salary_max": 100000, "description": "Python"},
+                {"source_job_id": "below", "title": "Software Developer", "company": "Below", "location": "Toronto", "source": "linkedin", "job_url": "https://example.com/below", "salary_min": 50000, "salary_max": 60000, "salary_interval": "yearly", "description": "Python"},
+                {"source_job_id": "above", "title": "Software Developer", "company": "Above", "location": "Toronto", "source": "linkedin", "job_url": "https://example.com/above", "salary_min": 90000, "salary_max": 100000, "salary_interval": "yearly", "description": "Python"},
                 {"source_job_id": "missing", "title": "Software Developer", "company": "Missing", "location": "Toronto", "source": "linkedin", "job_url": "https://example.com/missing", "description": "Python"},
                 {"source_job_id": "estimated", "title": "Software Developer", "company": "Estimated", "location": "Toronto", "source": "linkedin", "job_url": "https://example.com/estimated", "salary_text": "Estimated market range", "description": "Python"},
             ],
@@ -3075,14 +3149,15 @@ class JobAssistantTest(unittest.TestCase):
         )
         self.assertEqual(salary["salary_interval"], "hourly")
         self.assertEqual((salary["salary_min"], salary["salary_max"]), (30, 30))
-        self.assertEqual((salary["salary_annual_min"], salary["salary_annual_max"]), (62400, 62400))
+        self.assertEqual((salary["salary_annual_min"], salary["salary_annual_max"]), (0, 0))
+        self.assertIn("weekly hours not stated", salary["salary_ambiguity"])
         self.assertEqual((salary["salary_advertised_min"], salary["salary_advertised_max"]), (30, 30))
 
     def test_salary_parser_preserves_decimal_hourly_advertised_values(self):
         salary = app_module.parse_salary_text("Salary: $24.47-$28.36/hour")
         self.assertEqual(salary["salary_interval"], "hourly")
         self.assertEqual((salary["salary_advertised_min"], salary["salary_advertised_max"]), (24.47, 28.36))
-        self.assertEqual((salary["salary_annual_min"], salary["salary_annual_max"]), (round(24.47 * 2080), round(28.36 * 2080)))
+        self.assertEqual((salary["salary_annual_min"], salary["salary_annual_max"]), (0, 0))
         self.assertIn("24.47", salary["salary_text"])
 
     def test_discovery_salary_sorting_keeps_unknowns_after_known_when_requested(self):
@@ -3192,9 +3267,9 @@ class JobAssistantTest(unittest.TestCase):
 
     def test_discovery_filters_before_sorting(self):
         jobs = [
-            {"company": "SkipCo", "title": "Role A", "salary_max": 60000, "distance_km": 5, "overall_score": 90, "remote_type": "Remote", "posted_date": "2026-06-19"},
-            {"company": "KeepCo", "title": "Role B", "salary_max": 90000, "distance_km": 10, "overall_score": 85, "remote_type": "Hybrid", "posted_date": "2026-06-19"},
-            {"company": "LowerCo", "title": "Role C", "salary_max": 95000, "distance_km": 50, "overall_score": 60, "remote_type": "Hybrid", "posted_date": "2026-06-19"},
+            {"company": "SkipCo", "title": "Role A", "salary_max": 60000, "salary_interval": "yearly", "distance_km": 5, "overall_score": 90, "remote_type": "Remote", "posted_date": "2026-06-19"},
+            {"company": "KeepCo", "title": "Role B", "salary_max": 90000, "salary_interval": "yearly", "distance_km": 10, "overall_score": 85, "remote_type": "Hybrid", "posted_date": "2026-06-19"},
+            {"company": "LowerCo", "title": "Role C", "salary_max": 95000, "salary_interval": "yearly", "distance_km": 50, "overall_score": 60, "remote_type": "Hybrid", "posted_date": "2026-06-19"},
         ]
         filters = {"salary_min": 80000, "overall_score_min": 70, "remote_type": "Hybrid"}
         filtered = [job for job in jobs if app_module.apply_discovery_filters(job, filters)]
@@ -3351,7 +3426,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(yearly["salary_max"], 80000)
         self.assertEqual(hourly["salary_interval"], "hourly")
         self.assertEqual(hourly["salary_min"], 30)
-        self.assertEqual(hourly["salary_annual_min"], 62400)
+        self.assertEqual(hourly["salary_annual_min"], 0)
 
     def test_advertised_35_hour_schedule_controls_hourly_annualization(self):
         # Mothercraft RECE Float PDF states both 35 hours/week and this hourly
@@ -3402,7 +3477,7 @@ class JobAssistantTest(unittest.TestCase):
     def test_salary_parser_preserves_decimal_and_currency_prefixed_range_endpoints(self):
         hourly = app_module.parse_salary_text("Salary: $18.00-$21.00 per hour")
         self.assertEqual((hourly["salary_min"], hourly["salary_max"], hourly["salary_interval"], hourly["salary_currency"]), (18, 21, "hourly", "CAD"))
-        self.assertEqual((hourly["salary_annual_min"], hourly["salary_annual_max"]), (37440, 43680))
+        self.assertEqual((hourly["salary_annual_min"], hourly["salary_annual_max"]), (0, 0))
         annual = app_module.parse_salary_text("Base salary: CA$90,000–CA$130,000 CAD per year")
         self.assertEqual((annual["salary_min"], annual["salary_max"], annual["salary_interval"], annual["salary_currency"]), (90000, 130000, "yearly", "CAD"))
 
