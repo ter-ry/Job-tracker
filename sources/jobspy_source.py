@@ -12,9 +12,31 @@ from typing import Any
 JOBSPY_SOURCE_NAMES = {
     "linkedin": "linkedin",
     "indeed": "indeed",
-    "google": "google",
     "zip_recruiter": "zip_recruiter",
+    "glassdoor": "glassdoor",
 }
+
+
+def _provider_failure_state(exc: Exception) -> str:
+    """Classify an adapter failure without claiming that a provider worked."""
+    message = str(exc).lower()
+    if isinstance(exc, TimeoutError) or "timed out" in message or "timeout" in message:
+        return "timed_out"
+    if any(token in message for token in ("unsupported", "unknown site", "invalid site", "not implemented")):
+        return "unsupported"
+    if any(token in message for token in ("captcha", "blocked", "forbidden", "403", "429", "access denied", "robot")):
+        return "blocked"
+    return "unavailable"
+
+
+def _job_identity(job: dict[str, Any]) -> str:
+    source_id = clean(job.get("source_job_id"))
+    if source_id:
+        return f"id:{source_id.lower()}"
+    url = clean(job.get("job_url") or job.get("application_url"))
+    if url:
+        return f"url:{url.lower().rstrip('/')}"
+    return "|".join(clean(job.get(key)).lower() for key in ("source", "title", "company", "location"))
 
 
 def get_jobspy_version() -> str:
@@ -79,6 +101,15 @@ def fetch_jobspy_jobs(
     scrape_jobs_func: Any | None = None,
     provider_timeout_seconds: int | None = 45,
 ) -> dict[str, Any]:
+    """Fetch independently diagnosed JobSpy providers.
+
+    ``source_diagnostics`` exposes stable evidence counters (raw, normalized,
+    unique, URLs, descriptions, salary, and workplace evidence) plus a
+    ``state`` of ``running``, ``working``, ``no_results``, ``partial``,
+    ``blocked``, ``unavailable``, ``unsupported``, or ``timed_out``.
+    ``source_snapshots`` contains one lightweight snapshot per raw provider
+    row and is deliberately not capped by the requested result count.
+    """
     scrape_jobs = scrape_jobs_func or _load_scrape_jobs()
     sources = [source for source in (enabled_sources or ["linkedin", "indeed"]) if source in JOBSPY_SOURCE_NAMES]
     results: list[dict[str, Any]] = []
@@ -99,10 +130,17 @@ def fetch_jobspy_jobs(
             "raw_frame_row_count": 0,
             "raw_records_row_count": 0,
             "normalized_row_count": 0,
+            "valid_normalized_jobs": 0,
             "date_filtered_row_count": 0,
             "date_filtered_removed_count": 0,
             "deduped_row_count": 0,
+            "unique_job_count": 0,
             "returned_to_frontend_row_count": 0,
+            "original_url_count": 0,
+            "description_complete_count": 0,
+            "salary_evidence_count": 0,
+            "address_evidence_count": 0,
+            "state": "disabled",
             "success": False,
             "error_type": "",
             "error": "",
@@ -137,7 +175,7 @@ def fetch_jobspy_jobs(
                 "enabled_sources": list(sources),
                 "country_indeed": country_indeed,
                 "site_name": JOBSPY_SOURCE_NAMES[source],
-                "google_search_term": f"{keywords} jobs near {location}",
+                "description_format": "markdown",
             },
             "jobspy_version": get_jobspy_version(),
             "started_at": started_at,
@@ -147,10 +185,17 @@ def fetch_jobspy_jobs(
             "raw_frame_row_count": 0,
             "raw_records_row_count": 0,
             "normalized_row_count": 0,
+            "valid_normalized_jobs": 0,
             "date_filtered_row_count": 0,
             "date_filtered_removed_count": 0,
             "deduped_row_count": 0,
+            "unique_job_count": 0,
             "returned_to_frontend_row_count": 0,
+            "original_url_count": 0,
+            "description_complete_count": 0,
+            "salary_evidence_count": 0,
+            "address_evidence_count": 0,
+            "state": "running",
             "success": False,
             "error_type": "",
             "error": "",
@@ -168,7 +213,7 @@ def fetch_jobspy_jobs(
                 scrape_kwargs = {
                     "site_name": JOBSPY_SOURCE_NAMES[source],
                     "search_term": keywords,
-                    "google_search_term": f"{keywords} jobs near {location}",
+                    "description_format": "markdown",
                     "location": location,
                     # JobSpy expects miles; the application accepts kilometres.
                     "distance": round(float(distance or 0) * 0.621371) if distance is not None else None,
@@ -201,7 +246,7 @@ def fetch_jobspy_jobs(
             raw_rows = frame_to_records(frame)
             normalized_rows: list[dict[str, Any]] = []
             snapshots: list[dict[str, Any]] = []
-            for row in raw_rows[:25]:
+            for row in raw_rows:
                 snapshots.append(
                     {
                         "source": source,
@@ -219,53 +264,83 @@ def fetch_jobspy_jobs(
                     source_counts[source] = source_counts.get(source, 0) + 1
                     normalized_rows.append(normalized)
             date_filtered_removed = 0
+            returned_rows = normalized_rows
             if hours_old not in (None, 0):
                 limit = max(int(hours_old or 0), 0)
                 now = datetime.now(timezone.utc)
+                returned_rows = []
                 for normalized in normalized_rows:
                     posted_at = coerce_posted_date(normalized.get("posted_date"))
                     if posted_at is None:
+                        returned_rows.append(normalized)
                         continue
                     if posted_at.tzinfo is None:
                         posted_at = posted_at.replace(tzinfo=timezone.utc)
                     age_hours = (now - posted_at).total_seconds() / 3600
                     if age_hours > limit:
                         date_filtered_removed += 1
+                    else:
+                        returned_rows.append(normalized)
+            identities = {_job_identity(item) for item in normalized_rows}
+            description_complete_count = sum(1 for item in normalized_rows if item.get("description"))
+            salary_evidence_count = sum(
+                1 for item in normalized_rows
+                if item.get("salary_text") or item.get("salary_min") is not None or item.get("salary_max") is not None
+            )
+            address_evidence_count = sum(
+                1 for item in normalized_rows
+                if item.get("workplace_address") or item.get("workplace_postal_code") or item.get("workplace_alternatives")
+            )
             source_snapshots[source] = snapshots
             source_diagnostics[source].update(
                 {
                     "success": True,
+                    "state": "working" if returned_rows else ("partial" if raw_rows else "no_results"),
                     "raw_return_type": raw_type,
                     "raw_frame_row_count": frame_row_count(frame),
                     "raw_records_row_count": len(raw_rows),
                     "normalized_row_count": len(normalized_rows),
+                    "valid_normalized_jobs": len(normalized_rows),
                     "date_filtered_removed_count": date_filtered_removed,
-                    "date_filtered_row_count": max(0, len(normalized_rows) - date_filtered_removed),
-                    "deduped_row_count": len(normalized_rows),
-                    "returned_to_frontend_row_count": len(normalized_rows),
+                    "date_filtered_row_count": len(returned_rows),
+                    "deduped_row_count": len(identities),
+                    "unique_job_count": len(identities),
+                    "returned_to_frontend_row_count": len(returned_rows),
+                    "original_url_count": sum(1 for item in normalized_rows if item.get("job_url")),
+                    "description_complete_count": description_complete_count,
+                    "salary_evidence_count": salary_evidence_count,
+                    "address_evidence_count": address_evidence_count,
                     "warnings": [str(item.message) for item in caught_warnings],
                     "warnings_count": len(caught_warnings),
                     "raw_source_snapshot_count": len(snapshots),
-                    "result_count": len(normalized_rows),
+                    "result_count": len(returned_rows),
                     "ended_at": datetime.now(timezone.utc).isoformat(),
                     "duration_ms": int(round((time.perf_counter() - started) * 1000)),
                 }
             )
-            results.extend(normalized_rows)
+            source_counts[source] = len(returned_rows)
+            results.extend(returned_rows)
         except Exception as exc:
             error_message = f"{type(exc).__name__}: {exc}"
             errors[source] = error_message
             source_diagnostics[source].update(
                 {
                     "success": False,
+                    "state": _provider_failure_state(exc),
                     "raw_return_type": "",
                     "raw_frame_row_count": 0,
                     "raw_records_row_count": 0,
                     "normalized_row_count": 0,
+                    "valid_normalized_jobs": 0,
                     "date_filtered_removed_count": 0,
                     "date_filtered_row_count": 0,
                     "deduped_row_count": 0,
+                    "unique_job_count": 0,
                     "returned_to_frontend_row_count": 0,
+                    "original_url_count": 0,
+                    "description_complete_count": 0,
+                    "salary_evidence_count": 0,
+                    "address_evidence_count": 0,
                     "error_type": type(exc).__name__,
                     "error": error_message,
                     "warnings": [],
