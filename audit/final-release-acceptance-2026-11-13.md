@@ -18,6 +18,20 @@ probe, package integrity, and the normal disposable-AppData installer lifecycle.
 Those results make the artifact available for private-beta installation; they do
 not authorize a public or stable release.
 
+### Salary/benefit fix validation
+
+The latest hosted validation is [Windows release build #43](https://github.com/ter-ry/Job-tracker/actions/runs/43454847715), which passed for the exact application-fix commit
+`b4667057ca7ec1d72912d24a423ed2e87266cd7c`. Validate, package, and historical
+jobs passed; publish was skipped. Its artifact is
+`JobTracker-Windows-0.0.0-ci.43` (artifact 14052543477, SHA-256
+`01a38aea775154df3d439523a7547124cf689fb3de8ff6ed57d27fc84bba73df`).
+
+This run passed frozen executable launch, package integrity, normal disposable
+installer lifecycle, checksum/upload, and the historical lifecycle gate. The
+historical result remains narrowly scoped to schema 9-to-14 migration,
+preservation, and safe refusal of ci.29 schema-13 rollback; it does **not**
+claim a successful compatible rollback.
+
 ## Schema lifecycle: exact scope
 
 The historical job successfully migrated the disposable database from ci.8
