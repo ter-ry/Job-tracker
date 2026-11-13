@@ -104,33 +104,35 @@ assigned before Job Tracker output is viewed. Follow
 `complete-posting-acceptance-procedure.md`; do not commit the inputs or applicant
 data.
 
-## Windows version lifecycle
+## Windows version lifecycle (superseded scope clarification)
 
-Post-fix GitHub Actions Windows run
-[#32](https://github.com/ter-ry/Job-tracker/actions/runs/43223255352) completed
-successfully for exact commit `c79b2bb0899d6de98b50a5b4528adf21f31d194a`.
-The package job and its version-lifecycle step both report success. The test used
-disposable AppData and three genuinely different installer versions:
+The detailed, current evidence is in
+`audit/final-release-acceptance-2026-11-13.md`. The former wording in this
+section incorrectly called ci.29 schema-compatible. It is corrected as follows:
 
-1. `0.0.0-ci.8` created a saved job and Applied status.
-2. The current installer retained both, increased the SQLite schema version,
-   and created a pre-migration backup.
-3. Schema-compatible `0.0.0-ci.29` retained the job/status and did not change
-   the upgraded schema.
-4. Reinstalling current retained the same data and schema.
+1. Historical `0.0.0-ci.8` successfully created a saved job and `Applied`
+   status using schema 9.
+2. The then-current installer migrated that disposable database to schema 14,
+   retained both values, and created a pre-migration backup.
+3. `0.0.0-ci.29` declares schema 13 and is therefore incompatible with schema
+   14. The lifecycle script deliberately skipped starting it against the
+   upgraded database.
+4. The current installer was reinstalled and the schema-14 data was retained.
 
-Clean shutdown was asserted for current, rollback, and re-upgrade. The historical
-`ci.8` binary has no clean-exit endpoint and was process-scoped forced-stopped
-only after committed writes; rollback to that schema-incompatible binary was
-correctly not attempted.
+The success is evidence of schema 9-to-14 migration, preservation, and safe
+refusal of an unsafe rollback. **It is not evidence that current-schema rollback
+was tested.** A compatible historical binary is required for that test. The
+historical ci.8 binary has no clean-exit endpoint and was process-scoped
+force-stopped only after committed writes.
 
 ## Release decision
 
 Targeted Linux regressions after the shortlist fix: 288 passed, 1 skipped;
-`node --check static/app.js` passed. Post-fix Windows run #32, including the
-version upgrade and compatible rollback, passed. PR #18 is still **not ready for
-final review or merge** until the representative complete-posting extraction
-audit and the candidate-specific 15-posting SWE shortlist audit are completed.
+`node --check static/app.js` passed. The historical Windows gate passed only
+the schema 9-to-14 migration and unsafe-rollback refusal described above; it
+did not run a compatible rollback. PR #18 is still **not ready for final review
+or merge** until the representative complete-posting extraction audit and the
+candidate-specific 15-posting SWE shortlist audit are completed.
 
 ## Accuracy-stabilization follow-up
 
