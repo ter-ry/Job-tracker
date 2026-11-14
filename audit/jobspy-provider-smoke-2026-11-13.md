@@ -1,6 +1,6 @@
 # JobSpy provider smoke evidence — 2026-11-13
 
-Environment: repository branch `codex/jt-jobspy-provider-stabilization`, pinned
+Environment: repository branch `codex/jt-provider-quality-v2`, pinned
 `python-jobspy==1.1.82`, Canada, 50 km requested (adapter sends 31 miles),
 168 hours, 10 requested results. Each source was called independently for
 each query with a 20-second adapter timeout. Command:
@@ -17,14 +17,15 @@ that a provider is healthy.
 | Query | LinkedIn | Indeed | ZipRecruiter | Glassdoor |
 | --- | --- | --- | --- | --- |
 | Toronto junior software developer | working: 10 raw / 10 normalized / 10 returned | blocked: Indeed GraphQL proxy 403 | unavailable: ZipRecruiter DNS failure | timed_out: Glassdoor Canada DNS timeout |
-| Toronto junior software engineer | working: 10 / 10 / 10 | blocked: Indeed GraphQL proxy 403 | unavailable: ZipRecruiter DNS failure | timed_out: Glassdoor Canada DNS timeout |
-| Toronto Registered Early Childhood Educator | working: 10 / 10 / 9 (one outside 168h) | blocked: Indeed GraphQL proxy 403 | unavailable: ZipRecruiter DNS failure | timed_out: Glassdoor Canada DNS timeout |
+| Toronto software engineer | working: 10 / 10 / 10 | blocked: Indeed GraphQL proxy 403 | unavailable: ZipRecruiter DNS failure | timed_out: Glassdoor Canada DNS timeout |
+| Toronto frontend developer | working: 10 / 10 / 9 (one outside 168h) | blocked: Indeed GraphQL proxy 403 | unavailable: ZipRecruiter DNS failure | timed_out: Glassdoor Canada DNS timeout |
+| Toronto Registered Early Childhood Educator | working: 10 / 10 / 10 | blocked: Indeed GraphQL proxy 403 | unavailable: ZipRecruiter DNS failure | timed_out: Glassdoor Canada DNS timeout |
 | Mississauga RECE | working: 10 / 10 / 10 | blocked: Indeed GraphQL proxy 403 | unavailable: ZipRecruiter DNS failure | timed_out: Glassdoor Canada DNS timeout |
 | Canada remote software developer | working: 10 / 10 / 9 (one outside 168h) | blocked: Indeed GraphQL proxy 403 | unavailable: ZipRecruiter DNS failure | timed_out: Glassdoor Canada DNS timeout |
 
 For every LinkedIn row in this run, the original URL and description were
-available (10/10 per request); no salary or street-address evidence was
-returned in these result sets. A raw example was Thomson Reuters,
+available (10/10 per request). Salary evidence was absent in all six queries;
+one Toronto software-engineer result contained workplace evidence. A raw example was Thomson Reuters,
 `Software Engineer`, Toronto, with the authentic LinkedIn URL
 `https://www.linkedin.com/jobs/view/4481189188`.
 
