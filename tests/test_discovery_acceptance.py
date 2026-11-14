@@ -85,3 +85,27 @@ def test_short_result_set_is_not_called_provider_exhaustion_and_failures_are_vis
     failed = fetch_discovery_jobs_for_search(_search(), qualifying_predicate=lambda raw: True)
     assert failed["errors"]["linkedin"].startswith("TimeoutError")
     assert failed["attempted_queries_exhausted"] is False
+
+
+def test_final_eligibility_mode_does_not_stop_at_preliminary_target(monkeypatch):
+    """The API must normalize/finally qualify all planned batches first.
+
+    A preliminary title probe cannot know whether later location, required-years
+    or qualification checks will reject a candidate, so it may not end a
+    50-target search early.
+    """
+    calls = []
+
+    def fake_fetch(**kwargs):
+        calls.append(kwargs["keywords"])
+        return {"jobs": [{"source_job_id": kwargs["keywords"], "title": "Junior Software Developer"}], "errors": {}, "source_counts": {}, "source_diagnostics": {}, "source_snapshots": {}}
+
+    monkeypatch.setattr("app.fetch_jobspy_jobs", fake_fetch)
+    result = fetch_discovery_jobs_for_search(
+        _search(requested_target=1),
+        qualifying_predicate=lambda _raw: True,
+        stop_when_target=False,
+    )
+    assert len(calls) == 4
+    assert result["target_reached"] is False
+    assert result["planned_queries_completed"] is True

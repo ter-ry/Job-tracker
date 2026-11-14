@@ -2319,7 +2319,10 @@ def create_app() -> Flask:
 
         search["keywords"] = keywords
         prior_metadata = prior_run.get("metadata") if isinstance(prior_run.get("metadata"), dict) else {}
-        search["completed_query_batches"] = prior_metadata.get("attempted_query_batches", []) if prior_run else []
+        # Only successfully completed provider batches are durable progress.
+        # A blocked or timed-out batch must remain pending so Continue Search
+        # can retry it rather than silently treating it as exhausted.
+        search["completed_query_batches"] = prior_metadata.get("completed_query_batches", []) if prior_run else []
         search["progressive_acquisition"] = True
         probe_seen: list[dict[str, Any]] = []
         probe_count = 0
@@ -2356,7 +2359,7 @@ def create_app() -> Flask:
             search,
             country_indeed=text(payload.get("country_indeed")) or "Canada",
             qualification_probe=acquisition_probe,
-            target_matches=search["requested_target"],
+            stop_when_target=False,
         )
         fetched["probe_qualifying_count"] = probe_count
 
@@ -2525,11 +2528,11 @@ def create_app() -> Flask:
         if as_bool(payload.get("strict_technical")):
             ordered = [item for item in ordered if not (item.get("technical_compatibility") or {}).get("required_no_experience")]
         requested_target = int(search.get("requested_target") or 50)
-        matching_jobs = [item for item in ordered if item.get("discovery_result_category") == "actionable" and not discovery_is_clear_senior_role(item, search)]
-        senior_review_jobs = [item for item in ordered if item.get("discovery_result_category") == "actionable" and discovery_is_clear_senior_role(item, search)]
-        for item in senior_review_jobs:
+        target_review_jobs = [item for item in ordered if item.get("discovery_result_category") == "actionable" and not discovery_target_eligible(item, search)]
+        for item in target_review_jobs:
             item["discovery_result_category"] = "review_required"
-            item["discovery_result_reason"] = "Clearly senior or managerial SWE role kept out of the new-match target."
+            item["discovery_result_reason"] = discovery_target_ineligibility_reason(item, search)
+        matching_jobs = [item for item in ordered if item.get("discovery_result_category") == "actionable"]
         review_required_jobs = [item for item in ordered if item.get("discovery_result_category") not in {"actionable", "excluded"}]
         new_matching_jobs = matching_jobs[:requested_target]
         # The response is unified: actionable new matches first, followed by a
@@ -2553,6 +2556,7 @@ def create_app() -> Flask:
         diagnostics["raw_jobs_inspected"] = len(raw_jobs)
         diagnostics["search_complete"] = not bool(fetched.get("errors"))
         diagnostics["attempted_query_batches"] = fetched.get("attempted_query_batches", [])
+        diagnostics["completed_query_batches"] = fetched.get("completed_query_batches", [])
         diagnostics["pending_query_batches"] = fetched.get("pending_query_batches", [])
         diagnostics["target_reached"] = len(new_matching_jobs) >= requested_target
         timeout_error = any("timeout" in text(error).lower() or "timed out" in text(error).lower() for error in (fetched.get("errors") or {}).values())
@@ -2609,6 +2613,7 @@ def create_app() -> Flask:
                 "capped_count": capped_count,
                 "search_key": search_key,
                 "search": search,
+                "continuation": {"endpoint": "/api/discovery/jobspy", "method": "POST", "body": {**payload, "continue_search": True}} if diagnostics["continuation_available"] else None,
                 "raw_jobs_returned": len(raw_jobs),
                 "cap_reached": capped_count > 0,
                 "preferences": preferences,
@@ -3294,7 +3299,7 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
     pipeline_search_key = discovery_search_signature(payload)
     prior_pipeline_run = load_discovery_search_run(pipeline_search_key) if as_bool(payload.get("continue_search")) else {}
     prior_pipeline_metadata = prior_pipeline_run.get("metadata") if isinstance(prior_pipeline_run.get("metadata"), dict) else {}
-    search["completed_query_batches"] = prior_pipeline_metadata.get("attempted_query_batches", []) if prior_pipeline_run else []
+    search["completed_query_batches"] = prior_pipeline_metadata.get("completed_query_batches", []) if prior_pipeline_run else []
     search["progressive_acquisition"] = True
     profile = load_profile()
     evidence_profile = resolve_discovery_evidence_profile(payload)
@@ -3385,11 +3390,11 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
     persisted = persist_discovery_jobs(jobs, search_id, run_id)
     requested_target = int(search.get("requested_target") or 50)
     ordered = list(jobs)
-    matching_jobs = [item for item in ordered if item.get("discovery_result_category") == "actionable" and not discovery_is_clear_senior_role(item, search)][:requested_target]
-    senior_review_jobs = [item for item in ordered if item.get("discovery_result_category") == "actionable" and discovery_is_clear_senior_role(item, search)]
-    for item in senior_review_jobs:
+    target_review_jobs = [item for item in ordered if item.get("discovery_result_category") == "actionable" and not discovery_target_eligible(item, search)]
+    for item in target_review_jobs:
         item["discovery_result_category"] = "review_required"
-        item["discovery_result_reason"] = "Clearly senior or managerial SWE role kept out of the new-match target."
+        item["discovery_result_reason"] = discovery_target_ineligibility_reason(item, search)
+    matching_jobs = [item for item in ordered if item.get("discovery_result_category") == "actionable"][:requested_target]
     review_required_jobs = [item for item in ordered if item.get("discovery_result_category") not in {"actionable", "excluded"}]
     excluded_jobs = [item for item in ordered if item.get("discovery_result_category") == "excluded"]
     jobs = matching_jobs + review_required_jobs
@@ -3400,6 +3405,9 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         "source_counts": fetched.get("source_counts", {}),
         "source_errors": fetched.get("errors", {}),
         "source_diagnostics": fetched.get("source_diagnostics", {}),
+        "attempted_query_batches": fetched.get("attempted_query_batches", []),
+        "completed_query_batches": fetched.get("completed_query_batches", []),
+        "pending_query_batches": fetched.get("pending_query_batches", []),
         "countrywide_region_queries": fetched.get("countrywide_region_queries", []),
         "duplicates_removed": duplicates_in_search,
         "duplicates_in_search": duplicates_in_search,
@@ -7459,6 +7467,8 @@ def discovery_search_config(payload: dict[str, Any]) -> dict[str, Any]:
         "enabled_sources": enabled_sources,
         "search_mode": search_mode,
         "title_match_mode": title_match_mode,
+        "seniority": normalize_seniority_levels(payload.get("seniority")),
+        "maximum_required_years": clamp_int_default(payload.get("maximum_required_years"), 3, 0, 30),
         "occupation": occupation_for_keywords(text(payload.get("keywords"))),
         "applicant_profile_id": clamp_int(payload.get("applicant_profile_id"), 0, 10**9),
         "profile_independent": search_mode == "title" and not text(payload.get("candidate_profile_id")),
@@ -8596,7 +8606,9 @@ def is_countrywide_search_location(location: str) -> bool:
 def fetch_discovery_jobs_for_search(
     search: dict[str, Any], *, country_indeed: str = "Canada",
     qualification_probe: Callable[[dict[str, Any]], bool] | None = None,
+    qualifying_predicate: Callable[[dict[str, Any]], bool] | None = None,
     target_matches: int | None = None,
+    stop_when_target: bool = True,
 ) -> dict[str, Any]:
     """Acquire distinct provider batches without treating a first page as exhaustion.
 
@@ -8614,11 +8626,18 @@ def fetch_discovery_jobs_for_search(
     for query in base_queries:
         variants.extend([query, f"{query} junior", f"{query} entry level", f"{query} new grad"] if progressive else [query])
     queries = list(dict.fromkeys(query for query in variants if query))[:28]
+    # ``qualifying_predicate`` was the name used by the independent QA suite.
+    # Keep it as a supported alias so callers share one acquisition contract.
+    if qualification_probe is None:
+        qualification_probe = qualifying_predicate
+    if target_matches is None and qualification_probe is not None and stop_when_target:
+        target_matches = clamp_int(search.get("requested_target"), 0, 10000) or None
     completed = {
         (text(item.get("location")), text(item.get("keywords")))
         for item in search.get("completed_query_batches", [])
         if isinstance(item, dict)
     }
+    continuation_index = clamp_int(search.get("continuation_index"), 0, 1000)
     # Keep the first acquisition page at the user-selected per-source budget;
     # later distinct queries are progressive continuation, not a silent
     # reduction of the provider page size.
@@ -8632,8 +8651,15 @@ def fetch_discovery_jobs_for_search(
     target_reached = False
     qualified_count = 0
     pending_batches = 0
-    planned_batches = [(location, query) for location in locations for query in queries if (location, query) not in completed]
-    for location, keyword_query in planned_batches:
+    all_planned_batches = [(location, query) for location in locations for query in queries]
+    # Compatibility for the earlier index-only contract.  Persisted batch
+    # records take precedence because they survive a server restart and do not
+    # accidentally skip failed work.
+    if not completed and continuation_index:
+        completed = set(all_planned_batches[:continuation_index])
+    planned_batches = [batch for batch in all_planned_batches if batch not in completed]
+    completed_this_run: list[dict[str, str]] = []
+    for batch_index, (location, keyword_query) in enumerate(planned_batches):
         if time.monotonic() - started >= DISCOVERY_OVERALL_TIMEOUT_SECONDS:
             combined["errors"]["overall"] = f"Discovery timed out after {DISCOVERY_OVERALL_TIMEOUT_SECONDS}s before all locations completed."
             break
@@ -8681,17 +8707,29 @@ def fetch_discovery_jobs_for_search(
             current["success"] = bool(current.get("success") or diagnostic.get("success"))
         if result.get("errors"):
             break
+        completed_this_run.append({"location": location, "keywords": keyword_query})
         if target_reached:
             break
     combined["jobs"] = merged
     combined["keyword_queries"] = [query for _, query in planned_batches]
     combined["attempted_query_batches"] = attempted
-    pending_batches = max(0, len(planned_batches) - len(attempted))
-    combined["pending_query_batches"] = [{"location": location, "keywords": query} for location, query in planned_batches[len(attempted):]]
+    # A failed batch itself is pending: it was attempted for diagnostics, but
+    # not completed and must be retried by a continuation request.
+    pending_start = len(completed_this_run)
+    pending_batches = max(0, len(planned_batches) - pending_start)
+    combined["completed_query_batches"] = [
+        {"location": location, "keywords": keyword}
+        for location, keyword in all_planned_batches if (location, keyword) in completed
+    ] + completed_this_run
+    combined["pending_query_batches"] = [
+        {"location": location, "keywords": query} for location, query in planned_batches[pending_start:]
+    ]
     combined["target_reached"] = target_reached
     combined["probe_qualifying_count"] = qualified_count
     combined["planned_queries_completed"] = pending_batches == 0 and not combined.get("errors") and not target_reached
-    combined["continuation_available"] = bool(combined.get("errors")) or pending_batches > 0
+    combined["continuation_available"] = not target_reached and (bool(combined.get("errors")) or pending_batches > 0)
+    combined["continuation_index"] = len(completed) + len(completed_this_run)
+    combined["attempted_queries_exhausted"] = bool(combined["planned_queries_completed"])
     # A short provider page is not proof of total provider exhaustion. It only
     # proves that the currently planned distinct query batch was short.
     combined["providers_exhausted"] = False
@@ -9221,6 +9259,34 @@ def discovery_is_clear_senior_role(job: dict[str, Any], search: dict[str, Any]) 
     except (TypeError, ValueError):
         high_experience = False
     return level in {"senior", "lead", "manager", "director"} or bool(analysis.get("management_role")) or bool(analysis.get("leadership_expectations")) or high_experience
+
+
+def discovery_target_eligible(job: dict[str, Any], search: dict[str, Any]) -> bool:
+    if discovery_is_clear_senior_role(job, search):
+        return False
+    selected_levels = set(text(search.get("seniority")).split(","))
+    analysis = job.get("qualification_fit_seniority") or {}
+    level = text(analysis.get("detected_level") or job.get("seniority_level")).lower().replace("-", "_")
+    if selected_levels and "any" not in selected_levels and level and level not in selected_levels:
+        return False
+    required = analysis.get("required_experience") or {}
+    try:
+        minimum = float(required.get("minimum")) if isinstance(required, dict) and required.get("minimum") is not None else 0
+    except (TypeError, ValueError):
+        minimum = 0
+    return minimum <= float(search.get("maximum_required_years") or 3)
+
+
+def discovery_target_ineligibility_reason(job: dict[str, Any], search: dict[str, Any]) -> str:
+    """Explain a user-selected target gate without silently dropping a job."""
+    if discovery_is_clear_senior_role(job, search):
+        return "Clearly senior or managerial role kept out of the selected early-career target."
+    analysis = job.get("qualification_fit_seniority") or {}
+    level = text(analysis.get("detected_level") or job.get("seniority_level")).lower().replace("-", "_")
+    selected_levels = set(text(search.get("seniority")).split(","))
+    if selected_levels and "any" not in selected_levels and level and level not in selected_levels:
+        return "Posting seniority is outside the selected discovery seniority levels."
+    return "Posting required experience exceeds the selected maximum-required-years limit."
 
 
 def discovery_sort_value(job: dict[str, Any], field: str, direction: str = "desc", remote_rule: str = "remote_after_local", unknown_salary_position: str = "last") -> tuple[Any, ...]:
