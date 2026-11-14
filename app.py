@@ -2283,6 +2283,8 @@ def create_app() -> Flask:
             return jsonify({"error": str(exc)}), 400
         if search["search_mode"] == "shortlist" and not text(payload.get("candidate_profile_id")):
             return jsonify({"error": "Select a candidate résumé profile for the technical shortlist."}), 400
+        search["progressive_acquisition"] = True
+        search["continuation_index"] = clamp_int(payload.get("continuation_index"), 0, 1000)
         search_key = discovery_search_signature(payload)
         prior_run = load_discovery_search_run(search_key) if as_bool(payload.get("continue_search")) else {}
         with _ACTIVE_DISCOVERY_SEARCHES_LOCK:
@@ -2592,6 +2594,8 @@ def create_app() -> Flask:
                     "target_unmet_reason": diagnostics["target_unmet_reason"],
                     "termination_reason": diagnostics["search_termination_reason"],
                     "continuation_available": diagnostics["continuation_available"],
+                    "continuation_index": fetched.get("continuation_index", search.get("continuation_index", 0)),
+                    "attempted_query_batches": fetched.get("attempted_query_batches", []),
                     "incomplete": bool(fetched.get("errors")),
                 },
                 "errors": fetched.get("errors", {}),

@@ -7,6 +7,7 @@ const state = {
   discoveryResults: [],
   discoveryPreferences: {},
   discoverySearchKey: "",
+  discoveryContinuationIndex: 0,
   discoveryMeta: {},
   discoveryView: "table",
   shortlist: [],
@@ -131,6 +132,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("job-form").addEventListener("submit", saveJob);
   document.getElementById("profile-form").addEventListener("submit", saveProfile);
   document.getElementById("discovery-form").addEventListener("submit", searchDiscovery);
+  document.getElementById("discovery-continue")?.addEventListener("click", () => searchDiscovery({ preventDefault() {} }, true));
   document.getElementById("discovery-workflow")?.addEventListener("change", () => applyDiscoveryWorkflow(value("discovery-workflow"), { reset: true }));
   document.getElementById("saved-search-form").addEventListener("submit", saveSavedSearch);
   document.getElementById("new-saved-search").addEventListener("click", () => toggleSavedSearchForm(true));
@@ -1118,7 +1120,7 @@ function editSavedSearch(search) {
   setValue("saved-search-minimum-salary", search.minimum_salary || "");
   setValue("saved-search-date-window", search.date_window || "14d");
   setValue("saved-search-depth", search.search_depth || "standard");
-  setValue("saved-search-new-target", search.new_matching_target || 25);
+  setValue("saved-search-new-target", search.new_matching_target || 50);
   setValue("saved-search-total-cap", search.total_cap || 200);
   setValue("saved-search-per-source-cap", search.per_source_cap || 100);
   setValue("saved-search-interval", search.interval_minutes || 360);
@@ -1136,7 +1138,7 @@ async function saveSavedSearch(event) {
     name: value("saved-search-name"), keywords: value("saved-search-keywords"), location: value("saved-search-location"),
     remote_preference: value("saved-search-remote"), distance: Number(value("saved-search-distance") || 50), seniority: value("saved-search-seniority"), minimum_salary: Number(value("saved-search-minimum-salary") || 0),
     date_window: value("saved-search-date-window"), search_depth: value("saved-search-depth") || "standard",
-    new_matching_target: Number(value("saved-search-new-target") || 25), total_cap: Math.max(200, Number(value("saved-search-new-target") || 25) * 4), per_source_cap: Number(value("saved-search-per-source-cap") || 100),
+    new_matching_target: Number(value("saved-search-new-target") || 50), total_cap: Math.max(200, Number(value("saved-search-new-target") || 50) * 4), per_source_cap: Number(value("saved-search-per-source-cap") || 100),
     interval_minutes: Number(value("saved-search-interval") || 360), enabled: checked("saved-search-enabled"),
     auto_prepare_enabled: checked("saved-search-auto-prepare"), auto_prepare_min_priority: Number(value("saved-search-auto-min-priority") || 75),
     auto_prepare_candidate_profile_id: Number(value("saved-search-auto-profile") || 0),
@@ -1162,7 +1164,7 @@ function saveCurrentDiscoverySearch() {
   setValue("saved-search-minimum-salary", "");
   setValue("saved-search-date-window", criteria.date_window);
   setValue("saved-search-depth", criteria.search_depth);
-  setValue("saved-search-new-target", criteria.new_matching_target || criteria.requested_target || 25);
+  setValue("saved-search-new-target", criteria.new_matching_target || criteria.requested_target || 50);
   setValue("saved-search-total-cap", criteria.total_cap);
   setValue("saved-search-per-source-cap", criteria.per_source_cap);
   setValue("saved-search-interval", 360);
@@ -2508,7 +2510,7 @@ function syncDiscoveryDepthDefaults() {
   setValue("discovery-fetch-budget", preset.total_cap);
 }
 
-function discoverySearchCriteriaFromControls() {
+function discoverySearchCriteriaFromControls(continuation = false) {
   const workflow = value("discovery-workflow") || state.discoveryWorkflow || "software";
   return {
     search_mode: workflow === "software" ? "shortlist" : "title",
@@ -2522,17 +2524,18 @@ function discoverySearchCriteriaFromControls() {
     search_depth: value("discovery-search-depth") || "standard",
     date_window: value("discovery-date-window") || "14d",
     per_source_cap: value("discovery-per-source-cap") || 100,
-    new_matching_target: Number(value("discovery-new-matching-target") || 25),
-    total_cap: Math.max(200, Number(value("discovery-new-matching-target") || 25) * Math.max(4, selectedDiscoverySources().length)),
+    new_matching_target: Number(value("discovery-new-matching-target") || 50),
+    total_cap: Math.max(200, Number(value("discovery-new-matching-target") || 50) * Math.max(4, selectedDiscoverySources().length)),
     bypass_cache: checked("discovery-bypass-cache"),
     // Software shortlist scoring needs the selected résumé. ECE title search
     // deliberately stays résumé-independent, but retains the selected
     // applicant ID for durable saved-job/application association.
     candidate_profile_id: workflow === "software" ? value("discovery-profile") : "",
     applicant_profile_id: value("discovery-profile") || state.selectedCandidateProfileId || "",
-    shortlist_size: Number(value("discovery-new-matching-target") || 25),
+    shortlist_size: Number(value("discovery-new-matching-target") || 50),
     strict_technical: workflow === "software" ? checked("discovery-strict-technical") : false,
     workflow,
+    continuation_index: continuation ? Number(state.discoveryContinuationIndex || 0) : 0,
   };
 }
 
@@ -2549,7 +2552,7 @@ function applyDiscoverySearchCriteriaToControls(criteria = {}) {
   setValue("discovery-search-depth", criteria.search_depth || "standard");
   setValue("discovery-date-window", criteria.date_window || "14d");
   setValue("discovery-per-source-cap", criteria.per_source_cap || 100);
-  setValue("discovery-new-matching-target", criteria.requested_target || criteria.new_matching_target || criteria.shortlist_size || 25);
+  setValue("discovery-new-matching-target", criteria.requested_target || criteria.new_matching_target || criteria.shortlist_size || 50);
   document.querySelectorAll('input[name="discovery-source"]').forEach((input) => { input.checked = (criteria.enabled_sources || []).includes(input.value); });
 }
 
@@ -2708,11 +2711,11 @@ function setDiscoveryView(view) {
   renderDiscoveryResults(state.discoveryMeta || {});
 }
 
-async function searchDiscovery(event) {
+async function searchDiscovery(event, continuation = false) {
   event.preventDefault();
   const button = document.getElementById("discovery-submit");
   const status = document.getElementById("discovery-status");
-  const criteria = discoverySearchCriteriaFromControls();
+  const criteria = discoverySearchCriteriaFromControls(continuation);
   if (criteria.workflow === "software" && !criteria.candidate_profile_id) {
     status.textContent = "Choose an applicant in Profiles before searching.";
     toast("Choose an applicant before searching.");
@@ -2738,6 +2741,7 @@ async function searchDiscovery(event) {
     state.discoveryAllResults = result.jobs || [];
     state.discoveryResults = [...(result.matching_jobs || result.technical_shortlist || []), ...(result.review_required_jobs || [])];
     state.discoverySearchKey = result.search_key || "";
+    state.discoveryContinuationIndex = Number(result.search_progress?.continuation_index ?? result.diagnostics?.continuation_index ?? 0);
     state.discoveryPreferences = result.preferences || discoveryPreferencesFromControls();
     state.discoverySearchCriteria = result.search || criteria;
     applyDiscoveryPreferencesToControls(state.discoveryPreferences);
@@ -2756,10 +2760,12 @@ async function searchDiscovery(event) {
       document.getElementById("discovery-results").scrollIntoView({ behavior: "smooth", block: "start" });
     }
     setDiscoveryControlsEnabled(Boolean(state.discoveryResults.length));
+    const continueButton = document.getElementById("discovery-continue");
+    if (continueButton) continueButton.disabled = !Boolean(result.search_progress?.continuation_available || result.diagnostics?.continuation_available);
     const partialFailure = Object.keys(result.errors || {}).length > 0;
     const progress = result.search_progress || {};
     status.textContent = result.visible_total
-      ? `${partialFailure ? "Incomplete search" : "Search completed"}: ${Number(progress.new_matching_jobs || 0)} new matching jobs found of ${Number(progress.requested_target || criteria.new_matching_target || 25)} requested; inspected ${Number(progress.raw_jobs_inspected || result.total || 0)} raw jobs.`
+      ? `${partialFailure ? "Incomplete search" : "Search completed"}: ${Number(progress.new_matching_jobs || 0)} new matching jobs found of ${Number(progress.requested_target || criteria.new_matching_target || 50)} requested; inspected ${Number(progress.raw_jobs_inspected || result.total || 0)} raw jobs.`
       : result.total
         ? `${partialFailure ? "Completed with provider errors" : "Processing completed"}: fetched ${result.total} jobs; local filters are hiding all of them.`
         : partialFailure ? "Search completed with provider errors; no jobs were returned." : "Search completed; no jobs were fetched from the selected sources.";
@@ -2915,7 +2921,7 @@ function renderDiscoveryResults(result) {
       || diagnostics.search_criteria?.requested_target
       || state.discoverySearchCriteria?.requested_target
       || value("discovery-new-matching-target")
-      || 25
+      || 50
   );
   const fetchedCount = Number(diagnostics.raw_jobs_returned ?? totalCount ?? 0);
   const duplicateCount = Number(diagnostics.duplicates_in_search ?? diagnostics.duplicates_removed ?? result.duplicates ?? 0);

@@ -9,9 +9,9 @@ recorded sequence of distinct occupation queries rather than repeating the
 first page. Each run stores attempted and pending `{location, keywords}` query
 batches. A request with `continue_search: true` uses the same search signature
 and skips completed batches. An incomplete target is reported as one of
-`planned_queries_completed`, `provider_blocked_or_unavailable`, or
-`request_budget_reached_resumable`; a short page is never claimed to prove
-total provider exhaustion.
+`target_reached`, `planned_queries_completed`,
+`provider_blocked_or_unavailable`, or `request_budget_reached_resumable`; a
+short page is never claimed to prove total provider exhaustion.
 
 Skip, save, and applied states can be scoped by `applicant_profile_id`.  The
 additive `discovery_applicant_states` table keeps one applicant’s actions from
