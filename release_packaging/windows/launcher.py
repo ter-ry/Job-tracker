@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 import ctypes
+import multiprocessing
 import os
 from pathlib import Path
 import threading
@@ -111,6 +112,10 @@ def stop_waitress_server(server: object, server_thread: threading.Thread) -> Non
 
 
 def launch() -> int:
+    # Required before any isolated JobSpy child is spawned from the frozen
+    # launcher. The provider runtime uses Windows spawn and never re-enters
+    # launch() recursively.
+    multiprocessing.freeze_support()
     data_dir = default_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
     os.environ["JOB_TRACKER_DATA_DIR"] = str(data_dir)

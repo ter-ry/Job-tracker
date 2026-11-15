@@ -56,6 +56,7 @@ def main() -> None:
                 "source": source,
                 "request": diagnostic["request_params"],
                 "state": diagnostic["state"],
+                "provider_status": diagnostic["provider_status"],
                 "error": diagnostic["error"],
                 "warning_count": diagnostic["warnings_count"],
                 "raw_result_count": diagnostic["raw_records_row_count"],
