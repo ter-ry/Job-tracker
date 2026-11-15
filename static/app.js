@@ -2816,6 +2816,17 @@ function mergeProgressiveDiscoveryJobs(jobs = []) {
   state.discoveryAllResults = state.discoveryResults.slice();
 }
 
+function acknowledgeRenderedDiscoveryJobs(searchId, jobs = []) {
+  const jobIds = (Array.isArray(jobs) ? jobs : [])
+    .filter((job) => job?.result_stage === "qualified" && job?.discovery_result_category === "actionable" && Number(job?.id) > 0)
+    .map((job) => Number(job.id));
+  if (!jobIds.length) return;
+  // This acknowledgement follows renderDiscoveryResults().  A worker result
+  // alone must not make a vacancy disappear if the tab closes before display.
+  void api.sendOutcome(`/api/discovery/searches/${encodeURIComponent(searchId)}/delivered`, "POST", { job_ids: jobIds })
+    .catch(() => {});
+}
+
 function renderProgressiveSearchProgress(payload = {}) {
   const progress = payload.progress || payload.search_progress || {};
   const providers = payload.provider_states || payload.providers || {};
@@ -2839,7 +2850,8 @@ async function pollProgressiveDiscoverySearch(searchId, after = 0) {
   let sequence = Number(after || 0);
   while (state.discoveryActiveSearchId === String(searchId)) {
     const payload = await api.get(`/api/discovery/searches/${encodeURIComponent(searchId)}?after=${sequence}`);
-    mergeProgressiveDiscoveryJobs(payload.new_jobs || payload.jobs || payload.results || []);
+    const incomingJobs = payload.new_jobs || payload.jobs || payload.results || [];
+    mergeProgressiveDiscoveryJobs(incomingJobs);
     sequence = Number(payload.next_sequence ?? payload.progress?.next_sequence ?? sequence);
     state.discoveryContinuationIndex = sequence;
     state.discoveryMeta = {
@@ -2854,6 +2866,7 @@ async function pollProgressiveDiscoverySearch(searchId, after = 0) {
     };
     renderProgressiveSearchProgress({ ...payload, search_id: searchId });
     renderDiscoveryResults(state.discoveryMeta);
+    acknowledgeRenderedDiscoveryJobs(searchId, incomingJobs);
     if (progressiveSearchTerminal(payload)) break;
     await new Promise((resolve) => window.setTimeout(resolve, 700));
   }
@@ -3326,6 +3339,13 @@ function renderDiscoveryDiagnostics(diagnostics, visibleCount, totalCount) {
     details.push(`<li><strong>Origin next step:</strong> ${escapeHtml(guidance)}</li>`);
   }
   details.push(`<li><strong>Raw fetched:</strong> ${fetched}</li>`);
+  if (diagnostics.early_filtered_count !== undefined) {
+    const reasons = Object.entries(diagnostics.early_filter_reasons || {}).map(([reason, count]) => `${reason}=${Number(count)}`).join(" | ");
+    details.push(`<li><strong>Early reliable filters:</strong> ${Number(diagnostics.early_filtered_count || 0)}${reasons ? ` (${escapeHtml(reasons)})` : ""}</li>`);
+  }
+  if (diagnostics.eligible_previously_presented_count !== undefined || diagnostics.eligible_already_actioned_count !== undefined) {
+    details.push(`<li><strong>Eligible queue state:</strong> previously presented ${Number(diagnostics.eligible_previously_presented_count || 0)} | applicant action ${Number(diagnostics.eligible_already_actioned_count || 0)}</li>`);
+  }
   details.push(`<li><strong>Visible after local filters:</strong> ${Number(visibleCount || 0)}</li>`);
   details.push(`<li><strong>Hidden by local filters:</strong> ${hiddenByLocalFilters}</li>`);
   details.push(`<li><strong>Duplicates removed:</strong> ${Number(diagnostics.duplicates_removed || 0)}</li>`);

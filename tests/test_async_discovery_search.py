@@ -128,6 +128,32 @@ def test_async_search_publishes_provider_progress_before_final_qualification(mon
         assert final["jobs"][0]["id"] == 17
 
 
+def test_async_worker_does_not_mark_results_presented_before_delivery(monkeypatch):
+    with tempfile.TemporaryDirectory() as directory:
+        app_module.DATA_DIR = Path(directory)
+        app_module.DB_PATH = app_module.DATA_DIR / "delivery.sqlite"
+        app_module.app.config.update(TESTING=True)
+
+        def fake_pipeline(payload):
+            with app_module.app.app_context():
+                job = app_module.normalize_job_payload({"source": "fixture", "source_job_id": "unseen", "title": "Junior Software Developer", "company": "Example", "location": "Toronto, ON", "job_url": "https://example.test/unseen"})
+                app_module.persist_discovery_jobs([job], None, None)
+            return {"jobs": [{**job, "discovery_result_category": "actionable"}], "matching_jobs": [job], "review_required_jobs": [], "total": 1, "errors": {}, "search_progress": {"requested_target": 1, "new_matching_jobs": 1, "raw_jobs_inspected": 1}}
+
+        monkeypatch.setattr(app_module, "run_discovery_pipeline", fake_pipeline)
+        client = app_module.app.test_client()
+        response = client.post("/api/discovery/searches", json={"keywords": "software developer", "applicant_profile_id": 11, "new_matching_target": 1})
+        search_id = response.get_json()["search_id"]
+        for _ in range(80):
+            final = client.get(f"/api/discovery/searches/{search_id}").get_json()
+            if final["status"] == "completed":
+                break
+            time.sleep(0.01)
+        job_id = final["jobs"][0]["id"]
+        with app_module.app.app_context():
+            assert not app_module.applicant_presented_discovery_job(job_id, 11)
+
+
 def test_named_search_keeps_legacy_saved_search_contract():
     with tempfile.TemporaryDirectory() as directory:
         app_module.DATA_DIR = Path(directory)

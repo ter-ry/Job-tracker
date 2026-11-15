@@ -1974,6 +1974,29 @@ def create_app() -> Flask:
         _update_async_discovery(search_id, status="cancelled", cancel_requested=1, termination_reason="cancelled_by_user")
         return jsonify({"search_id": search_id, "status": "cancelled"})
 
+    @app.post("/api/discovery/searches/<search_id>/delivered")
+    def acknowledge_async_discovery_delivery(search_id: str) -> Response:
+        """Mark only browser-rendered final rows as presented for this applicant."""
+        row = _async_discovery_row(search_id)
+        if row is None:
+            return jsonify({"error": "Async discovery search not found"}), 404
+        payload = request.get_json(silent=True) or {}
+        job_ids = payload.get("job_ids") if isinstance(payload.get("job_ids"), list) else []
+        profile_id = int(row.get("applicant_profile_id") or 0)
+        # A browser may only acknowledge the final, actionable rows emitted by
+        # this search.  Do not let a stale tab (or a forged request) suppress
+        # unrelated vacancies from a later New Opportunities queue.
+        final_ids = {
+            clamp_int(item.get("id"), 0, 10**9)
+            for item in parse_json_array(row.get("results_json"))
+            if isinstance(item, dict)
+            and text(item.get("result_stage")) == "qualified"
+            and text(item.get("discovery_result_category")) == "actionable"
+        }
+        ids = sorted({clamp_int(value, 0, 10**9) for value in job_ids} & final_ids)
+        mark_discovery_jobs_presented(ids, profile_id)
+        return jsonify({"search_id": search_id, "acknowledged": len(ids), "applicant_profile_id": profile_id})
+
     @app.post("/api/discovery/searches/<search_id>/continue")
     def continue_async_discovery_search(search_id: str) -> Response:
         row = _async_discovery_row(search_id)
@@ -3446,22 +3469,16 @@ def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, ru
         match = find_existing_job_match(job)
         if match is not None:
             counts["duplicate"] += 1
-            # Refresh discovery-owned assessment fields on repeat sightings.
-            # User status, notes, dates, and decisions remain untouched.
+            # Refresh shared, source-owned facts on repeat sightings.  Scores,
+            # qualification evidence, categories and profile ids are derived
+            # from the selected applicant and must never be overwritten by a
+            # second applicant seeing the same vacancy.
             assessment_columns = {
                 "overall_score", "score_breakdown", "distance_km", "distance_confidence",
                 "distance_radius_status", "distance_origin_label", "distance_origin_precision",
                 "distance_origin_status", "distance_type", "commute_status", "commute_source",
                 "remote_eligibility", "remote_eligibility_explanation", "remote_search_eligible",
-                "discovery_salary_filter_status", "qualification_match_score", "application_priority_score",
-                "opportunity_score", "opportunity_score_reasons", "discovery_remote_preference",
-                "discovery_location_scope", "discovery_occupation", "discovery_profile_independent",
-                "candidate_profile_id", "discovery_search_mode", "title_match_mode", "occupation_match_type",
-                "title_match_score", "discovery_result_category", "discovery_result_reason",
-                "recommendation_eligible", "qualification_fit_seniority", "qualification_fit_matched_requirements",
-                "qualification_fit_missing_requirements", "qualification_fit_partial_requirements",
-                "qualification_evidence_profile_id", "qualification_evidence_profile_name",
-                "qualification_evidence_source", "posting_availability", "description_source",
+                "posting_availability", "description_source",
                 "description_fetched_at", "last_verified_at", "workplace_address", "workplace_postal_code",
                 "workplace_evidence", "workplace_evidence_source", "workplace_precision", "workplace_confidence",
                 "workplace_alternatives_json", "remote_classification_conflict", "warnings",
@@ -3675,6 +3692,7 @@ def run_discovery_pipeline(
     duplicates_in_search = 0
     already_saved_matches = 0
     filtered = 0
+    early_filter_reasons: dict[str, int] = {}
     for raw_job in fetched.get("jobs", []):
         clean = normalize_job_payload(jobspy_result_to_job_payload(raw_job))
         clean["candidate_profile_id"] = clamp_int(payload.get("applicant_profile_id") or payload.get("candidate_profile_id"), 0, 10**9)
@@ -3717,12 +3735,12 @@ def run_discovery_pipeline(
         if minimum_salary and reliable_salary and int(normalize_salary_snapshot(clean).get("salary_annual_max") or 0) < minimum_salary:
             clean["filtered_reason"] = f"Known salary is below the saved-search minimum of ${minimum_salary:,}."
             filtered += 1
+            early_filter_reasons["known_salary_below_minimum"] = early_filter_reasons.get("known_salary_below_minimum", 0) + 1
             continue
-        seniority_filter = normalize_space(text(payload.get("seniority"))).lower()
-        if seniority_filter and text(clean.get("seniority_level")) and not any(term in text(clean.get("seniority_level")).lower() for term in re.split(r"[,;/]+", seniority_filter) if term.strip()):
-            clean["filtered_reason"] = "Posting seniority does not match the saved-search seniority preference."
-            filtered += 1
-            continue
+        # Do not compare free-text experience such as "2–3 years" against
+        # enum preferences like "entry_level,junior".  The authoritative
+        # evidence-aware target assessment below handles explicit seniority,
+        # maximum required years, and unknown/provisional evidence together.
         if any(dedupe_match(clean, seen) for seen in seen_jobs):
             duplicates_in_search += 1
             continue
@@ -3748,6 +3766,8 @@ def run_discovery_pipeline(
         item["discovery_result_reason"] = discovery_target_ineligibility_reason(item, search)
     selected_applicant_id = applicant_profile_id(payload)
     eligible_unpresented: list[dict[str, Any]] = []
+    previously_presented_count = 0
+    already_actioned_count = 0
     for item in ordered:
         hydrate_discovery_identity(item)
         job_id = int(item.get("id") or 0)
@@ -3755,15 +3775,18 @@ def run_discovery_pipeline(
         presented = applicant_presented_discovery_job(job_id, selected_applicant_id)
         item["applicant_discovery_state"] = state
         item["presented_to_applicant"] = presented
+        if item.get("discovery_result_category") == "actionable" and presented:
+            previously_presented_count += 1
+        if item.get("discovery_result_category") == "actionable" and state:
+            already_actioned_count += 1
         # New-only is a presentation queue, not a mirror of all fetched rows.
         # Saved/Applied/Skipped and previously presented jobs remain available
         # in history but must never consume a new-opportunity slot.
         if item.get("discovery_result_category") == "actionable" and not state and not presented:
             eligible_unpresented.append(item)
     matching_jobs = eligible_unpresented[:requested_target]
-    mark_discovery_jobs_presented([int(item.get("id") or 0) for item in matching_jobs], selected_applicant_id)
-    for item in matching_jobs:
-        item["presented_to_applicant"] = True
+    # Presentation is acknowledged only after the browser renders final rows;
+    # a worker completing while a browser crashes must not silently hide jobs.
     review_required_jobs = [item for item in ordered if item.get("discovery_result_category") not in {"actionable", "excluded"}]
     excluded_jobs = [item for item in ordered if item.get("discovery_result_category") == "excluded"]
     # Find Jobs intentionally exposes only the bounded, qualified new queue.
@@ -3783,7 +3806,9 @@ def run_discovery_pipeline(
         "duplicates_removed": duplicates_in_search,
         "duplicates_in_search": duplicates_in_search,
         "already_saved_matches": already_saved_matches,
-        "excluded_count": filtered,
+        "early_filtered_count": filtered,
+        "early_filter_reasons": early_filter_reasons,
+        "excluded_count": len(excluded_jobs),
         "capped_count": capped_count,
         "visible_count": len(jobs),
         "requested_target": requested_target,
@@ -3794,8 +3819,10 @@ def run_discovery_pipeline(
         "disqualified_count": len(excluded_jobs),
         "review_required_count": len(review_required_jobs),
         "new_matching_count": len(matching_jobs),
+        "eligible_previously_presented_count": previously_presented_count,
+        "eligible_already_actioned_count": already_actioned_count,
         "target_unmet_reason": (
-            "No further matching results were returned by the selected sources."
+            f"No new eligible opportunities remained in attempted batches: {previously_presented_count} eligible jobs were previously presented and {already_actioned_count} already have an applicant action."
             if len(matching_jobs) < requested_target and not fetched.get("errors")
             else "Provider failures, timeouts, or rate limits interrupted the search. Continue search to retry."
             if len(matching_jobs) < requested_target and fetched.get("errors")
@@ -3804,6 +3831,8 @@ def run_discovery_pipeline(
         "raw_jobs_returned": len(fetched.get("jobs", [])),
         "displayed_jobs": len(jobs),
         "display_jobs": jobs,
+        # Retained for older clients; this is an early reliable-salary filter,
+        # not the final eligibility/exclusion count.
         "filtered_by_saved_search": filtered,
         "persisted": persisted,
         "auto_preparation_queued": auto_preparation_queued,
@@ -3829,7 +3858,10 @@ def run_discovery_pipeline(
             "disqualified": len(excluded_jobs),
             "review_required": len(review_required_jobs),
             "new_matching_jobs": len(matching_jobs),
-            "previously_presented": sum(1 for item in ordered if item.get("presented_to_applicant")),
+            "previously_presented": previously_presented_count,
+            "already_actioned": already_actioned_count,
+            "early_filtered": filtered,
+            "early_filter_reasons": early_filter_reasons,
             "filtered_technical": sum(1 for item in ordered if text(item.get("discovery_result_reason")).lower().find("role family") >= 0),
             "review_missing_distance": sum(1 for item in ordered if text(item.get("distance_radius_status")).lower() == "unknown"),
             "confirmed_excluded": len(excluded_jobs),
@@ -3845,7 +3877,7 @@ def run_discovery_pipeline(
         "duplicates": duplicates_in_search,
         "duplicates_in_search": duplicates_in_search,
         "already_saved_matches": already_saved_matches,
-        "excluded_count": filtered,
+        "excluded_count": len(excluded_jobs),
         "capped_count": capped_count,
         "persisted": persisted,
         "search_key": search_key,
@@ -8587,7 +8619,7 @@ def geocode_workplace_alternative(
     geocode: dict[str, Any] = {}
     for lookup in lookups:
         candidate = geocode_location_value(lookup, lookup_type="job", profile=profile, provider=provider, use_cache=use_cache)
-        if candidate.get("ok") and geocode_matches_canadian_location(lookup, candidate):
+        if candidate.get("ok") and geocode_matches_canadian_location(lookup, candidate) and geocode_matches_advertised_city(enriched, candidate):
             geocode = candidate
             break
         if not geocode:
@@ -8702,8 +8734,9 @@ def geocode_discovery_job(
             break
         if not geocode:
             geocode = candidate
-    if geocode.get("ok") and geocode_lookup_value and (
-        not geocode_matches_canadian_location(geocode_lookup_value, geocode)
+    if geocode.get("ok") and (
+        not geocode_lookup_value
+        or not geocode_matches_canadian_location(geocode_lookup_value, geocode)
         or not geocode_matches_advertised_city(job, geocode)
     ):
         geocode = {
