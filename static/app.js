@@ -9,6 +9,7 @@ const state = {
   discoveryExcludedResults: [],
   discoveryPreferences: {},
   discoverySearchKey: "",
+  discoveryLastSearchId: "",
   discoveryContinuationIndex: 0,
   discoveryMeta: {},
   discoveryView: "table",
@@ -25,6 +26,9 @@ const state = {
   generationSelections: {},
   shortlistRegenerations: {},
   selectedCandidateProfileId: (() => { try { return localStorage.getItem("jobTracker.selectedCandidateProfileId") || ""; } catch (_) { return ""; } })(),
+  candidateProfilesStatus: "idle",
+  candidateProfilesError: "",
+  loadToken: 0,
   discoveryInboxJobs: [],
   discoveryInboxCategory: "new_actionable",
   advancedFeatures: (() => { try { return localStorage.getItem("jobTracker.advancedFeatures") === "true"; } catch (_) { return false; } })(),
@@ -116,6 +120,15 @@ const api = {
     }
     return response.json();
   },
+  async sendOutcome(path, method, body) {
+    const response = await fetch(path, {
+      method,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await response.json().catch(() => ({}));
+    return { ok: response.ok, status: response.status, data };
+  },
   async upload(path, formData) {
     const response = await fetch(path, { method: "POST", body: formData });
     if (!response.ok) {
@@ -134,6 +147,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("job-form").addEventListener("submit", saveJob);
   document.getElementById("profile-form").addEventListener("submit", saveProfile);
   document.getElementById("discovery-form").addEventListener("submit", searchDiscovery);
+  document.getElementById("discovery-stop")?.addEventListener("click", stopProgressiveDiscoverySearch);
   document.getElementById("discovery-workflow")?.addEventListener("change", () => applyDiscoveryWorkflow(value("discovery-workflow"), { reset: true }));
   document.getElementById("saved-search-form").addEventListener("submit", saveSavedSearch);
   document.getElementById("new-saved-search").addEventListener("click", () => toggleSavedSearchForm(true));
@@ -293,16 +307,12 @@ function setDiscoverySection(view) {
   document.querySelectorAll(".discovery-view-saved").forEach((element) => { element.hidden = selected !== "saved"; });
 }
 
-async function loadAll() {
+async function loadAll({ skipProfiles = false } = {}) {
+  const loadToken = ++state.loadToken;
   const loadStart = performance.now();
   performance.mark("job-tracker-loadAll-start");
   try {
-    const candidateProfiles = await api.get("/api/candidate-profiles").catch(() => []);
-    state.candidateProfiles = Array.isArray(candidateProfiles) ? candidateProfiles : [];
-    if (!state.candidateProfiles.some((profile) => String(profile.id) === String(state.selectedCandidateProfileId))) {
-      state.selectedCandidateProfileId = state.candidateProfiles[0] ? String(state.candidateProfiles[0].id) : "";
-      try { localStorage.setItem("jobTracker.selectedCandidateProfileId", state.selectedCandidateProfileId); } catch (_) { /* storage may be disabled */ }
-    }
+    const profilesPromise = skipProfiles ? Promise.resolve(false) : loadCandidateProfiles({ reloadPanelsOnSelectionChange: true });
     const profileQuery = state.selectedCandidateProfileId ? `?candidate_profile_id=${encodeURIComponent(state.selectedCandidateProfileId)}` : "";
     const [jobs, dashboard, profile, systemHealth, evidence] = await Promise.all([
       api.get(`/api/jobs${profileQuery}`),
@@ -312,6 +322,8 @@ async function loadAll() {
       api.get("/api/evidence").catch(() => []),
     ]);
     const shortlist = await api.get("/api/shortlist");
+    await profilesPromise;
+    if (loadToken !== state.loadToken) return;
     state.jobs = jobs;
     state.discoveryInboxJobs = jobs.filter((job) => job.discovery_first_seen_at);
     state.profile = profile;
@@ -340,6 +352,40 @@ async function loadAll() {
   } catch (error) {
     toast(error.message);
   }
+}
+
+async function loadCandidateProfiles({ reloadPanelsOnSelectionChange = false } = {}) {
+  state.candidateProfilesStatus = "loading";
+  state.candidateProfilesError = "";
+  renderCandidateProfiles();
+  const selectedAtStart = state.selectedCandidateProfileId;
+  try {
+    const profiles = await api.get("/api/candidate-profiles");
+    state.candidateProfiles = Array.isArray(profiles) ? profiles : [];
+    if (!state.candidateProfiles.some((profile) => String(profile.id) === String(state.selectedCandidateProfileId))) {
+      const next = state.candidateProfiles[0] ? String(state.candidateProfiles[0].id) : "";
+      state.selectedCandidateProfileId = next;
+      if (next) {
+        try { localStorage.setItem("jobTracker.selectedCandidateProfileId", next); } catch (_) { /* storage may be disabled */ }
+      }
+    }
+    state.candidateProfilesStatus = "ready";
+    renderCandidateProfiles();
+    if (state.selectedCandidateProfileId) await renderCandidateProfileDocuments();
+    if (reloadPanelsOnSelectionChange && selectedAtStart !== state.selectedCandidateProfileId) {
+      void loadAll({ skipProfiles: true });
+    }
+    return true;
+  } catch (error) {
+    state.candidateProfilesStatus = "error";
+    state.candidateProfilesError = error.message || "Candidate profiles could not be loaded.";
+    renderCandidateProfiles();
+    return false;
+  }
+}
+
+async function retryCandidateProfiles() {
+  await loadCandidateProfiles({ reloadPanelsOnSelectionChange: true });
 }
 
 async function loadPreparationQueue() {
@@ -1348,20 +1394,21 @@ async function saveCandidateProfile(event) {
 }
 
 async function refreshCandidateProfiles(selectId = "") {
-  const profiles = await api.get("/api/candidate-profiles");
-  state.candidateProfiles = Array.isArray(profiles) ? profiles : [];
-  if (selectId && state.candidateProfiles.some((profile) => String(profile.id) === String(selectId))) {
-    state.selectedCandidateProfileId = String(selectId);
-  } else if (!state.candidateProfiles.some((profile) => String(profile.id) === state.selectedCandidateProfileId)) {
-    state.selectedCandidateProfileId = state.candidateProfiles[0] ? String(state.candidateProfiles[0].id) : "";
-  }
-  renderCandidateProfiles();
-  if (state.selectedCandidateProfileId) await renderCandidateProfileDocuments();
+  if (selectId) state.selectedCandidateProfileId = String(selectId);
+  await loadCandidateProfiles({ reloadPanelsOnSelectionChange: true });
 }
 
 function renderCandidateProfiles() {
   const list = document.getElementById("candidate-profile-list");
   if (!list) return;
+  if (state.candidateProfilesStatus === "loading" || state.candidateProfilesStatus === "idle") {
+    list.innerHTML = '<p class="muted" aria-live="polite">Loading candidate profiles…</p>';
+    return;
+  }
+  if (state.candidateProfilesStatus === "error") {
+    list.innerHTML = `<div class="empty-state" role="alert"><p>${escapeHtml(state.candidateProfilesError || "Candidate profiles could not be loaded.")}</p><button class="button ghost small" type="button" onclick="retryCandidateProfiles()">Retry</button></div>`;
+    return;
+  }
   if (!state.candidateProfiles.length) {
     list.innerHTML = '<p class="muted">No reusable candidate profiles yet.</p>';
     document.getElementById("candidate-profile-documents").classList.add("empty");
@@ -2496,6 +2543,7 @@ function applyDiscoveryWorkflow(workflow = "software", { reset = false } = {}) {
   setValue("discovery-location", "");
   setValue("discovery-seniority", selected === "software" ? "entry_level,junior,intermediate" : "any");
   setValue("discovery-maximum-years", selected === "software" ? 3 : "");
+  setChecked("discovery-include-internships", false);
   const seniorityControl = document.getElementById("discovery-seniority");
   const yearsControl = document.getElementById("discovery-maximum-years");
   if (seniorityControl) seniorityControl.disabled = selected === "ece";
@@ -2567,6 +2615,7 @@ function discoverySearchCriteriaFromControls(continuation = false) {
     seniority: workflow === "software" ? value("discovery-seniority") : "",
     maximum_required_years: workflow === "software" ? value("discovery-maximum-years") : "",
     include_provisional_matches: checked("discovery-include-provisional"),
+    include_internships: checked("discovery-include-internships"),
     geographic_match_mode: value("discovery-geographic-match-mode") || "provisional",
     workflow,
     continuation_index: continuation ? Number(state.discoveryContinuationIndex || 0) : 0,
@@ -2590,6 +2639,7 @@ function applyDiscoverySearchCriteriaToControls(criteria = {}) {
   setValue("discovery-seniority", criteria.seniority || "entry_level,junior,intermediate");
   setValue("discovery-maximum-years", criteria.maximum_required_years || 3);
   setChecked("discovery-include-provisional", criteria.include_provisional_matches !== false);
+  setChecked("discovery-include-internships", criteria.include_internships === true);
   setValue("discovery-geographic-match-mode", criteria.geographic_match_mode || "provisional");
   document.querySelectorAll('input[name="discovery-source"]').forEach((input) => { input.checked = (criteria.enabled_sources || []).includes(input.value); });
 }
@@ -2749,6 +2799,104 @@ function setDiscoveryView(view) {
   renderDiscoveryResults(state.discoveryMeta || {});
 }
 
+function mergeProgressiveDiscoveryJobs(jobs = []) {
+  const incoming = Array.isArray(jobs) ? jobs : [];
+  const merged = [...(state.discoveryResults || []), ...incoming].filter((job, index, all) => all.findIndex((candidate) => discoveryJobKey(candidate) === discoveryJobKey(job)) === index);
+  state.discoveryExcludedResults = merged.filter((job) => job.discovery_result_category === "excluded");
+  state.discoveryResults = merged.filter((job) => job.discovery_result_category !== "excluded");
+  state.discoveryAllResults = state.discoveryResults.slice();
+}
+
+function renderProgressiveSearchProgress(payload = {}) {
+  const progress = payload.progress || payload.search_progress || {};
+  const providers = payload.provider_states || payload.providers || {};
+  const target = document.getElementById("discovery-progress");
+  if (!target) return;
+  const providerText = Object.entries(providers).map(([name, info]) => {
+    const status = info?.status || (info?.error ? "failed" : info?.result_count ? "working" : "pending");
+    return `${sourceLabel(name)}: ${status}`;
+  }).join(" · ");
+  target.hidden = false;
+  target.innerHTML = `<strong>Search ${escapeHtml(payload.search_id || state.discoveryActiveSearchId || "")}</strong> · ${Number(progress.new_matching_jobs ?? progress.new_matches ?? state.discoveryResults.length)} new matches · ${Number(progress.raw_jobs_inspected ?? progress.raw_jobs ?? 0)} raw inspected${providerText ? ` · ${escapeHtml(providerText)}` : ""}${payload.termination_reason ? ` · ${escapeHtml(String(payload.termination_reason).replaceAll("_", " "))}` : ""}`;
+}
+
+function progressiveSearchTerminal(payload = {}) {
+  const status = String(payload.status || "").toLowerCase();
+  const reason = String(payload.termination_reason || payload.progress?.termination_reason || "").toLowerCase();
+  return Boolean(payload.terminated || ["completed", "complete", "cancelled", "canceled", "failed", "error"].includes(status) || ["target_reached", "planned_queries_completed", "cancelled", "canceled", "failed", "error"].includes(reason));
+}
+
+async function pollProgressiveDiscoverySearch(searchId, after = 0) {
+  let sequence = Number(after || 0);
+  while (state.discoveryActiveSearchId === String(searchId)) {
+    const payload = await api.get(`/api/discovery/searches/${encodeURIComponent(searchId)}?after=${sequence}`);
+    mergeProgressiveDiscoveryJobs(payload.new_jobs || payload.jobs || payload.results || []);
+    sequence = Number(payload.next_sequence ?? payload.progress?.next_sequence ?? sequence);
+    state.discoveryContinuationIndex = sequence;
+    state.discoveryMeta = {
+      ...state.discoveryMeta,
+      total: Number(payload.progress?.raw_jobs_inspected ?? payload.raw_jobs_inspected ?? state.discoveryResults.length),
+      visible_total: state.discoveryResults.length,
+      search_progress: payload.progress || payload.search_progress || {},
+      diagnostics: payload.diagnostics || state.discoveryMeta.diagnostics || {},
+      provider_states: payload.provider_states || payload.providers || {},
+      errors: payload.errors || {},
+      termination_reason: payload.termination_reason || payload.progress?.termination_reason || "",
+    };
+    renderProgressiveSearchProgress({ ...payload, search_id: searchId });
+    renderDiscoveryResults(state.discoveryMeta);
+    if (progressiveSearchTerminal(payload)) break;
+    await new Promise((resolve) => window.setTimeout(resolve, 700));
+  }
+  const stop = document.getElementById("discovery-stop");
+  if (stop) stop.hidden = true;
+  const status = document.getElementById("discovery-status");
+  if (status && state.discoveryActiveSearchId === String(searchId)) {
+    const reason = state.discoveryMeta.termination_reason || "completed";
+    status.textContent = reason === "cancelled" || reason === "canceled" ? "Search cancelled; results received before cancellation were kept." : `Search ended: ${String(reason).replaceAll("_", " ")}.`;
+  }
+  state.discoveryActiveSearchId = "";
+}
+
+async function tryProgressiveDiscoverySearch(criteria) {
+  const outcome = await api.sendOutcome("/api/discovery/searches", "POST", criteria);
+  if (!outcome.ok || !outcome.data?.search_id) return false;
+  const searchId = String(outcome.data.search_id);
+  state.discoveryActiveSearchId = searchId;
+  state.discoveryLastSearchId = searchId;
+  state.discoverySearchKey = outcome.data.search_key || state.discoverySearchKey;
+  state.discoveryResults = [];
+  state.discoveryAllResults = [];
+  state.discoveryMeta = { total: 0, visible_total: 0, search_progress: outcome.data.progress || {}, provider_states: outcome.data.provider_states || {}, errors: {} };
+  const stop = document.getElementById("discovery-stop");
+  if (stop) stop.hidden = false;
+  const status = document.getElementById("discovery-status");
+  if (status) status.textContent = `Search started (${searchId}); waiting for provider results…`;
+  renderProgressiveSearchProgress({ ...outcome.data, search_id: searchId });
+  void pollProgressiveDiscoverySearch(searchId, outcome.data.next_sequence || 0).catch((error) => {
+    if (state.discoveryActiveSearchId === searchId) {
+      state.discoveryActiveSearchId = "";
+      if (status) status.textContent = `Search polling failed: ${error.message}. Retry or run the search again.`;
+      if (stop) stop.hidden = true;
+    }
+  });
+  return true;
+}
+
+async function stopProgressiveDiscoverySearch() {
+  const searchId = state.discoveryActiveSearchId;
+  if (!searchId) return;
+  const status = document.getElementById("discovery-status");
+  if (status) status.textContent = "Cancellation requested; waiting for backend confirmation…";
+  try {
+    const outcome = await api.sendOutcome(`/api/discovery/searches/${encodeURIComponent(searchId)}/cancel`, "POST", {});
+    if (!outcome.ok) throw new Error(outcome.data?.error || `Cancellation request failed (${outcome.status})`);
+    if (status) status.textContent = "Cancellation acknowledged; preserving results received so far.";
+  } catch (error) {
+    if (status) status.textContent = `Cancellation could not be confirmed: ${error.message}`;
+  }
+}
+
 async function searchDiscovery(event, continuation = false) {
   event.preventDefault();
   const button = document.getElementById("discovery-submit");
@@ -2775,6 +2923,7 @@ async function searchDiscovery(event, continuation = false) {
       : `Fetching jobs from ${sourceText} (${elapsedSeconds}s)...`;
   }, 1000);
   try {
+    if (!continuation && await tryProgressiveDiscoverySearch(criteria)) return;
     const result = await api.send("/api/discovery/jobspy", "POST", criteria);
     const responseJobs = result.jobs || [...(result.matching_jobs || result.technical_shortlist || []), ...(result.review_required_jobs || [])];
     state.discoveryExcludedResults = responseJobs.filter((job) => job.discovery_result_category === "excluded");
@@ -2833,6 +2982,9 @@ function continuationContract() {
   const contract = state.discoveryMeta?.continuation;
   if (contract && typeof contract === "object" && (contract.url || contract.endpoint)) return contract;
   if (progress.continuation && typeof progress.continuation === "object" && (progress.continuation.url || progress.continuation.endpoint)) return progress.continuation;
+  if (progress.continuation_available && state.discoveryLastSearchId) {
+    return { url: `/api/discovery/searches/${encodeURIComponent(state.discoveryLastSearchId)}/continue`, method: "POST" };
+  }
   return null;
 }
 
@@ -2849,6 +3001,8 @@ async function continueDiscoverySearch() {
   try {
     const result = await api.send(contract.url || contract.endpoint, contract.method || "POST", contract.body || {
       search_key: state.discoverySearchKey,
+      search_id: state.discoveryLastSearchId,
+      after: state.discoveryContinuationIndex || 0,
       continuation_token: contract.token || contract.continuation_token,
       candidate_profile_id: value("discovery-profile") || state.selectedCandidateProfileId || "",
     });
@@ -3283,10 +3437,12 @@ function renderDiscoveryRow(job) {
 }
 
 function resultWorkplaceLabel(job) {
+  // Legacy test compatibility: the user-facing wording is "unconfirmed", not
+  // the older "Exact workplace unknown" label.
   if (isRemoteJob(job)) return `Remote · eligibility: ${jobLocationLabel(job) || "hiring region not listed"}`;
   const precision = String(job.location_precision || "").toLowerCase();
   const precise = job.workplace_address || job.workplace_postal_code || (["street address", "postal code", "house"].some((value) => precision.includes(value)) ? job.normalized_location : "");
-  return precise || `Exact workplace unknown · ${job.location || "Location unavailable"}`;
+  return precise || `Exact workplace unconfirmed · ${job.location || "Location unavailable"}`;
 }
 
 function resultDistanceLabel(job) {
@@ -3294,18 +3450,31 @@ function resultDistanceLabel(job) {
   const precision = String(job.workplace_precision || job.location_precision || "").toLowerCase();
   const verifiedPrecision = precision.includes("street") || precision.includes("postal") || precision.includes("house");
   if (job.city_estimate_km !== undefined && job.city_estimate_km !== null) {
-    return verifiedPrecision ? `Approx. ${Number(job.city_estimate_km)} km (verified ${precision})` : "Exact workplace unknown";
+    return verifiedPrecision ? `Approx. ${Number(job.city_estimate_km)} km (verified ${precision})` : "Exact workplace unconfirmed";
   }
   if (Number(job.distance_km) < 9999 && job.distance_label !== "unknown") {
     return precision.includes("postal") ? `Approx. ${Number(job.distance_km)} km (postal centroid)` : `${Number(job.distance_km)} km straight-line`;
   }
-  return "Exact workplace unknown";
+  return "Exact workplace unconfirmed";
 }
 
 function resultMatchLabel(job) {
-  if (Number(job.discovery_profile_independent || 0)) return `Title/seniority: ${job.qualification_fit_label || job.discovery_result_category || "Review"}`;
+  const eligibility = eligibilityAssessment(job);
+  if (Number(job.discovery_profile_independent || 0)) return `${eligibility.label} · Title/seniority: ${job.qualification_fit_label || job.discovery_result_category || "Review"}`;
   const compatibility = job.technical_compatibility || {};
-  return `Technical match: ${compatibility.decision || job.qualification_fit_label || "Review"}`;
+  return `${eligibility.label} · Technical match: ${compatibility.decision || job.qualification_fit_label || "Review"}`;
+}
+
+function eligibilityAssessment(job) {
+  const category = String(job.discovery_result_category || "").toLowerCase();
+  const backendStatus = String(job.discovery_match_status || "").toLowerCase();
+  const status = category === "excluded" ? "excluded" : category === "review_required" ? "review_required" : backendStatus || "verified";
+  const labels = { verified: "Verified", provisional: "Provisional", review_required: "Review required", excluded: "Excluded", ineligible: "Excluded" };
+  if (window.JobEligibilityPolicy && !backendStatus && category !== "") {
+    const fallback = window.JobEligibilityPolicy.assess(job, { maximum_required_years: value("discovery-maximum-years") || 3 });
+    return { status: fallback.status, label: labels[fallback.status] || "Review required", reasons: fallback.reasons || [] };
+  }
+  return { status, label: labels[status] || "Review required", reasons: [] };
 }
 
 function renderBenefits(job) {
@@ -3326,7 +3495,8 @@ function renderDiscoveryCard(job) {
   const buttonLabel = alreadySaved ? "Saved" : "Save";
   const buttonDisabled = alreadySaved && savedStatus === "shortlisted" ? "disabled" : "";
   const saved = alreadySaved ? `<span class="risk low">${escapeHtml(job.saved_job_status || job.status || "Saved")}</span>` : "";
-  const category = job.discovery_result_category === "review_required" ? `<span class="risk medium">Review required</span>` : "";
+  const eligibility = eligibilityAssessment(job);
+  const category = `<span class="risk ${eligibility.status === "verified" ? "low" : eligibility.status === "provisional" ? "medium" : "high"}">${escapeHtml(eligibility.label)}</span>`;
   return `
     <section class="discovery-card" data-job-key="${key}">
       <div class="discovery-card-main">
@@ -3377,14 +3547,16 @@ function renderExperienceSummary(job) {
   const experience = job.experience_requirements || {};
   const candidate = experience.candidate_professional_years;
   const independent = Boolean(Number(job.discovery_profile_independent || 0));
-  const candidateText = independent ? "Not assessed — no résumé selected" : candidate === undefined || candidate === null ? "Unverified" : `${Number(candidate)} years verified`;
+  const evidenceSource = job.qualification_evidence_source || job.qualification_evidence_profile_name || "selected résumé evidence was not returned by the matcher";
+  const candidateText = independent ? "Not assessed — ECE matching is résumé-independent" : candidate === undefined || candidate === null ? `Résumé evidence unavailable — ${evidenceSource}` : `${Number(candidate)} years verified`;
   const fit = experience.fit_status || "Unverified";
   const level = job.qualification_fit_seniority?.detected_level || job.seniority_level || "Unverified";
   const ambiguous = experience.ambiguous || [];
   const requiredLabel = experience.required ? formatExperienceRange(experience.required) : ambiguous.length ? `Experience mentioned (unclassified): ${formatExperienceRange(ambiguous[0])}` : "No minimum years stated";
   const technical = job.technical_compatibility?.decision || "Unverified";
+  const verifiedSkills = (job.qualification_fit_matched_requirements || []).slice(0, 6);
   const explanation = (job.qualification_fit_reasons || []).slice(0, 2).join(" ");
-  return `<div class="experience-summary"><div><strong>Detected seniority:</strong> ${escapeHtml(level)}</div><div><strong>Required experience:</strong> ${escapeHtml(requiredLabel)}</div><div><strong>Preferred experience:</strong> ${escapeHtml(formatExperienceRange(experience.preferred) || "Not specified")}</div><div><strong>Applicant demonstrated experience:</strong> ${escapeHtml(candidateText)}</div><div><strong>Experience fit:</strong> ${escapeHtml(independent ? "Not assessed" : fit)}</div><div><strong>Technical compatibility:</strong> ${escapeHtml(independent ? "Not assessed — no résumé selected" : technical)}</div>${explanation ? `<details><summary>Why this result</summary><p class="muted">${escapeHtml(explanation)}</p>${experience.source_evidence ? `<p class="muted">Source excerpt: ${escapeHtml(experience.source_evidence)}</p>` : ""}</details>` : ""}</div>`;
+  return `<div class="experience-summary"><div><strong>Detected seniority:</strong> ${escapeHtml(level)}</div><div><strong>Required experience:</strong> ${escapeHtml(requiredLabel)}</div><div><strong>Preferred experience:</strong> ${escapeHtml(formatExperienceRange(experience.preferred) || "Not specified")}</div><div><strong>Applicant demonstrated experience:</strong> ${escapeHtml(candidateText)}</div><div><strong>Experience fit:</strong> ${escapeHtml(independent ? "Not assessed" : fit)}</div><div><strong>Technical compatibility:</strong> ${escapeHtml(independent ? "Not assessed — ECE matching is résumé-independent" : technical)}</div>${verifiedSkills.length ? `<details><summary>Verified résumé skills</summary><p class="muted">${escapeHtml(verifiedSkills.join(" · "))}</p></details>` : ""}${explanation ? `<details><summary>Why this result</summary><p class="muted">${escapeHtml(explanation)}</p>${experience.source_evidence ? `<p class="muted">Source excerpt: ${escapeHtml(experience.source_evidence)}</p>` : ""}</details>` : ""}</div>`;
 }
 
 function badge(label, value) {
@@ -3404,7 +3576,7 @@ function distanceBadge(job) {
   if (job.distance_label === "remote") return "Remote";
   if (job.distance_label === "multiple_alternatives" || workplaceAlternatives(job).length > 1) return "Multiple workplaces · assigned site not confirmed";
   const precision = String(job.workplace_precision || job.location_precision || "").toLowerCase();
-  if (job.city_estimate_km !== undefined && job.city_estimate_km !== null) return precision.includes("street") || precision.includes("postal") || precision.includes("house") ? `Approx. ${Number(job.city_estimate_km)} km (${precision})` : "Exact workplace unknown";
+  if (job.city_estimate_km !== undefined && job.city_estimate_km !== null) return precision.includes("street") || precision.includes("postal") || precision.includes("house") ? `Approx. ${Number(job.city_estimate_km)} km (${precision})` : "Exact workplace unconfirmed";
   if (job.distance_km === undefined || job.distance_km === null) return "Unknown";
   if (Number(job.distance_km) >= 9999) return "Unknown";
   return job.distance_note ? `${job.distance_note} · ${Number(job.distance_km)} km (straight-line)` : `${Number(job.distance_km)} km (straight-line)`;
