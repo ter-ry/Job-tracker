@@ -377,6 +377,12 @@ legend {
 .discovery-counts strong { color: #f1f1f1; font-size: 1.05rem; }
 .discovery-counts span { color: #a9a9a9; font-size: .7rem; margin-top: 2px; }
 
+.discovery-progress {
+  border-left: 3px solid var(--accent);
+  margin: 8px 0;
+  padding: 6px 10px;
+}
+
 .discovery-result-group {
   margin-top: 14px;
 }
