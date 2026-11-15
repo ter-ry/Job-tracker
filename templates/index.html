@@ -138,6 +138,7 @@
                 <small class="muted">Only confirmed professional experience is enforced.</small>
               </label>
               <label class="checkline"><input id="discovery-include-provisional" type="checkbox" checked> Include plausible matches with unstated seniority</label>
+              <label class="checkline"><input id="discovery-include-internships" type="checkbox"> Include internships in the junior eligibility policy</label>
               <label>Location confidence
                 <select id="discovery-geographic-match-mode">
                   <option value="provisional" selected>Include city/region matches; verify commute later</option>
@@ -182,9 +183,11 @@
               </div>
             </details>
             <div id="discovery-status" class="muted helper" aria-live="polite"></div>
+            <div id="discovery-progress" class="discovery-progress" aria-live="polite" hidden></div>
             <div id="discovery-source-test-output" class="muted helper" aria-live="polite"></div>
             <div class="actions">
               <button class="button" type="submit" id="discovery-submit">Search</button>
+              <button class="button ghost" type="button" id="discovery-stop" hidden>Stop Search</button>
               <button class="button ghost beta-secondary" type="button" id="save-current-discovery-search">Save current search</button>
               <button class="button ghost beta-secondary" type="button" id="discovery-test-sources">Test job sources</button>
               <button class="button ghost beta-secondary" type="button" id="discovery-recalculate-distances">Recalculate distances</button>
@@ -476,7 +479,7 @@
             <div><h2>Applicants and documents</h2><p class="muted helper">Each applicant keeps a separate identity, résumé, and cover-letter template. ECE matching does not require a résumé.</p></div>
             <button class="button" type="button" id="new-candidate-profile">New candidate profile</button>
           </div>
-          <div id="candidate-profile-list" class="candidate-profile-list"></div>
+          <div id="candidate-profile-list" class="candidate-profile-list" aria-live="polite"><p class="muted">Loading candidate profiles…</p></div>
           <form id="candidate-profile-form" class="nested-panel profile-manager-form" hidden>
             <h3 id="candidate-profile-form-title">Create candidate profile</h3>
             <p id="candidate-profile-form-error" class="risk high" role="alert" hidden></p>
@@ -560,6 +563,7 @@
     </main>
 
     <script>window.JOB_TRACKER_EXIT_TOKEN = {{ exit_token|tojson }};</script>
+    <script src="{{ url_for('static', filename='eligibility-policy.js') }}"></script>
     <script src="{{ url_for('static', filename='app.js') }}"></script>
   </body>
 </html>
