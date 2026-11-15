@@ -71,7 +71,7 @@ def test_async_cancel_preserves_cancelled_state(monkeypatch):
         assert client.get(f"/api/discovery/searches/{search_id}").get_json()["status"] == "cancelled"
 
 
-def test_async_search_publishes_provider_rows_before_final_qualification(monkeypatch):
+def test_async_search_publishes_provider_progress_before_final_qualification(monkeypatch):
     with tempfile.TemporaryDirectory() as directory:
         app_module.DATA_DIR = Path(directory)
         app_module.DB_PATH = app_module.DATA_DIR / "incremental.sqlite"
@@ -96,6 +96,7 @@ def test_async_search_publishes_provider_rows_before_final_qualification(monkeyp
             return {
                 "jobs": [{
                     "source": "Indeed", "source_job_id": "incremental-1",
+                    "id": 17,
                     "title": "Junior Software Developer", "company": "Example",
                     "location": "Toronto, ON", "url": "https://example.test/incremental-1",
                     "discovery_result_category": "actionable", "discovery_match_status": "verified",
@@ -113,8 +114,7 @@ def test_async_search_publishes_provider_rows_before_final_qualification(monkeyp
         early = client.get(f"/api/discovery/searches/{search_id}?after=0").get_json()
         assert early["status"] == "running"
         assert early["provider_states"]["indeed"]["state"] == "working"
-        assert early["jobs"][0]["result_stage"] == "provider_normalized"
-        assert early["jobs"][0]["discovery_match_status"] == "pending"
+        assert early["jobs"] == []
         release.set()
         for _ in range(80):
             final = client.get(f"/api/discovery/searches/{search_id}?after={early['next_sequence']}").get_json()
@@ -125,6 +125,7 @@ def test_async_search_publishes_provider_rows_before_final_qualification(monkeyp
         assert len(final["jobs"]) == 1
         assert final["jobs"][0]["result_stage"] == "qualified"
         assert final["jobs"][0]["discovery_match_status"] == "verified"
+        assert final["jobs"][0]["id"] == 17
 
 
 def test_named_search_keeps_legacy_saved_search_contract():
@@ -138,6 +139,43 @@ def test_named_search_keeps_legacy_saved_search_contract():
         )
         assert response.status_code == 201
         assert response.get_json()["name"] == "SWE saved"
+
+
+def test_presented_history_and_actions_are_durable_and_applicant_scoped():
+    with tempfile.TemporaryDirectory() as directory:
+        app_module.DATA_DIR = Path(directory)
+        app_module.DB_PATH = app_module.DATA_DIR / "presented.sqlite"
+        app_module.app.config.update(TESTING=True)
+        client = app_module.app.test_client()
+        client.get("/api/health")
+        jobs = [
+            {
+                "company": "Example", "title": f"Junior Software Developer {index}", "location": "Toronto, ON",
+                "url": f"https://example.test/{index}", "application_url": f"https://example.test/{index}",
+                "source": "Indeed", "source_job_id": f"new-{index}", "discovery_result_category": "actionable",
+            }
+            for index in range(10)
+        ]
+        with app_module.app.app_context():
+            app_module.persist_discovery_jobs(jobs, None, None)
+            assert all(int(job["id"]) > 0 for job in jobs)
+            app_module.mark_discovery_jobs_presented([job["id"] for job in jobs], 101)
+            assert all(app_module.applicant_presented_discovery_job(job["id"], 101) for job in jobs)
+            assert not any(app_module.applicant_presented_discovery_job(job["id"], 202) for job in jobs)
+
+        assert client.post(f"/api/discovery/inbox/{jobs[0]['id']}/applied", json={"applicant_profile_id": 101}).status_code == 200
+        assert client.post(f"/api/discovery/inbox/{jobs[1]['id']}/save", json={"applicant_profile_id": 101}).status_code == 200
+        assert client.post(f"/api/discovery/inbox/{jobs[2]['id']}/ignore", json={"applicant_profile_id": 101}).status_code == 200
+        with app_module.app.app_context():
+            assert app_module.applicant_discovery_state(jobs[0]["id"], 101) == "applied"
+            assert app_module.applicant_discovery_state(jobs[1]["id"], 101) == "saved"
+            assert app_module.applicant_discovery_state(jobs[2]["id"], 101) == "skipped"
+            assert app_module.applicant_discovery_state(jobs[0]["id"], 202) == ""
+
+        assert client.post(f"/api/discovery/inbox/{jobs[2]['id']}/restore", json={"applicant_profile_id": 101}).status_code == 200
+        with app_module.app.app_context():
+            assert not app_module.applicant_presented_discovery_job(jobs[2]["id"], 101)
+            assert app_module.applicant_discovery_state(jobs[2]["id"], 101) == ""
 
 
 def test_indexed_identity_lookup_scales_with_ten_thousand_jobs():
