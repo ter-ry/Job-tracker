@@ -39,3 +39,22 @@ migration semantics.
 The active source configuration is LinkedIn, Indeed, Glassdoor, and
 ZipRecruiter.  Historical saved Google selections are ignored safely during
 normalization; they are not sent to JobSpy.
+
+## Asynchronous search API
+
+`POST /api/discovery/searches` with an unnamed payload containing `keywords`
+queues a search and returns HTTP 202 with `{ "search_id": "...", "status":
+"queued" }`. Named payloads retain the saved-search CRUD behavior.
+
+`GET /api/discovery/searches/{search_id}?after=0` returns the durable status,
+progress, result jobs, `next_sequence`, `continuation_available`,
+`termination_reason`, timings, and provider errors. Result records include a
+monotonic `result_sequence`; clients pass the last sequence they have received
+as `after` on the next poll. Status requests do not run providers.
+
+`POST /api/discovery/searches/{search_id}/cancel` records cancellation and
+preserves completed results. It does not claim to forcibly terminate an
+already-running upstream scraper. `POST /api/discovery/searches/{search_id}/continue`
+queues the next attempt only when the durable search has pending/retryable work.
+Interrupted `running` rows are marked `paused` with
+`termination_reason=application_restarted` during database initialization.
