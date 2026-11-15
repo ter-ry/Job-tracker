@@ -27,9 +27,10 @@ assert.match(js, /state\.discoveryInboxJobs = \[\];[\s\S]*loadDiscoveryInbox\(tr
 assert.match(js, /candidate_profile_id \|\| ""/);
 
 // Result categories are explicit and excluded jobs never enter the main queue.
-assert.match(js, /renderGroup\("Verified matches"/);
-assert.match(js, /renderGroup\("Provisional matches"/);
-assert.match(js, /renderGroup\("Review required"/);
+assert.match(js, /renderGroup\("New Opportunities"/);
+assert.doesNotMatch(js, /renderGroup\("Verified matches"/);
+assert.doesNotMatch(js, /renderGroup\("Provisional matches"/);
+assert.doesNotMatch(js, /renderGroup\("Review required"/);
 assert.match(js, /state\.discoveryExcludedResults = responseJobs\.filter/);
 assert.match(js, /job\.discovery_result_category !== "excluded"/);
 

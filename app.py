@@ -2080,6 +2080,10 @@ def create_app() -> Flask:
         profile_id = applicant_profile_id(payload)
         if profile_id:
             get_db().execute("DELETE FROM discovery_applicant_states WHERE job_id = ? AND applicant_profile_id = ?", [job_id, profile_id])
+            # Explicit restore/resurface is the only route that permits a
+            # previously presented vacancy to return to this applicant's New
+            # Opportunities queue.
+            get_db().execute("DELETE FROM discovery_applicant_presentations WHERE job_id = ? AND applicant_profile_id = ?", [job_id, profile_id])
         else:
             get_db().execute("UPDATE jobs SET discovery_state = 'new', status = CASE WHEN status IN ('Saved', 'Discovered') THEN 'Discovered' ELSE status END, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
         get_db().commit()
@@ -3157,43 +3161,21 @@ def _run_async_discovery_search(search_id: str, payload: dict[str, Any]) -> None
                 return
             _update_async_discovery(search_id, status="running", started_at=datetime.now().isoformat(timespec="seconds"), progress_json={"requested_target": int(row.get("requested_target") or 50), "qualifying_matches": 0, "verified_matches": 0, "provisional_matches": 0, "review_required": 0, "raw_inspected": 0, "deduplicated": 0, "skipped": 0, "provider_states": {}})
 
-            published_provider_jobs: set[str] = set()
-
             def publish_provider_update(event: dict[str, Any]) -> None:
-                """Persist actual provider state and safely-normalized early rows.
-
-                Early rows are explicitly review-required until the authoritative
-                pipeline has completed geocoding, evidence, and qualification.
-                They can never be mistaken for verified matches.
-                """
+                """Persist real provider progress without exposing unqualified rows."""
                 current = _async_discovery_row(search_id)
                 if not current or int(current.get("cancel_requested") or 0):
                     return
                 progress = parse_json_object(current.get("progress_json"))
                 states = progress.get("provider_states") if isinstance(progress.get("provider_states"), dict) else {}
                 states.update(event.get("source_diagnostics") if isinstance(event.get("source_diagnostics"), dict) else {})
-                early_rows: list[dict[str, Any]] = []
-                for raw in event.get("jobs") if isinstance(event.get("jobs"), list) else []:
-                    if not isinstance(raw, dict):
-                        continue
-                    early = normalize_job_payload(jobspy_result_to_job_payload(raw))
-                    identity = _async_discovery_result_identity(early)
-                    if identity in published_provider_jobs:
-                        continue
-                    published_provider_jobs.add(identity)
-                    early.update({
-                        "candidate_profile_id": applicant_profile_id(payload),
-                        "discovery_result_category": "review_required",
-                        "discovery_result_reason": "Provider record received; final eligibility verification is still in progress.",
-                        "discovery_match_status": "pending",
-                        "result_stage": "provider_normalized",
-                    })
-                    early_rows.append(early)
-                _append_async_discovery_results(search_id, early_rows)
+                raw_count = len(event.get("jobs")) if isinstance(event.get("jobs"), list) else 0
+                prior_errors = parse_json_object(current.get("error_json"))
+                event_errors = event.get("errors") if isinstance(event.get("errors"), dict) else {}
                 _update_async_discovery(
                     search_id,
-                    progress_json={**progress, "raw_inspected": int(progress.get("raw_inspected") or 0) + len(early_rows), "review_required": int(progress.get("review_required") or 0) + len(early_rows), "provider_states": states},
-                    error_json=event.get("errors") if isinstance(event.get("errors"), dict) else {},
+                    progress_json={**progress, "raw_inspected": int(progress.get("raw_inspected") or 0) + raw_count, "provider_states": states},
+                    error_json={**prior_errors, **event_errors},
                 )
 
             try:
@@ -3209,10 +3191,7 @@ def _run_async_discovery_search(search_id: str, payload: dict[str, Any]) -> None
                 _update_async_discovery(search_id, status="cancelled", termination_reason="cancelled_by_user")
                 return
             jobs = result.get("jobs") if isinstance(result.get("jobs"), list) else []
-            # Publish final authoritative classifications as newer cursor
-            # events. The status endpoint returns only the newest event for an
-            # identity, while clients that already saw an early row receive
-            # the replacement after their cursor.
+            # Only persisted, final, applicant-unseen rows are actionable.
             _append_async_discovery_results(search_id, [{**job, "result_stage": "qualified"} for job in jobs])
             progress = _async_discovery_progress(result, int(payload.get("new_matching_target") or payload.get("shortlist_size") or 50))
             diagnostics = result.get("diagnostics") if isinstance(result.get("diagnostics"), dict) else {}
@@ -3436,6 +3415,13 @@ def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, ru
                    discovery_last_search_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
                 [now, int(search_id or 0), int(match["id"])],
             )
+            # Every returned discovery object needs the durable identity that
+            # actions use, including a cross-source duplicate discovered in a
+            # later run.
+            job["id"] = int(match["id"])
+            job["saved_job_id"] = int(match["id"])
+            job["saved_job_status"] = text(match["status"])
+            job["discovery_state"] = text(match["discovery_state"])
             continue
         clean = {column: job.get(column, "") for column in JOB_COLUMNS}
         # Discovery is not an explicit user save.  Keep the user-facing
@@ -3451,12 +3437,17 @@ def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, ru
         for column, value in list(clean.items()):
             if isinstance(value, (dict, list, tuple)):
                 clean[column] = dumps_json(value, sort_keys=True)
-        db.execute(
+        cursor = db.execute(
             f"INSERT INTO jobs ({', '.join(JOB_COLUMNS.keys())}) VALUES ({', '.join(['?'] * len(JOB_COLUMNS))})",
             tuple(clean[column] for column in JOB_COLUMNS),
         )
+        job_id = int(cursor.lastrowid)
+        job["id"] = job_id
+        job["saved_job_id"] = job_id
+        job["saved_job_status"] = "Discovered"
+        job["discovery_state"] = "new"
         counts["new"] += 1
-        counts["new_job_ids"].append(int(db.execute("SELECT last_insert_rowid()").fetchone()[0]))
+        counts["new_job_ids"].append(job_id)
     db.commit()
     return counts
 
@@ -3477,6 +3468,32 @@ def hydrate_discovery_identity(job: dict[str, Any]) -> dict[str, Any]:
         or text(existing["discovery_state"]) in {"ignored", "saved", "applied"}
     )
     return job
+
+
+def applicant_presented_discovery_job(job_id: int, profile_id: int) -> bool:
+    if not job_id or not profile_id:
+        return False
+    return query_db(
+        "SELECT 1 FROM discovery_applicant_presentations WHERE job_id = ? AND applicant_profile_id = ?",
+        [job_id, profile_id], one=True,
+    ) is not None
+
+
+def mark_discovery_jobs_presented(job_ids: list[int], profile_id: int) -> None:
+    """Record only jobs actually returned in New Opportunities for one applicant."""
+    if not profile_id:
+        return
+    unique_ids = sorted({int(job_id) for job_id in job_ids if int(job_id or 0) > 0})
+    if not unique_ids:
+        return
+    db = get_db()
+    db.executemany(
+        """INSERT INTO discovery_applicant_presentations (job_id, applicant_profile_id)
+           VALUES (?, ?)
+           ON CONFLICT(job_id, applicant_profile_id) DO NOTHING""",
+        [(job_id, profile_id) for job_id in unique_ids],
+    )
+    db.commit()
 
 
 def create_discovery_run(search_id: int | None, trigger: str) -> int:
@@ -3666,10 +3683,29 @@ def run_discovery_pipeline(
     for item in target_review_jobs:
         item["discovery_result_category"] = "review_required"
         item["discovery_result_reason"] = discovery_target_ineligibility_reason(item, search)
-    matching_jobs = [item for item in ordered if item.get("discovery_result_category") == "actionable"][:requested_target]
+    selected_applicant_id = applicant_profile_id(payload)
+    eligible_unpresented: list[dict[str, Any]] = []
+    for item in ordered:
+        hydrate_discovery_identity(item)
+        job_id = int(item.get("id") or 0)
+        state = applicant_discovery_state(job_id, selected_applicant_id)
+        presented = applicant_presented_discovery_job(job_id, selected_applicant_id)
+        item["applicant_discovery_state"] = state
+        item["presented_to_applicant"] = presented
+        # New-only is a presentation queue, not a mirror of all fetched rows.
+        # Saved/Applied/Skipped and previously presented jobs remain available
+        # in history but must never consume a new-opportunity slot.
+        if item.get("discovery_result_category") == "actionable" and not state and not presented:
+            eligible_unpresented.append(item)
+    matching_jobs = eligible_unpresented[:requested_target]
+    mark_discovery_jobs_presented([int(item.get("id") or 0) for item in matching_jobs], selected_applicant_id)
+    for item in matching_jobs:
+        item["presented_to_applicant"] = True
     review_required_jobs = [item for item in ordered if item.get("discovery_result_category") not in {"actionable", "excluded"}]
     excluded_jobs = [item for item in ordered if item.get("discovery_result_category") == "excluded"]
-    jobs = matching_jobs + review_required_jobs
+    # Find Jobs intentionally exposes only the bounded, qualified new queue.
+    # Everything else remains durably discoverable in history/diagnostics.
+    jobs = matching_jobs
     auto_preparation_queued = enqueue_auto_preparation(search, persisted.get("new_job_ids", [])) if search_id else 0
     search_key = discovery_search_signature(payload)
     metadata = {
@@ -9960,6 +9996,19 @@ def init_db() -> None:
     )
     ensure_columns("discovery_applicant_states", {"date_applied": "TEXT NOT NULL DEFAULT ''"})
     db.execute("CREATE INDEX IF NOT EXISTS discovery_applicant_states_profile_idx ON discovery_applicant_states(applicant_profile_id, state)")
+    # Presented is deliberately separate from a user's Saved/Applied/Skipped
+    # choice. It makes New Opportunities applicant-scoped without rewriting
+    # legacy job history or hiding a shared posting from another applicant.
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS discovery_applicant_presentations (
+            job_id INTEGER NOT NULL,
+            applicant_profile_id INTEGER NOT NULL,
+            presented_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (job_id, applicant_profile_id),
+            FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+        )"""
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS discovery_applicant_presentations_profile_idx ON discovery_applicant_presentations(applicant_profile_id, presented_at)")
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS discovery_debug_runs (

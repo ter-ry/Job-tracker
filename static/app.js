@@ -2817,11 +2817,11 @@ function renderProgressiveSearchProgress(payload = {}) {
   const target = document.getElementById("discovery-progress");
   if (!target) return;
   const providerText = Object.entries(providers).map(([name, info]) => {
-    const status = info?.status || (info?.error ? "failed" : info?.result_count ? "working" : "pending");
+    const status = info?.state || info?.provider_status || info?.status || (info?.error ? "failed" : info?.result_count ? "working" : "not attempted");
     return `${sourceLabel(name)}: ${status}`;
   }).join(" · ");
   target.hidden = false;
-  target.innerHTML = `<strong>Search ${escapeHtml(payload.search_id || state.discoveryActiveSearchId || "")}</strong> · ${Number(progress.new_matching_jobs ?? progress.new_matches ?? state.discoveryResults.length)} new matches · ${Number(progress.raw_jobs_inspected ?? progress.raw_jobs ?? 0)} raw inspected${providerText ? ` · ${escapeHtml(providerText)}` : ""}${payload.termination_reason ? ` · ${escapeHtml(String(payload.termination_reason).replaceAll("_", " "))}` : ""}`;
+  target.innerHTML = `<strong>Search ${escapeHtml(payload.search_id || state.discoveryActiveSearchId || "")}</strong> · ${Number(progress.qualifying_matches ?? progress.new_matching_jobs ?? progress.new_matches ?? 0)} new matches · ${Number(progress.raw_inspected ?? progress.raw_jobs_inspected ?? progress.raw_jobs ?? 0)} raw inspected${providerText ? ` · ${escapeHtml(providerText)}` : ""}${payload.termination_reason ? ` · ${escapeHtml(String(payload.termination_reason).replaceAll("_", " "))}` : ""}`;
 }
 
 function progressiveSearchTerminal(payload = {}) {
@@ -3162,15 +3162,10 @@ function renderDiscoveryResults(result) {
   const totalCount = Number(result.total || state.discoveryMeta.total || state.discoveryResults.length || 0);
   const profileFreeResults = jobs.length > 0 && jobs.every((job) => Boolean(job.discovery_profile_independent));
   const evidenceProfileName = jobs[0]?.qualification_evidence_profile_name || state.discoveryResults[0]?.qualification_evidence_profile_name || (value("discovery-profile") ? "Selected candidate profile" : "Active Profile");
-  const categoryCounts = (state.discoveryResults || []).reduce((counts, job) => { const key = job.discovery_result_category || "review_required"; counts[key] = (counts[key] || 0) + 1; return counts; }, {});
   document.getElementById("discovery-active-state").textContent = describeDiscoveryState(prefs, visibleCount, totalCount);
   renderDiscoveryOriginSummary();
-  const newMatches = jobs.filter((job) => job.discovery_result_category === "actionable");
-  const verifiedMatches = newMatches.filter((job) => job.discovery_match_status !== "provisional");
-  const provisionalMatches = newMatches.filter((job) => job.discovery_match_status === "provisional");
-  const reviewRequired = jobs.filter((job) => job.discovery_result_category !== "actionable" && job.discovery_result_category !== "excluded");
   const renderGroup = (title, group, emptyText) => `<section class="discovery-result-group"><div class="discovery-result-group-header"><h3>${escapeHtml(title)}</h3><span class="muted">${group.length}</span></div>${group.length ? (state.discoveryView === "table" ? renderDiscoveryTable(group) : renderDiscoveryCards(group)) : `<p class="muted">${escapeHtml(emptyText)}</p>`}</section>`;
-  let body = `${renderGroup("Verified matches", verifiedMatches, "No verified matches in this search.")}${renderGroup("Provisional matches", provisionalMatches, "No provisional matches in this search.")}${renderGroup("Review required", reviewRequired, "No additional jobs require review.")}`;
+  let body = renderGroup("New Opportunities", jobs, "No new qualifying opportunities were found. Previous discoveries remain in All discovered history.");
   if (visibleCount === 0 && totalCount > 0) {
     body = `<div class="empty-state">
       <p>No jobs are visible with the current filters.</p>
@@ -3433,9 +3428,14 @@ function discoveryJobKey(job) {
   return `${source}|${identity}`.trim().toLowerCase();
 }
 
+function discoveryActionDisabled(job) {
+  return !Number(job?.id) || String(job?.result_stage || "qualified") !== "qualified";
+}
+
 function renderDiscoveryRow(job) {
   const postingUrl = job.application_url || job.url || "";
   const key = escapeAttribute(discoveryJobKey(job));
+  const disabled = discoveryActionDisabled(job) ? "disabled title=\"Waiting for durable qualification\"" : "";
   return `
     <tr>
       <td>
@@ -3449,9 +3449,9 @@ function renderDiscoveryRow(job) {
       <td>${renderExperienceSummary(job)}<br>${escapeHtml(resultMatchLabel(job))}</td>
       <td>${escapeHtml(job.source || "JobSpy")}<br><span class="muted">${escapeHtml(job.posted_date || "Date unknown")}</span></td>
       <td><div class="row-actions compact-actions">
-        <button class="button small" type="button" data-discovery-action="save" data-job-key="${key}">Save</button>
-        <button class="button small ghost" type="button" data-discovery-action="applied" data-job-key="${key}">Applied</button>
-        <button class="button small ghost" type="button" data-discovery-action="skip" data-job-key="${key}">Skip</button>
+        <button class="button small" type="button" data-discovery-action="save" data-job-key="${key}" ${disabled}>Save</button>
+        <button class="button small ghost" type="button" data-discovery-action="applied" data-job-key="${key}" ${disabled}>Applied</button>
+        <button class="button small ghost" type="button" data-discovery-action="skip" data-job-key="${key}" ${disabled}>Skip</button>
         ${postingUrl ? `<a class="button small ghost" href="${escapeAttribute(postingUrl)}" target="_blank" rel="noreferrer">Open job</a>` : ""}
         ${renderMapLinks(job)}
       </div></td>
@@ -3516,7 +3516,7 @@ function renderDiscoveryCard(job) {
   const savedStatus = String(job.saved_job_status || job.status || "").toLowerCase();
   const alreadySaved = Boolean(job.already_saved || savedStatus);
   const buttonLabel = alreadySaved ? "Saved" : "Save";
-  const buttonDisabled = alreadySaved && savedStatus === "shortlisted" ? "disabled" : "";
+  const buttonDisabled = alreadySaved && savedStatus === "shortlisted" || discoveryActionDisabled(job) ? "disabled" : "";
   const saved = alreadySaved ? `<span class="risk low">${escapeHtml(job.saved_job_status || job.status || "Saved")}</span>` : "";
   const eligibility = eligibilityAssessment(job);
   const category = `<span class="risk ${eligibility.status === "verified" ? "low" : eligibility.status === "provisional" ? "medium" : "high"}">${escapeHtml(eligibility.label)}</span>`;
