@@ -134,7 +134,6 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("job-form").addEventListener("submit", saveJob);
   document.getElementById("profile-form").addEventListener("submit", saveProfile);
   document.getElementById("discovery-form").addEventListener("submit", searchDiscovery);
-  document.getElementById("discovery-continue")?.addEventListener("click", () => searchDiscovery({ preventDefault() {} }, true));
   document.getElementById("discovery-workflow")?.addEventListener("change", () => applyDiscoveryWorkflow(value("discovery-workflow"), { reset: true }));
   document.getElementById("saved-search-form").addEventListener("submit", saveSavedSearch);
   document.getElementById("new-saved-search").addEventListener("click", () => toggleSavedSearchForm(true));
@@ -2567,6 +2566,8 @@ function discoverySearchCriteriaFromControls(continuation = false) {
     strict_technical: workflow === "software" ? checked("discovery-strict-technical") : false,
     seniority: workflow === "software" ? value("discovery-seniority") : "",
     maximum_required_years: workflow === "software" ? value("discovery-maximum-years") : "",
+    include_provisional_matches: checked("discovery-include-provisional"),
+    geographic_match_mode: value("discovery-geographic-match-mode") || "provisional",
     workflow,
     continuation_index: continuation ? Number(state.discoveryContinuationIndex || 0) : 0,
   };
@@ -2588,6 +2589,8 @@ function applyDiscoverySearchCriteriaToControls(criteria = {}) {
   setValue("discovery-new-matching-target", criteria.requested_target || criteria.new_matching_target || criteria.shortlist_size || 50);
   setValue("discovery-seniority", criteria.seniority || "entry_level,junior,intermediate");
   setValue("discovery-maximum-years", criteria.maximum_required_years || 3);
+  setChecked("discovery-include-provisional", criteria.include_provisional_matches !== false);
+  setValue("discovery-geographic-match-mode", criteria.geographic_match_mode || "provisional");
   document.querySelectorAll('input[name="discovery-source"]').forEach((input) => { input.checked = (criteria.enabled_sources || []).includes(input.value); });
 }
 
@@ -2986,9 +2989,11 @@ function renderDiscoveryResults(result) {
   document.getElementById("discovery-active-state").textContent = describeDiscoveryState(prefs, visibleCount, totalCount);
   renderDiscoveryOriginSummary();
   const newMatches = jobs.filter((job) => job.discovery_result_category === "actionable");
+  const verifiedMatches = newMatches.filter((job) => job.discovery_match_status !== "provisional");
+  const provisionalMatches = newMatches.filter((job) => job.discovery_match_status === "provisional");
   const reviewRequired = jobs.filter((job) => job.discovery_result_category !== "actionable" && job.discovery_result_category !== "excluded");
   const renderGroup = (title, group, emptyText) => `<section class="discovery-result-group"><div class="discovery-result-group-header"><h3>${escapeHtml(title)}</h3><span class="muted">${group.length}</span></div>${group.length ? (state.discoveryView === "table" ? renderDiscoveryTable(group) : renderDiscoveryCards(group)) : `<p class="muted">${escapeHtml(emptyText)}</p>`}</section>`;
-  let body = `${renderGroup("New matches", newMatches, "No new qualifying jobs in this search.")}${renderGroup("Review required", reviewRequired, "No additional jobs require review.")}`;
+  let body = `${renderGroup("Verified matches", verifiedMatches, "No verified matches in this search.")}${renderGroup("Provisional matches", provisionalMatches, "No provisional matches in this search.")}${renderGroup("Review required", reviewRequired, "No additional jobs require review.")}`;
   if (visibleCount === 0 && totalCount > 0) {
     body = `<div class="empty-state">
       <p>No jobs are visible with the current filters.</p>
@@ -3033,8 +3038,10 @@ function renderDiscoveryResults(result) {
         <div><strong>${Number(progress.previously_processed ?? diagnostics.processed_count ?? 0)}</strong><span>Previously processed</span></div>
         <div><strong>${Number(progress.skipped ?? diagnostics.skipped_count ?? 0)}</strong><span>Previously skipped</span></div>
         <div><strong>${Number(progress.disqualified ?? diagnostics.excluded_count ?? 0)}</strong><span>Disqualified</span></div>
+        <div><strong>${verifiedMatches.length}</strong><span>Verified new matches</span></div>
+        <div><strong>${provisionalMatches.length}</strong><span>Provisional new matches</span></div>
         <div><strong>${Number(progress.review_required ?? diagnostics.review_required_count ?? reviewRequired.length)}</strong><span>Review required</span></div>
-        <div><strong>${Number(progress.new_matching_jobs ?? diagnostics.new_matching_count ?? newMatches.length)}</strong><span>New matching jobs</span></div>
+        <div><strong>${Number(progress.new_matching_jobs ?? diagnostics.new_matching_count ?? newMatches.length)}</strong><span>Total new matches</span></div>
         <div><strong>${sourceFailureCount}</strong><span>Source failures</span></div>
         <div><strong>${requestedTarget}</strong><span>Requested target</span></div>
       </div>
@@ -3575,6 +3582,9 @@ function renderDiscoveryWhy(job) {
         <summary>Why this job ranks here</summary>
         <ul>
           <li><strong>Job Opportunity Score:</strong> ${opportunity}/100</li>
+          <li><strong>Result:</strong> ${escapeHtml(String(job.discovery_result_category || "review_required").replaceAll("_", " "))} — ${escapeHtml(job.discovery_result_reason || "No categorization reason recorded.")}</li>
+          <li><strong>Seniority target:</strong> ${escapeHtml(job.discovery_match_status || "not assessed")} — ${escapeHtml(job.discovery_match_explanation || "No target assessment recorded.")}</li>
+          <li><strong>Geographic eligibility:</strong> ${escapeHtml(job.geographic_eligibility || "unknown")} · distance ${escapeHtml(job.distance_radius_status || "unknown")}</li>
           <li><strong>Score basis:</strong> Posting evidence only; candidate documents are not used.</li>
           ${opportunityReasons.map((reason) => `<li>${escapeHtml(reason)}</li>`).join("")}
           <li><strong>Eligibility:</strong> ${escapeHtml(job.canadian_eligibility || "unknown")} · ${escapeHtml(job.work_arrangement || job.remote_type || "unknown arrangement")}</li>
@@ -3585,6 +3595,9 @@ function renderDiscoveryWhy(job) {
   const compatibility = job.technical_compatibility || {};
   const compatibilityItems = (compatibility.items || []).slice(0, 8).map((item) => `${item.requirement}: ${item.state}`).join(" | ");
   const lines = [
+    `<li><strong>Result:</strong> ${escapeHtml(String(job.discovery_result_category || "review_required").replaceAll("_", " "))} — ${escapeHtml(job.discovery_result_reason || "No categorization reason recorded.")}</li>`,
+    `<li><strong>Seniority target:</strong> ${escapeHtml(job.discovery_match_status || "not assessed")} — ${escapeHtml(job.discovery_match_explanation || "No target assessment recorded.")}</li>`,
+    `<li><strong>Geographic eligibility:</strong> ${escapeHtml(job.geographic_eligibility || "unknown")} · distance ${escapeHtml(job.distance_radius_status || "unknown")}</li>`,
     `<li><strong>Qualification Match:</strong> ${qualification}/100</li>`,
     `<li><strong>Application Priority:</strong> ${priority}/100</li>`,
     `<li><strong>Matched:</strong> ${escapeHtml(matched.join(", ") || "None identified")}</li>`,

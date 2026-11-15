@@ -4,7 +4,7 @@ import warnings
 import re
 from importlib import metadata
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
 from datetime import datetime, timezone
 from typing import Any
 
@@ -88,6 +88,57 @@ def coerce_posted_date(value: Any) -> datetime | None:
 
 
 def fetch_jobspy_jobs(
+    *, keywords: str, location: str, distance: int | None = 50,
+    job_type: str | None = None, remote_preference: str | None = None,
+    results_wanted: int = 10, hours_old: int | None = 168,
+    enabled_sources: list[str] | None = None, country_indeed: str = "Canada",
+    scrape_jobs_func: Any | None = None, provider_timeout_seconds: int | None = 45,
+) -> dict[str, Any]:
+    """Run a small, bounded set of independent provider requests concurrently.
+
+    JobSpy calls cannot be forcibly killed.  We therefore cap concurrency to
+    two and surface a timeout honestly; the serial worker keeps the existing
+    per-provider diagnostics and best-effort cancellation behaviour.
+    """
+    sources = [source for source in (enabled_sources or ["linkedin", "indeed"]) if source in JOBSPY_SOURCE_NAMES]
+    if len(sources) <= 1:
+        return _fetch_jobspy_jobs_serial(
+            keywords=keywords, location=location, distance=distance, job_type=job_type,
+            remote_preference=remote_preference, results_wanted=results_wanted,
+            hours_old=hours_old, enabled_sources=sources, country_indeed=country_indeed,
+            scrape_jobs_func=scrape_jobs_func, provider_timeout_seconds=provider_timeout_seconds,
+        )
+    combined: dict[str, Any] = {"jobs": [], "errors": {}, "source_counts": {}, "source_snapshots": {}, "source_diagnostics": {}}
+    with ThreadPoolExecutor(max_workers=min(2, len(sources)), thread_name_prefix="jobspy-provider") as executor:
+        futures = {
+            executor.submit(
+                _fetch_jobspy_jobs_serial, keywords=keywords, location=location, distance=distance,
+                job_type=job_type, remote_preference=remote_preference, results_wanted=results_wanted,
+                hours_old=hours_old, enabled_sources=[source], country_indeed=country_indeed,
+                scrape_jobs_func=scrape_jobs_func, provider_timeout_seconds=provider_timeout_seconds,
+            ): source for source in sources
+        }
+        # Each worker has its own bounded provider call. Waiting here does not
+        # serialize sources, and a finished provider's rows survive another
+        # provider's failure.
+        for future in as_completed(futures):
+            source = futures[future]
+            try:
+                result = future.result()
+            except Exception as exc:  # defensive: worker normally diagnoses itself
+                combined["errors"][source] = f"{type(exc).__name__}: {exc}"
+                continue
+            combined["jobs"].extend(result.get("jobs", []))
+            combined["errors"].update(result.get("errors", {}))
+            combined["source_counts"][source] = int(result.get("source_counts", {}).get(source, 0) or 0)
+            combined["source_snapshots"].update(result.get("source_snapshots", {}))
+            diagnostic = result.get("source_diagnostics", {}).get(source)
+            if diagnostic:
+                combined["source_diagnostics"][source] = diagnostic
+    return combined
+
+
+def _fetch_jobspy_jobs_serial(
     *,
     keywords: str,
     location: str,

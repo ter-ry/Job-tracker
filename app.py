@@ -149,8 +149,10 @@ CURRENT_DB_SCHEMA_VERSION = 14
 DISCOVERY_DEBUG_SNAPSHOT_LIMIT = 25
 GEOCODING_FAILURE_CACHE_SECONDS = 15 * 60
 DISCOVERY_TASK_NAME = "Job Tracker Discovery"
-DISCOVERY_PROVIDER_TIMEOUT_SECONDS = 45
-DISCOVERY_OVERALL_TIMEOUT_SECONDS = 180
+# Discovery is interactive.  These are wall-clock budgets, not promises that
+# an uncooperative upstream scraper can be force-stopped.
+DISCOVERY_PROVIDER_TIMEOUT_SECONDS = 20
+DISCOVERY_OVERALL_TIMEOUT_SECONDS = 75
 TESTED_DEPENDENCY_VERSIONS = {
     "python-jobspy": "1.1.82",
     "pandas": "2.3.3",
@@ -2400,7 +2402,7 @@ def create_app() -> Flask:
                 geocoding_unknown += 1
             clean["remote_eligibility"], clean["remote_eligibility_explanation"] = discovery_remote_eligibility(clean)
             clean = enrich_discovery_job(clean, profile, {"weights": preferences.get("weights", {}), "remote_rule": preferences.get("sort", {}).get("remote_rule"), "distance_origin": origin}, evidence_profile=evidence_profile)
-            clean = apply_discovery_search_constraints(clean, search["remote_preference"], search["discovery_location"], search["distance"])
+            clean = apply_discovery_search_constraints(clean, search["remote_preference"], search["discovery_location"], search["distance"], search["geographic_match_mode"])
             clean["discovery_remote_preference"] = search["remote_preference"]
             clean["discovery_location_scope"] = search["discovery_location"]
             clean["remote_search_eligible"] = "true" if clean.get("remote_search_eligible") is True else "false" if clean.get("remote_search_eligible") is False else "unknown"
@@ -2529,6 +2531,9 @@ def create_app() -> Flask:
             ordered = [item for item in ordered if not (item.get("technical_compatibility") or {}).get("required_no_experience")]
         requested_target = int(search.get("requested_target") or 50)
         target_review_jobs = [item for item in ordered if item.get("discovery_result_category") == "actionable" and not discovery_target_eligible(item, search)]
+        for item in ordered:
+            if item.get("discovery_result_category") == "actionable":
+                item["discovery_match_status"], item["discovery_match_explanation"] = discovery_target_assessment(item, search)
         for item in target_review_jobs:
             item["discovery_result_category"] = "review_required"
             item["discovery_result_reason"] = discovery_target_ineligibility_reason(item, search)
@@ -3345,7 +3350,7 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         clean, _ = geocode_discovery_job(clean, profile, origin, provider, use_cache=True)
         clean["remote_eligibility"], clean["remote_eligibility_explanation"] = discovery_remote_eligibility(clean)
         clean = enrich_discovery_job(clean, profile, {"remote_rule": "remote_after_local", "distance_origin": origin}, evidence_profile=evidence_profile)
-        clean = apply_discovery_search_constraints(clean, search["remote_preference"], search["discovery_location"], search["distance"])
+        clean = apply_discovery_search_constraints(clean, search["remote_preference"], search["discovery_location"], search["distance"], search["geographic_match_mode"])
         clean["discovery_remote_preference"] = search["remote_preference"]
         clean["discovery_location_scope"] = search["discovery_location"]
         clean["remote_search_eligible"] = "true" if clean.get("remote_search_eligible") is True else "false" if clean.get("remote_search_eligible") is False else "unknown"
@@ -3391,6 +3396,9 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
     requested_target = int(search.get("requested_target") or 50)
     ordered = list(jobs)
     target_review_jobs = [item for item in ordered if item.get("discovery_result_category") == "actionable" and not discovery_target_eligible(item, search)]
+    for item in ordered:
+        if item.get("discovery_result_category") == "actionable":
+            item["discovery_match_status"], item["discovery_match_explanation"] = discovery_target_assessment(item, search)
     for item in target_review_jobs:
         item["discovery_result_category"] = "review_required"
         item["discovery_result_reason"] = discovery_target_ineligibility_reason(item, search)
@@ -7469,6 +7477,8 @@ def discovery_search_config(payload: dict[str, Any]) -> dict[str, Any]:
         "title_match_mode": title_match_mode,
         "seniority": normalize_seniority_levels(payload.get("seniority")),
         "maximum_required_years": clamp_int_default(payload.get("maximum_required_years"), 3, 0, 30),
+        "include_provisional_matches": as_bool(payload.get("include_provisional_matches", True)),
+        "geographic_match_mode": normalize_choice(payload.get("geographic_match_mode"), {"strict", "provisional"}) or "provisional",
         "occupation": occupation_for_keywords(text(payload.get("keywords"))),
         "applicant_profile_id": clamp_int(payload.get("applicant_profile_id"), 0, 10**9),
         "profile_independent": search_mode == "title" and not text(payload.get("candidate_profile_id")),
@@ -8660,16 +8670,18 @@ def fetch_discovery_jobs_for_search(
     planned_batches = [batch for batch in all_planned_batches if batch not in completed]
     completed_this_run: list[dict[str, str]] = []
     for batch_index, (location, keyword_query) in enumerate(planned_batches):
-        if time.monotonic() - started >= DISCOVERY_OVERALL_TIMEOUT_SECONDS:
+        elapsed = time.monotonic() - started
+        if elapsed >= DISCOVERY_OVERALL_TIMEOUT_SECONDS:
             combined["errors"]["overall"] = f"Discovery timed out after {DISCOVERY_OVERALL_TIMEOUT_SECONDS}s before all locations completed."
             break
+        remaining_budget = max(1, int(DISCOVERY_OVERALL_TIMEOUT_SECONDS - elapsed))
         attempted.append({"location": location, "keywords": keyword_query})
         result = fetch_jobspy_jobs(
             keywords=keyword_query, location=location, distance=search["distance"],
             remote_preference=search["remote_preference"], job_type=None,
             results_wanted=per_region, hours_old=search["hours_old"],
             enabled_sources=search["enabled_sources"], country_indeed=country_indeed,
-            provider_timeout_seconds=DISCOVERY_PROVIDER_TIMEOUT_SECONDS,
+            provider_timeout_seconds=min(DISCOVERY_PROVIDER_TIMEOUT_SECONDS, remaining_budget),
         )
         if result.get("errors"):
             # Do not repeatedly hammer a provider that has already reported a
@@ -9147,7 +9159,10 @@ def enrich_discovery_job(job: dict[str, Any], profile: dict[str, str], settings:
     return enriched
 
 
-def apply_discovery_search_constraints(job: dict[str, Any], remote_preference: str, search_location: str = "", max_distance_km: int = 0) -> dict[str, Any]:
+def apply_discovery_search_constraints(
+    job: dict[str, Any], remote_preference: str, search_location: str = "",
+    max_distance_km: int = 0, geographic_match_mode: str = "provisional",
+) -> dict[str, Any]:
     """Apply work-arrangement and requested-location constraints before ranking."""
     preference = normalize_space(text(remote_preference)).lower()
     if preference != "remote":
@@ -9162,8 +9177,9 @@ def apply_discovery_search_constraints(job: dict[str, Any], remote_preference: s
             job.setdefault("application_priority_reasons", []).append("Excluded because the confirmed job location is outside the requested hybrid/on-site search area.")
         elif max_distance_km and "remote" not in text(job.get("remote_type")).lower() and clamp_int(job.get("distance_km"), 0, 9999) >= 9999:
             job["distance_radius_status"] = "unknown"
-            job["location_search_eligible"] = None
-            job["application_priority_score"] = min(int(job.get("application_priority_score") or 0), 49)
+            job["geographic_eligibility"] = "provisional" if geographic_match_mode == "provisional" else "unverified"
+            job["location_search_eligible"] = True if geographic_match_mode == "provisional" else None
+            job["distance_confidence_reason"] = "Exact workplace distance is unknown; the advertised city/region is retained as a provisional geographic match."
         elif max_distance_km and "remote" not in text(job.get("remote_type")).lower() and int(job.get("distance_km") or 0) > max_distance_km:
             job["distance_radius_status"] = "outside_radius"
             job["location_search_eligible"] = False
@@ -9171,8 +9187,10 @@ def apply_discovery_search_constraints(job: dict[str, Any], remote_preference: s
         else:
             job["distance_radius_status"] = "within_radius" if max_distance_km else "not_checked"
             job["location_search_eligible"] = True if search_location else None
+            job["geographic_eligibility"] = "verified" if max_distance_km else "not_enforced"
         return job
     job["location_search_eligible"] = True
+    job["geographic_eligibility"] = "not_applicable" if "remote" in text(job.get("remote_type")).lower() else "verified"
     if province_code_from_text(search_location) == "ON":
         ontario_status, ontario_reason = discovery_ontario_eligibility(job)
         job["ontario_eligibility"] = ontario_status
@@ -9203,8 +9221,8 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
             return "excluded", "Posting is confirmed closed."
         if text(job.get("distance_radius_status")).lower() == "outside_radius":
             return "excluded", "Confirmed workplace distance is outside the requested radius."
-        if text(job.get("distance_radius_status")).lower() == "unknown":
-            return "review_required", "Workplace distance could not be verified against the requested radius."
+        if text(job.get("distance_radius_status")).lower() == "unknown" and text(job.get("geographic_eligibility")).lower() != "provisional":
+            return "review_required", "Exact workplace distance could not be verified under strict-radius matching."
         if job.get("location_search_eligible") is False or text(job.get("location_search_eligible")).lower() == "false":
             return "excluded", "Confirmed job location is outside the requested search area."
         if search_mode == "title":
@@ -9215,11 +9233,11 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
         seniority = job.get("qualification_fit_seniority") or {}
         if seniority.get("stretch_role") or (text(job.get("application_priority_score")).isdigit() and int(job.get("application_priority_score")) < 50):
             return "review_required", "The posting expects experience or seniority that is not confirmed as aligned with the selected target."
+        if text(job.get("distance_radius_status")).lower() == "unknown":
+            return "actionable", "Title and hard requirements are suitable; workplace distance remains a provisional city/region match."
         return "actionable", "No remote-only restriction applies."
     if text(job.get("remote_search_eligible")).lower() == "false" or text(job.get("remote_eligibility")).lower() in {"restricted", "confirmed_ineligible"} or text(job.get("ontario_eligibility")).lower() == "confirmed_ineligible" or text(job.get("posting_availability")).lower() == "confirmed_closed":
         return "excluded", "Confirmed onsite, hybrid, ineligible, or closed posting."
-    if text(job.get("distance_radius_status")).lower() == "unknown":
-        return "review_required", "Remote eligibility or workplace distance requires review."
     if text(job.get("remote_search_eligible")).lower() == "true" and text(job.get("remote_eligibility")).lower() == "canadian_eligible" and "remote" in text(job.get("remote_type")).lower():
         if search_mode == "title":
             return title_search_result_category(job)
@@ -9229,7 +9247,7 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
         seniority = job.get("qualification_fit_seniority") or {}
         if seniority.get("stretch_role") or (text(job.get("application_priority_score")).isdigit() and int(job.get("application_priority_score")) < 50):
             return "review_required", "The posting expects experience or seniority that is not confirmed as aligned with the selected target."
-        return "actionable", "Remote arrangement and Canadian eligibility are supported by the posting data."
+        return "actionable", "Remote arrangement and Canadian eligibility are supported by the posting data; commute distance does not apply."
     return "review_required", "Work arrangement or Canadian eligibility requires review."
 
 
@@ -9261,32 +9279,37 @@ def discovery_is_clear_senior_role(job: dict[str, Any], search: dict[str, Any]) 
     return level in {"senior", "lead", "manager", "director"} or bool(analysis.get("management_role")) or bool(analysis.get("leadership_expectations")) or high_experience
 
 
-def discovery_target_eligible(job: dict[str, Any], search: dict[str, Any]) -> bool:
+def discovery_target_assessment(job: dict[str, Any], search: dict[str, Any]) -> tuple[str, str]:
+    """Return verified, provisional, or ineligible without treating absence as proof."""
     if discovery_is_clear_senior_role(job, search):
-        return False
+        return "ineligible", "Confirmed seniority or required experience is outside the selected early-career target."
     selected_levels = set(text(search.get("seniority")).split(","))
     analysis = job.get("qualification_fit_seniority") or {}
     level = text(analysis.get("detected_level") or job.get("seniority_level")).lower().replace("-", "_")
-    if selected_levels and "any" not in selected_levels and level and level not in selected_levels:
-        return False
     required = analysis.get("required_experience") or {}
     try:
         minimum = float(required.get("minimum")) if isinstance(required, dict) and required.get("minimum") is not None else 0
     except (TypeError, ValueError):
         minimum = 0
-    return minimum <= float(search.get("maximum_required_years") or 3)
+    if minimum > float(search.get("maximum_required_years") or 3):
+        return "ineligible", "Confirmed required professional experience exceeds the selected maximum."
+    unknown_levels = {"", "unknown", "ambiguous", "unverified"}
+    if selected_levels and "any" not in selected_levels and level not in unknown_levels and level not in selected_levels:
+        return "ineligible", "Confirmed seniority is outside the selected discovery seniority levels."
+    if level in unknown_levels:
+        return "provisional", "Seniority is not stated; title and hard requirements are compatible, but this is not a verified junior role."
+    return "verified", "Confirmed eligible: stated seniority and required experience meet the selected target."
+
+
+def discovery_target_eligible(job: dict[str, Any], search: dict[str, Any]) -> bool:
+    status, _ = discovery_target_assessment(job, search)
+    return status == "verified" or (status == "provisional" and as_bool(search.get("include_provisional_matches", True)))
 
 
 def discovery_target_ineligibility_reason(job: dict[str, Any], search: dict[str, Any]) -> str:
     """Explain a user-selected target gate without silently dropping a job."""
-    if discovery_is_clear_senior_role(job, search):
-        return "Clearly senior or managerial role kept out of the selected early-career target."
-    analysis = job.get("qualification_fit_seniority") or {}
-    level = text(analysis.get("detected_level") or job.get("seniority_level")).lower().replace("-", "_")
-    selected_levels = set(text(search.get("seniority")).split(","))
-    if selected_levels and "any" not in selected_levels and level and level not in selected_levels:
-        return "Posting seniority is outside the selected discovery seniority levels."
-    return "Posting required experience exceeds the selected maximum-required-years limit."
+    _status, reason = discovery_target_assessment(job, search)
+    return reason
 
 
 def discovery_sort_value(job: dict[str, Any], field: str, direction: str = "desc", remote_rule: str = "remote_after_local", unknown_salary_position: str = "last") -> tuple[Any, ...]:

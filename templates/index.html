@@ -135,7 +135,14 @@
               </label>
               <label>Maximum required experience
                 <input id="discovery-maximum-years" type="number" min="0" max="30" step="1" value="3">
-                <small class="muted">Used when supported by the search backend.</small>
+                <small class="muted">Only confirmed professional experience is enforced.</small>
+              </label>
+              <label class="checkline"><input id="discovery-include-provisional" type="checkbox" checked> Include plausible matches with unstated seniority</label>
+              <label>Location confidence
+                <select id="discovery-geographic-match-mode">
+                  <option value="provisional" selected>Include city/region matches; verify commute later</option>
+                  <option value="strict">Strict radius; verified workplaces only</option>
+                </select>
               </label>
             </div>
             <fieldset class="source-picker">
@@ -178,7 +185,6 @@
             <div id="discovery-source-test-output" class="muted helper" aria-live="polite"></div>
             <div class="actions">
               <button class="button" type="submit" id="discovery-submit">Search</button>
-              <button class="button ghost" type="button" id="discovery-continue" disabled>Continue Search</button>
               <button class="button ghost beta-secondary" type="button" id="save-current-discovery-search">Save current search</button>
               <button class="button ghost beta-secondary" type="button" id="discovery-test-sources">Test job sources</button>
               <button class="button ghost beta-secondary" type="button" id="discovery-recalculate-distances">Recalculate distances</button>
