@@ -8,6 +8,8 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from datetime import datetime, timezone
 from typing import Any
 
+from sources.provider_runtime import ProviderCircuitBreaker, ProviderWorkerError, run_isolated_provider
+
 
 JOBSPY_SOURCE_NAMES = {
     "linkedin": "linkedin",
@@ -93,12 +95,15 @@ def fetch_jobspy_jobs(
     results_wanted: int = 10, hours_old: int | None = 168,
     enabled_sources: list[str] | None = None, country_indeed: str = "Canada",
     scrape_jobs_func: Any | None = None, provider_timeout_seconds: int | None = 45,
+    execution_mode: str = "process",
+    circuit_breaker: ProviderCircuitBreaker | None = None,
+    on_provider_update: Any | None = None,
 ) -> dict[str, Any]:
     """Run a small, bounded set of independent provider requests concurrently.
 
-    JobSpy calls cannot be forcibly killed.  We therefore cap concurrency to
-    two and surface a timeout honestly; the serial worker keeps the existing
-    per-provider diagnostics and best-effort cancellation behaviour.
+    Real JobSpy calls run in killable child processes; concurrency is capped at
+    two. Injected callables or explicit ``execution_mode="thread"`` use the
+    legacy soft-timeout path and are labelled accordingly in diagnostics.
     """
     sources = [source for source in (enabled_sources or ["linkedin", "indeed"]) if source in JOBSPY_SOURCE_NAMES]
     if len(sources) <= 1:
@@ -107,15 +112,23 @@ def fetch_jobspy_jobs(
             remote_preference=remote_preference, results_wanted=results_wanted,
             hours_old=hours_old, enabled_sources=sources, country_indeed=country_indeed,
             scrape_jobs_func=scrape_jobs_func, provider_timeout_seconds=provider_timeout_seconds,
+            execution_mode=execution_mode,
+            circuit_breaker=circuit_breaker,
+            on_provider_update=on_provider_update,
         )
     combined: dict[str, Any] = {"jobs": [], "errors": {}, "source_counts": {}, "source_snapshots": {}, "source_diagnostics": {}}
     with ThreadPoolExecutor(max_workers=min(2, len(sources)), thread_name_prefix="jobspy-provider") as executor:
+        if on_provider_update is not None:
+            for source in sources:
+                on_provider_update(source, {"jobs": [], "errors": {}, "source_diagnostics": {source: {"source": source, "state": "running", "provider_status": "running"}}})
         futures = {
             executor.submit(
                 _fetch_jobspy_jobs_serial, keywords=keywords, location=location, distance=distance,
                 job_type=job_type, remote_preference=remote_preference, results_wanted=results_wanted,
                 hours_old=hours_old, enabled_sources=[source], country_indeed=country_indeed,
                 scrape_jobs_func=scrape_jobs_func, provider_timeout_seconds=provider_timeout_seconds,
+                execution_mode=execution_mode,
+                circuit_breaker=circuit_breaker,
             ): source for source in sources
         }
         # Each worker has its own bounded provider call. Waiting here does not
@@ -127,6 +140,8 @@ def fetch_jobspy_jobs(
                 result = future.result()
             except Exception as exc:  # defensive: worker normally diagnoses itself
                 combined["errors"][source] = f"{type(exc).__name__}: {exc}"
+                if on_provider_update is not None:
+                    on_provider_update(source, {"jobs": [], "errors": {source: combined["errors"][source]}, "source_diagnostics": {source: {"source": source, "state": "failed", "provider_status": "failed", "error": combined["errors"][source]}}})
                 continue
             combined["jobs"].extend(result.get("jobs", []))
             combined["errors"].update(result.get("errors", {}))
@@ -135,6 +150,8 @@ def fetch_jobspy_jobs(
             diagnostic = result.get("source_diagnostics", {}).get(source)
             if diagnostic:
                 combined["source_diagnostics"][source] = diagnostic
+            if on_provider_update is not None:
+                on_provider_update(source, result)
     return combined
 
 
@@ -151,13 +168,17 @@ def _fetch_jobspy_jobs_serial(
     country_indeed: str = "Canada",
     scrape_jobs_func: Any | None = None,
     provider_timeout_seconds: int | None = 45,
+    execution_mode: str = "process",
+    circuit_breaker: ProviderCircuitBreaker | None = None,
+    on_provider_update: Any | None = None,
 ) -> dict[str, Any]:
     """Fetch independently diagnosed JobSpy providers.
 
     ``source_diagnostics`` exposes stable evidence counters (raw, normalized,
     unique, URLs, descriptions, salary, and workplace evidence) plus a
     ``state`` of ``running``, ``working``, ``no_results``, ``partial``,
-    ``blocked``, ``unavailable``, ``unsupported``, or ``timed_out``.
+    ``blocked``, ``unavailable``, ``unsupported``, ``timed_out``, or
+    ``circuit_open``.
     ``source_snapshots`` contains one lightweight snapshot per raw provider
     row and is deliberately not capped by the requested result count.
     """
@@ -206,12 +227,17 @@ def _fetch_jobspy_jobs_serial(
             "result_count": 0,
             "cached": False,
             "effective_country_indeed": country_indeed,
+            "execution_mode": execution_mode,
+            "process_pid": 0,
+            "child_terminated": False,
         }
         for source in JOBSPY_SOURCE_NAMES
     }
 
     for source in sources:
         started = time.perf_counter()
+        if on_provider_update is not None:
+            on_provider_update(source, {"jobs": [], "errors": {}, "source_diagnostics": {source: {"source": source, "state": "running", "provider_status": "running"}}})
         started_at = datetime.now(timezone.utc).isoformat()
         source_diagnostics[source] = {
             "source": source,
@@ -265,8 +291,21 @@ def _fetch_jobspy_jobs_serial(
             "result_count": 0,
             "cached": False,
             "effective_country_indeed": country_indeed,
+            "execution_mode": execution_mode,
+            "process_pid": 0,
+            "child_terminated": False,
         }
         try:
+            if circuit_breaker is not None and not circuit_breaker.allow(source):
+                source_diagnostics[source].update({
+                    "attempted": False,
+                    "state": "circuit_open",
+                    "provider_status": "circuit_open",
+                    "error_classification": "circuit_open",
+                    "skipped_reason": "circuit breaker open after repeated provider failures",
+                    "ended_at": datetime.now(timezone.utc).isoformat(),
+                })
+                continue
             with warnings.catch_warnings(record=True) as caught_warnings:
                 warnings.simplefilter("always")
                 scrape_kwargs = {
@@ -292,16 +331,26 @@ def _fetch_jobspy_jobs_serial(
                 # becomes a partial failure instead of holding the HTTP request
                 # forever.  The underlying provider cannot be force-killed, so
                 # cancellation is best-effort and diagnostics retain the timeout.
-                executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"jobspy-{source}")
-                future = executor.submit(scrape_jobs, **scrape_kwargs)
-                try:
-                    frame = future.result(timeout=provider_timeout_seconds)
-                except FutureTimeoutError as exc:
-                    future.cancel()
-                    raise TimeoutError(f"{source} provider timed out after {provider_timeout_seconds}s") from exc
-                finally:
-                    executor.shutdown(wait=False, cancel_futures=True)
-            raw_type = type(frame).__name__ if frame is not None else "NoneType"
+                if scrape_jobs_func is None and execution_mode == "process":
+                    isolated = run_isolated_provider(scrape_kwargs, provider_timeout_seconds or 45)
+                    frame = isolated.get("rows", [])
+                    isolated_frame_type = isolated.get("frame_type", "list")
+                    source_diagnostics[source]["process_pid"] = int(isolated.get("pid") or 0)
+                else:
+                    # Injected test providers and explicit compatibility mode
+                    # retain the historical soft timeout. Their threads cannot
+                    # be forcibly killed; diagnostics make that mode visible.
+                    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"jobspy-{source}")
+                    future = executor.submit(scrape_jobs, **scrape_kwargs)
+                    try:
+                        frame = future.result(timeout=provider_timeout_seconds)
+                    except FutureTimeoutError as exc:
+                        future.cancel()
+                        raise TimeoutError(f"{source} provider timed out after {provider_timeout_seconds}s") from exc
+                    finally:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                    isolated_frame_type = ""
+            raw_type = isolated_frame_type or (type(frame).__name__ if frame is not None else "NoneType")
             raw_rows = frame_to_records(frame)
             normalized_rows: list[dict[str, Any]] = []
             snapshots: list[dict[str, Any]] = []
@@ -382,10 +431,13 @@ def _fetch_jobspy_jobs_serial(
                 }
             )
             source_counts[source] = len(returned_rows)
+            if circuit_breaker is not None:
+                circuit_breaker.record(source, source_diagnostics[source]["state"])
             results.extend(returned_rows)
         except Exception as exc:
             error_message = f"{type(exc).__name__}: {exc}"
             errors[source] = error_message
+            provider_error_type = getattr(exc, "error_type", type(exc).__name__)
             source_diagnostics[source].update(
                 {
                     "success": False,
@@ -408,8 +460,9 @@ def _fetch_jobspy_jobs_serial(
                     "description_complete_count": 0,
                     "salary_evidence_count": 0,
                     "address_evidence_count": 0,
-                    "error_type": type(exc).__name__,
+                    "error_type": provider_error_type,
                     "error": error_message,
+                    "child_terminated": bool(execution_mode == "process" and isinstance(exc, TimeoutError)),
                     "warnings": [],
                     "warnings_count": 0,
                     "raw_source_snapshot_count": 0,
@@ -418,6 +471,15 @@ def _fetch_jobspy_jobs_serial(
                     "duration_ms": int(round((time.perf_counter() - started) * 1000)),
                 }
             )
+        if on_provider_update is not None:
+            on_provider_update(source, {
+                "jobs": [job for job in results if clean(job.get("source")).lower() == source],
+                "errors": {source: errors[source]} if source in errors else {},
+                "source_counts": {source: source_counts.get(source, 0)},
+                "source_diagnostics": {source: source_diagnostics[source]},
+            })
+        if circuit_breaker is not None:
+            circuit_breaker.record(source, source_diagnostics[source]["state"])
 
     return {
         "jobs": results,

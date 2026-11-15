@@ -4,6 +4,7 @@ const fs = require("fs");
 const html = fs.readFileSync("templates/index.html", "utf8");
 const js = fs.readFileSync("static/app.js", "utf8");
 const css = fs.readFileSync("static/styles.css", "utf8");
+const policy = require("../static/eligibility-policy.js");
 
 function count(text, needle) {
   return text.split(needle).length - 1;
@@ -47,16 +48,65 @@ assert.match(js, /continuation_available/);
 assert.doesNotMatch(html, /id="discovery-continue"/);
 assert.match(html, /id="discovery-include-provisional"/);
 assert.match(html, /id="discovery-geographic-match-mode"/);
+assert.match(html, /id="discovery-include-internships"/);
+assert.match(js, /function tryProgressiveDiscoverySearch/);
+assert.match(js, /search_id/);
+assert.match(js, /new_jobs \|\| payload\.jobs/);
+assert.match(js, /function stopProgressiveDiscoverySearch/);
+assert.match(js, /Cancellation acknowledged/);
+assert.match(js, /"paused", "completed", "completed_with_errors"/);
+assert.match(js, /outcome\.status === 202 && result\.search_id/);
+assert.match(js, /retaining earlier results while new provider batches arrive/);
+assert.match(js, /function loadCandidateProfiles/);
+assert.match(js, /candidateProfilesStatus = "error"/);
+assert.match(js, /Retry/);
 
 // Experience, salary, and workplace wording remain evidence-safe.
 for (const label of ["Detected seniority", "Required experience", "Preferred experience", "Applicant demonstrated experience", "Experience fit", "Technical compatibility"]) {
   assert.ok(count(js, label) >= 1, `missing experience label: ${label}`);
 }
 assert.match(js, /Pay period unverified/);
-assert.match(js, /Exact workplace unknown/);
+assert.match(js, /Exact workplace unconfirmed/);
 assert.match(js, /View area on map/);
 assert.match(js, /sourceDiagnosticStatus/);
 assert.match(js, /discovery_result_reason/);
 assert.match(css, /discovery-result-group/);
+
+// The pure policy never uses a low ranking score as a hard rejection.
+const junior = policy.assess({
+  role_type: "software developer",
+  occupation_match_type: "exact",
+  qualification_fit_seniority: { detected_level: "junior", required_experience: { minimum: 1 } },
+  application_priority_score: 20,
+}, { maximum_required_years: 3 });
+assert.notStrictEqual(junior.status, "excluded");
+assert.strictEqual(policy.assess({
+  role_type: "software developer",
+  occupation_match_type: "exact",
+  qualification_fit_seniority: { detected_level: "senior", required_experience: { minimum: 8 } },
+}, { maximum_required_years: 3 }).status, "excluded");
+assert.strictEqual(policy.assess({
+  role_type: "software developer",
+  occupation_match_type: "exact",
+  qualification_fit_seniority: { detected_level: "junior", required_experience: { minimum: 1 } },
+  geographic_eligibility: "city_only",
+  distance_km: 9999,
+}, { maximum_required_years: 3 }).status, "provisional");
+
+// Synthetic release-audit fixtures: names/descriptions are intentionally local
+// regression data, not claims about live postings or candidate experience.
+const fixtures = [
+  ["Hootsuite", { title: "Junior Software Developer", role_type: "software developer", occupation_match_type: "exact", geographic_eligibility: "exact", distance_km: 8, qualification_fit_seniority: { detected_level: "junior", required_experience: { minimum: 1 } } }, "verified"],
+  ["Priceline", { title: "Associate Software Developer", role_type: "software developer", occupation_match_type: "exact", geographic_eligibility: "exact", distance_km: 8, qualification_fit_seniority: { detected_level: "entry_level", required_experience: { minimum: 0 } } }, "verified"],
+  ["UHN", { title: "Software Developer", job_description: "Build software with the product engineering team.", role_type: "software developer", occupation_match_type: "exact", geographic_eligibility: "exact", distance_km: 8, qualification_fit_seniority: { detected_level: "intermediate", required_experience: { minimum: 2 } } }, "verified"],
+  ["BMO", { title: "Software Developer — New or Recent Graduate", job_description: "New or recent graduate opportunity; numeric experience context requires review.", role_type: "software developer", occupation_match_type: "exact", qualification_fit_seniority: { detected_level: "unknown", required_experience: { minimum: 4 } } }, "review_required"],
+  ["TOPBOX", { title: "Marketing Coordinator", role_type: "marketing", occupation_match_type: "unrelated" }, "excluded"],
+  ["Leap", { title: "Senior Software Engineer", role_type: "software developer", occupation_match_type: "exact", qualification_fit_seniority: { detected_level: "senior", required_experience: { minimum: 6 } } }, "excluded"],
+];
+for (const [name, job, expected] of fixtures) {
+  assert.strictEqual(policy.assess(job, { maximum_required_years: 3 }).status, expected, `${name} fixture classification`);
+}
+assert.strictEqual(policy.assess({ title: "Software Engineering Intern", role_type: "internship", occupation_match_type: "exact" }, { include_internships: false }).status, "excluded");
+assert.notStrictEqual(policy.assess({ title: "Software Engineering Intern", role_type: "internship", occupation_match_type: "exact" }, { include_internships: true }).status, "excluded");
 
 console.log("discovery UI regression checks passed");
