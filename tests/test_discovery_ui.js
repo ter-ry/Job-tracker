@@ -26,7 +26,8 @@ assert.match(js, /state\.discoveryInboxJobs = \[\];[\s\S]*loadDiscoveryInbox\(tr
 assert.match(js, /candidate_profile_id \|\| ""/);
 
 // Result categories are explicit and excluded jobs never enter the main queue.
-assert.match(js, /renderGroup\("New matches"/);
+assert.match(js, /renderGroup\("Verified matches"/);
+assert.match(js, /renderGroup\("Provisional matches"/);
 assert.match(js, /renderGroup\("Review required"/);
 assert.match(js, /state\.discoveryExcludedResults = responseJobs\.filter/);
 assert.match(js, /job\.discovery_result_category !== "excluded"/);
@@ -43,6 +44,9 @@ assert.match(js, /function restoreInboxJob/);
 assert.match(js, /function continuationContract/);
 assert.match(js, /Continue Search is not available for this search response yet/);
 assert.match(js, /continuation_available/);
+assert.doesNotMatch(html, /id="discovery-continue"/);
+assert.match(html, /id="discovery-include-provisional"/);
+assert.match(html, /id="discovery-geographic-match-mode"/);
 
 // Experience, salary, and workplace wording remain evidence-safe.
 for (const label of ["Detected seniority", "Required experience", "Preferred experience", "Applicant demonstrated experience", "Experience fit", "Technical compatibility"]) {
@@ -52,6 +56,7 @@ assert.match(js, /Pay period unverified/);
 assert.match(js, /Exact workplace unknown/);
 assert.match(js, /View area on map/);
 assert.match(js, /sourceDiagnosticStatus/);
+assert.match(js, /discovery_result_reason/);
 assert.match(css, /discovery-result-group/);
 
 console.log("discovery UI regression checks passed");
