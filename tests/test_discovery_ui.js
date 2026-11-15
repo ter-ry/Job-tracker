@@ -50,6 +50,8 @@ assert.doesNotMatch(html, /id="discovery-continue"/);
 assert.match(html, /id="discovery-include-provisional"/);
 assert.match(html, /id="discovery-geographic-match-mode"/);
 assert.match(html, /id="discovery-include-internships"/);
+assert.match(html, /id="open-all-discovered"/);
+assert.match(js, /setDiscoverySection\("saved"\)/);
 assert.match(js, /function tryProgressiveDiscoverySearch/);
 assert.match(js, /search_id/);
 assert.match(js, /new_jobs \|\| payload\.jobs/);
@@ -71,6 +73,7 @@ assert.match(js, /Exact workplace unconfirmed/);
 assert.match(js, /View area on map/);
 assert.match(js, /sourceDiagnosticStatus/);
 assert.match(js, /discovery_result_reason/);
+assert.match(js, /data-discovery-no-new-reason/);
 assert.match(css, /discovery-result-group/);
 
 // The pure policy never uses a low ranking score as a hard rejection.

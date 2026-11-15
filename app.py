@@ -498,6 +498,20 @@ JOB_COLUMNS = {
     "title_match_mode": "TEXT NOT NULL DEFAULT 'related'",
     "occupation_match_type": "TEXT NOT NULL DEFAULT 'uncertain'",
     "title_match_score": "INTEGER NOT NULL DEFAULT 0",
+    # Discovery assessments are versioned by each search and refreshed on a
+    # repeat source identity. They are additive columns so schema version 14
+    # and its rollback-compatible migration contract remain unchanged.
+    "discovery_result_category": "TEXT NOT NULL DEFAULT ''",
+    "discovery_result_reason": "TEXT NOT NULL DEFAULT ''",
+    "recommendation_eligible": "INTEGER NOT NULL DEFAULT 0",
+    "qualification_fit_seniority": "TEXT NOT NULL DEFAULT '{}'",
+    "qualification_fit_matched_requirements": "TEXT NOT NULL DEFAULT '[]'",
+    "qualification_fit_missing_requirements": "TEXT NOT NULL DEFAULT '[]'",
+    "qualification_fit_partial_requirements": "TEXT NOT NULL DEFAULT '[]'",
+    "qualification_evidence_profile_id": "TEXT NOT NULL DEFAULT ''",
+    "qualification_evidence_profile_name": "TEXT NOT NULL DEFAULT ''",
+    "qualification_evidence_source": "TEXT NOT NULL DEFAULT ''",
+    "warnings": "TEXT NOT NULL DEFAULT '[]'",
     "salary_evidence_text": "TEXT NOT NULL DEFAULT ''",
     "salary_ambiguity": "TEXT NOT NULL DEFAULT ''",
     "distance_type": "TEXT NOT NULL DEFAULT 'unknown'",
@@ -1935,6 +1949,7 @@ def create_app() -> Flask:
             "search_id": search_id,
             "status": text(row.get("status")) or "queued",
             "progress": progress,
+            "diagnostics": progress.get("diagnostics") if isinstance(progress.get("diagnostics"), dict) else {},
             # Keep the durable progress payload compact while also exposing
             # the live provider view at the documented top level.  Polling
             # clients should never have to infer a provider state from an
@@ -2009,11 +2024,18 @@ def create_app() -> Flask:
         include_history = as_bool(request.args.get("include_history"))
         applicant_id = applicant_profile_id(request.args)
         query = "SELECT * FROM jobs WHERE discovery_first_seen_at <> ''"
+        query_args: list[Any] = []
+        if applicant_id:
+            # History is applicant-scoped. Include source rows owned by this
+            # applicant plus explicit presentation/state records, never another
+            # applicant's discoveries merely because they share a title or URL.
+            query += " AND (candidate_profile_id = 0 OR candidate_profile_id = ? OR EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = jobs.id AND p.applicant_profile_id = ?) OR EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = jobs.id AND s.applicant_profile_id = ?))"
+            query_args.extend([applicant_id, applicant_id, applicant_id])
         if not include_history and not applicant_id:
             query += " AND discovery_state NOT IN ('ignored', 'saved', 'applied') AND status NOT IN ('Applied', 'shortlisted')"
         query += " ORDER BY discovery_state = 'new' DESC, discovery_last_seen_at DESC, id DESC LIMIT 500"
         rows = query_db(
-            query
+            query, query_args
         )
         evidence_profile = None
         if request.args.get("candidate_profile_id"):
@@ -3088,7 +3110,14 @@ def _async_discovery_progress(result: dict[str, Any] | None = None, requested_ta
         "raw_inspected": int(progress.get("raw_jobs_inspected") or result.get("total") or 0),
         "deduplicated": int(result.get("duplicates_in_search") or result.get("duplicates") or 0),
         "skipped": int(progress.get("skipped") or 0),
+        "fetched_raw": int(progress.get("fetched_raw") or progress.get("raw_jobs_inspected") or result.get("total") or 0),
+        "previously_presented": int(progress.get("previously_presented") or 0),
+        "filtered_technical": int(progress.get("filtered_technical") or 0),
+        "review_missing_distance": int(progress.get("review_missing_distance") or 0),
+        "confirmed_excluded": int(progress.get("confirmed_excluded") or progress.get("disqualified") or 0),
+        "no_new_reason": text(progress.get("target_unmet_reason")),
         "provider_states": result.get("source_diagnostics") if isinstance(result.get("source_diagnostics"), dict) else {},
+        "source_counts": result.get("source_counts") if isinstance(result.get("source_counts"), dict) else {},
     }
 
 
@@ -3205,7 +3234,7 @@ def _run_async_discovery_search(search_id: str, payload: dict[str, Any]) -> None
                 "postprocessing_seconds": diagnostics.get("postprocessing_seconds", 0),
                 "persistence_seconds": diagnostics.get("persistence_seconds", 0),
             }
-            _update_async_discovery(search_id, status=status, progress_json={**progress, "timings": timings}, continuation_available=continuation, termination_reason=termination, timings_json=timings, error_json=errors)
+            _update_async_discovery(search_id, status=status, progress_json={**progress, "timings": timings, "diagnostics": diagnostics}, continuation_available=continuation, termination_reason=termination, timings_json=timings, error_json=errors)
     except Exception as exc:
         with app.app_context():
             _update_async_discovery(search_id, status="failed", termination_reason="worker_failure", error_json={"worker": str(exc)})
@@ -3343,7 +3372,14 @@ def saved_search_to_discovery_payload(search: dict[str, Any]) -> dict[str, Any]:
 def resolve_discovery_evidence_profile(payload: dict[str, Any]) -> dict[str, Any]:
     """Resolve the résumé used for discovery scoring, without mixing profiles."""
     search_mode = normalize_choice(payload.get("search_mode"), {"title", "explore", "shortlist"}) or "title"
-    profile_id = payload.get("candidate_profile_id") or payload.get("auto_prepare_candidate_profile_id")
+    # The discovery UI uses applicant_profile_id for the selected workflow.
+    # Treat it as evidence ownership for shortlist searches too; otherwise the
+    # selected résumé is silently omitted from qualification matching.
+    profile_id = (
+        payload.get("candidate_profile_id")
+        or payload.get("auto_prepare_candidate_profile_id")
+        or (payload.get("applicant_profile_id") if search_mode == "shortlist" else None)
+    )
     if search_mode == "title" and profile_id in (None, "", 0):
         # Title Search is useful before a résumé exists.  An active SWE résumé
         # must not silently become evidence for an unrelated occupation such as
@@ -3410,6 +3446,33 @@ def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, ru
         match = find_existing_job_match(job)
         if match is not None:
             counts["duplicate"] += 1
+            # Refresh discovery-owned assessment fields on repeat sightings.
+            # User status, notes, dates, and decisions remain untouched.
+            assessment_columns = {
+                "overall_score", "score_breakdown", "distance_km", "distance_confidence",
+                "distance_radius_status", "distance_origin_label", "distance_origin_precision",
+                "distance_origin_status", "distance_type", "commute_status", "commute_source",
+                "remote_eligibility", "remote_eligibility_explanation", "remote_search_eligible",
+                "discovery_salary_filter_status", "qualification_match_score", "application_priority_score",
+                "opportunity_score", "opportunity_score_reasons", "discovery_remote_preference",
+                "discovery_location_scope", "discovery_occupation", "discovery_profile_independent",
+                "candidate_profile_id", "discovery_search_mode", "title_match_mode", "occupation_match_type",
+                "title_match_score", "discovery_result_category", "discovery_result_reason",
+                "recommendation_eligible", "qualification_fit_seniority", "qualification_fit_matched_requirements",
+                "qualification_fit_missing_requirements", "qualification_fit_partial_requirements",
+                "qualification_evidence_profile_id", "qualification_evidence_profile_name",
+                "qualification_evidence_source", "posting_availability", "description_source",
+                "description_fetched_at", "last_verified_at", "workplace_address", "workplace_postal_code",
+                "workplace_evidence", "workplace_evidence_source", "workplace_precision", "workplace_confidence",
+                "workplace_alternatives_json", "remote_classification_conflict", "warnings",
+            }
+            updates = {column: job.get(column, "") for column in assessment_columns if column in JOB_COLUMNS}
+            for column, value in updates.items():
+                if isinstance(value, (dict, list, tuple)):
+                    updates[column] = dumps_json(value, sort_keys=True)
+            if updates:
+                assignments = ", ".join(f"{column} = ?" for column in updates)
+                db.execute(f"UPDATE jobs SET {assignments} WHERE id = ?", [*updates.values(), int(match["id"])])
             db.execute(
                 """UPDATE jobs SET discovery_last_seen_at = ?, discovery_seen_count = discovery_seen_count + 1,
                    discovery_last_search_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
@@ -3759,12 +3822,17 @@ def run_discovery_pipeline(
         "review_required_jobs": review_required_jobs,
         "search_progress": {
             "raw_jobs_inspected": len(fetched.get("jobs", [])),
+            "fetched_raw": len(fetched.get("jobs", [])),
             "unique_jobs_found": len(seen_jobs),
             "previously_processed": int(persisted.get("duplicate") or 0),
             "skipped": sum(1 for item in jobs if text(item.get("discovery_state")) == "ignored"),
             "disqualified": len(excluded_jobs),
             "review_required": len(review_required_jobs),
             "new_matching_jobs": len(matching_jobs),
+            "previously_presented": sum(1 for item in ordered if item.get("presented_to_applicant")),
+            "filtered_technical": sum(1 for item in ordered if text(item.get("discovery_result_reason")).lower().find("role family") >= 0),
+            "review_missing_distance": sum(1 for item in ordered if text(item.get("distance_radius_status")).lower() == "unknown"),
+            "confirmed_excluded": len(excluded_jobs),
             "requested_target": requested_target,
             "target_unmet_reason": metadata["target_unmet_reason"],
             "incomplete": bool(fetched.get("errors")),
@@ -3782,6 +3850,7 @@ def run_discovery_pipeline(
         "persisted": persisted,
         "search_key": search_key,
         "search": search,
+        "diagnostics": metadata,
     }
 
 
@@ -8467,6 +8536,17 @@ def geocode_matches_canadian_location(raw_location: str, geocode: dict[str, Any]
     return True
 
 
+def geocode_matches_advertised_city(job: dict[str, Any], geocode: dict[str, Any]) -> bool:
+    """Reject a successful Canadian lookup that belongs to another city."""
+    advertised = " ".join(text(job.get(field)) for field in ("location", "provider_location", "workplace_address", "workplace_postal_code")).lower()
+    display = normalize_space(text(geocode.get("display_name") or geocode.get("normalized_query"))).lower()
+    expected = [city for city in DISCOVERY_CITY_COORDS if city != "remote" and city in advertised]
+    returned = [city for city in DISCOVERY_CITY_COORDS if city != "remote" and city in display]
+    # If the provider does not return a city token, preserve the result for
+    # postal/street evidence; a contradictory city is the unsafe case.
+    return not expected or not returned or any(city in returned for city in expected)
+
+
 def geocoding_result_matches_query(raw_value: str, normalized_query: str, geocode: dict[str, Any]) -> bool:
     if not geocode_matches_canadian_location(raw_value, geocode):
         return False
@@ -8616,14 +8696,21 @@ def geocode_discovery_job(
     for label, lookup in lookup_values or [("posting location", raw_location)]:
         candidate = geocode_location_value(lookup, lookup_type="job", profile=profile, provider=provider, use_cache=use_cache)
         attempts.append(f"{label}: {lookup} -> {text(candidate.get('status')) or ('ok' if candidate.get('ok') else 'failed')}")
-        if candidate.get("ok") and geocode_matches_canadian_location(lookup, candidate):
+        if candidate.get("ok") and geocode_matches_canadian_location(lookup, candidate) and geocode_matches_advertised_city(job, candidate):
             geocode = candidate
             geocode_lookup_value = lookup
             break
         if not geocode:
             geocode = candidate
-    if geocode.get("ok") and geocode_lookup_value and not geocode_matches_canadian_location(geocode_lookup_value, geocode):
-        geocode = {**geocode, "ok": False, "status": "invalid_location", "latitude": "", "longitude": "", "error": "Geocoding result did not match the posting's Canadian province or country."}
+    if geocode.get("ok") and geocode_lookup_value and (
+        not geocode_matches_canadian_location(geocode_lookup_value, geocode)
+        or not geocode_matches_advertised_city(job, geocode)
+    ):
+        geocode = {
+            **geocode, "ok": False, "status": "invalid_location", "latitude": "", "longitude": "",
+            "normalized_query": raw_location,
+            "error": "Geocoding result did not match the posting's advertised city or Canadian location.",
+        }
     job["location_original"] = raw_location
     job["normalized_location"] = text(geocode.get("normalized_query")) or raw_location
     job["location_provider"] = text(geocode.get("provider"))
@@ -10791,11 +10878,14 @@ def job_to_dict(
         "restricted": "confirmed_ineligible",
     }.get(legacy_eligibility, "unknown")
     data["ontario_eligibility"], data["ontario_eligibility_explanation"] = discovery_ontario_eligibility(data)
+    data["qualification_fit_seniority"] = parse_json_object(data.get("qualification_fit_seniority"))
     if text(data.get("discovery_location_scope")) and normalize_space(text(data.get("discovery_remote_preference"))).lower() != "remote":
         data["location_search_eligible"] = not outside_requested_location(data, text(data.get("discovery_location_scope")))
     data["discovery_result_category"], data["discovery_result_reason"] = discovery_result_category(data, text(data.get("discovery_remote_preference")))
     data["recommendation_eligible"] = data["discovery_result_category"] == "actionable"
     data["score_breakdown"] = parse_json_object(data.get("score_breakdown"))
+    for field in ("qualification_fit_matched_requirements", "qualification_fit_missing_requirements", "qualification_fit_partial_requirements", "warnings"):
+        data[field] = parse_json_array(data.get(field))
     data["opportunity_score_reasons"] = parse_json_values(data.get("opportunity_score_reasons"))
     data["data_quality_flags"] = parse_json_values(data.get("data_quality_flags"))
     data["workplace_alternatives"] = parse_json_array(data.get("workplace_alternatives_json"))
