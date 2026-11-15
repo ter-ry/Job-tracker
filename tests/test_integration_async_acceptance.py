@@ -19,11 +19,15 @@ def test_submission_and_status_poll_are_responsive_with_slow_pipeline(monkeypatc
     with tempfile.TemporaryDirectory() as directory:
         entered = threading.Event()
         release = threading.Event()
+        finished = threading.Event()
 
         def slow_pipeline(_payload):
             entered.set()
-            release.wait(1)
-            return {"jobs": [], "matching_jobs": [], "review_required_jobs": [], "errors": {"linkedin": "TimeoutError: timed out"}}
+            try:
+                release.wait(1)
+                return {"jobs": [], "matching_jobs": [], "review_required_jobs": [], "errors": {"linkedin": "TimeoutError: timed out"}}
+            finally:
+                finished.set()
 
         monkeypatch.setattr(app_module, "run_discovery_pipeline", slow_pipeline)
         client = _isolated_client(directory)
@@ -39,15 +43,20 @@ def test_submission_and_status_poll_are_responsive_with_slow_pipeline(monkeypatc
         assert polling.get_json()["status"] == "running"
         assert time.perf_counter() - started < 2
         release.set()
+        assert finished.wait(2)
 
 
 def test_cancel_and_continue_contracts_are_real_routes(monkeypatch):
     with tempfile.TemporaryDirectory() as directory:
         release = threading.Event()
+        finished = threading.Event()
 
         def slow_pipeline(_payload):
-            release.wait(1)
-            return {"jobs": [{"title": "Indeed result"}], "matching_jobs": [], "review_required_jobs": [], "errors": {}}
+            try:
+                release.wait(1)
+                return {"jobs": [{"title": "Indeed result"}], "matching_jobs": [], "review_required_jobs": [], "errors": {}}
+            finally:
+                finished.set()
 
         monkeypatch.setattr(app_module, "run_discovery_pipeline", slow_pipeline)
         client = _isolated_client(directory)
@@ -57,6 +66,7 @@ def test_cancel_and_continue_contracts_are_real_routes(monkeypatch):
         assert cancelled.status_code == 200
         assert cancelled.get_json()["status"] == "cancelled"
         release.set()
+        assert finished.wait(2)
         time.sleep(0.05)
         snapshot = client.get(f"/api/discovery/searches/{search_id}?after=0").get_json()
         assert snapshot["status"] == "cancelled"
