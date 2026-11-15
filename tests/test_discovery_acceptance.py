@@ -4,7 +4,7 @@ These tests use synthetic provider responses only; they do not contain applicant
 records or posting snapshots.
 """
 
-from app import fetch_discovery_jobs_for_search
+from app import discovery_result_category, fetch_discovery_jobs_for_search
 
 
 def _search(**overrides):
@@ -109,3 +109,10 @@ def test_final_eligibility_mode_does_not_stop_at_preliminary_target(monkeypatch)
     assert len(calls) == 4
     assert result["target_reached"] is False
     assert result["planned_queries_completed"] is True
+
+
+def test_internship_preference_is_an_authoritative_backend_gate():
+    job = {"role_type": "intern", "discovery_search_mode": "shortlist", "discovery_include_internships": False}
+    assert discovery_result_category(job)[0] == "excluded"
+    job["discovery_include_internships"] = True
+    assert discovery_result_category(job)[0] != "excluded"

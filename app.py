@@ -68,6 +68,7 @@ from sources.jobspy_source import (
     fetch_jobspy_jobs,
     requirement_phrase_evidence,
 )
+from sources.provider_runtime import ProviderCircuitBreaker
 from tailoring import generate_tailored_resume_draft
 from tailoring_pipeline import (
     build_cover_letter_paragraphs,
@@ -1917,17 +1918,35 @@ def create_app() -> Flask:
             return jsonify({"error": "after must be a non-negative integer"}), 400
         progress = parse_json_object(row.get("progress_json"))
         results = parse_json_array(row.get("results_json"))
-        visible = [item for item in results if int(item.get("result_sequence") or 0) >= after]
+        # Provider-normalized rows are immutable cursor events. A later
+        # qualified event replaces the same vacancy, so clients never render a
+        # duplicate when they first poll after completion or resume polling.
+        latest_by_identity: dict[str, dict[str, Any]] = {}
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            identity = text(item.get("result_identity")) or _async_discovery_result_identity(item)
+            previous = latest_by_identity.get(identity)
+            if previous is None or int(item.get("result_sequence") or 0) >= int(previous.get("result_sequence") or 0):
+                latest_by_identity[identity] = item
+        visible = [item for item in latest_by_identity.values() if int(item.get("result_sequence") or 0) >= after]
+        visible.sort(key=lambda item: int(item.get("result_sequence") or 0))
         return jsonify({
             "search_id": search_id,
             "status": text(row.get("status")) or "queued",
             "progress": progress,
+            # Keep the durable progress payload compact while also exposing
+            # the live provider view at the documented top level.  Polling
+            # clients should never have to infer a provider state from an
+            # absent result list.
+            "provider_states": progress.get("provider_states") if isinstance(progress.get("provider_states"), dict) else {},
             "jobs": visible,
             "next_sequence": int(row.get("next_sequence") or 0),
             "continuation_available": bool(row.get("continuation_available")),
             "termination_reason": text(row.get("termination_reason")),
             "timings": parse_json_object(row.get("timings_json")),
             "error": parse_json_object(row.get("error_json")),
+            "errors": parse_json_object(row.get("error_json")),
         })
 
     @app.post("/api/discovery/searches/<search_id>/cancel")
@@ -3087,6 +3106,40 @@ def _update_async_discovery(search_id: str, **fields: Any) -> None:
 _ASYNC_DISCOVERY_ACTIVE: set[str] = set()
 
 
+def _async_discovery_result_identity(job: dict[str, Any]) -> str:
+    """Stable identity used for cursor updates without duplicating a vacancy."""
+    source = normalize_space(text(job.get("source"))).casefold()
+    source_id = normalize_space(text(job.get("source_job_id"))).casefold()
+    if source_id:
+        return f"id:{source}:{source_id}"
+    url = normalize_space(text(job.get("application_url") or job.get("url"))).casefold().rstrip("/")
+    if url:
+        return f"url:{url}"
+    return "row:" + "|".join(normalize_space(text(job.get(name))).casefold() for name in ("company", "title", "location"))
+
+
+def _append_async_discovery_results(search_id: str, jobs: list[dict[str, Any]]) -> int:
+    """Append immutable cursor events; GET exposes only each identity's latest event."""
+    if not jobs:
+        return 0
+    row = _async_discovery_row(search_id)
+    if not row or int(row.get("cancel_requested") or 0):
+        return 0
+    results = parse_json_array(row.get("results_json"))
+    next_sequence = int(row.get("next_sequence") or 0)
+    appended = 0
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        event = {**job, "result_sequence": next_sequence, "result_identity": _async_discovery_result_identity(job)}
+        results.append(event)
+        next_sequence += 1
+        appended += 1
+    if appended:
+        _update_async_discovery(search_id, results_json=results, next_sequence=next_sequence)
+    return appended
+
+
 def _run_async_discovery_search(search_id: str, payload: dict[str, Any]) -> None:
     """Run the existing durable pipeline off the request thread.
 
@@ -3103,13 +3156,64 @@ def _run_async_discovery_search(search_id: str, payload: dict[str, Any]) -> None
             if not row or int(row.get("cancel_requested") or 0):
                 return
             _update_async_discovery(search_id, status="running", started_at=datetime.now().isoformat(timespec="seconds"), progress_json={"requested_target": int(row.get("requested_target") or 50), "qualifying_matches": 0, "verified_matches": 0, "provisional_matches": 0, "review_required": 0, "raw_inspected": 0, "deduplicated": 0, "skipped": 0, "provider_states": {}})
-            result = run_discovery_pipeline(payload)
+
+            published_provider_jobs: set[str] = set()
+
+            def publish_provider_update(event: dict[str, Any]) -> None:
+                """Persist actual provider state and safely-normalized early rows.
+
+                Early rows are explicitly review-required until the authoritative
+                pipeline has completed geocoding, evidence, and qualification.
+                They can never be mistaken for verified matches.
+                """
+                current = _async_discovery_row(search_id)
+                if not current or int(current.get("cancel_requested") or 0):
+                    return
+                progress = parse_json_object(current.get("progress_json"))
+                states = progress.get("provider_states") if isinstance(progress.get("provider_states"), dict) else {}
+                states.update(event.get("source_diagnostics") if isinstance(event.get("source_diagnostics"), dict) else {})
+                early_rows: list[dict[str, Any]] = []
+                for raw in event.get("jobs") if isinstance(event.get("jobs"), list) else []:
+                    if not isinstance(raw, dict):
+                        continue
+                    early = normalize_job_payload(jobspy_result_to_job_payload(raw))
+                    identity = _async_discovery_result_identity(early)
+                    if identity in published_provider_jobs:
+                        continue
+                    published_provider_jobs.add(identity)
+                    early.update({
+                        "candidate_profile_id": applicant_profile_id(payload),
+                        "discovery_result_category": "review_required",
+                        "discovery_result_reason": "Provider record received; final eligibility verification is still in progress.",
+                        "discovery_match_status": "pending",
+                        "result_stage": "provider_normalized",
+                    })
+                    early_rows.append(early)
+                _append_async_discovery_results(search_id, early_rows)
+                _update_async_discovery(
+                    search_id,
+                    progress_json={**progress, "raw_inspected": int(progress.get("raw_inspected") or 0) + len(early_rows), "review_required": int(progress.get("review_required") or 0) + len(early_rows), "provider_states": states},
+                    error_json=event.get("errors") if isinstance(event.get("errors"), dict) else {},
+                )
+
+            try:
+                result = run_discovery_pipeline(payload, on_provider_update=publish_provider_update)
+            except TypeError as exc:
+                # Existing extensions and the worker's independent tests may
+                # still provide the historical one-argument pipeline hook.
+                if "on_provider_update" not in str(exc):
+                    raise
+                result = run_discovery_pipeline(payload)
             latest = _async_discovery_row(search_id)
             if latest and int(latest.get("cancel_requested") or 0):
                 _update_async_discovery(search_id, status="cancelled", termination_reason="cancelled_by_user")
                 return
             jobs = result.get("jobs") if isinstance(result.get("jobs"), list) else []
-            sequenced = [{**job, "result_sequence": index} for index, job in enumerate(jobs)]
+            # Publish final authoritative classifications as newer cursor
+            # events. The status endpoint returns only the newest event for an
+            # identity, while clients that already saw an early row receive
+            # the replacement after their cursor.
+            _append_async_discovery_results(search_id, [{**job, "result_stage": "qualified"} for job in jobs])
             progress = _async_discovery_progress(result, int(payload.get("new_matching_target") or payload.get("shortlist_size") or 50))
             diagnostics = result.get("diagnostics") if isinstance(result.get("diagnostics"), dict) else {}
             continuation = bool(diagnostics.get("continuation_available") or (result.get("search_progress") or {}).get("continuation_available"))
@@ -3122,7 +3226,7 @@ def _run_async_discovery_search(search_id: str, payload: dict[str, Any]) -> None
                 "postprocessing_seconds": diagnostics.get("postprocessing_seconds", 0),
                 "persistence_seconds": diagnostics.get("persistence_seconds", 0),
             }
-            _update_async_discovery(search_id, status=status, progress_json={**progress, "timings": timings}, results_json=sequenced, next_sequence=len(sequenced), continuation_available=continuation, termination_reason=termination, timings_json=timings, error_json=errors)
+            _update_async_discovery(search_id, status=status, progress_json={**progress, "timings": timings}, continuation_available=continuation, termination_reason=termination, timings_json=timings, error_json=errors)
     except Exception as exc:
         with app.app_context():
             _update_async_discovery(search_id, status="failed", termination_reason="worker_failure", error_json={"worker": str(exc)})
@@ -3439,7 +3543,10 @@ def start_discovery_search_lease_heartbeat(search_id: int, owner: str) -> tuple[
     return stop, thread
 
 
-def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = None, run_id: int | None = None) -> dict[str, Any]:
+def run_discovery_pipeline(
+    payload: dict[str, Any], *, search_id: int | None = None, run_id: int | None = None,
+    on_provider_update: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
     """Run the existing JobSpy, enrichment, scoring and dedupe pipeline.
 
     This is deliberately independent of Flask request handling so the worker can
@@ -3482,7 +3589,7 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         origin_lookup = location_context.get("distance_origin_lookup") or {}
         origin = {"input": search["distance_origin_input"], "normalized": search["distance_origin_input"], "provider": origin_lookup.get("provider", ""), "status": origin_lookup.get("status") or "unresolved", "precision": "unknown", "error": origin_lookup.get("error") or "The requested private distance origin could not be resolved.", "failure_reasons": origin_lookup.get("failure_reasons", [])}
     search["keywords"] = keywords
-    fetched = fetch_discovery_jobs_for_search(search, country_indeed="Canada")
+    fetched = fetch_discovery_jobs_for_search(search, country_indeed="Canada", on_provider_update=on_provider_update)
     seen_jobs: list[dict[str, Any]] = []
     jobs: list[dict[str, Any]] = []
     duplicates_in_search = 0
@@ -3496,6 +3603,7 @@ def run_discovery_pipeline(payload: dict[str, Any], *, search_id: int | None = N
         clean["discovery_profile_independent"] = int(search["profile_independent"])
         clean["discovery_search_mode"] = search["search_mode"]
         clean["title_match_mode"] = search["title_match_mode"]
+        clean["discovery_include_internships"] = bool(search.get("include_internships"))
         if search["search_mode"] == "title":
             clean["occupation_match_type"], clean["title_match_score"] = classify_title_match(
                 text(clean.get("title")), keywords, search["title_match_mode"]
@@ -7655,6 +7763,7 @@ def discovery_search_config(payload: dict[str, Any]) -> dict[str, Any]:
         "seniority": normalize_seniority_levels(payload.get("seniority")),
         "maximum_required_years": clamp_int_default(payload.get("maximum_required_years"), 3, 0, 30),
         "include_provisional_matches": as_bool(payload.get("include_provisional_matches", True)),
+        "include_internships": as_bool(payload.get("include_internships", False)),
         "geographic_match_mode": normalize_choice(payload.get("geographic_match_mode"), {"strict", "provisional"}) or "provisional",
         "occupation": occupation_for_keywords(text(payload.get("keywords"))),
         "applicant_profile_id": clamp_int(payload.get("applicant_profile_id"), 0, 10**9),
@@ -8796,6 +8905,7 @@ def fetch_discovery_jobs_for_search(
     qualifying_predicate: Callable[[dict[str, Any]], bool] | None = None,
     target_matches: int | None = None,
     stop_when_target: bool = True,
+    on_provider_update: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Acquire distinct provider batches without treating a first page as exhaustion.
 
@@ -8846,6 +8956,9 @@ def fetch_discovery_jobs_for_search(
         completed = set(all_planned_batches[:continuation_index])
     planned_batches = [batch for batch in all_planned_batches if batch not in completed]
     completed_this_run: list[dict[str, str]] = []
+    # Scope the breaker to this attempt. A continuation can retry a source,
+    # but a repeatedly failing source cannot consume every remaining batch.
+    circuit_breaker = ProviderCircuitBreaker()
     for batch_index, (location, keyword_query) in enumerate(planned_batches):
         elapsed = time.monotonic() - started
         if elapsed >= DISCOVERY_OVERALL_TIMEOUT_SECONDS:
@@ -8853,12 +8966,26 @@ def fetch_discovery_jobs_for_search(
             break
         remaining_budget = max(1, int(DISCOVERY_OVERALL_TIMEOUT_SECONDS - elapsed))
         attempted.append({"location": location, "keywords": keyword_query})
+        def provider_update(source: str, provider_result: dict[str, Any]) -> None:
+            if on_provider_update is None:
+                return
+            on_provider_update({
+                "location": location,
+                "keywords": keyword_query,
+                "source": source,
+                "jobs": provider_result.get("jobs") if isinstance(provider_result.get("jobs"), list) else [],
+                "errors": provider_result.get("errors") if isinstance(provider_result.get("errors"), dict) else {},
+                "source_diagnostics": provider_result.get("source_diagnostics") if isinstance(provider_result.get("source_diagnostics"), dict) else {},
+            })
+
         result = fetch_jobspy_jobs(
             keywords=keyword_query, location=location, distance=search["distance"],
             remote_preference=search["remote_preference"], job_type=None,
             results_wanted=per_region, hours_old=search["hours_old"],
             enabled_sources=search["enabled_sources"], country_indeed=country_indeed,
             provider_timeout_seconds=min(DISCOVERY_PROVIDER_TIMEOUT_SECONDS, remaining_budget),
+            circuit_breaker=circuit_breaker,
+            on_provider_update=provider_update,
         )
         if result.get("errors"):
             # Do not repeatedly hammer a provider that has already reported a
@@ -9393,6 +9520,8 @@ def apply_discovery_search_constraints(
 def discovery_result_category(job: dict[str, Any], remote_preference: str = "") -> tuple[str, str]:
     target_role_families = ACTIONABLE_DISCOVERY_ROLE_FAMILIES
     search_mode = text(job.get("discovery_search_mode")).lower() or "legacy"
+    if text(job.get("role_type")).lower() == "intern" and not bool(job.get("discovery_include_internships")):
+        return "excluded", "Internships are excluded by the selected search preference."
     if normalize_space(text(remote_preference)).lower() != "remote":
         if text(job.get("posting_availability")).lower() == "confirmed_closed":
             return "excluded", "Posting is confirmed closed."

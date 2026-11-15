@@ -71,6 +71,62 @@ def test_async_cancel_preserves_cancelled_state(monkeypatch):
         assert client.get(f"/api/discovery/searches/{search_id}").get_json()["status"] == "cancelled"
 
 
+def test_async_search_publishes_provider_rows_before_final_qualification(monkeypatch):
+    with tempfile.TemporaryDirectory() as directory:
+        app_module.DATA_DIR = Path(directory)
+        app_module.DB_PATH = app_module.DATA_DIR / "incremental.sqlite"
+        app_module.app.config.update(TESTING=True)
+        published = threading.Event()
+        release = threading.Event()
+
+        def fake_pipeline(payload, *, on_provider_update=None):
+            assert on_provider_update is not None
+            on_provider_update({
+                "source": "indeed",
+                "jobs": [{
+                    "source": "indeed", "source_job_id": "incremental-1",
+                    "title": "Junior Software Developer", "company": "Example",
+                    "location": "Toronto, ON", "job_url": "https://example.test/incremental-1",
+                }],
+                "errors": {},
+                "source_diagnostics": {"indeed": {"source": "indeed", "state": "working"}},
+            })
+            published.set()
+            release.wait(2)
+            return {
+                "jobs": [{
+                    "source": "Indeed", "source_job_id": "incremental-1",
+                    "title": "Junior Software Developer", "company": "Example",
+                    "location": "Toronto, ON", "url": "https://example.test/incremental-1",
+                    "discovery_result_category": "actionable", "discovery_match_status": "verified",
+                }],
+                "matching_jobs": [{"title": "Junior Software Developer"}],
+                "review_required_jobs": [], "total": 1, "errors": {},
+                "search_progress": {"requested_target": 10, "new_matching_jobs": 1, "raw_jobs_inspected": 1},
+                "source_diagnostics": {"indeed": {"source": "indeed", "state": "working"}},
+            }
+
+        monkeypatch.setattr(app_module, "run_discovery_pipeline", fake_pipeline)
+        client = app_module.app.test_client()
+        search_id = client.post("/api/discovery/searches", json={"keywords": "software developer", "new_matching_target": 10}).get_json()["search_id"]
+        assert published.wait(2)
+        early = client.get(f"/api/discovery/searches/{search_id}?after=0").get_json()
+        assert early["status"] == "running"
+        assert early["provider_states"]["indeed"]["state"] == "working"
+        assert early["jobs"][0]["result_stage"] == "provider_normalized"
+        assert early["jobs"][0]["discovery_match_status"] == "pending"
+        release.set()
+        for _ in range(80):
+            final = client.get(f"/api/discovery/searches/{search_id}?after={early['next_sequence']}").get_json()
+            if final["status"] == "completed":
+                break
+            time.sleep(0.01)
+        assert final["status"] == "completed"
+        assert len(final["jobs"]) == 1
+        assert final["jobs"][0]["result_stage"] == "qualified"
+        assert final["jobs"][0]["discovery_match_status"] == "verified"
+
+
 def test_named_search_keeps_legacy_saved_search_contract():
     with tempfile.TemporaryDirectory() as directory:
         app_module.DATA_DIR = Path(directory)

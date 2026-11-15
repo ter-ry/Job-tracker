@@ -47,10 +47,27 @@ queues a search and returns HTTP 202 with `{ "search_id": "...", "status":
 "queued" }`. Named payloads retain the saved-search CRUD behavior.
 
 `GET /api/discovery/searches/{search_id}?after=0` returns the durable status,
-progress, result jobs, `next_sequence`, `continuation_available`,
-`termination_reason`, timings, and provider errors. Result records include a
-monotonic `result_sequence`; clients pass the last sequence they have received
-as `after` on the next poll. Status requests do not run providers.
+progress, top-level `provider_states`, result jobs, `next_sequence`,
+`continuation_available`, `termination_reason`, timings, and provider errors.
+Result records include a monotonic `result_sequence`; clients pass the last
+sequence they have received as `after` on the next poll. Status requests do
+not run providers or rewrite stored results.
+
+Provider state is published when a bounded provider starts and when it returns
+or times out. A returned provider row is first emitted as
+`result_stage: "provider_normalized"` and `review_required`/`pending`: that is
+an honest normalized record, never a claim of final eligibility. After the
+authoritative enrichment and qualification stage, the same stable vacancy gets
+a newer `result_stage: "qualified"` cursor event. The status endpoint exposes
+only the newest event per stable identity, so fresh and resumed clients do not
+receive duplicate vacancies. Clients retaining an earlier normalized row must
+replace it when the later cursor event arrives.
+
+Terminal statuses are `paused`, `completed`, `completed_with_errors`,
+`cancelled`, and `failed`; all stop polling. `paused` means a durable
+continuation is available. `POST .../continue` returns HTTP 202 with queued
+status: clients retain existing results and resume polling rather than
+announcing completion.
 
 `POST /api/discovery/searches/{search_id}/cancel` records cancellation and
 preserves completed results. It does not claim to forcibly terminate an

@@ -98,6 +98,11 @@ jobs:
       - name: Run JobSpy-only frozen probe
         shell: pwsh
         run: build\jobspy-probe-dist\JobSpyProbe\JobSpyProbe.exe
+      - name: Probe frozen provider child-process runtime
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --distpath build\provider-runtime-probe-dist --workpath build\provider-runtime-probe-work release_packaging/windows/provider_runtime_probe.spec
+          build\provider-runtime-probe-dist\ProviderRuntimeProbe\ProviderRuntimeProbe.exe
       - name: Build PyInstaller application
         shell: pwsh
         env:

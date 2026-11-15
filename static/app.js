@@ -2801,7 +2801,11 @@ function setDiscoveryView(view) {
 
 function mergeProgressiveDiscoveryJobs(jobs = []) {
   const incoming = Array.isArray(jobs) ? jobs : [];
-  const merged = [...(state.discoveryResults || []), ...incoming].filter((job, index, all) => all.findIndex((candidate) => discoveryJobKey(candidate) === discoveryJobKey(job)) === index);
+  // A provider-normalized event is deliberately replaced by the later,
+  // authoritative qualification event for the same vacancy.
+  const byIdentity = new Map();
+  [...(state.discoveryResults || []), ...incoming].forEach((job) => byIdentity.set(discoveryJobKey(job), job));
+  const merged = [...byIdentity.values()];
   state.discoveryExcludedResults = merged.filter((job) => job.discovery_result_category === "excluded");
   state.discoveryResults = merged.filter((job) => job.discovery_result_category !== "excluded");
   state.discoveryAllResults = state.discoveryResults.slice();
@@ -2823,7 +2827,7 @@ function renderProgressiveSearchProgress(payload = {}) {
 function progressiveSearchTerminal(payload = {}) {
   const status = String(payload.status || "").toLowerCase();
   const reason = String(payload.termination_reason || payload.progress?.termination_reason || "").toLowerCase();
-  return Boolean(payload.terminated || ["completed", "complete", "cancelled", "canceled", "failed", "error"].includes(status) || ["target_reached", "planned_queries_completed", "cancelled", "canceled", "failed", "error"].includes(reason));
+  return Boolean(payload.terminated || ["paused", "completed", "completed_with_errors", "complete", "cancelled", "canceled", "failed", "error"].includes(status) || ["target_reached", "planned_queries_completed", "cancelled", "canceled", "failed", "error"].includes(reason));
 }
 
 async function pollProgressiveDiscoverySearch(searchId, after = 0) {
@@ -2999,13 +3003,32 @@ async function continueDiscoverySearch() {
   if (button) button.disabled = true;
   if (status) status.textContent = "Continuing with the provider cursor; this will not repeat the same query.";
   try {
-    const result = await api.send(contract.url || contract.endpoint, contract.method || "POST", contract.body || {
+    const outcome = await api.sendOutcome(contract.url || contract.endpoint, contract.method || "POST", contract.body || {
       search_key: state.discoverySearchKey,
       search_id: state.discoveryLastSearchId,
       after: state.discoveryContinuationIndex || 0,
       continuation_token: contract.token || contract.continuation_token,
       candidate_profile_id: value("discovery-profile") || state.selectedCandidateProfileId || "",
     });
+    if (!outcome.ok) throw new Error(outcome.data?.error || `Continue Search failed (${outcome.status})`);
+    const result = outcome.data || {};
+    // The durable async endpoint acknowledges a continuation with 202 and a
+    // queued status.  It deliberately has no completed job list yet.
+    if (outcome.status === 202 && result.search_id) {
+      const searchId = String(result.search_id);
+      state.discoveryActiveSearchId = searchId;
+      state.discoveryLastSearchId = searchId;
+      const stop = document.getElementById("discovery-stop");
+      if (stop) stop.hidden = false;
+      if (status) status.textContent = "Continue Search queued; retaining earlier results while new provider batches arrive…";
+      void pollProgressiveDiscoverySearch(searchId, state.discoveryContinuationIndex || 0).catch((error) => {
+        if (state.discoveryActiveSearchId === searchId) {
+          state.discoveryActiveSearchId = "";
+          if (status) status.textContent = `Continue Search polling failed: ${error.message}`;
+        }
+      });
+      return;
+    }
     const jobs = result.jobs || [];
     const merged = [...state.discoveryResults, ...jobs].filter((job, index, all) => all.findIndex((candidate) => discoveryJobKey(candidate) === discoveryJobKey(job)) === index);
     state.discoveryResults = merged.filter((job) => job.discovery_result_category !== "excluded");

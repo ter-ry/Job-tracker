@@ -97,6 +97,7 @@ def fetch_jobspy_jobs(
     scrape_jobs_func: Any | None = None, provider_timeout_seconds: int | None = 45,
     execution_mode: str = "process",
     circuit_breaker: ProviderCircuitBreaker | None = None,
+    on_provider_update: Any | None = None,
 ) -> dict[str, Any]:
     """Run a small, bounded set of independent provider requests concurrently.
 
@@ -113,9 +114,13 @@ def fetch_jobspy_jobs(
             scrape_jobs_func=scrape_jobs_func, provider_timeout_seconds=provider_timeout_seconds,
             execution_mode=execution_mode,
             circuit_breaker=circuit_breaker,
+            on_provider_update=on_provider_update,
         )
     combined: dict[str, Any] = {"jobs": [], "errors": {}, "source_counts": {}, "source_snapshots": {}, "source_diagnostics": {}}
     with ThreadPoolExecutor(max_workers=min(2, len(sources)), thread_name_prefix="jobspy-provider") as executor:
+        if on_provider_update is not None:
+            for source in sources:
+                on_provider_update(source, {"jobs": [], "errors": {}, "source_diagnostics": {source: {"source": source, "state": "running", "provider_status": "running"}}})
         futures = {
             executor.submit(
                 _fetch_jobspy_jobs_serial, keywords=keywords, location=location, distance=distance,
@@ -135,6 +140,8 @@ def fetch_jobspy_jobs(
                 result = future.result()
             except Exception as exc:  # defensive: worker normally diagnoses itself
                 combined["errors"][source] = f"{type(exc).__name__}: {exc}"
+                if on_provider_update is not None:
+                    on_provider_update(source, {"jobs": [], "errors": {source: combined["errors"][source]}, "source_diagnostics": {source: {"source": source, "state": "failed", "provider_status": "failed", "error": combined["errors"][source]}}})
                 continue
             combined["jobs"].extend(result.get("jobs", []))
             combined["errors"].update(result.get("errors", {}))
@@ -143,6 +150,8 @@ def fetch_jobspy_jobs(
             diagnostic = result.get("source_diagnostics", {}).get(source)
             if diagnostic:
                 combined["source_diagnostics"][source] = diagnostic
+            if on_provider_update is not None:
+                on_provider_update(source, result)
     return combined
 
 
@@ -161,6 +170,7 @@ def _fetch_jobspy_jobs_serial(
     provider_timeout_seconds: int | None = 45,
     execution_mode: str = "process",
     circuit_breaker: ProviderCircuitBreaker | None = None,
+    on_provider_update: Any | None = None,
 ) -> dict[str, Any]:
     """Fetch independently diagnosed JobSpy providers.
 
@@ -226,6 +236,8 @@ def _fetch_jobspy_jobs_serial(
 
     for source in sources:
         started = time.perf_counter()
+        if on_provider_update is not None:
+            on_provider_update(source, {"jobs": [], "errors": {}, "source_diagnostics": {source: {"source": source, "state": "running", "provider_status": "running"}}})
         started_at = datetime.now(timezone.utc).isoformat()
         source_diagnostics[source] = {
             "source": source,
@@ -459,8 +471,15 @@ def _fetch_jobspy_jobs_serial(
                     "duration_ms": int(round((time.perf_counter() - started) * 1000)),
                 }
             )
-            if circuit_breaker is not None:
-                circuit_breaker.record(source, source_diagnostics[source]["state"])
+        if on_provider_update is not None:
+            on_provider_update(source, {
+                "jobs": [job for job in results if clean(job.get("source")).lower() == source],
+                "errors": {source: errors[source]} if source in errors else {},
+                "source_counts": {source: source_counts.get(source, 0)},
+                "source_diagnostics": {source: source_diagnostics[source]},
+            })
+        if circuit_breaker is not None:
+            circuit_breaker.record(source, source_diagnostics[source]["state"])
 
     return {
         "jobs": results,
