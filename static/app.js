@@ -3152,6 +3152,7 @@ function renderDiscoveryResults(result) {
   const errors = result.errors || state.discoveryMeta.errors || {};
   const diagnostics = result.diagnostics || state.discoveryMeta.diagnostics || {};
   const sourceDiagnostics = diagnostics.source_diagnostics || {};
+  const progress = result.search_progress || state.discoveryMeta.search_progress || {};
   const countText = Object.keys(counts).map((source) => `${sourceLabel(source)}: ${counts[source]}`).join(" | ");
   const errorText = Object.keys(errors).length
     ? `<div class="discovery-errors">${Object.entries(errors).map(([source, message]) => `<p><strong>${escapeHtml(sourceLabel(source))}:</strong> ${escapeHtml(message)}</p>`).join("")}</div>`
@@ -3189,7 +3190,6 @@ function renderDiscoveryResults(result) {
       || value("discovery-new-matching-target")
       || 50
   );
-  const progress = result.search_progress || state.discoveryMeta.search_progress || {};
   const sourceFailureCount = Object.keys(errors).length || Object.values(sourceDiagnostics).filter((info) => info?.attempted && info.success === false).length;
   const continuation = continuationContract();
   const unsupportedCriteria = state.discoveryMeta?.unsupportedCriteria || [];
@@ -3210,16 +3210,15 @@ function renderDiscoveryResults(result) {
         <div><strong>${Number(progress.previously_processed ?? diagnostics.processed_count ?? 0)}</strong><span>Previously processed</span></div>
         <div><strong>${Number(progress.skipped ?? diagnostics.skipped_count ?? 0)}</strong><span>Previously skipped</span></div>
         <div><strong>${Number(progress.disqualified ?? diagnostics.excluded_count ?? 0)}</strong><span>Disqualified</span></div>
-        <div><strong>${verifiedMatches.length}</strong><span>Verified new matches</span></div>
-        <div><strong>${provisionalMatches.length}</strong><span>Provisional new matches</span></div>
-        <div><strong>${Number(progress.review_required ?? diagnostics.review_required_count ?? reviewRequired.length)}</strong><span>Review required</span></div>
-        <div><strong>${Number(progress.new_matching_jobs ?? diagnostics.new_matching_count ?? newMatches.length)}</strong><span>Total new matches</span></div>
+        <div><strong>${Number(progress.verified_matches ?? diagnostics.verified_matches ?? jobs.filter((job) => job.discovery_match_status === "verified").length)}</strong><span>Verified new matches</span></div>
+        <div><strong>${Number(progress.provisional_matches ?? diagnostics.provisional_matches ?? jobs.filter((job) => job.discovery_match_status === "provisional").length)}</strong><span>Provisional new matches</span></div>
+        <div><strong>${Number(progress.review_required ?? diagnostics.review_required_count ?? 0)}</strong><span>Review required</span></div>
+        <div><strong>${Number(progress.qualifying_matches ?? progress.new_matching_jobs ?? diagnostics.new_matching_count ?? jobs.length)}</strong><span>Total new matches</span></div>
         <div><strong>${sourceFailureCount}</strong><span>Source failures</span></div>
         <div><strong>${requestedTarget}</strong><span>Requested target</span></div>
       </div>
       <p class="muted">${escapeHtml(countText || "No source counts returned")}</p>
       <p class="muted">${profileFreeResults ? "Score basis: posting evidence only; no résumé used." : `Qualification evidence: ${escapeHtml(evidenceProfileName)}`}</p>
-      <p class="muted">Remote result groups: actionable ${Number(categoryCounts.actionable || 0)} · review required ${Number(categoryCounts.review_required || 0)} · excluded ${Number(categoryCounts.excluded || 0)}</p>
       ${unsupportedCriteria.length ? `<p class="warning-text">${escapeHtml(unsupportedCriteria.join(" and "))} was requested, but this backend response did not confirm that control. Results were not locally relabeled as filtered.</p>` : ""}
       ${errorText}
       ${diagnostics.target_unmet_reason ? `<p class="warning-text">${escapeHtml(diagnostics.target_unmet_reason)}</p>` : ""}
