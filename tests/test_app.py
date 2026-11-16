@@ -246,7 +246,7 @@ class JobAssistantTest(unittest.TestCase):
             {"title": "Software Engineer", "job_description": "Required: 3+ years of professional software development experience."},
             evidence_profile={"target_seniority_levels": "junior, intermediate", "resume_text": "Built Python projects."},
         )
-        self.assertEqual(unverified["experience_requirements"]["candidate_years_status"], "unverified from selected résumé")
+        self.assertEqual(unverified["experience_requirements"]["candidate_years_status"], "résumé loaded; professional years are not explicitly quantified")
         self.assertEqual(unverified["experience_requirements"]["fit_status"], "unverified")
 
     def test_cached_home_coordinates_are_rejected_by_canadian_region(self):

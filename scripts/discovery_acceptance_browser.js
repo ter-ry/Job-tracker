@@ -26,11 +26,15 @@ async function main() {
     headers: { "content-type": "application/json" },
     data: { name: "SWE résumé", description: "Python, Flask, SQL, REST APIs, JavaScript and cloud fundamentals." },
   });
-  await jsonRequest(page.request, `/api/candidate-profiles/${profile.id}/resumes`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    data: { name: "SWE base résumé", content: "Built Python and Flask REST APIs with SQL. Automated testing and cloud fundamentals.", docx_path: process.env.ACCEPTANCE_RESUME_DOCX_PATH || "", is_default: true },
-  });
+  if (process.env.ACCEPTANCE_RESUME_DOCX_PATH) {
+    const upload = await page.request.post(`${baseUrl}/api/candidate-profiles/${profile.id}/resumes/upload`, { multipart: { file: { name: "synthetic-resume.docx", mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", buffer: fs.readFileSync(process.env.ACCEPTANCE_RESUME_DOCX_PATH) }, name: "SWE base résumé", is_default: "true" } });
+    if (!upload.ok()) throw new Error(`POST resume upload: HTTP ${upload.status()} ${await upload.text()}`);
+  } else {
+    await jsonRequest(page.request, `/api/candidate-profiles/${profile.id}/resumes`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      data: { name: "SWE base résumé", content: "Built Python and Flask REST APIs with SQL. Automated testing and cloud fundamentals.", is_default: true },
+    });
+  }
   const seeded = [];
   for (const item of fixture.jobs) {
     seeded.push(await jsonRequest(page.request, "/api/jobs", {
@@ -117,7 +121,12 @@ async function main() {
 
   await page.reload({ waitUntil: "networkidle" });
   await page.getByRole("button", { name: "Find Jobs" }).click();
+  // Candidate selection is intentionally not persisted in browser state.
+  // Re-select the owner before replaying applicant-scoped Inbox history.
+  await page.locator("#discovery-profile").selectOption(String(profile.id));
   await page.evaluate(async () => { setDiscoverySection("saved"); await loadDiscoveryInbox(true); });
+  console.log(`inbox filters after restart: ${await page.locator("#discovery-inbox-filters").innerText()}`);
+  console.log(`inbox body after restart: ${(await page.locator("#discovery-inbox").innerText()).slice(0, 500)}`);
   const appliedCount = await page.locator('[data-inbox-category="applied"]').innerText();
   const skippedCount = await page.locator('[data-inbox-category="skipped"]').innerText();
   const savedCount = await page.locator('[data-inbox-category="saved"]').innerText();
@@ -136,10 +145,12 @@ async function main() {
     method: "POST", headers: { "content-type": "application/json" },
     data: { name: "Other applicant", identity_mode: "distinct", applicant_name: "Other Candidate" },
   });
-  await jsonRequest(page.request, `/api/candidate-profiles/${otherProfile.id}/resumes`, {
-    method: "POST", headers: { "content-type": "application/json" },
-    data: { name: "Other synthetic résumé", content: "Python and SQL", docx_path: process.env.ACCEPTANCE_RESUME_DOCX_PATH || "", is_default: true },
-  });
+  if (process.env.ACCEPTANCE_RESUME_DOCX_PATH) {
+    const upload = await page.request.post(`${baseUrl}/api/candidate-profiles/${otherProfile.id}/resumes/upload`, { multipart: { file: { name: "other-resume.docx", mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", buffer: fs.readFileSync(process.env.ACCEPTANCE_RESUME_DOCX_PATH) }, name: "Other synthetic résumé", is_default: "true" } });
+    if (!upload.ok()) throw new Error(`POST other resume upload: HTTP ${upload.status()} ${await upload.text()}`);
+  } else {
+    await jsonRequest(page.request, `/api/candidate-profiles/${otherProfile.id}/resumes`, { method: "POST", headers: { "content-type": "application/json" }, data: { name: "Other synthetic résumé", content: "Python and SQL", is_default: true } });
+  }
   const otherHistory = await jsonRequest(page.request, `/api/discovery/inbox?candidate_profile_id=${otherProfile.id}&include_history=1`);
   const leakedState = otherHistory.filter((item) => ["saved", "applied", "skipped"].includes(item.discovery_inbox_category));
   if (leakedState.length) throw new Error(`Applicant state leaked to another profile: ${JSON.stringify(leakedState.map((item) => item.title))}`);

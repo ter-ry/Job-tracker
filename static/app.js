@@ -3233,7 +3233,9 @@ function renderDiscoveryResults(result) {
   const diagnostics = result.diagnostics || state.discoveryMeta.diagnostics || {};
   const sourceDiagnostics = diagnostics.source_diagnostics || {};
   const progress = result.search_progress || state.discoveryMeta.search_progress || {};
-  const countText = Object.keys(counts).map((source) => `${sourceLabel(source)}: ${counts[source]}`).join(" | ");
+  const diagnosticCounts = Object.fromEntries(Object.entries(sourceDiagnostics).map(([source, info]) => [source, Number(info?.raw_records_row_count || info?.result_count || 0)]));
+  const displayedCounts = Object.keys(counts).length ? counts : diagnosticCounts;
+  const countText = Object.keys(displayedCounts).map((source) => `${sourceLabel(source)}: ${displayedCounts[source]}`).join(" | ");
   const errorText = Object.keys(errors).length
     ? `<div class="discovery-errors">${Object.entries(errors).map(([source, message]) => `<p><strong>${escapeHtml(sourceLabel(source))}:</strong> ${escapeHtml(message)}</p>`).join("")}</div>`
     : "";
@@ -3349,7 +3351,7 @@ function renderDiscoveryOriginSummary() {
   const element = document.getElementById("discovery-distance-origin-summary");
   if (!element) return;
   const diagnostics = state.discoveryMeta?.diagnostics || {};
-  const origin = diagnostics.saved_origin || diagnostics.distance_origin || state.discoverySearchCriteria?.distance_origin || "";
+  const origin = diagnostics.saved_origin || diagnostics.distance_origin || diagnostics.distance_origin_input || diagnostics.origin_input_redacted || state.discoverySearchCriteria?.distance_origin || state.discoverySearchCriteria?.distance_origin_input || "";
   if (origin) {
     const label = typeof origin === "object" ? (origin.normalized || origin.input || "configured origin") : origin;
     const precision = diagnostics.origin_precision || origin.precision || "approximate";
@@ -3693,7 +3695,8 @@ function renderExperienceSummary(job) {
   const candidate = experience.candidate_professional_years;
   const independent = Boolean(Number(job.discovery_profile_independent || 0));
   const evidenceSource = job.qualification_evidence_source || job.qualification_evidence_profile_name || "selected résumé evidence was not returned by the matcher";
-  const candidateText = independent ? "Not assessed — ECE matching is résumé-independent" : candidate === undefined || candidate === null ? `Résumé evidence unavailable — ${evidenceSource}` : `${Number(candidate)} years verified`;
+  const resumeStatus = String(job.resume_evidence_status || "").toLowerCase();
+  const candidateText = independent ? "Not assessed — ECE matching is résumé-independent" : resumeStatus === "resume_unavailable" ? `Résumé unavailable — ${evidenceSource}` : resumeStatus === "resume_loaded_years_unquantified" || candidate === undefined || candidate === null ? "Résumé loaded; professional years not explicitly quantified" : `${Number(candidate)} years verified`;
   const fit = experience.fit_status || "Unverified";
   const level = job.qualification_fit_seniority?.detected_level || job.seniority_level || "Unverified";
   const ambiguous = experience.ambiguous || [];

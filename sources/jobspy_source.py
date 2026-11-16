@@ -96,6 +96,7 @@ def fetch_jobspy_jobs(
     enabled_sources: list[str] | None = None, country_indeed: str = "Canada",
     scrape_jobs_func: Any | None = None, provider_timeout_seconds: int | None = 45,
     execution_mode: str = "process",
+    fetch_linkedin_description: bool = True,
     circuit_breaker: ProviderCircuitBreaker | None = None,
     on_provider_update: Any | None = None,
 ) -> dict[str, Any]:
@@ -113,6 +114,7 @@ def fetch_jobspy_jobs(
             hours_old=hours_old, enabled_sources=sources, country_indeed=country_indeed,
             scrape_jobs_func=scrape_jobs_func, provider_timeout_seconds=provider_timeout_seconds,
             execution_mode=execution_mode,
+            fetch_linkedin_description=fetch_linkedin_description,
             circuit_breaker=circuit_breaker,
             on_provider_update=on_provider_update,
         )
@@ -128,6 +130,7 @@ def fetch_jobspy_jobs(
                 hours_old=hours_old, enabled_sources=[source], country_indeed=country_indeed,
                 scrape_jobs_func=scrape_jobs_func, provider_timeout_seconds=provider_timeout_seconds,
                 execution_mode=execution_mode,
+                fetch_linkedin_description=fetch_linkedin_description,
                 circuit_breaker=circuit_breaker,
             ): source for source in sources
         }
@@ -169,6 +172,7 @@ def _fetch_jobspy_jobs_serial(
     scrape_jobs_func: Any | None = None,
     provider_timeout_seconds: int | None = 45,
     execution_mode: str = "process",
+    fetch_linkedin_description: bool = True,
     circuit_breaker: ProviderCircuitBreaker | None = None,
     on_provider_update: Any | None = None,
 ) -> dict[str, Any]:
@@ -323,7 +327,7 @@ def _fetch_jobspy_jobs_serial(
                     # Request the provider description when JobSpy supports it.
                     # Without this, LinkedIn rows often arrive as title/URL-only
                     # records and cannot be qualified transparently.
-                    "linkedin_fetch_description": True,
+                    "linkedin_fetch_description": bool(fetch_linkedin_description),
                     "verbose": 0,
                 }
                 # JobSpy has no portable provider timeout parameter.  Run each

@@ -2513,6 +2513,8 @@ def create_app() -> Flask:
             clean["discovery_profile_independent"] = int(search["profile_independent"])
             clean["discovery_search_mode"] = search["search_mode"]
             clean["discovery_match_policy"] = search["match_policy"]
+            clean["discovery_maximum_required_years"] = search.get("maximum_required_years")
+            clean["discovery_seniority"] = search.get("seniority")
             clean["title_match_mode"] = search["title_match_mode"]
             if search["search_mode"] == "title":
                 clean["occupation_match_type"], clean["title_match_score"] = classify_title_match(
@@ -2788,6 +2790,7 @@ def create_app() -> Flask:
             hours_old=168,
             enabled_sources=enabled_sources,
             country_indeed="Canada",
+            fetch_linkedin_description=False,
         )
         return jsonify(
             {
@@ -3711,6 +3714,8 @@ def run_discovery_pipeline(
         clean["discovery_profile_independent"] = int(search["profile_independent"])
         clean["discovery_search_mode"] = search["search_mode"]
         clean["discovery_match_policy"] = search["match_policy"]
+        clean["discovery_maximum_required_years"] = search.get("maximum_required_years")
+        clean["discovery_seniority"] = search.get("seniority")
         clean["title_match_mode"] = search["title_match_mode"]
         clean["discovery_include_internships"] = bool(search.get("include_internships"))
         if search["search_mode"] == "title":
@@ -9209,6 +9214,7 @@ def fetch_discovery_jobs_for_search(
             enabled_sources=batch_sources, country_indeed=country_indeed,
             provider_timeout_seconds=min(DISCOVERY_PROVIDER_TIMEOUT_SECONDS, remaining_budget),
             circuit_breaker=circuit_breaker,
+            fetch_linkedin_description=False,
             on_provider_update=provider_update,
         )
         attempted_work_items.update((normalize_space(source).lower(), location, keyword_query) for source in batch_sources)
@@ -9774,6 +9780,9 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
             return "review_required", "Exact workplace distance could not be verified under strict-radius matching."
         if job.get("location_search_eligible") is False or text(job.get("location_search_eligible")).lower() == "false":
             return "excluded", "Confirmed job location is outside the requested search area."
+        hard_reason = discovery_hard_exclusion_reason(job)
+        if hard_reason:
+            return "excluded", hard_reason
         if search_mode == "title":
             return title_search_result_category(job)
         role_type = text(job.get("role_type")).lower()
@@ -9794,6 +9803,9 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
     if text(job.get("remote_search_eligible")).lower() == "true" and text(job.get("remote_eligibility")).lower() == "canadian_eligible" and "remote" in text(job.get("remote_type")).lower():
         if search_mode == "title":
             return title_search_result_category(job)
+        hard_reason = discovery_hard_exclusion_reason(job)
+        if hard_reason:
+            return "excluded", hard_reason
         role_type = text(job.get("role_type")).lower()
         if broad and search_mode == "shortlist":
             if not plausible_software_role(job):
@@ -9820,6 +9832,10 @@ def plausible_software_role(job: dict[str, Any]) -> bool:
 
 
 def apply_broadly_reason(job: dict[str, Any]) -> str:
+    hard_reason = discovery_hard_exclusion_reason(job)
+    if hard_reason:
+        job["discovery_fit_label"] = "Not eligible"
+        return hard_reason
     analysis = job.get("qualification_fit_seniority") or {}
     required = analysis.get("required_experience") or {}
     years = required.get("minimum") if isinstance(required, dict) else None
@@ -9833,6 +9849,41 @@ def apply_broadly_reason(job: dict[str, Any]) -> str:
         return "Relevant technical role; match is not fully assessed from the selected résumé evidence."
     job["discovery_fit_label"] = "Strong fit"
     return "Relevant technical role ranked by likely fit."
+
+
+def discovery_hard_exclusion_reason(job: dict[str, Any], search: dict[str, Any] | None = None) -> str:
+    """Apply the same non-negotiable SWE gates to sync and async discovery.
+
+    Missing or ambiguous evidence remains reviewable.  Only explicit required
+    experience and title/seniority evidence can make this a hard exclusion.
+    """
+    search = search or {}
+    analysis = job.get("qualification_fit_seniority") or {}
+    required = analysis.get("required_experience") or {}
+    try:
+        minimum = float(required.get("minimum")) if isinstance(required, dict) and required.get("minimum") is not None else None
+    except (TypeError, ValueError):
+        minimum = None
+    configured_max = search.get("maximum_required_years")
+    if configured_max in (None, ""):
+        configured_max = job.get("discovery_maximum_required_years")
+    try:
+        maximum = float(configured_max) if configured_max not in (None, "") else None
+    except (TypeError, ValueError):
+        maximum = None
+    if minimum is not None and maximum is not None and minimum > maximum:
+        return f"Confirmed required experience starts at {minimum:g} years, above the selected maximum of {maximum:g}."
+
+    selected = normalize_space(text(search.get("seniority") or job.get("discovery_seniority"))).lower().replace("-", "_")
+    junior_target = not selected or any(token in selected.split(",") for token in ("junior", "entry_level", "entry"))
+    if junior_target and not any(token in selected.split(",") for token in ("intermediate", "senior", "lead", "manager", "director", "any")):
+        level = text(analysis.get("detected_level") or job.get("seniority_level")).lower().replace("-", "_")
+        title = normalize_space(text(job.get("title"))).lower()
+        if level in {"senior", "lead", "manager", "director"} or re.search(r"\b(?:senior|sr\.?|staff|principal|lead|manager|director|head of)\b", title):
+            return "Confirmed seniority is outside the selected junior/entry-level target."
+        if bool(analysis.get("management_role")):
+            return "Confirmed management responsibility is outside the selected junior/entry-level target."
+    return ""
 
 
 def discovery_reason_bucket(job: dict[str, Any]) -> str:
@@ -9947,13 +9998,16 @@ def discovery_is_clear_senior_role(job: dict[str, Any], search: dict[str, Any]) 
 
 def discovery_target_assessment(job: dict[str, Any], search: dict[str, Any]) -> tuple[str, str]:
     """Return verified, provisional, or ineligible without treating absence as proof."""
+    hard_reason = discovery_hard_exclusion_reason(job, search)
+    if hard_reason:
+        return "ineligible", hard_reason
     if search.get("match_policy") == "apply_broadly" and search.get("search_mode") == "shortlist":
         if not plausible_software_role(job):
             return "ineligible", "Confirmed unrelated or management-only occupation is outside the Apply Broadly scope."
         return "provisional", "Apply Broadly retains this plausible technical role; verify requirements before applying."
     if discovery_is_clear_senior_role(job, search):
         return "ineligible", "Confirmed seniority or required experience is outside the selected early-career target."
-    selected_levels = set(text(search.get("seniority")).split(","))
+    selected_levels = {item.strip().replace("-", "_") for item in text(search.get("seniority")).lower().split(",") if item.strip()}
     analysis = job.get("qualification_fit_seniority") or {}
     level = text(analysis.get("detected_level") or job.get("seniority_level")).lower().replace("-", "_")
     required = analysis.get("required_experience") or {}
@@ -10029,7 +10083,9 @@ def discovery_sort_value(job: dict[str, Any], field: str, direction: str = "desc
         return (normalize_space(text(job.get("seniority_level"))).lower(), normalize_space(text(job.get("company"))).lower())
     if field in {"match_score", "overall_score", "application_priority_score", "score"}:
         score_value = clamp_int(job.get("match_score") if field == "match_score" else job.get("application_priority_score") if field == "application_priority_score" else job.get("overall_score"), 0, 100)
-        return ((-score_value if direction == "desc" else score_value), normalize_space(text(job.get("company"))).lower(), normalize_space(text(job.get("title"))).lower())
+        level = text((job.get("qualification_fit_seniority") or {}).get("detected_level") or job.get("seniority_level")).lower().replace("-", "_")
+        tier = 0 if level in {"entry_level", "junior", "internship"} else 1 if level == "intermediate" else 2
+        return (tier, (-score_value if direction == "desc" else score_value), normalize_space(text(job.get("company"))).lower(), normalize_space(text(job.get("title"))).lower())
     if field == "deadline":
         deadline = text(job.get("deadline")) or "9999-12-31"
         return (deadline if direction == "asc" else "".join(chr(255 - ord(ch)) for ch in deadline), normalize_space(text(job.get("company"))).lower())
@@ -11533,6 +11589,13 @@ def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any
             "Confirmed missing core technology: " + ", ".join(technical_compatibility["required_no_experience"][:5]) + "."
         )
     label = "Review required — non-target role family" if non_target_role else "Insufficient requirement evidence" if insufficient_mandatory_evidence else "Stretch opportunity" if stretch or score < 60 else "Strong qualification match" if score >= 75 else "Review qualification fit"
+    resume_text_available = bool(profile.get("_resume_text") or profile.get("resume_text") or profile.get("_resume_sections"))
+    candidate_years = explicit_professional_years(profile)
+    resume_evidence_status = (
+        "resume_loaded_years_verified" if candidate_years is not None else
+        "resume_loaded_years_unquantified" if resume_text_available or evidence else
+        "resume_unavailable"
+    )
     return {
         "qualification_match_status": "assessed" if mandatory_score is not None else "partial_evidence",
         "qualification_fit_score": clamp_int(score, 0, 100),
@@ -11549,8 +11612,8 @@ def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any
             "required": analysis.get("required_experience"),
             "preferred": analysis.get("preferred_experience"),
             "ambiguous": analysis.get("ambiguous_experience", []),
-            "candidate_professional_years": explicit_professional_years(profile),
-            "candidate_years_status": "verified from explicit résumé evidence" if explicit_professional_years(profile) is not None else "unverified from selected résumé",
+            "candidate_professional_years": candidate_years,
+            "candidate_years_status": "verified from explicit résumé evidence" if candidate_years is not None else "résumé loaded; professional years are not explicitly quantified" if resume_evidence_status == "resume_loaded_years_unquantified" else "selected résumé evidence is unavailable",
             "fit_status": (
                 "unverified" if explicit_professional_years(profile) is None and (required_experience or analysis.get("detected_level") != "unknown") else
                 "stretch" if stretch else
@@ -11563,6 +11626,7 @@ def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any
         "qualification_evidence_profile_id": profile.get("id") or profile.get("_candidate_profile_id") or "",
         "qualification_evidence_profile_name": "No résumé selected — title search" if as_bool(job.get("discovery_profile_independent")) else profile.get("_candidate_profile_name") or "Active Profile",
         "qualification_evidence_source": "No résumé selected; qualification is optional for occupation title search" if as_bool(job.get("discovery_profile_independent")) else "selected candidate profile résumé DOCX, structured experience, projects, education, and skills" if profile.get("_candidate_profile_id") else "active Profile résumé text and structured evidence",
+        "resume_evidence_status": resume_evidence_status,
         "qualification_fit_seniority": seniority,
         "application_priority_score": priority,
         "application_priority_reasons": priority_reasons,

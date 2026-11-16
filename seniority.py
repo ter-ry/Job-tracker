@@ -180,9 +180,9 @@ def detect_level(content: str) -> tuple[str, list[str]]:
         ("manager", ["engineering manager", "development manager", "manager, software", "people manager"]),
         ("lead", ["lead ", "tech lead", "technical lead", "principal", "staff engineer", "staff software engineer"]),
         ("senior", ["senior", "sr.", "sr "]),
-        ("intermediate", ["intermediate", "mid-level", "mid level", "level 2"]),
-        ("junior", ["junior", "jr.", "jr ", "early career"]),
-        ("entry_level", ["entry level", "entry-level", "new grad", "graduate developer", "no experience required"]),
+        ("intermediate", ["intermediate", "mid-level", "mid level", "level 2", "engineer ii"]),
+        ("junior", ["junior", "jr.", "jr ", "associate", "early career"]),
+        ("entry_level", ["entry level", "entry-level", "new grad", "recent graduate", "graduate developer", "software engineer i", "engineer i", "no experience required"]),
         ("internship", ["intern", "internship", "co-op", "coop"]),
     ]
     hits: list[str] = []
@@ -253,7 +253,7 @@ def extract_experience_ranges(content: str) -> tuple[list[ExperienceRange], list
         if is_false_experience_match(content, match.start(), match.end()):
             continue
         snippet = content[max(0, match.start() - 80) : min(len(content), match.end() + 80)]
-        kind = classify_experience_section(content, match.start()) or classify_experience_context(snippet)
+        kind = classify_experience_section(content, match.start()) or classify_experience_context(snippet, min(80, match.start()))
         a = float(match.group("a"))
         b = float(match.group("b")) if match.group("b") else (None if "+" in match.group(0) or r"\+" in match.group(0) or "plus" in match.group(0).lower() else a)
         if re.search(r"\b(?:no more than|up to|at most|maximum of)\b", snippet, re.I):
@@ -277,7 +277,7 @@ def extract_experience_ranges(content: str) -> tuple[list[ExperienceRange], list
         if is_false_experience_match(content, match.start(), match.end()):
             continue
         snippet = content[max(0, match.start() - 80) : min(len(content), match.end() + 80)]
-        kind = classify_experience_section(content, match.start()) or classify_experience_context(snippet)
+        kind = classify_experience_section(content, match.start()) or classify_experience_context(snippet, min(80, match.start()))
         minimum = word_values[(match.group("a") or match.group("c")).lower()]
         maximum = word_values[match.group("b").lower()] if match.group("b") else None
         item = ExperienceRange(minimum, maximum, kind, match.group(0).strip())
@@ -320,12 +320,20 @@ def is_false_experience_match(content: str, start: int, end: int) -> bool:
     return False
 
 
-def classify_experience_context(snippet: str) -> str:
+def classify_experience_context(snippet: str, match_offset: int | None = None) -> str:
     lowered = snippet.lower()
-    if any(term in lowered for term in ["required", "requirements", "must have", "minimum", "at least", "need", "requires", "no more than", "up to", "at most", "maximum of"]):
-        return "required"
-    if any(term in lowered for term in ["preferred", "nice to have", "bonus", "asset", "ideally"]):
-        return "preferred"
+    markers = [
+        ("required", ["required", "requirements", "must have", "minimum", "at least", "need", "requires", "no more than", "up to", "at most", "maximum of"]),
+        ("preferred", ["preferred", "nice to have", "bonus", "asset", "ideally"]),
+    ]
+    found: list[tuple[int, str]] = []
+    anchor = match_offset if match_offset is not None else len(snippet) // 2
+    for kind, terms in markers:
+        for term in terms:
+            for hit in re.finditer(rf"\b{re.escape(term)}\b", lowered):
+                found.append((abs(hit.start() - anchor), kind))
+    if found:
+        return min(found, key=lambda item: item[0])[1]
     return "ambiguous"
 
 
