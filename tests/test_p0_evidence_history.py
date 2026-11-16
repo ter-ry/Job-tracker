@@ -148,6 +148,22 @@ class P0EvidenceHistoryTests(unittest.TestCase):
         self.assertEqual(len(result["matching_jobs"]), 10)
         self.assertTrue(all("Junior" in job["title"] for job in result["matching_jobs"]))
 
+    def test_apply_broadly_surfaces_related_stretch_but_not_management_or_unrelated_roles(self):
+        related = {"title": "Senior Python API Developer", "role_type": "software developer", "discovery_search_mode": "shortlist", "discovery_match_policy": "apply_broadly", "qualification_fit_seniority": {"required_experience": {"minimum": 6}}, "application_priority_score": 22}
+        unrelated = {"title": "Finance Analyst", "role_type": "finance", "discovery_search_mode": "shortlist", "discovery_match_policy": "apply_broadly"}
+        manager = {"title": "Engineering Manager", "role_type": "software developer", "discovery_search_mode": "shortlist", "discovery_match_policy": "apply_broadly"}
+        self.assertEqual(app_module.discovery_result_category(related)[0], "actionable")
+        self.assertEqual(related["discovery_fit_label"], "Stretch")
+        self.assertEqual(app_module.discovery_result_category(unrelated)[0], "excluded")
+        self.assertEqual(app_module.discovery_result_category(manager)[0], "excluded")
+
+    def test_rejected_wrong_city_alternative_never_receives_verified_coordinates(self):
+        candidate = {"ok": True, "status": "saved", "display_name": "30 Adelaide St E, Ottawa, Ontario, Canada", "normalized_query": "Ottawa", "precision": "street address", "latitude": 45.4, "longitude": -75.7}
+        with patch.object(app_module, "geocode_location_value", return_value=candidate):
+            alternative, _ = app_module.geocode_workplace_alternative({"address": "30 Adelaide St E", "precision": "street address"}, {}, {}, object(), use_cache=False, parent_location="Toronto, ON")
+        self.assertFalse(alternative["coordinates_verified"])
+        self.assertEqual(alternative["latitude"], "")
+
 
 if __name__ == "__main__":
     unittest.main()

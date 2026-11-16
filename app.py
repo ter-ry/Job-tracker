@@ -2512,6 +2512,7 @@ def create_app() -> Flask:
             clean["discovery_occupation"] = search["occupation"]
             clean["discovery_profile_independent"] = int(search["profile_independent"])
             clean["discovery_search_mode"] = search["search_mode"]
+            clean["discovery_match_policy"] = search["match_policy"]
             clean["title_match_mode"] = search["title_match_mode"]
             if search["search_mode"] == "title":
                 clean["occupation_match_type"], clean["title_match_score"] = classify_title_match(
@@ -3350,6 +3351,9 @@ def normalize_saved_search_payload(payload: dict[str, Any], existing: dict[str, 
         "total_cap": total_cap,
         "search_mode": search_mode,
         "title_match_mode": title_match_mode,
+        # SWE defaults to breadth; ECE keeps its existing title-only policy.
+        "match_policy": normalize_choice(payload.get("match_policy"), {"apply_broadly", "strict_matching"})
+        or ("apply_broadly" if search_mode == "shortlist" and occupation_for_keywords(text(payload.get("keywords"))) == "software developer" else "strict_matching"),
         "interval_minutes": interval_minutes,
         "enabled": 1 if as_bool(payload.get("enabled", existing.get("enabled", False))) else 0,
         "auto_prepare_enabled": auto_prepare_enabled,
@@ -3700,6 +3704,7 @@ def run_discovery_pipeline(
         clean["discovery_occupation"] = search["occupation"]
         clean["discovery_profile_independent"] = int(search["profile_independent"])
         clean["discovery_search_mode"] = search["search_mode"]
+        clean["discovery_match_policy"] = search["match_policy"]
         clean["title_match_mode"] = search["title_match_mode"]
         clean["discovery_include_internships"] = bool(search.get("include_internships"))
         if search["search_mode"] == "title":
@@ -3789,6 +3794,10 @@ def run_discovery_pipeline(
     # a worker completing while a browser crashes must not silently hide jobs.
     review_required_jobs = [item for item in ordered if item.get("discovery_result_category") not in {"actionable", "excluded"}]
     excluded_jobs = [item for item in ordered if item.get("discovery_result_category") == "excluded"]
+    review_reason_counts: dict[str, int] = {}
+    for item in review_required_jobs:
+        bucket = discovery_reason_bucket(item)
+        review_reason_counts[bucket] = review_reason_counts.get(bucket, 0) + 1
     # Find Jobs intentionally exposes only the bounded, qualified new queue.
     # Everything else remains durably discoverable in history/diagnostics.
     jobs = matching_jobs
@@ -3818,6 +3827,7 @@ def run_discovery_pipeline(
         "skipped_count": sum(1 for item in jobs if text(item.get("discovery_state")) == "ignored"),
         "disqualified_count": len(excluded_jobs),
         "review_required_count": len(review_required_jobs),
+        "review_reason_counts": review_reason_counts,
         "new_matching_count": len(matching_jobs),
         "eligible_previously_presented_count": previously_presented_count,
         "eligible_already_actioned_count": already_actioned_count,
@@ -3857,6 +3867,7 @@ def run_discovery_pipeline(
             "skipped": sum(1 for item in jobs if text(item.get("discovery_state")) == "ignored"),
             "disqualified": len(excluded_jobs),
             "review_required": len(review_required_jobs),
+            "review_reason_counts": review_reason_counts,
             "new_matching_jobs": len(matching_jobs),
             "previously_presented": previously_presented_count,
             "already_actioned": already_actioned_count,
@@ -7879,6 +7890,10 @@ def discovery_search_config(payload: dict[str, Any]) -> dict[str, Any]:
     # silently exceed the user's aggregate limit when it is not divisible by
     # the number of enabled sources.
     request_per_source_cap = min(per_source_cap, max(1, total_cap // source_count))
+    occupation = occupation_for_keywords(text(payload.get("keywords")))
+    match_policy = normalize_choice(payload.get("match_policy"), {"apply_broadly", "strict_matching"}) or (
+        "apply_broadly" if search_mode == "shortlist" and occupation == "software developer" else "strict_matching"
+    )
     return {
         "search_depth": depth,
         "date_window": date_window,
@@ -7897,12 +7912,13 @@ def discovery_search_config(payload: dict[str, Any]) -> dict[str, Any]:
         "enabled_sources": enabled_sources,
         "search_mode": search_mode,
         "title_match_mode": title_match_mode,
+        "match_policy": match_policy,
         "seniority": normalize_seniority_levels(payload.get("seniority")),
         "maximum_required_years": clamp_int_default(payload.get("maximum_required_years"), 3, 0, 30),
         "include_provisional_matches": as_bool(payload.get("include_provisional_matches", True)),
         "include_internships": as_bool(payload.get("include_internships", False)),
         "geographic_match_mode": normalize_choice(payload.get("geographic_match_mode"), {"strict", "provisional"}) or "provisional",
-        "occupation": occupation_for_keywords(text(payload.get("keywords"))),
+        "occupation": occupation,
         "applicant_profile_id": clamp_int(payload.get("applicant_profile_id"), 0, 10**9),
         "profile_independent": search_mode == "title" and not text(payload.get("candidate_profile_id")),
     }
@@ -8612,9 +8628,17 @@ def workplace_alternatives_for_job(job: dict[str, Any]) -> list[dict[str, Any]]:
 
 def geocode_workplace_alternative(
     alternative: dict[str, Any], profile: dict[str, str], origin: dict[str, Any],
-    provider: GeocodingProvider, *, use_cache: bool,
+    provider: GeocodingProvider, *, use_cache: bool, parent_location: str = "",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    enriched = dict(alternative)
+    enriched = {
+        **alternative,
+        "location": text(alternative.get("location")) or parent_location,
+        # The city matcher uses normalized workplace fields. Preserve the
+        # source alternative address so a Mississauga alternative is not
+        # judged only against the parent posting's Toronto city.
+        "workplace_address": text(alternative.get("workplace_address")) or text(alternative.get("address")),
+        "workplace_postal_code": text(alternative.get("workplace_postal_code")) or text(alternative.get("postal_code")),
+    }
     lookups = list(dict.fromkeys(filter(None, [text(enriched.get("address")), text(enriched.get("postal_code"))])))
     geocode: dict[str, Any] = {}
     for lookup in lookups:
@@ -8622,7 +8646,9 @@ def geocode_workplace_alternative(
         if candidate.get("ok") and geocode_matches_canadian_location(lookup, candidate) and geocode_matches_advertised_city(enriched, candidate):
             geocode = candidate
             break
-        if not geocode:
+        # Rejected successful lookups are never safe fallbacks. Retain only a
+        # failure for diagnostics, otherwise leave coordinates unverified.
+        if not geocode and not candidate.get("ok"):
             geocode = candidate
     verified = bool(
         geocode.get("ok")
@@ -8666,7 +8692,7 @@ def geocode_discovery_job(
         geocodes = []
         for alternative in alternatives:
             enriched, alternative_geocode = geocode_workplace_alternative(
-                alternative, profile, origin, provider, use_cache=use_cache,
+                alternative, profile, origin, provider, use_cache=use_cache, parent_location=text(job.get("location")),
             )
             enriched["assignment_status"] = "advertised_alternative"
             enriched_alternatives.append(enriched)
@@ -9676,6 +9702,7 @@ def apply_discovery_search_constraints(
 def discovery_result_category(job: dict[str, Any], remote_preference: str = "") -> tuple[str, str]:
     target_role_families = ACTIONABLE_DISCOVERY_ROLE_FAMILIES
     search_mode = text(job.get("discovery_search_mode")).lower() or "legacy"
+    broad = text(job.get("discovery_match_policy")) == "apply_broadly"
     if text(job.get("role_type")).lower() == "intern" and not bool(job.get("discovery_include_internships")):
         return "excluded", "Internships are excluded by the selected search preference."
     if normalize_space(text(remote_preference)).lower() != "remote":
@@ -9690,6 +9717,10 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
         if search_mode == "title":
             return title_search_result_category(job)
         role_type = text(job.get("role_type")).lower()
+        if broad and search_mode == "shortlist":
+            if not plausible_software_role(job):
+                return "excluded", "Confirmed unrelated occupation is outside the Apply Broadly software scope."
+            return "actionable", apply_broadly_reason(job)
         if role_type and role_type not in target_role_families:
             return ("adjacent_opportunity", "Explore mode retained an adjacent role for manual review.") if search_mode == "explore" else ("review_required", "The stored role family is outside the selected software-developer target family.")
         seniority = job.get("qualification_fit_seniority") or {}
@@ -9704,6 +9735,10 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
         if search_mode == "title":
             return title_search_result_category(job)
         role_type = text(job.get("role_type")).lower()
+        if broad and search_mode == "shortlist":
+            if not plausible_software_role(job):
+                return "excluded", "Confirmed unrelated occupation is outside the Apply Broadly software scope."
+            return "actionable", apply_broadly_reason(job)
         if role_type and role_type not in target_role_families:
             return ("adjacent_opportunity", "Explore mode retained an adjacent role for manual review.") if search_mode == "explore" else ("review_required", "The stored role family is outside the selected software-developer target family.")
         seniority = job.get("qualification_fit_seniority") or {}
@@ -9711,6 +9746,54 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
             return "review_required", "The posting expects experience or seniority that is not confirmed as aligned with the selected target."
         return "actionable", "Remote arrangement and Canadian eligibility are supported by the posting data; commute distance does not apply."
     return "review_required", "Work arrangement or Canadian eligibility requires review."
+
+
+def plausible_software_role(job: dict[str, Any]) -> bool:
+    """Apply Broadly admits related technical IC roles, never management-only work."""
+    title = normalize_space(text(job.get("title"))).lower()
+    role_type = normalize_space(text(job.get("role_type"))).lower()
+    if re.search(r"\b(manager|director|vice president|vp|head of|chief)\b", title):
+        return False
+    if role_type in ACTIONABLE_DISCOVERY_ROLE_FAMILIES:
+        return True
+    return bool(re.search(r"\b(software|full[ -]?stack|front[ -]?end|back[ -]?end|python|qa automation|test automation|devops|cloud|api|integration|automation|platform)\b", title))
+
+
+def apply_broadly_reason(job: dict[str, Any]) -> str:
+    analysis = job.get("qualification_fit_seniority") or {}
+    required = analysis.get("required_experience") or {}
+    years = required.get("minimum") if isinstance(required, dict) else None
+    score = clamp_int(job.get("application_priority_score"), 0, 100)
+    evidence = text(job.get("qualification_evidence_source"))
+    if years is not None and float(years) >= 4:
+        job["discovery_fit_label"] = "Stretch"
+        return "Relevant technical stretch role; required experience is above the early-career preference."
+    if score < 50 or not evidence:
+        job["discovery_fit_label"] = "Possible fit"
+        return "Relevant technical role; match is not fully assessed from the selected résumé evidence."
+    job["discovery_fit_label"] = "Strong fit"
+    return "Relevant technical role ranked by likely fit."
+
+
+def discovery_reason_bucket(job: dict[str, Any]) -> str:
+    """One mutually exclusive diagnostic reason per non-new discovery row."""
+    category = text(job.get("discovery_result_category"))
+    reason = text(job.get("discovery_result_reason")).lower()
+    if category == "excluded":
+        return "confirmed_hard_ineligibility"
+    if "location" in reason or "workplace" in reason or "arrangement" in reason or "canadian" in reason:
+        return "unverified_location_or_work_arrangement"
+    if "role family" in reason or "occupation" in reason:
+        return "software_adjacent_occupation"
+    analysis = job.get("qualification_fit_seniority") or {}
+    required = analysis.get("required_experience") or {}
+    if bool(analysis.get("stretch_role")) or (isinstance(required, dict) and required.get("minimum") is not None and float(required["minimum"]) > 3):
+        return "stretch_or_intermediate_seniority"
+    if clamp_int(job.get("application_priority_score"), 0, 100) < 50:
+        return "technical_priority_below_50"
+    if not text(job.get("qualification_evidence_source")):
+        return "unknown_resume_evidence"
+    return "other_review_required"
 
 
 def title_search_result_category(job: dict[str, Any]) -> tuple[str, str]:
@@ -9743,6 +9826,10 @@ def discovery_is_clear_senior_role(job: dict[str, Any], search: dict[str, Any]) 
 
 def discovery_target_assessment(job: dict[str, Any], search: dict[str, Any]) -> tuple[str, str]:
     """Return verified, provisional, or ineligible without treating absence as proof."""
+    if search.get("match_policy") == "apply_broadly" and search.get("search_mode") == "shortlist":
+        if not plausible_software_role(job):
+            return "ineligible", "Confirmed unrelated or management-only occupation is outside the Apply Broadly scope."
+        return "provisional", "Apply Broadly retains this plausible technical role; verify requirements before applying."
     if discovery_is_clear_senior_role(job, search):
         return "ineligible", "Confirmed seniority or required experience is outside the selected early-career target."
     selected_levels = set(text(search.get("seniority")).split(","))
