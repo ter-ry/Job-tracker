@@ -109,6 +109,13 @@ def stop_waitress_server(server: object, server_thread: threading.Thread) -> Non
 
     wasyncore.close_all(server._map)
     server_thread.join(timeout=5)
+    # A frozen Windows process must not remain resident after the authenticated
+    # local exit request.  Waitress normally exits after its channels close;
+    # if a runner/browser keeps an untracked handle alive, the packaged
+    # process is still safe to terminate now because discovery activity was
+    # rejected by the exit endpoint before this callback was started.
+    if isinstance(server_thread, threading.Thread) and server_thread.is_alive():
+        os._exit(0)
 
 
 def launch() -> int:
