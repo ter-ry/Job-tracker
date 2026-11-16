@@ -1245,7 +1245,7 @@ async function runSavedSearch(id) {
 }
 
 function discoveryInboxCategory(job) {
-  if (String(job.status || "") === "Applied") return "applied";
+  if (String(job.status || "") === "Applied" || String(job.discovery_state || "") === "applied") return "applied";
   if (["ignored", "skipped"].includes(String(job.discovery_state || ""))) return "skipped";
   if (String(job.discovery_state || "") === "saved") return "saved";
   if (String(job.discovery_result_category || "") === "excluded") return "excluded";
@@ -1327,7 +1327,13 @@ async function loadDiscoveryInbox(force = false) {
     const separator = profileQuery ? "&" : "?";
     const jobs = await api.get(`/api/discovery/inbox${profileQuery}${separator}include_history=1`);
     const selectedProfile = state.selectedCandidateProfileId ? String(state.selectedCandidateProfileId) : "";
-    state.discoveryInboxJobs = (Array.isArray(jobs) ? jobs : []).filter((job) => !selectedProfile || String(job.candidate_profile_id || "") === selectedProfile);
+    // Shared discovery rows use candidate_profile_id=0; applicant-specific
+    // state returned by the API is the ownership signal for those rows.
+    state.discoveryInboxJobs = (Array.isArray(jobs) ? jobs : []).filter((job) => {
+      if (!selectedProfile) return true;
+      const owner = String(job.candidate_profile_id || "");
+      return owner === "" || owner === "0" || owner === selectedProfile;
+    });
     renderDiscoveryInbox(state.discoveryInboxJobs);
   } catch (error) { target.textContent = error.message; }
 }

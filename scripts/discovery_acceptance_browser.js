@@ -20,6 +20,7 @@ async function main() {
   const browser = await chromium.launch({ headless: true, executablePath: process.env.CHROMIUM_PATH || "/usr/bin/chromium", args: ["--no-sandbox"] });
   const context = await browser.newContext({ viewport: { width: 1440, height: 1200 } });
   const page = await context.newPage();
+  page.on("pageerror", (error) => console.error(`browser pageerror: ${error.stack || error}`));
   const profile = await jsonRequest(page.request, "/api/candidate-profiles", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -93,11 +94,25 @@ async function main() {
   }
 
   const saveAction = page.locator('[data-discovery-action="save"]').first();
-  await Promise.all([page.waitForResponse((response) => response.url().includes("/api/discovery/inbox/") && response.url().endsWith("/save")), saveAction.click()]);
-  const appliedAction = page.locator('[data-discovery-action="applied"]').first();
-  await Promise.all([page.waitForResponse((response) => response.url().includes("/api/discovery/inbox/") && response.url().endsWith("/applied")), appliedAction.click()]);
-  const skipAction = page.locator('[data-discovery-action="skip"]').first();
-  await Promise.all([page.waitForResponse((response) => response.url().includes("/api/discovery/inbox/") && response.url().endsWith("/ignore")), skipAction.click()]);
+  const action = async (name, suffix) => {
+    const button = page.locator(`[data-discovery-action="${name}"]`).first();
+    await button.waitFor({ state: "visible", timeout: 5000 });
+    const key = await button.getAttribute("data-job-key");
+    console.log(`browser action ${name} key=${key} html=${(await button.evaluate((node) => node.outerHTML)).slice(0, 300)}`);
+    console.log(`browser state=${JSON.stringify(await page.evaluate((value) => ({ found: state.discoveryResults.some((item) => discoveryJobKey(item) === String(value)), fn: typeof saveDiscoveryJob, ids: state.discoveryResults.map((item) => ({ id: item.id, source: item.source_job_id })) } ), key))}`);
+    const requestPromise = page.waitForRequest((request) => request.method() === "POST" && request.url().includes("/api/discovery/inbox/") && request.url().endsWith(suffix), { timeout: 5000 });
+    await page.evaluate((value) => {
+      const node = document.querySelector(`[data-discovery-action="${value.name}"][data-job-key="${CSS.escape(value.key)}"]`);
+      if (!node) throw new Error(`Action button disappeared: ${value.name}/${value.key}`);
+      node.click();
+    }, { name, key });
+    await requestPromise;
+    await page.waitForTimeout(100);
+    return key;
+  };
+  await action("save", "/save");
+  await action("applied", "/applied");
+  await action("skip", "/ignore");
   await page.screenshot({ path: path.join(artifactDir, "02-applied-skipped.png"), fullPage: true });
 
   await page.reload({ waitUntil: "networkidle" });
@@ -108,15 +123,28 @@ async function main() {
   const savedCount = await page.locator('[data-inbox-category="saved"]').innerText();
   if (!/1/.test(appliedCount) || !/1/.test(skippedCount) || !/1/.test(savedCount)) throw new Error(`History counts wrong: ${appliedCount}; ${skippedCount}; ${savedCount}`);
 
-  const inbox = await page.evaluate(async () => ({
-    current: await fetch("/api/discovery/inbox").then((response) => response.json()),
-    history: await fetch("/api/discovery/inbox?include_history=1").then((response) => response.json()),
-  }));
-  if (inbox.current.length !== 0) throw new Error(`Processed records returned to New inbox: ${inbox.current.length}`);
-  const categories = Object.fromEntries(inbox.history.map((item) => [item.title, item.discovery_inbox_category]));
-  if (categories["Junior Python Developer"] !== "saved" || categories["Backend Engineer"] !== "applied" || categories["Backend Engineer QA"] !== "skipped") throw new Error(`Unexpected categories: ${JSON.stringify(categories)}`);
+  const inbox = await page.evaluate(async (profileId) => ({
+    current: await fetch(`/api/discovery/inbox?candidate_profile_id=${encodeURIComponent(profileId)}`).then((response) => response.json()),
+    history: await fetch(`/api/discovery/inbox?candidate_profile_id=${encodeURIComponent(profileId)}&include_history=1`).then((response) => response.json()),
+  }), profile.id);
+  const processedInNew = inbox.current.filter((item) => ["saved", "applied", "skipped"].includes(item.discovery_inbox_category));
+  if (processedInNew.length) throw new Error(`Processed records returned to New inbox: ${JSON.stringify(processedInNew.map((item) => item.id))}`);
+  const categories = Object.fromEntries(inbox.history.map((item) => [item.id, item.discovery_inbox_category]));
+  if (categories[seeded[0].id] !== "saved" || categories[seeded[1].id] !== "applied" || categories[seeded[2].id] !== "skipped") throw new Error(`Unexpected categories: ${JSON.stringify(categories)}`);
 
-  fs.writeFileSync(path.join(artifactDir, "browser-log.json"), JSON.stringify({ profileId: profile.id, seededJobIds: seeded.map((job) => job.id), categories, appliedCount, skippedCount, savedCount }, null, 2));
+  const otherProfile = await jsonRequest(page.request, "/api/candidate-profiles", {
+    method: "POST", headers: { "content-type": "application/json" },
+    data: { name: "Other applicant", identity_mode: "distinct", applicant_name: "Other Candidate" },
+  });
+  await jsonRequest(page.request, `/api/candidate-profiles/${otherProfile.id}/resumes`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    data: { name: "Other synthetic résumé", content: "Python and SQL", docx_path: process.env.ACCEPTANCE_RESUME_DOCX_PATH || "", is_default: true },
+  });
+  const otherHistory = await jsonRequest(page.request, `/api/discovery/inbox?candidate_profile_id=${otherProfile.id}&include_history=1`);
+  const leakedState = otherHistory.filter((item) => ["saved", "applied", "skipped"].includes(item.discovery_inbox_category));
+  if (leakedState.length) throw new Error(`Applicant state leaked to another profile: ${JSON.stringify(leakedState.map((item) => item.title))}`);
+
+  fs.writeFileSync(path.join(artifactDir, "browser-log.json"), JSON.stringify({ profileId: profile.id, otherProfileId: otherProfile.id, seededJobIds: seeded.map((job) => job.id), categories, appliedCount, skippedCount, savedCount }, null, 2));
   await browser.close();
 }
 

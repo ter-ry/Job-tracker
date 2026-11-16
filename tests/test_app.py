@@ -1013,6 +1013,41 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(saved["name"], "Software Engineering")
         self.assertEqual(saved["identity_mode"], "shared")
 
+    def test_selected_swe_resume_docx_is_loaded_as_discovery_evidence(self):
+        profile = self.client.post(
+            "/api/candidate-profiles",
+            json={"name": "Synthetic SWE", "identity_mode": "distinct", "applicant_name": "SWE Candidate"},
+        ).get_json()
+        document = Document()
+        document.add_heading("SWE Candidate", level=1)
+        document.add_heading("Summary", level=2)
+        document.add_paragraph("Early-career software developer building Python services.")
+        document.add_heading("Experience", level=2)
+        document.add_paragraph("Built Python and Flask REST APIs backed by SQL and automated tests.")
+        document.add_heading("Skills", level=2)
+        document.add_paragraph("Python, Flask, SQL, REST APIs, JavaScript")
+        buffer = io.BytesIO()
+        document.save(buffer)
+        upload = self.client.post(
+            f"/api/candidate-profiles/{profile['id']}/resumes/upload",
+            data={"file": (io.BytesIO(buffer.getvalue()), "synthetic-swe.docx"), "is_default": "true"},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(upload.status_code, 201, upload.get_data(as_text=True))
+        with app_module.app.app_context():
+            selected = app_module.resolve_discovery_evidence_profile({
+                "search_mode": "shortlist", "candidate_profile_id": profile["id"],
+            })
+        self.assertEqual(selected["_candidate_profile_id"], str(profile["id"]))
+        self.assertIn("Python", selected["key_skills"])
+        self.assertIn("Flask REST APIs", selected["work_experience"])
+        fit = app_module.build_qualification_fit(
+            {"title": "Junior Backend Developer", "job_description": "Python, Flask and SQL required."},
+            selected,
+        )
+        self.assertEqual(fit["qualification_evidence_profile_id"], str(profile["id"]))
+        self.assertNotEqual(fit["qualification_evidence_source"], "")
+
     def test_tailoring_studio_analyzes_selected_resume_and_applies_copy_edit(self):
         self.client.post("/api/profile", json={"name": "Terry Mak", "email": "terry@example.com"})
         profile = self.client.post("/api/candidate-profiles", json={"name": "Software Engineering", "identity_mode": "shared"}).get_json()

@@ -25,7 +25,7 @@ import zipfile
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 from xml.etree import ElementTree
 import platform
 import warnings
@@ -2077,7 +2077,7 @@ def create_app() -> Flask:
                 item["applicant_discovery_state"] = state
             if applicant_id and not include_history and state in {"skipped", "saved", "applied"}:
                 continue
-            if text(item.get("status")) == "Applied":
+            if text(item.get("status")) == "Applied" or text(item.get("discovery_state")) == "applied":
                 category = "applied"
             elif text(item.get("discovery_state")) in {"ignored", "skipped"}:
                 category = "skipped"
@@ -7847,9 +7847,15 @@ def _software_title_match(title_text: str, terms: list[str], match_mode: str) ->
 
 def _ece_title_match(title_text: str, terms: list[str], match_mode: str) -> tuple[str, int]:
     exact_blockers = r"\b(?:sales|representative|manager|director|supervisor|assistant|aide|coordinator|administrator|instructor|faculty|therapist)\b"
+    # A classroom context must not wash out a supervisory, administrative, or
+    # unrelated occupational title.  This guard applies to both exact and
+    # related matching; otherwise titles such as "Early Childhood Educator
+    # Supervisor" fall through to the related-role branch.
+    if re.search(exact_blockers, title_text):
+        return "uncertain", 0
     exact_terms = [term for term in terms if term not in {"early childhood education", "registered early childhood education"}]
     has_exact = any(re.search(rf"(?<![a-z]){re.escape(term)}(?![a-z])", title_text) for term in exact_terms)
-    if has_exact and not re.search(exact_blockers, title_text):
+    if has_exact:
         return "exact", 100
     early_context = re.search(r"\b(?:early childhood|early years|preschool|daycare|childcare|child care)\b", title_text)
     educator_role = re.search(r"\b(?:educator|teacher|worker)\b", title_text)
@@ -9759,6 +9765,10 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
         if text(job.get("posting_availability")).lower() == "confirmed_closed":
             return "excluded", "Posting is confirmed closed."
         if text(job.get("distance_radius_status")).lower() == "outside_radius":
+            # A stale or relabelled radius status is not evidence of a hard
+            # exclusion when the workplace distance was never verified.
+            if clamp_int(job.get("distance_confidence"), 0, 100) <= 0:
+                return "review_required", "The radius label is unverified because workplace distance evidence is missing."
             return "excluded", "Confirmed workplace distance is outside the requested radius."
         if text(job.get("distance_radius_status")).lower() == "unknown" and text(job.get("geographic_eligibility")).lower() != "provisional":
             return "review_required", "Exact workplace distance could not be verified under strict-radius matching."
@@ -9870,6 +9880,41 @@ def discovery_exclusion_reason_bucket(job: dict[str, Any]) -> str:
     if "canadian" in reason or "ontario" in reason or "eligib" in reason:
         return "confirmed_geographic_ineligibility"
     return "other_confirmed_hard_exclusion"
+
+
+def discovery_diagnostic_breakdown(items: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize a discovery replay without collapsing review into exclusion.
+
+    This is intentionally a pure diagnostic helper.  It lets acceptance
+    reports show the exact reason buckets for a representative replay while
+    retaining every posting and avoiding any mutation of applicant data.
+    """
+    category_counts: dict[str, int] = {}
+    exclusion_reason_counts: dict[str, int] = {}
+    review_reason_counts: dict[str, int] = {}
+    previously_presented = 0
+    new_count = 0
+    for item in items:
+        category = text(item.get("discovery_result_category")) or "new"
+        category_counts[category] = category_counts.get(category, 0) + 1
+        if category == "excluded":
+            bucket = discovery_exclusion_reason_bucket(item)
+            exclusion_reason_counts[bucket] = exclusion_reason_counts.get(bucket, 0) + 1
+        elif category in {"review_required", "adjacent_opportunity"}:
+            bucket = discovery_reason_bucket(item)
+            review_reason_counts[bucket] = review_reason_counts.get(bucket, 0) + 1
+        if as_bool(item.get("previously_presented")):
+            previously_presented += 1
+        elif category == "new":
+            new_count += 1
+    return {
+        "category_counts": category_counts,
+        "exclusion_reason_counts": exclusion_reason_counts,
+        "review_reason_counts": review_reason_counts,
+        "previously_presented": previously_presented,
+        "new_count": new_count,
+        "total": sum(category_counts.values()),
+    }
 
 
 def title_search_result_category(job: dict[str, Any]) -> tuple[str, str]:
