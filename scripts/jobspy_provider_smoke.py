@@ -34,7 +34,7 @@ def main() -> None:
     args = parser.parse_args()
     evidence = {
         "recorded_at": datetime.now(timezone.utc).isoformat(),
-        "jobspy_version": "1.1.82",
+        "jobspy_version": "1.4.1",
         "adapter": "sources.jobspy_source.fetch_jobspy_jobs",
         "requests": [],
     }

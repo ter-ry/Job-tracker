@@ -158,7 +158,7 @@ DISCOVERY_TASK_NAME = "Job Tracker Discovery"
 DISCOVERY_PROVIDER_TIMEOUT_SECONDS = 20
 DISCOVERY_OVERALL_TIMEOUT_SECONDS = 75
 TESTED_DEPENDENCY_VERSIONS = {
-    "python-jobspy": "1.1.82",
+    "python-jobspy": "1.4.1",
     "pandas": "2.3.3",
     "numpy": "1.26.3",
 }
