@@ -158,7 +158,7 @@ DISCOVERY_TASK_NAME = "Job Tracker Discovery"
 DISCOVERY_PROVIDER_TIMEOUT_SECONDS = 20
 DISCOVERY_OVERALL_TIMEOUT_SECONDS = 75
 TESTED_DEPENDENCY_VERSIONS = {
-    "python-jobspy": "1.1.82",
+    "python-jobspy": "1.4.1",
     "pandas": "2.3.3",
     "numpy": "1.26.3",
 }
@@ -7834,13 +7834,13 @@ def _software_title_match(title_text: str, terms: list[str], match_mode: str) ->
 
 
 def _ece_title_match(title_text: str, terms: list[str], match_mode: str) -> tuple[str, int]:
-    exact_blockers = r"\b(?:sales|representative|manager|director|assistant|aide|coordinator|administrator)\b"
+    exact_blockers = r"\b(?:sales|representative|manager|director|supervisor|assistant|aide|coordinator|administrator|instructor|faculty|therapist)\b"
     exact_terms = [term for term in terms if term not in {"early childhood education", "registered early childhood education"}]
     has_exact = any(re.search(rf"(?<![a-z]){re.escape(term)}(?![a-z])", title_text) for term in exact_terms)
     if has_exact and not re.search(exact_blockers, title_text):
         return "exact", 100
     early_context = re.search(r"\b(?:early childhood|early years|preschool|daycare|childcare|child care)\b", title_text)
-    educator_role = re.search(r"\b(?:educator|teacher|worker|assistant|aide)\b", title_text)
+    educator_role = re.search(r"\b(?:educator|teacher|worker)\b", title_text)
     if early_context and educator_role:
         return ("related", 75) if match_mode == "related" else ("uncertain", 30)
     return "uncertain", 0
@@ -7881,14 +7881,9 @@ def discovery_search_config(payload: dict[str, Any]) -> dict[str, Any]:
     search_mode = normalize_choice(payload.get("search_mode"), {"title", "explore", "shortlist"}) or "title"
     title_match_mode = normalize_choice(payload.get("title_match_mode"), {"strict", "related"}) or "related"
     validate_discovery_budget(total_cap, enabled_sources)
-    # total_cap is the user's aggregate fetch/display budget.  JobSpy applies
-    # results_wanted per provider, so divide that budget across enabled
-    # providers instead of silently raising it to the per-source cap.
+    # Initial allocation stays within the configured aggregate safety budget.
+    # Acquisition later redistributes the unused share when sources fail.
     source_count = max(1, len(enabled_sources))
-    # Keep the aggregate provider request budget at or below total_cap for
-    # normal multi-source searches. A floor is intentional: ceil would
-    # silently exceed the user's aggregate limit when it is not divisible by
-    # the number of enabled sources.
     request_per_source_cap = min(per_source_cap, max(1, total_cap // source_count))
     occupation = occupation_for_keywords(text(payload.get("keywords")))
     match_policy = normalize_choice(payload.get("match_policy"), {"apply_broadly", "strict_matching"}) or (
@@ -9121,7 +9116,6 @@ def fetch_discovery_jobs_for_search(
     # later distinct queries are progressive continuation, not a silent
     # reduction of the provider page size.
     batch_count = max(1, len(locations) * len(base_queries))
-    per_region = max(1, int(search["request_per_source_cap"]) // batch_count)
     merged: list[dict[str, Any]] = []
     seen: set[str] = set()
     combined: dict[str, Any] = {"jobs": [], "errors": {}, "source_counts": {}, "source_diagnostics": {}, "source_snapshots": {}}
@@ -9138,6 +9132,7 @@ def fetch_discovery_jobs_for_search(
         completed = set(all_planned_batches[:continuation_index])
     planned_batches = [batch for batch in all_planned_batches if batch not in completed]
     completed_this_run: list[dict[str, str]] = []
+    active_sources = list(search["enabled_sources"])
     # Scope the breaker to this attempt. A continuation can retry a source,
     # but a repeatedly failing source cannot consume every remaining batch.
     circuit_breaker = ProviderCircuitBreaker()
@@ -9160,11 +9155,18 @@ def fetch_discovery_jobs_for_search(
                 "source_diagnostics": provider_result.get("source_diagnostics") if isinstance(provider_result.get("source_diagnostics"), dict) else {},
             })
 
+        if not active_sources:
+            break
+        # Redistribute the original aggregate share only among providers still
+        # working in this attempt; never increase the configured total budget.
+        configured_cap = int(search.get("per_source_cap") or search["request_per_source_cap"])
+        total_budget = int(search.get("total_cap") or configured_cap * max(1, len(search["enabled_sources"])))
+        per_region = max(1, min(configured_cap, total_budget // max(1, len(active_sources) * batch_count)))
         result = fetch_jobspy_jobs(
             keywords=keyword_query, location=location, distance=search["distance"],
             remote_preference=search["remote_preference"], job_type=None,
             results_wanted=per_region, hours_old=search["hours_old"],
-            enabled_sources=search["enabled_sources"], country_indeed=country_indeed,
+            enabled_sources=active_sources, country_indeed=country_indeed,
             provider_timeout_seconds=min(DISCOVERY_PROVIDER_TIMEOUT_SECONDS, remaining_budget),
             circuit_breaker=circuit_breaker,
             on_provider_update=provider_update,
@@ -9203,8 +9205,11 @@ def fetch_discovery_jobs_for_search(
             current["raw_records_row_count"] = int(current.get("raw_records_row_count") or 0) + int(diagnostic.get("raw_records_row_count") or 0)
             current["region_queries"] = locations
             current["success"] = bool(current.get("success") or diagnostic.get("success"))
-        if result.get("errors"):
-            break
+        # Errors are provider-scoped. Do not invoke a failed provider again in
+        # this attempt, but continue later distinct batches for every provider
+        # that remains healthy (for example Indeed after LinkedIn times out).
+        failed_sources = {normalize_space(source).lower() for source in result.get("errors", {})}
+        active_sources = [source for source in active_sources if normalize_space(source).lower() not in failed_sources]
         completed_this_run.append({"location": location, "keywords": keyword_query})
         if target_reached:
             break

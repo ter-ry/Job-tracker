@@ -2757,7 +2757,8 @@ class JobAssistantTest(unittest.TestCase):
 
         body = response.get_json()
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(body["source_counts"]["indeed"], 1)
+        # LinkedIn's timeout no longer aborts later distinct Indeed batches.
+        self.assertEqual(body["source_counts"]["indeed"], 4)
         self.assertEqual(body["source_counts"]["linkedin"], 0)
         self.assertIn("linkedin", body["errors"])
         self.assertEqual(body["total"], 1)

@@ -31,6 +31,7 @@ const state = {
   loadToken: 0,
   discoveryInboxJobs: [],
   discoveryInboxCategory: "new_actionable",
+  discoveryInboxSelected: new Set(),
   advancedFeatures: (() => { try { return localStorage.getItem("jobTracker.advancedFeatures") === "true"; } catch (_) { return false; } })(),
   pendingAppliedJobs: new Set(),
   tailoring: { draftId: null, jobId: null, profileId: null, resumeId: null, data: null, selectedParagraph: null, selectedKeyword: null, aiImproveJobId: null },
@@ -154,6 +155,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("cancel-saved-search").addEventListener("click", () => toggleSavedSearchForm(false));
   document.getElementById("refresh-saved-searches").addEventListener("click", loadSavedSearches);
   document.getElementById("refresh-discovery-inbox").addEventListener("click", () => loadDiscoveryInbox(true));
+  ["save", "skip", "applied"].forEach((action) => document.getElementById(`inbox-bulk-${action}`)?.addEventListener("click", () => bulkInboxAction(action)));
   document.getElementById("open-all-discovered")?.addEventListener("click", () => {
     document.querySelector('.tab[data-tab="discovery"]')?.click();
     setDiscoverySection("saved");
@@ -1268,7 +1270,18 @@ function renderDiscoveryInbox(jobs) {
   }
   const visibleJobs = jobs.filter((job) => (job.discovery_inbox_category || discoveryInboxCategory(job)) === state.discoveryInboxCategory);
   target.classList.toggle("empty", !visibleJobs.length);
-  target.innerHTML = visibleJobs.length ? visibleJobs.map((job) => { const profileFree = Boolean(job.discovery_profile_independent); const category = job.discovery_inbox_category || discoveryInboxCategory(job); return `<article class="inbox-row"><div><strong>${escapeHtml(job.title || "Untitled role")}</strong><span>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location unavailable")}</span><span class="muted">${escapeHtml(job.work_arrangement || job.remote_type || "Unknown arrangement")} · Canada: ${escapeHtml(job.canadian_eligibility || "unknown")} · ${escapeHtml(displaySalary(job))} · ${escapeHtml(sourceLabel(job.source || "JobSpy"))} · ${escapeHtml(job.posted_date || "date unknown")}</span><span class="muted">${escapeHtml(labels[category] || "Review required")} · Description: ${escapeHtml(job.description_completeness || "unknown")}</span>${renderExperienceSummary(job)}<span class="muted">Source evidence: ${escapeHtml(job.qualification_evidence_source || "Not available")}</span></div><div><strong>${profileFree ? `Job Opportunity Score ${Number(job.opportunity_score ?? job.application_priority_score ?? 0)}` : `Qualification Match ${Number(job.qualification_match_score ?? job.qualification_fit_score ?? 0)} · ${escapeHtml(job.qualification_fit_label || "Review required")}`}</strong><span class="muted">${profileFree ? `Posting evidence only · Salary ${escapeHtml(displaySalary(job))} · ${escapeHtml(job.distance_note || "Distance unverified")}` : `Evidence confidence: ${escapeHtml(job.qualification_evidence_confidence || "standard")} · Application Priority ${Number(job.application_priority_score || 0)} · Canada eligibility ${escapeHtml(job.canadian_eligibility || "unknown")}`}</span><span class="muted">Discovered ${escapeHtml(job.discovery_first_seen_at || "")}${job.date_applied ? ` · Applied ${escapeHtml(job.date_applied)}` : ""}</span></div><div class="row-actions">${category === "new_actionable" || category === "review_required" ? `<button class="button small" type="button" onclick="reviewInboxJob(${job.id})">Review</button><button class="button ghost small" type="button" onclick="saveInboxJob(${job.id})">Save for later</button><button class="button ghost small" type="button" onclick="applyInboxJob(${job.id})">Mark Applied</button><button class="button ghost small" type="button" onclick="ignoreInboxJob(${job.id})">Skip</button>` : category === "skipped" ? `<button class="button ghost small" type="button" onclick="restoreInboxJob(${job.id})">Restore</button>` : ""}${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open original posting</a>` : ""}</div></article>`; }).join("") : `No ${labels[state.discoveryInboxCategory].toLowerCase()} discovery records.`;
+  target.innerHTML = visibleJobs.length ? visibleJobs.map((job) => { const profileFree = Boolean(job.discovery_profile_independent); const category = job.discovery_inbox_category || discoveryInboxCategory(job); return `<article class="inbox-row"><label><input type="checkbox" data-inbox-select="${job.id}" ${state.discoveryInboxSelected.has(Number(job.id)) ? "checked" : ""}> Select</label><div><strong>${escapeHtml(job.title || "Untitled role")}</strong><span>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location unavailable")}</span><span class="muted">${escapeHtml(job.work_arrangement || job.remote_type || "Unknown arrangement")} · ${escapeHtml(displaySalary(job))}</span>${renderExperienceSummary(job)}<details><summary>Evidence</summary><span class="muted">Source evidence: ${escapeHtml(job.qualification_evidence_source || "Not available")} · Evidence confidence: ${escapeHtml(job.qualification_evidence_confidence || "unverified")}</span></details></div><div class="row-actions">${category === "new_actionable" || category === "review_required" ? `<button class="button ghost small" type="button" onclick="saveInboxJob(${job.id})">Save</button><button class="button ghost small" type="button" onclick="applyInboxJob(${job.id})">Confirm Applied</button><button class="button ghost small" type="button" onclick="ignoreInboxJob(${job.id})">Skip</button>` : category === "skipped" ? `<button class="button ghost small" type="button" onclick="restoreInboxJob(${job.id})">Restore</button>` : ""}${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open Original</a>` : ""}</div></article>`; }).join("") : `No ${labels[state.discoveryInboxCategory].toLowerCase()} discovery records.`;
+  target.querySelectorAll("[data-inbox-select]").forEach((box) => box.addEventListener("change", () => { const id = Number(box.dataset.inboxSelect); if (box.checked) state.discoveryInboxSelected.add(id); else state.discoveryInboxSelected.delete(id); }));
+}
+
+async function bulkInboxAction(action) {
+  const jobs = state.discoveryInboxJobs.filter((job) => state.discoveryInboxSelected.has(Number(job.id)));
+  if (!jobs.length) { toast("Select one or more jobs first."); return; }
+  if (action === "applied" && !window.confirm("Confirm these applications were submitted externally?")) return;
+  const path = action === "skip" ? "ignore" : action;
+  await Promise.all(jobs.map((job) => api.send(`/api/discovery/inbox/${job.id}/${path}`, "POST", { applicant_profile_id: value("discovery-profile") || state.selectedCandidateProfileId || "" })));
+  state.discoveryInboxSelected.clear();
+  await loadDiscoveryInbox(true);
 }
 
 async function loadDiscoveryInbox(force = false) {
