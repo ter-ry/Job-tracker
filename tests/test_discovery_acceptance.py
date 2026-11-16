@@ -108,6 +108,11 @@ def test_linkedin_failure_does_not_stop_later_indeed_batches(monkeypatch):
     assert calls[0][1] == ("linkedin", "indeed")
     assert all("linkedin" not in sources for _, sources in calls[1:])
     assert result["errors"]["linkedin"].startswith("TimeoutError")
+    assert len(result["completed_work_items"]) == 3
+    assert len(result["pending_query_batches"]) == 8
+    # The requested target was reached; retryable failed-provider work remains
+    # visible in diagnostics but does not require a Continue action.
+    assert result["continuation_available"] is False
 
 
 def test_continuation_retries_failed_provider_without_repeating_successful_provider(monkeypatch):
@@ -121,6 +126,36 @@ def test_continuation_retries_failed_provider_without_repeating_successful_provi
     completed = [{"location": "Toronto, ON", "keywords": "software developer", "provider": "indeed"}]
     fetch_discovery_jobs_for_search(_search(enabled_sources=["linkedin", "indeed"], completed_query_batches=completed), qualifying_predicate=lambda _raw: False)
     assert calls[0] == ("linkedin",)
+
+
+def test_all_provider_failure_does_not_complete_unattempted_queries(monkeypatch):
+    calls = []
+
+    def failed(**kwargs):
+        calls.append(tuple(kwargs["enabled_sources"]))
+        return {"jobs": [], "errors": {source: "timeout" for source in kwargs["enabled_sources"]}, "source_counts": {}, "source_diagnostics": {}, "source_snapshots": {}}
+
+    monkeypatch.setattr("app.fetch_jobspy_jobs", failed)
+    result = fetch_discovery_jobs_for_search(_search(enabled_sources=["linkedin", "indeed"], requested_target=5), qualifying_predicate=lambda _raw: True)
+    assert len(calls) == 1
+    assert result["completed_query_batches"] == []
+    assert len(result["pending_query_batches"]) == 4
+    assert len(result["pending_work_items"]) == 8
+    assert result["continuation_available"] is True
+
+
+def test_provider_specific_records_override_legacy_numeric_cursor(monkeypatch):
+    calls = []
+
+    def fake_fetch(**kwargs):
+        calls.append(tuple(kwargs["enabled_sources"]))
+        return {"jobs": [], "errors": {}, "source_counts": {}, "source_diagnostics": {}, "source_snapshots": {}}
+
+    monkeypatch.setattr("app.fetch_jobspy_jobs", fake_fetch)
+    result = fetch_discovery_jobs_for_search(_search(enabled_sources=["linkedin", "indeed"], continuation_index=3, completed_query_batches=[{"provider": "indeed", "location": "Toronto, ON", "keywords": "software developer"}]), qualifying_predicate=lambda _raw: False)
+    assert calls[0] == ("linkedin",)
+    assert result["completed_query_batches"][0] == {"provider": "indeed", "location": "Toronto, ON", "keywords": "software developer"}
+    assert len(result["completed_query_batches"]) == 8
 
 
 def test_final_eligibility_mode_does_not_stop_at_preliminary_target(monkeypatch):

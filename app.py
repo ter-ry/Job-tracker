@@ -8971,7 +8971,11 @@ def resolve_discovery_location_context(
     normalized_postal = normalize_canadian_postal_code(postal) if postal else ""
     private_origin = normalize_space(distance_origin_input)
     distance_origin = normalize_canadian_postal_code(extract_canadian_postal_code(private_origin)) if extract_canadian_postal_code(private_origin) else private_origin or normalized_postal or normalized_input
-    distance_origin_lookup = geocode_location_value(private_origin, lookup_type="distance_origin", profile=profile, provider=provider, use_cache=use_cache) if private_origin else {}
+    # A postal-code search is also a valid approximate origin when the user
+    # has not supplied a separate home/commute origin. Keep this distinct from
+    # the search-area geocode and label it with postal precision.
+    origin_lookup_input = private_origin or normalized_postal
+    distance_origin_lookup = geocode_location_value(origin_lookup_input, lookup_type="distance_origin", profile=profile, provider=provider, use_cache=use_cache) if origin_lookup_input else {}
     lookup_input = normalized_postal or normalized_input
     if is_countrywide_search_location(normalized_input):
         return {
@@ -9115,7 +9119,7 @@ def fetch_discovery_jobs_for_search(
         for item in completed_records if not text(item.get("provider"))
     }
     completed_by_provider = {
-        (text(item.get("location")), text(item.get("keywords")), normalize_space(text(item.get("provider"))).lower())
+        (normalize_space(text(item.get("provider"))).lower(), text(item.get("location")), text(item.get("keywords")))
         for item in completed_records if text(item.get("provider"))
     }
     continuation_index = clamp_int(search.get("continuation_index"), 0, 1000)
@@ -9132,13 +9136,19 @@ def fetch_discovery_jobs_for_search(
     qualified_count = 0
     pending_batches = 0
     all_planned_batches = [(location, query) for location in locations for query in queries]
-    # Compatibility for the earlier index-only contract.  Persisted batch
-    # records take precedence because they survive a server restart and do not
-    # accidentally skip failed work.
-    if not completed and continuation_index:
+    # Compatibility for the earlier index-only contract. It is safe only when
+    # no provider-specific records exist; otherwise a numeric cursor could
+    # promote partial work into a false all-provider completion.
+    if not completed and not completed_by_provider and continuation_index:
         completed = set(all_planned_batches[:continuation_index])
     planned_batches = [batch for batch in all_planned_batches if batch not in completed]
     completed_this_run: list[dict[str, str]] = []
+    providers = [normalize_space(source).lower() for source in search["enabled_sources"]]
+    all_work_items = {(provider, location, query) for location, query in all_planned_batches for provider in providers}
+    completed_work_items = set(completed_by_provider)
+    completed_work_items.update((provider, location, query) for location, query in completed for provider in providers)
+    attempted_work_items: set[tuple[str, str, str]] = set()
+    failed_work_items: set[tuple[str, str, str]] = set()
     active_sources = list(search["enabled_sources"])
     # Scope the breaker to this attempt. A continuation can retry a source,
     # but a repeatedly failing source cannot consume every remaining batch.
@@ -9162,12 +9172,13 @@ def fetch_discovery_jobs_for_search(
                 "source_diagnostics": provider_result.get("source_diagnostics") if isinstance(provider_result.get("source_diagnostics"), dict) else {},
             })
 
-        batch_sources = [source for source in active_sources if (location, keyword_query, normalize_space(source).lower()) not in completed_by_provider]
-        if not batch_sources:
-            completed_this_run.append({"location": location, "keywords": keyword_query})
-            continue
         if not active_sources:
             break
+        batch_sources = [source for source in active_sources if (normalize_space(source).lower(), location, keyword_query) not in completed_work_items]
+        # Every currently active provider already completed this batch. There
+        # is no new work item to write and, crucially, no providerless record.
+        if not batch_sources:
+            continue
         # Redistribute the original aggregate share only among providers still
         # working in this attempt; never increase the configured total budget.
         configured_cap = int(search.get("per_source_cap") or search["request_per_source_cap"])
@@ -9182,6 +9193,7 @@ def fetch_discovery_jobs_for_search(
             circuit_breaker=circuit_breaker,
             on_provider_update=provider_update,
         )
+        attempted_work_items.update((normalize_space(source).lower(), location, keyword_query) for source in batch_sources)
         if result.get("errors"):
             # Do not repeatedly hammer a provider that has already reported a
             # timeout/block/rate-limit in this acquisition run.
@@ -9220,27 +9232,39 @@ def fetch_discovery_jobs_for_search(
         # this attempt, but continue later distinct batches for every provider
         # that remains healthy (for example Indeed after LinkedIn times out).
         failed_sources = {normalize_space(source).lower() for source in result.get("errors", {})}
+        failed_work_items.update((normalize_space(source).lower(), location, keyword_query) for source in batch_sources if normalize_space(source).lower() in failed_sources)
         active_sources = [source for source in active_sources if normalize_space(source).lower() not in failed_sources]
         successful_sources = [source for source in batch_sources if normalize_space(source).lower() not in failed_sources]
-        completed_this_run.extend({"location": location, "keywords": keyword_query, "provider": source} for source in successful_sources)
+        for source in successful_sources:
+            provider = normalize_space(source).lower()
+            completed_work_items.add((provider, location, keyword_query))
+            completed_this_run.append({"location": location, "keywords": keyword_query, "provider": source})
         if target_reached:
             break
     combined["jobs"] = merged
     combined["keyword_queries"] = [query for _, query in planned_batches]
     combined["attempted_query_batches"] = attempted
-    # A failed batch itself is pending: it was attempted for diagnostics, but
-    # not completed and must be retried by a continuation request.
-    pending_start = len(completed_this_run)
-    pending_batches = max(0, len(planned_batches) - pending_start)
+    pending_work_items = all_work_items - completed_work_items
+    completed_query_keys = {
+        (location, query) for location, query in all_planned_batches
+        if all((provider, location, query) in completed_work_items for provider in providers)
+    }
+    pending_query_keys = [batch for batch in all_planned_batches if batch not in completed_query_keys]
+    retryable_work_items = sorted(failed_work_items)
+    pending_batches = len(pending_query_keys)
     combined["completed_query_batches"] = completed_records + completed_this_run
     combined["pending_query_batches"] = [
-        {"location": location, "keywords": query} for location, query in planned_batches[pending_start:]
+        {"location": location, "keywords": query} for location, query in pending_query_keys
     ]
+    combined["attempted_work_items"] = [{"provider": provider, "location": location, "keywords": query} for provider, location, query in sorted(attempted_work_items)]
+    combined["completed_work_items"] = [{"provider": provider, "location": location, "keywords": query} for provider, location, query in sorted(completed_work_items)]
+    combined["pending_work_items"] = [{"provider": provider, "location": location, "keywords": query} for provider, location, query in sorted(pending_work_items)]
+    combined["retryable_work_items"] = [{"provider": provider, "location": location, "keywords": query} for provider, location, query in retryable_work_items]
     combined["target_reached"] = target_reached
     combined["probe_qualifying_count"] = qualified_count
     combined["planned_queries_completed"] = pending_batches == 0 and not combined.get("errors") and not target_reached
     combined["continuation_available"] = not target_reached and (bool(combined.get("errors")) or pending_batches > 0)
-    combined["continuation_index"] = len(completed) + len(completed_this_run)
+    combined["continuation_index"] = len(completed_query_keys)
     combined["attempted_queries_exhausted"] = bool(combined["planned_queries_completed"])
     # A short provider page is not proof of total provider exhaustion. It only
     # proves that the currently planned distinct query batch was short.
