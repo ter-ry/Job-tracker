@@ -9106,10 +9106,17 @@ def fetch_discovery_jobs_for_search(
         qualification_probe = qualifying_predicate
     if target_matches is None and qualification_probe is not None and stop_when_target:
         target_matches = clamp_int(search.get("requested_target"), 0, 10000) or None
+    completed_records = [item for item in search.get("completed_query_batches", []) if isinstance(item, dict)]
+    # Legacy records without a provider mean the whole batch completed. New
+    # records retain provider identity so a healthy Indeed batch never hides a
+    # failed LinkedIn retry on continuation.
     completed = {
         (text(item.get("location")), text(item.get("keywords")))
-        for item in search.get("completed_query_batches", [])
-        if isinstance(item, dict)
+        for item in completed_records if not text(item.get("provider"))
+    }
+    completed_by_provider = {
+        (text(item.get("location")), text(item.get("keywords")), normalize_space(text(item.get("provider"))).lower())
+        for item in completed_records if text(item.get("provider"))
     }
     continuation_index = clamp_int(search.get("continuation_index"), 0, 1000)
     # Keep the first acquisition page at the user-selected per-source budget;
@@ -9155,6 +9162,10 @@ def fetch_discovery_jobs_for_search(
                 "source_diagnostics": provider_result.get("source_diagnostics") if isinstance(provider_result.get("source_diagnostics"), dict) else {},
             })
 
+        batch_sources = [source for source in active_sources if (location, keyword_query, normalize_space(source).lower()) not in completed_by_provider]
+        if not batch_sources:
+            completed_this_run.append({"location": location, "keywords": keyword_query})
+            continue
         if not active_sources:
             break
         # Redistribute the original aggregate share only among providers still
@@ -9166,7 +9177,7 @@ def fetch_discovery_jobs_for_search(
             keywords=keyword_query, location=location, distance=search["distance"],
             remote_preference=search["remote_preference"], job_type=None,
             results_wanted=per_region, hours_old=search["hours_old"],
-            enabled_sources=active_sources, country_indeed=country_indeed,
+            enabled_sources=batch_sources, country_indeed=country_indeed,
             provider_timeout_seconds=min(DISCOVERY_PROVIDER_TIMEOUT_SECONDS, remaining_budget),
             circuit_breaker=circuit_breaker,
             on_provider_update=provider_update,
@@ -9210,7 +9221,8 @@ def fetch_discovery_jobs_for_search(
         # that remains healthy (for example Indeed after LinkedIn times out).
         failed_sources = {normalize_space(source).lower() for source in result.get("errors", {})}
         active_sources = [source for source in active_sources if normalize_space(source).lower() not in failed_sources]
-        completed_this_run.append({"location": location, "keywords": keyword_query})
+        successful_sources = [source for source in batch_sources if normalize_space(source).lower() not in failed_sources]
+        completed_this_run.extend({"location": location, "keywords": keyword_query, "provider": source} for source in successful_sources)
         if target_reached:
             break
     combined["jobs"] = merged
@@ -9220,10 +9232,7 @@ def fetch_discovery_jobs_for_search(
     # not completed and must be retried by a continuation request.
     pending_start = len(completed_this_run)
     pending_batches = max(0, len(planned_batches) - pending_start)
-    combined["completed_query_batches"] = [
-        {"location": location, "keywords": keyword}
-        for location, keyword in all_planned_batches if (location, keyword) in completed
-    ] + completed_this_run
+    combined["completed_query_batches"] = completed_records + completed_this_run
     combined["pending_query_batches"] = [
         {"location": location, "keywords": query} for location, query in planned_batches[pending_start:]
     ]

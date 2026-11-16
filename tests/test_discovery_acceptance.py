@@ -110,6 +110,19 @@ def test_linkedin_failure_does_not_stop_later_indeed_batches(monkeypatch):
     assert result["errors"]["linkedin"].startswith("TimeoutError")
 
 
+def test_continuation_retries_failed_provider_without_repeating_successful_provider(monkeypatch):
+    calls = []
+
+    def fake_fetch(**kwargs):
+        calls.append(tuple(kwargs["enabled_sources"]))
+        return {"jobs": [], "errors": {}, "source_counts": {}, "source_diagnostics": {}, "source_snapshots": {}}
+
+    monkeypatch.setattr("app.fetch_jobspy_jobs", fake_fetch)
+    completed = [{"location": "Toronto, ON", "keywords": "software developer", "provider": "indeed"}]
+    fetch_discovery_jobs_for_search(_search(enabled_sources=["linkedin", "indeed"], completed_query_batches=completed), qualifying_predicate=lambda _raw: False)
+    assert calls[0] == ("linkedin",)
+
+
 def test_final_eligibility_mode_does_not_stop_at_preliminary_target(monkeypatch):
     """The API must normalize/finally qualify all planned batches first.
 
