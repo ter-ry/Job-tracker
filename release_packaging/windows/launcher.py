@@ -8,6 +8,7 @@ import multiprocessing
 import os
 from pathlib import Path
 import threading
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -104,18 +105,21 @@ def stop_waitress_server(server: object, server_thread: threading.Thread) -> Non
     # Closing the listener alone does not wake Waitress while a browser keeps
     # an accepted keep-alive connection open. Close those channels before
     # waiting, otherwise launch() can remain blocked on the server thread.
-    server.close()
-    from waitress import wasyncore
+    try:
+        server.close()
+        from waitress import wasyncore
 
-    wasyncore.close_all(server._map)
-    server_thread.join(timeout=5)
-    # A frozen Windows process must not remain resident after the authenticated
-    # local exit request.  Waitress normally exits after its channels close;
-    # if a runner/browser keeps an untracked handle alive, the packaged
-    # process is still safe to terminate now because discovery activity was
-    # rejected by the exit endpoint before this callback was started.
-    if isinstance(server_thread, threading.Thread) and server_thread.is_alive():
-        os._exit(0)
+        wasyncore.close_all(server._map)
+        server_thread.join(timeout=5)
+    finally:
+        # The authenticated exit request is the frozen application's process
+        # boundary.  A Windows Waitress worker can retain a native handle even
+        # after the listener and thread have been closed, so always terminate
+        # the packaged process after bounded cleanup.  This also guarantees the
+        # smoke and installer lifecycle gates cannot hang on a half-shutdown
+        # executable.
+        if getattr(sys, "frozen", False):
+            os._exit(0)
 
 
 def launch() -> int:
