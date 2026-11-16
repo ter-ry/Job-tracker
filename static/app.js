@@ -3815,6 +3815,13 @@ function discoveryFieldValue(job, field, preferences) {
   }
 }
 
+function discoveryEligibilityTier(job) {
+  const level = String(job?.qualification_fit_seniority?.detected_level || job?.seniority_level || "").toLowerCase().replaceAll("-", "_");
+  if (["entry_level", "junior", "internship"].includes(level)) return 0;
+  if (level === "intermediate") return 1;
+  return 2;
+}
+
 function compareDiscoveryValues(aValue, bValue, direction) {
   const asc = direction !== "desc";
   const maxLength = Math.max(aValue.length, bValue.length);
@@ -3837,6 +3844,10 @@ function compareDiscoveryJobs(a, b, preferences) {
   const secondary = sort.secondary_field || "";
   const primaryDirection = sort.direction || "desc";
   const secondaryDirection = sort.secondary_direction || "asc";
+  if (["application_priority_score", "overall_score", "score"].includes(primary)) {
+    const tierDiff = discoveryEligibilityTier(a) - discoveryEligibilityTier(b);
+    if (tierDiff !== 0) return tierDiff;
+  }
   const primaryDiff = compareDiscoveryValues(discoveryFieldValue(a, primary, preferences), discoveryFieldValue(b, primary, preferences), primaryDirection);
   if (primaryDiff !== 0) return primaryDiff;
   if (secondary) {

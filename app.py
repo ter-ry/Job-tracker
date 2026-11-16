@@ -9765,6 +9765,12 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
     target_role_families = ACTIONABLE_DISCOVERY_ROLE_FAMILIES
     search_mode = text(job.get("discovery_search_mode")).lower() or "legacy"
     broad = text(job.get("discovery_match_policy")) == "apply_broadly"
+    # Apply the user-selected SWE hard gates before any location, remote, or
+    # provisional-review branch. Otherwise unresolved geography can turn a
+    # confirmed senior role into a Needs Review opportunity.
+    hard_reason = discovery_hard_exclusion_reason(job)
+    if hard_reason:
+        return "excluded", hard_reason
     if text(job.get("role_type")).lower() == "intern" and not bool(job.get("discovery_include_internships")):
         return "excluded", "Internships are excluded by the selected search preference."
     if normalize_space(text(remote_preference)).lower() != "remote":
@@ -9780,9 +9786,6 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
             return "review_required", "Exact workplace distance could not be verified under strict-radius matching."
         if job.get("location_search_eligible") is False or text(job.get("location_search_eligible")).lower() == "false":
             return "excluded", "Confirmed job location is outside the requested search area."
-        hard_reason = discovery_hard_exclusion_reason(job)
-        if hard_reason:
-            return "excluded", hard_reason
         if search_mode == "title":
             return title_search_result_category(job)
         role_type = text(job.get("role_type")).lower()
@@ -9803,9 +9806,6 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
     if text(job.get("remote_search_eligible")).lower() == "true" and text(job.get("remote_eligibility")).lower() == "canadian_eligible" and "remote" in text(job.get("remote_type")).lower():
         if search_mode == "title":
             return title_search_result_category(job)
-        hard_reason = discovery_hard_exclusion_reason(job)
-        if hard_reason:
-            return "excluded", hard_reason
         role_type = text(job.get("role_type")).lower()
         if broad and search_mode == "shortlist":
             if not plausible_software_role(job):
@@ -9858,6 +9858,9 @@ def discovery_hard_exclusion_reason(job: dict[str, Any], search: dict[str, Any] 
     experience and title/seniority evidence can make this a hard exclusion.
     """
     search = search or {}
+    occupation = normalize_space(text(job.get("discovery_occupation") or job.get("occupation"))).lower()
+    if occupation and occupation not in {"software developer", "software development", "swe", "software engineer"}:
+        return ""
     analysis = job.get("qualification_fit_seniority") or {}
     required = analysis.get("required_experience") or {}
     try:

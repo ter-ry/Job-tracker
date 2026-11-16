@@ -113,3 +113,22 @@ def test_seniority_parser_prefers_associate_and_new_grad_title_signals():
     assert associate["detected_level"] in {"entry_level", "junior"}
     assert graduate["detected_level"] == "entry_level"
     assert senior_staff["detected_level"] in {"senior", "lead"}
+
+
+def test_swe_hard_exclusions_precede_unknown_geography_and_remote_review():
+    search = _search(match_policy="apply_broadly", maximum_required_years=3)
+    unknown_radius = _swe_policy_job(
+        "Senior Staff Software Engineer", "10+ years of software engineering experience required.",
+        distance_radius_status="unknown", geographic_eligibility="unverified",
+        location_search_eligible=True,
+    )
+    unknown_remote = _swe_policy_job(
+        "Senior Software Engineer", "6 years of software engineering experience required.",
+        remote_type="Remote", remote_search_eligible="", remote_eligibility="unknown",
+        location_search_eligible=True,
+    )
+    for job in (unknown_radius, unknown_remote):
+        category, reason = app.discovery_result_category(job, "remote" if job is unknown_remote else "")
+        assert category == "excluded", (category, reason)
+        assert app.discovery_target_assessment(job, search)[0] == "ineligible"
+        assert "senior" in reason.lower() or "experience" in reason.lower()
