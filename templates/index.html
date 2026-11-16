@@ -137,6 +137,13 @@
                 <input id="discovery-maximum-years" type="number" min="0" max="30" step="1" value="3">
                 <small class="muted">Only confirmed professional experience is enforced.</small>
               </label>
+              <label id="discovery-match-policy-label">Matching approach
+                <select id="discovery-match-policy">
+                  <option value="apply_broadly" selected>Apply Broadly — plausible technical roles</option>
+                  <option value="strict_matching">Strict Matching — closely qualifying roles</option>
+                </select>
+                <small class="muted">Broad mode ranks fit; it does not claim an unverified résumé match.</small>
+              </label>
               <label class="checkline"><input id="discovery-include-provisional" type="checkbox" checked> Include plausible matches with unstated seniority</label>
               <label class="checkline"><input id="discovery-include-internships" type="checkbox"> Include internships in the junior eligibility policy</label>
               <label>Location confidence
@@ -187,6 +194,7 @@
             <div id="discovery-source-test-output" class="muted helper" aria-live="polite"></div>
             <div class="actions">
               <button class="button" type="submit" id="discovery-submit">Search</button>
+              <button class="button ghost" type="button" id="fast-apply-open">Fast Apply</button>
               <button class="button ghost" type="button" id="discovery-stop" hidden>Stop Search</button>
               <button class="button ghost beta-secondary" type="button" id="save-current-discovery-search">Save current search</button>
               <button class="button ghost beta-secondary" type="button" id="discovery-test-sources">Test job sources</button>
@@ -263,6 +271,11 @@
               </div>
             </div>
             <div id="discovery-results" class="generated-output empty">Search results will appear here.</div>
+          </section>
+
+          <section class="panel discovery-view-find" id="fast-apply-panel" hidden>
+            <div class="panel-header"><div><h2>Fast Apply</h2><p class="muted helper">Open the original posting, submit externally, then confirm the outcome here.</p></div><button class="button ghost small" type="button" id="fast-apply-close">Close</button></div>
+            <div id="fast-apply-current" class="generated-output empty">Run a search to build a new-opportunities queue.</div>
           </section>
 
           <section class="panel discovery-inbox-panel discovery-view-saved">

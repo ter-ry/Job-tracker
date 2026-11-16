@@ -200,6 +200,8 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("discovery-filter-toggle").addEventListener("click", toggleDiscoveryFilters);
   document.getElementById("discovery-clear-filters").addEventListener("click", clearDiscoveryFilters);
   document.getElementById("discovery-filter-show-all")?.addEventListener("click", showAllFetchedDiscoveryJobs);
+  document.getElementById("fast-apply-open")?.addEventListener("click", openFastApply);
+  document.getElementById("fast-apply-close")?.addEventListener("click", () => { document.getElementById("fast-apply-panel").hidden = true; });
   setDiscoverySection("find");
   applyAdvancedFeaturesVisibility();
   ["search", "status-filter", "fit-filter", "role-filter", "remote-filter", "risk-filter", "sort-by"].forEach((id) => {
@@ -2548,6 +2550,9 @@ function applyDiscoveryWorkflow(workflow = "software", { reset = false } = {}) {
   setValue("discovery-location", "");
   setValue("discovery-seniority", selected === "software" ? "entry_level,junior,intermediate" : "any");
   setValue("discovery-maximum-years", selected === "software" ? 3 : "");
+  setValue("discovery-match-policy", selected === "software" ? "apply_broadly" : "strict_matching");
+  const policyControl = document.getElementById("discovery-match-policy");
+  if (policyControl) policyControl.disabled = selected === "ece";
   setChecked("discovery-include-internships", false);
   const seniorityControl = document.getElementById("discovery-seniority");
   const yearsControl = document.getElementById("discovery-maximum-years");
@@ -2597,6 +2602,7 @@ function discoverySearchCriteriaFromControls(continuation = false) {
   const workflow = value("discovery-workflow") || state.discoveryWorkflow || "software";
   return {
     search_mode: workflow === "software" ? "shortlist" : "title",
+    match_policy: workflow === "software" ? (value("discovery-match-policy") || "apply_broadly") : "strict_matching",
     title_match_mode: value("discovery-title-match-mode") || "related",
     keywords: value("discovery-keywords"),
     location: value("discovery-location"),
@@ -2817,14 +2823,16 @@ function mergeProgressiveDiscoveryJobs(jobs = []) {
 }
 
 function acknowledgeRenderedDiscoveryJobs(searchId, jobs = []) {
+  const displayed = new Set((state.discoveryResults || []).map((job) => Number(job?.id)).filter(Boolean));
   const jobIds = (Array.isArray(jobs) ? jobs : [])
-    .filter((job) => job?.result_stage === "qualified" && job?.discovery_result_category === "actionable" && Number(job?.id) > 0)
+    .filter((job) => displayed.has(Number(job?.id)) && job?.result_stage === "qualified" && job?.discovery_result_category === "actionable" && Number(job?.id) > 0)
     .map((job) => Number(job.id));
   if (!jobIds.length) return;
   // This acknowledgement follows renderDiscoveryResults().  A worker result
   // alone must not make a vacancy disappear if the tab closes before display.
   void api.sendOutcome(`/api/discovery/searches/${encodeURIComponent(searchId)}/delivered`, "POST", { job_ids: jobIds })
-    .catch(() => {});
+    .then((outcome) => { if (!outcome?.ok) { state.discoveryDeliveryPending = jobIds; toast("Results are visible but Seen acknowledgement will retry after refresh."); } })
+    .catch(() => { state.discoveryDeliveryPending = jobIds; toast("Results are visible but Seen acknowledgement will retry after refresh."); });
 }
 
 function renderProgressiveSearchProgress(payload = {}) {
@@ -3240,7 +3248,7 @@ function renderDiscoveryResults(result) {
       <p class="muted">${profileFreeResults ? "Score basis: posting evidence only; no résumé used." : `Qualification evidence: ${escapeHtml(evidenceProfileName)}`}</p>
       ${unsupportedCriteria.length ? `<p class="warning-text">${escapeHtml(unsupportedCriteria.join(" and "))} was requested, but this backend response did not confirm that control. Results were not locally relabeled as filtered.</p>` : ""}
       ${errorText}
-      ${noNewReason ? `<p class="warning-text" data-discovery-no-new-reason>Why no new jobs: ${escapeHtml(noNewReason)}</p>` : ""}
+      ${noNewReason ? `<p class="warning-text" data-discovery-no-new-reason>Why the requested target was not reached: ${escapeHtml(noNewReason)}</p>` : ""}
       ${continueButton}
     </div>
     ${rawSummary}
@@ -3255,6 +3263,32 @@ function renderDiscoveryResults(result) {
     });
   });
   container.querySelector("[data-discovery-continue]")?.addEventListener("click", continueDiscoverySearch);
+}
+
+function openFastApply() {
+  const panel = document.getElementById("fast-apply-panel");
+  if (!panel) return;
+  panel.hidden = false;
+  renderFastApply();
+}
+
+function renderFastApply() {
+  const target = document.getElementById("fast-apply-current");
+  if (!target) return;
+  const queue = applyDiscoveryClientFiltersAndSort(state.discoveryResults || [], discoveryPreferencesFromControls());
+  const job = queue[0];
+  target.classList.toggle("empty", !job);
+  if (!job) { target.textContent = "No new opportunities remain in this queue."; return; }
+  const key = escapeAttribute(discoveryJobKey(job));
+  const url = job.application_url || job.url || "";
+  target.innerHTML = `<article class="discovery-card"><h3>${escapeHtml(job.title || "Untitled role")}</h3><p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(resultWorkplaceLabel(job))}</p><p class="muted">${escapeHtml(displaySalary(job))} · ${escapeHtml(job.discovery_fit_label || "Match not fully assessed")}</p><details><summary>Essential requirements</summary>${escapeHtml((job.qualification_requirements || job.required_skills || "Not fully assessed from the posting.").toString())}</details><div class="row-actions">${url ? `<a class="button small" href="${escapeAttribute(url)}" target="_blank" rel="noreferrer">Open Original / Apply</a>` : ""}<button class="button small ghost" data-fast-action="applied" data-job-key="${key}">Confirm Applied</button><button class="button small ghost" data-fast-action="save" data-job-key="${key}">Save for later</button><button class="button small ghost" data-fast-action="skip" data-job-key="${key}">Skip</button></div><p class="muted helper">Opening a posting never marks it applied. Confirm only after submitting externally.</p></article>`;
+  target.querySelectorAll("[data-fast-action]").forEach((button) => button.addEventListener("click", async () => {
+    const action = button.dataset.fastAction;
+    if (action === "applied") await applyDiscoveryJob(button.dataset.jobKey);
+    if (action === "save") await saveDiscoveryJob(button.dataset.jobKey);
+    if (action === "skip") await skipDiscoveryJob(button.dataset.jobKey);
+    renderFastApply();
+  }));
 }
 
 function renderDiscoveryOriginSummary() {
@@ -3345,6 +3379,10 @@ function renderDiscoveryDiagnostics(diagnostics, visibleCount, totalCount) {
   }
   if (diagnostics.eligible_previously_presented_count !== undefined || diagnostics.eligible_already_actioned_count !== undefined) {
     details.push(`<li><strong>Eligible queue state:</strong> previously presented ${Number(diagnostics.eligible_previously_presented_count || 0)} | applicant action ${Number(diagnostics.eligible_already_actioned_count || 0)}</li>`);
+  }
+  if (diagnostics.review_reason_counts && Object.keys(diagnostics.review_reason_counts).length) {
+    const reasons = Object.entries(diagnostics.review_reason_counts).map(([reason, count]) => `${reason.replaceAll("_", " ")}: ${Number(count)}`).join(" | ");
+    details.push(`<li><strong>Review-required reasons:</strong> ${escapeHtml(reasons)}</li>`);
   }
   details.push(`<li><strong>Visible after local filters:</strong> ${Number(visibleCount || 0)}</li>`);
   details.push(`<li><strong>Hidden by local filters:</strong> ${hiddenByLocalFilters}</li>`);
@@ -3544,7 +3582,8 @@ function renderDiscoveryCard(job) {
   const buttonDisabled = alreadySaved && savedStatus === "shortlisted" || discoveryActionDisabled(job) ? "disabled" : "";
   const saved = alreadySaved ? `<span class="risk low">${escapeHtml(job.saved_job_status || job.status || "Saved")}</span>` : "";
   const eligibility = eligibilityAssessment(job);
-  const category = `<span class="risk ${eligibility.status === "verified" ? "low" : eligibility.status === "provisional" ? "medium" : "high"}">${escapeHtml(eligibility.label)}</span>`;
+  const fitLabel = job.discovery_fit_label || (eligibility.status === "verified" ? "Strong fit" : eligibility.status === "provisional" ? "Possible fit" : eligibility.label);
+  const category = `<span class="risk ${fitLabel === "Strong fit" ? "low" : fitLabel === "Stretch" ? "high" : "medium"}">${escapeHtml(fitLabel)}</span>`;
   return `
     <section class="discovery-card" data-job-key="${key}">
       <div class="discovery-card-main">
