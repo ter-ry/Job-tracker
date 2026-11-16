@@ -157,6 +157,7 @@ DISCOVERY_TASK_NAME = "Job Tracker Discovery"
 # an uncooperative upstream scraper can be force-stopped.
 DISCOVERY_PROVIDER_TIMEOUT_SECONDS = 20
 DISCOVERY_OVERALL_TIMEOUT_SECONDS = 75
+DISCOVERY_MIN_PROVIDER_BUDGET_SECONDS = 3
 TESTED_DEPENDENCY_VERSIONS = {
     "python-jobspy": "1.4.1",
     "pandas": "2.3.3",
@@ -1943,7 +1944,14 @@ def create_app() -> Flask:
             previous = latest_by_identity.get(identity)
             if previous is None or int(item.get("result_sequence") or 0) >= int(previous.get("result_sequence") or 0):
                 latest_by_identity[identity] = item
-        visible = [item for item in latest_by_identity.values() if int(item.get("result_sequence") or 0) >= after]
+        # An exclusion event is a durable tombstone for an older actionable
+        # event. Keep it in history/diagnostics, but never expose it as an
+        # inbox result after the vacancy becomes hard-ineligible.
+        visible = [
+            item for item in latest_by_identity.values()
+            if int(item.get("result_sequence") or 0) >= after
+            and text(item.get("result_stage")) != "excluded"
+        ]
         visible.sort(key=lambda item: int(item.get("result_sequence") or 0))
         return jsonify({
             "search_id": search_id,
@@ -2648,7 +2656,6 @@ def create_app() -> Flask:
             )
         jobs = jobs[: search["total_cap"]]
         manual_run_id = create_discovery_run(None, "manual")
-        persisted = persist_discovery_jobs(jobs, None, manual_run_id)
         selected_applicant_id = applicant_profile_id(payload)
         for item in jobs:
             hydrate_discovery_identity(item)
@@ -2675,8 +2682,13 @@ def create_app() -> Flask:
         for item in target_review_jobs:
             item["discovery_result_category"] = "review_required"
             item["discovery_result_reason"] = discovery_target_ineligibility_reason(item, search)
+        for item in ordered:
+            item["recommendation_eligible"] = item.get("discovery_result_category") == "actionable"
         matching_jobs = [item for item in ordered if item.get("discovery_result_category") == "actionable"]
         review_required_jobs = [item for item in ordered if item.get("discovery_result_category") not in {"actionable", "excluded"}]
+        # Persist only after the final hard and target gates have run. This
+        # prevents stale actionable rows from surviving a stricter recheck.
+        persisted = persist_discovery_jobs(ordered, None, manual_run_id)
         new_matching_jobs = matching_jobs[:requested_target]
         # The response is unified: actionable new matches first, followed by a
         # separately labelled review queue. Excluded jobs never enter it.
@@ -3254,7 +3266,14 @@ def _run_async_discovery_search(search_id: str, payload: dict[str, Any]) -> None
                 return
             jobs = result.get("jobs") if isinstance(result.get("jobs"), list) else []
             # Only persisted, final, applicant-unseen rows are actionable.
-            _append_async_discovery_results(search_id, [{**job, "result_stage": "qualified"} for job in jobs])
+            # Exclusions are emitted as tombstones so an older actionable
+            # cursor event cannot resurrect a vacancy after re-evaluation.
+            excluded_jobs = result.get("excluded_jobs") if isinstance(result.get("excluded_jobs"), list) else []
+            _append_async_discovery_results(
+                search_id,
+                ([{**job, "result_stage": "qualified"} for job in jobs]
+                 + [{**job, "result_stage": "excluded"} for job in excluded_jobs]),
+            )
             progress = _async_discovery_progress(result, int(payload.get("new_matching_target") or payload.get("shortlist_size") or 50))
             diagnostics = result.get("diagnostics") if isinstance(result.get("diagnostics"), dict) else {}
             continuation = bool(diagnostics.get("continuation_available") or (result.get("search_progress") or {}).get("continuation_available"))
@@ -3495,6 +3514,8 @@ def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, ru
                 "description_fetched_at", "last_verified_at", "workplace_address", "workplace_postal_code",
                 "workplace_evidence", "workplace_evidence_source", "workplace_precision", "workplace_confidence",
                 "workplace_alternatives_json", "remote_classification_conflict", "warnings",
+                "discovery_result_category", "discovery_result_reason", "recommendation_eligible",
+                "discovery_match_status", "discovery_match_explanation",
             }
             updates = {column: job.get(column, "") for column in assessment_columns if column in JOB_COLUMNS}
             for column, value in updates.items():
@@ -3770,7 +3791,6 @@ def run_discovery_pipeline(
         jobs.append(clean)
     capped_count = max(0, len(jobs) - search["total_cap"])
     jobs = sort_discovery_jobs(jobs, "application_priority_score", "desc", "", "asc", "remote_after_local", "last")[: search["total_cap"]]
-    persisted = persist_discovery_jobs(jobs, search_id, run_id)
     requested_target = int(search.get("requested_target") or 50)
     ordered = list(jobs)
     target_review_jobs = [item for item in ordered if item.get("discovery_result_category") == "actionable" and not discovery_target_eligible(item, search)]
@@ -3780,6 +3800,11 @@ def run_discovery_pipeline(
     for item in target_review_jobs:
         item["discovery_result_category"] = "review_required"
         item["discovery_result_reason"] = discovery_target_ineligibility_reason(item, search)
+    for item in ordered:
+        item["recommendation_eligible"] = item.get("discovery_result_category") == "actionable"
+    # Persist only after the final hard and target gates have run. This keeps
+    # the durable row, async cursor, and inbox category consistent.
+    persisted = persist_discovery_jobs(ordered, search_id, run_id)
     selected_applicant_id = applicant_profile_id(payload)
     eligible_unpresented: list[dict[str, Any]] = []
     previously_presented_count = 0
@@ -3857,6 +3882,7 @@ def run_discovery_pipeline(
         "raw_jobs_returned": len(fetched.get("jobs", [])),
         "displayed_jobs": len(jobs),
         "display_jobs": jobs,
+        "excluded_jobs": excluded_jobs,
         # Retained for older clients; this is an early reliable-salary filter,
         # not the final eligibility/exclusion count.
         "filtered_by_saved_search": filtered,
@@ -3873,6 +3899,7 @@ def run_discovery_pipeline(
     save_discovery_debug_run(search_key, {**payload, "search_id": search_id}, metadata, fetched.get("source_snapshots", {}))
     return {
         "jobs": jobs,
+        "excluded_jobs": excluded_jobs,
         "matching_jobs": matching_jobs,
         "review_required_jobs": review_required_jobs,
         "search_progress": {
@@ -9181,7 +9208,13 @@ def fetch_discovery_jobs_for_search(
         if elapsed >= DISCOVERY_OVERALL_TIMEOUT_SECONDS:
             combined["errors"]["overall"] = f"Discovery timed out after {DISCOVERY_OVERALL_TIMEOUT_SECONDS}s before all locations completed."
             break
-        remaining_budget = max(1, int(DISCOVERY_OVERALL_TIMEOUT_SECONDS - elapsed))
+        remaining_budget = max(0, int(DISCOVERY_OVERALL_TIMEOUT_SECONDS - elapsed))
+        if remaining_budget < DISCOVERY_MIN_PROVIDER_BUDGET_SECONDS:
+            combined["errors"]["budget"] = (
+                f"Discovery stopped with {remaining_budget}s remaining; the next provider request was not started."
+            )
+            combined["pending_budget"] = True
+            break
         attempted.append({"location": location, "keywords": keyword_query})
         def provider_update(source: str, provider_result: dict[str, Any]) -> None:
             if on_provider_update is None:
@@ -9828,7 +9861,13 @@ def plausible_software_role(job: dict[str, Any]) -> bool:
         return False
     if role_type in ACTIONABLE_DISCOVERY_ROLE_FAMILIES:
         return True
-    return bool(re.search(r"\b(software|full[ -]?stack|front[ -]?end|back[ -]?end|python|qa automation|test automation|devops|cloud|api|integration|automation|platform)\b", title))
+    # A technology keyword alone is not a job family. For example, an
+    # academic-assistant posting may mention Python and data science while
+    # being unrelated to software employment. Require an engineering/developer
+    # role signal when the normalized provider family is unavailable.
+    if re.search(r"\b(academic assistant|teaching assistant|instructor|teacher|faculty|professor|tutor|research|analyst|recruiter|recruitment|human resources|administrator|coordinator)\b", title):
+        return False
+    return bool(re.search(r"\b(software engineer|software developer|developer|engineer|full[ -]?stack|front[ -]?end|back[ -]?end|qa automation|test automation|devops|cloud engineer|api engineer|integration engineer|automation engineer|platform engineer|sdet)\b", title))
 
 
 def apply_broadly_reason(job: dict[str, Any]) -> str:

@@ -132,3 +132,29 @@ def test_swe_hard_exclusions_precede_unknown_geography_and_remote_review():
         assert category == "excluded", (category, reason)
         assert app.discovery_target_assessment(job, search)[0] == "ineligible"
         assert "senior" in reason.lower() or "experience" in reason.lower()
+
+
+def test_ci76_owner_swe_examples_do_not_leak_through_apply_broadly_fallbacks():
+    search = _search(match_policy="apply_broadly", maximum_required_years=3)
+    td = _swe_policy_job(
+        "Software Engineer II (Full Stack)",
+        "Minimum qualifications: 5+ years of professional software engineering experience.",
+        qualification_fit_seniority={"detected_level": "intermediate", "required_experience": {"minimum": 5}},
+        distance_radius_status="unknown", geographic_eligibility="unverified",
+    )
+    academic = _swe_policy_job(
+        "Academic Assistant, Python Programming and Data Science",
+        "Support students with Python and data science programming.",
+        role_type="",
+        qualification_fit_seniority={"detected_level": "unknown", "required_experience": {}},
+    )
+    amex = _swe_policy_job(
+        "Campus Software Engineer I",
+        "Entry-level software engineering role with mentorship.",
+        qualification_fit_seniority={"detected_level": "entry_level", "required_experience": {"minimum": 0}},
+    )
+    assert app.discovery_target_assessment(td, search)[0] == "ineligible"
+    assert app.discovery_result_category(td)[0] == "excluded"
+    assert app.plausible_software_role(academic) is False
+    assert app.plausible_software_role(amex) is True
+    assert app.discovery_result_category(amex)[0] != "excluded"
