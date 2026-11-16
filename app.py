@@ -2573,6 +2573,11 @@ def create_app() -> Flask:
         for item in jobs:
             category = item.get("discovery_result_category") or "review_required"
             category_counts[category] = category_counts.get(category, 0) + 1
+        exclusion_reason_counts: dict[str, int] = {}
+        for item in jobs:
+            if item.get("discovery_result_category") == "excluded":
+                bucket = discovery_exclusion_reason_bucket(item)
+                exclusion_reason_counts[bucket] = exclusion_reason_counts.get(bucket, 0) + 1
         excluded_count = category_counts.get("excluded", 0)
         outside_radius_count = sum(1 for item in jobs if text(item.get("distance_radius_status")) == "outside_radius")
         unknown_distance_count = sum(1 for item in jobs if text(item.get("distance_radius_status")) == "unknown")
@@ -2627,6 +2632,7 @@ def create_app() -> Flask:
             "distance_origin": search["distance_origin"],
             "location_resolution_method": search["location_resolution_method"],
             "remote_result_groups": category_counts,
+            "exclusion_reason_counts": exclusion_reason_counts,
         }
         if jobs:
             jobs = sort_discovery_jobs(
@@ -3798,6 +3804,10 @@ def run_discovery_pipeline(
     for item in review_required_jobs:
         bucket = discovery_reason_bucket(item)
         review_reason_counts[bucket] = review_reason_counts.get(bucket, 0) + 1
+    exclusion_reason_counts: dict[str, int] = {}
+    for item in excluded_jobs:
+        bucket = discovery_exclusion_reason_bucket(item)
+        exclusion_reason_counts[bucket] = exclusion_reason_counts.get(bucket, 0) + 1
     # Find Jobs intentionally exposes only the bounded, qualified new queue.
     # Everything else remains durably discoverable in history/diagnostics.
     jobs = matching_jobs
@@ -3828,6 +3838,7 @@ def run_discovery_pipeline(
         "disqualified_count": len(excluded_jobs),
         "review_required_count": len(review_required_jobs),
         "review_reason_counts": review_reason_counts,
+        "exclusion_reason_counts": exclusion_reason_counts,
         "new_matching_count": len(matching_jobs),
         "eligible_previously_presented_count": previously_presented_count,
         "eligible_already_actioned_count": already_actioned_count,
@@ -3868,6 +3879,7 @@ def run_discovery_pipeline(
             "disqualified": len(excluded_jobs),
             "review_required": len(review_required_jobs),
             "review_reason_counts": review_reason_counts,
+            "exclusion_reason_counts": exclusion_reason_counts,
             "new_matching_jobs": len(matching_jobs),
             "previously_presented": previously_presented_count,
             "already_actioned": already_actioned_count,
@@ -9832,6 +9844,32 @@ def discovery_reason_bucket(job: dict[str, Any]) -> str:
     if not text(job.get("qualification_evidence_source")):
         return "unknown_resume_evidence"
     return "other_review_required"
+
+
+def discovery_exclusion_reason_bucket(job: dict[str, Any]) -> str:
+    """Return one auditable hard-exclusion reason for diagnostics.
+
+    Missing evidence is deliberately not an exclusion.  Only facts already
+    classified as hard blockers are counted here so an uncertain posting can
+    remain available in the review queue.
+    """
+    reason = normalize_space(text(job.get("discovery_result_reason"))).lower()
+    if text(job.get("posting_availability")).lower() in {"closed", "expired", "removed"} or any(token in reason for token in ("closed", "expired", "no longer available")):
+        return "closed_or_unavailable"
+    radius_status = text(job.get("distance_radius_status")).lower()
+    if radius_status == "outside_radius":
+        if text(job.get("distance_confidence")) not in {"", "0", "unknown"}:
+            return "confirmed_outside_radius"
+        return "unverified_location_not_hard_exclusion"
+    if "internship" in reason or text(job.get("role_type")).lower() == "internship":
+        return "internship_not_requested"
+    if "role family" in reason or "occupation" in reason or "unrelated" in reason or "management" in reason:
+        return "confirmed_unrelated_or_management"
+    if "salary" in reason and "minimum" in reason:
+        return "confirmed_salary_below_minimum"
+    if "canadian" in reason or "ontario" in reason or "eligib" in reason:
+        return "confirmed_geographic_ineligibility"
+    return "other_confirmed_hard_exclusion"
 
 
 def title_search_result_category(job: dict[str, Any]) -> tuple[str, str]:

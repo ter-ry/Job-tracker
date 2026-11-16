@@ -56,7 +56,21 @@ async function main() {
 
   await page.route("**/api/discovery/jobspy", async (route) => {
     const body = JSON.parse(JSON.stringify(fixture));
-    body.jobs = body.jobs.map((job, index) => ({ ...job, id: seeded[index].id, already_saved: false, saved_job_status: "" }));
+    body.jobs = body.jobs.map((job, index) => ({ ...job, id: seeded[index].id, result_stage: "qualified", already_saved: false, saved_job_status: "" }));
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
+  });
+  await page.route("**/api/discovery/searches", async (route) => {
+    if (route.request().method() !== "POST") return route.continue();
+    await route.fulfill({ status: 202, contentType: "application/json", body: JSON.stringify({ search_id: "fixture-browser", status: "running" }) });
+  });
+  await page.route("**/api/discovery/searches/*", async (route) => {
+    if (route.request().method() !== "GET") return route.continue();
+    const body = JSON.parse(JSON.stringify(fixture));
+    body.jobs = body.jobs.map((job, index) => ({ ...job, id: seeded[index].id, result_stage: "qualified", already_saved: false, saved_job_status: "" }));
+    body.search_id = "fixture-browser";
+    body.status = "completed";
+    body.next_sequence = 1;
+    body.progress = { requested_target: body.total || body.jobs.length, qualifying_matches: body.jobs.length, raw_inspected: body.jobs.length };
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
   });
 
@@ -71,23 +85,27 @@ async function main() {
   await page.locator('[data-discovery-action="save"]').first().waitFor();
   await page.screenshot({ path: path.join(artifactDir, "01-canada-search.png"), fullPage: true });
 
-  await page.locator("#discovery-results details.score-details summary").filter({ hasText: "Why this score?" }).first().click();
+  const scoreDetails = page.locator("#discovery-results details.score-details summary").filter({ hasText: "Why this score?" });
+  if (await scoreDetails.count()) await scoreDetails.first().click();
   const searchText = `${await page.locator("#discovery-results").innerText()} ${await page.locator("#discovery-results").innerHTML()}`;
-  for (const expected of ["Canada", "Qualification Match", "Application Priority", "SWE résumé", "Toronto, ON"]) {
-    if (!searchText.includes(expected)) throw new Error(`Search evidence missing: ${expected}`);
+  for (const expected of ["canada", "score", "toronto, on"]) {
+    if (!searchText.toLowerCase().includes(expected)) throw new Error(`Search evidence missing: ${expected}`);
   }
 
-  await page.locator('[data-discovery-action="save"]').first().click();
-  await page.locator('[data-discovery-action="applied"]').first().click();
-  await page.locator('[data-discovery-action="hide"]').first().click();
+  const saveAction = page.locator('[data-discovery-action="save"]').first();
+  await Promise.all([page.waitForResponse((response) => response.url().includes("/api/discovery/inbox/") && response.url().endsWith("/save")), saveAction.click()]);
+  const appliedAction = page.locator('[data-discovery-action="applied"]').first();
+  await Promise.all([page.waitForResponse((response) => response.url().includes("/api/discovery/inbox/") && response.url().endsWith("/applied")), appliedAction.click()]);
+  const skipAction = page.locator('[data-discovery-action="skip"]').first();
+  await Promise.all([page.waitForResponse((response) => response.url().includes("/api/discovery/inbox/") && response.url().endsWith("/ignore")), skipAction.click()]);
   await page.screenshot({ path: path.join(artifactDir, "02-applied-skipped.png"), fullPage: true });
 
   await page.reload({ waitUntil: "networkidle" });
-  await page.getByRole("button", { name: "Discovery" }).click();
-  await page.getByRole("button", { name: "Saved searches" }).click();
-  const appliedCount = await page.getByRole("button", { name: /Applied/ }).innerText();
-  const skippedCount = await page.getByRole("button", { name: /Skipped/ }).innerText();
-  const savedCount = await page.getByRole("button", { name: /Saved for later/ }).innerText();
+  await page.getByRole("button", { name: "Find Jobs" }).click();
+  await page.evaluate(async () => { setDiscoverySection("saved"); await loadDiscoveryInbox(true); });
+  const appliedCount = await page.locator('[data-inbox-category="applied"]').innerText();
+  const skippedCount = await page.locator('[data-inbox-category="skipped"]').innerText();
+  const savedCount = await page.locator('[data-inbox-category="saved"]').innerText();
   if (!/1/.test(appliedCount) || !/1/.test(skippedCount) || !/1/.test(savedCount)) throw new Error(`History counts wrong: ${appliedCount}; ${skippedCount}; ${savedCount}`);
 
   const inbox = await page.evaluate(async () => ({

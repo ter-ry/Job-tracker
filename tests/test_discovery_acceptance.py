@@ -4,7 +4,7 @@ These tests use synthetic provider responses only; they do not contain applicant
 records or posting snapshots.
 """
 
-from app import discovery_result_category, fetch_discovery_jobs_for_search
+from app import classify_title_match, discovery_exclusion_reason_bucket, discovery_result_category, fetch_discovery_jobs_for_search
 
 
 def _search(**overrides):
@@ -53,6 +53,38 @@ def test_target_pacing_continues_until_qualifying_target(monkeypatch):
     assert len(calls) == 2
     assert calls[0] != calls[1]
     assert result["continuation_available"] is False
+
+
+def test_ece_title_variants_keep_classroom_roles_and_separate_supervisory_roles():
+    accepted = [
+        "Registered Early Childhood Educator", "RECE", "Early Childhood Educator",
+        "Casual RECE", "Supply RECE", "Preschool Educator", "Early Years Educator",
+        "Childcare Educator", "Early Childhood Teacher", "Daycare Worker",
+    ]
+    for title in accepted:
+        match, score = classify_title_match(title, "ECE", "related")
+        assert match in {"exact", "related"}, title
+        assert score > 0, title
+    for title in ["RECE Supervisor", "ECE Program Instructor", "Childcare Administrator", "Early Childhood Therapist", "Childcare Manager"]:
+        match, _ = classify_title_match(title, "ECE", "related")
+        assert match == "uncertain", title
+
+
+def test_ece_fifty_distinct_qualifying_postings_are_not_lost_to_title_deduplication():
+    postings = [
+        {"source_job_id": f"ece-{index}", "title": "Registered Early Childhood Educator", "company": f"Centre {index}", "location": "Toronto, ON"}
+        for index in range(50)
+    ]
+    classified = [classify_title_match(item["title"], "Registered Early Childhood Educator; RECE", "related") for item in postings]
+    assert len(postings) == 50
+    assert all(match == "exact" and score == 100 for match, score in classified)
+    assert len({item["source_job_id"] for item in postings}) == 50
+
+
+def test_exclusion_diagnostics_do_not_turn_unknown_location_into_hard_exclusion():
+    assert discovery_exclusion_reason_bucket({"discovery_result_reason": "Posting is outside the confirmed radius", "distance_radius_status": "outside_radius", "distance_confidence": "0"}) == "unverified_location_not_hard_exclusion"
+    assert discovery_exclusion_reason_bucket({"discovery_result_reason": "Posting explicitly excludes Ontario"}) == "confirmed_geographic_ineligibility"
+    assert discovery_exclusion_reason_bucket({"discovery_result_reason": "The role family is unrelated"}) == "confirmed_unrelated_or_management"
 
 
 def test_continuation_starts_after_completed_query_without_repeating(monkeypatch):

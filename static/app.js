@@ -32,6 +32,8 @@ const state = {
   discoveryInboxJobs: [],
   discoveryInboxCategory: "new_actionable",
   discoveryInboxSelected: new Set(),
+  discoveryInboxBulkAction: "",
+  discoveryInboxBulkMessage: "",
   advancedFeatures: (() => { try { return localStorage.getItem("jobTracker.advancedFeatures") === "true"; } catch (_) { return false; } })(),
   pendingAppliedJobs: new Set(),
   tailoring: { draftId: null, jobId: null, profileId: null, resumeId: null, data: null, selectedParagraph: null, selectedKeyword: null, aiImproveJobId: null },
@@ -1254,23 +1256,41 @@ function discoveryInboxCategory(job) {
 function renderDiscoveryInbox(jobs) {
   const target = document.getElementById("discovery-inbox");
   if (!target) return;
-  const labels = { new_actionable: "New actionable", review_required: "Review required", excluded: "Excluded", saved: "Saved for later", applied: "Applied", skipped: "Skipped" };
+  ["save", "skip", "applied"].forEach((action) => {
+    const button = document.getElementById(`inbox-bulk-${action}`);
+    if (button) button.disabled = Boolean(state.discoveryInboxBulkAction);
+  });
+  const labels = { all_relevant: "All Relevant", new_actionable: "New Opportunities", review_required: "Needs Review", saved: "Saved", applied: "Applied", skipped: "Skipped", all_discovered: "All Discovered" };
   const counts = jobs.reduce((result, job) => {
     const category = job.discovery_inbox_category || discoveryInboxCategory(job);
     result[category] = (result[category] || 0) + 1;
     return result;
   }, {});
+  counts.all_discovered = jobs.length;
+  counts.all_relevant = jobs.filter((job) => ["new_actionable", "review_required", "saved", "applied"].includes(job.discovery_inbox_category || discoveryInboxCategory(job))).length;
   const filters = document.getElementById("discovery-inbox-filters");
   if (filters) {
-    filters.innerHTML = Object.entries(labels).map(([category, label]) => `<button class="button ghost small ${state.discoveryInboxCategory === category ? "active" : ""}" type="button" data-inbox-category="${category}">${label} <span class="muted">${Number(counts[category] || 0)}</span></button>`).join("");
+    filters.innerHTML = Object.entries(labels).map(([category, label]) => `<button class="button ghost small ${state.discoveryInboxCategory === category ? "active" : ""}" type="button" data-inbox-category="${category}" ${state.discoveryInboxBulkAction ? "disabled" : ""}>${label} <span class="muted">${Number(counts[category] || 0)}</span></button>`).join("");
     filters.querySelectorAll("[data-inbox-category]").forEach((button) => button.addEventListener("click", () => {
       state.discoveryInboxCategory = button.dataset.inboxCategory || "new_actionable";
       renderDiscoveryInbox(state.discoveryInboxJobs);
     }));
   }
-  const visibleJobs = jobs.filter((job) => (job.discovery_inbox_category || discoveryInboxCategory(job)) === state.discoveryInboxCategory);
+  const categoryFor = (job) => job.discovery_inbox_category || discoveryInboxCategory(job);
+  const visibleJobs = jobs.filter((job) => {
+    const category = categoryFor(job);
+    if (state.discoveryInboxCategory === "all_discovered") return true;
+    if (state.discoveryInboxCategory === "all_relevant") return ["new_actionable", "review_required", "saved", "applied"].includes(category);
+    return category === state.discoveryInboxCategory;
+  });
+  const visibleIds = new Set(visibleJobs.map((job) => Number(job.id)));
+  if (filters) {
+    filters.innerHTML += `<button class="button ghost small" type="button" data-inbox-select-visible ${state.discoveryInboxBulkAction ? "disabled" : ""}>Select visible</button><button class="button ghost small" type="button" data-inbox-clear-selection ${state.discoveryInboxBulkAction ? "disabled" : ""}>Clear selection</button>${state.discoveryInboxBulkMessage ? `<span class="muted" role="status">${escapeHtml(state.discoveryInboxBulkMessage)}</span>` : ""}`;
+    filters.querySelector("[data-inbox-select-visible]")?.addEventListener("click", () => { visibleIds.forEach((id) => state.discoveryInboxSelected.add(id)); renderDiscoveryInbox(state.discoveryInboxJobs); });
+    filters.querySelector("[data-inbox-clear-selection]")?.addEventListener("click", () => { state.discoveryInboxSelected.clear(); renderDiscoveryInbox(state.discoveryInboxJobs); });
+  }
   target.classList.toggle("empty", !visibleJobs.length);
-  target.innerHTML = visibleJobs.length ? visibleJobs.map((job) => { const profileFree = Boolean(job.discovery_profile_independent); const category = job.discovery_inbox_category || discoveryInboxCategory(job); return `<article class="inbox-row"><label><input type="checkbox" data-inbox-select="${job.id}" ${state.discoveryInboxSelected.has(Number(job.id)) ? "checked" : ""}> Select</label><div><strong>${escapeHtml(job.title || "Untitled role")}</strong><span>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(job.location || "Location unavailable")}</span><span class="muted">${escapeHtml(job.work_arrangement || job.remote_type || "Unknown arrangement")} · ${escapeHtml(displaySalary(job))}</span>${renderExperienceSummary(job)}<details><summary>Evidence</summary><span class="muted">Source evidence: ${escapeHtml(job.qualification_evidence_source || "Not available")} · Evidence confidence: ${escapeHtml(job.qualification_evidence_confidence || "unverified")}</span></details></div><div class="row-actions">${category === "new_actionable" || category === "review_required" ? `<button class="button ghost small" type="button" onclick="saveInboxJob(${job.id})">Save</button><button class="button ghost small" type="button" onclick="applyInboxJob(${job.id})">Confirm Applied</button><button class="button ghost small" type="button" onclick="ignoreInboxJob(${job.id})">Skip</button>` : category === "skipped" ? `<button class="button ghost small" type="button" onclick="restoreInboxJob(${job.id})">Restore</button>` : ""}${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open Original</a>` : ""}</div></article>`; }).join("") : `No ${labels[state.discoveryInboxCategory].toLowerCase()} discovery records.`;
+  target.innerHTML = visibleJobs.length ? visibleJobs.map((job) => { const category = categoryFor(job); return `<article class="inbox-row"><label><input type="checkbox" data-inbox-select="${job.id}" ${state.discoveryInboxSelected.has(Number(job.id)) ? "checked" : ""}> Select</label><div><strong>${escapeHtml(job.title || "Untitled role")}</strong><span>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(resultWorkplaceLabel(job))}</span><span class="muted">${escapeHtml(job.work_arrangement || job.remote_type || "Unknown arrangement")} · ${escapeHtml(displaySalary(job))} · ${escapeHtml(resultDistanceLabel(job))}</span>${renderExperienceSummary(job)}<details><summary>Requirements and evidence</summary><span class="muted">Fit: ${escapeHtml(job.discovery_fit_label || eligibilityAssessment(job).label)} · Source evidence: ${escapeHtml(job.qualification_evidence_source || "Not available")} · Evidence confidence: ${escapeHtml(job.qualification_evidence_confidence || "unverified")}</span></details></div><div class="row-actions">${category === "new_actionable" || category === "review_required" ? `<button class="button ghost small" type="button" onclick="saveInboxJob(${job.id})">Save</button><button class="button ghost small" type="button" onclick="applyInboxJob(${job.id})">Confirm Applied</button><button class="button ghost small" type="button" onclick="ignoreInboxJob(${job.id})">Skip</button>` : category === "skipped" ? `<button class="button ghost small" type="button" onclick="restoreInboxJob(${job.id})">Restore</button>` : ""}${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open Original</a>` : ""}</div></article>`; }).join("") : `No ${labels[state.discoveryInboxCategory].toLowerCase()} discovery records.`;
   target.querySelectorAll("[data-inbox-select]").forEach((box) => box.addEventListener("change", () => { const id = Number(box.dataset.inboxSelect); if (box.checked) state.discoveryInboxSelected.add(id); else state.discoveryInboxSelected.delete(id); }));
 }
 
@@ -1278,9 +1298,20 @@ async function bulkInboxAction(action) {
   const jobs = state.discoveryInboxJobs.filter((job) => state.discoveryInboxSelected.has(Number(job.id)));
   if (!jobs.length) { toast("Select one or more jobs first."); return; }
   if (action === "applied" && !window.confirm("Confirm these applications were submitted externally?")) return;
+  if (state.discoveryInboxBulkAction) return;
   const path = action === "skip" ? "ignore" : action;
-  await Promise.all(jobs.map((job) => api.send(`/api/discovery/inbox/${job.id}/${path}`, "POST", { applicant_profile_id: value("discovery-profile") || state.selectedCandidateProfileId || "" })));
-  state.discoveryInboxSelected.clear();
+  state.discoveryInboxBulkAction = action;
+  renderDiscoveryInbox(state.discoveryInboxJobs);
+  const profileId = value("discovery-profile") || state.selectedCandidateProfileId || "";
+  const outcomes = await Promise.all(jobs.map(async (job) => {
+    try { await api.send(`/api/discovery/inbox/${job.id}/${path}`, "POST", { applicant_profile_id: profileId }); return { id: Number(job.id), ok: true }; }
+    catch (error) { return { id: Number(job.id), ok: false, error: error.message || "Request failed" }; }
+  }));
+  outcomes.filter((item) => item.ok).forEach((item) => state.discoveryInboxSelected.delete(item.id));
+  const failed = outcomes.filter((item) => !item.ok);
+  state.discoveryInboxBulkAction = "";
+  state.discoveryInboxBulkMessage = failed.length ? `${outcomes.length - failed.length} updated; ${failed.length} failed. Failed selections remain selected for retry.` : `${outcomes.length} jobs updated.`;
+  renderDiscoveryInbox(state.discoveryInboxJobs);
   await loadDiscoveryInbox(true);
 }
 
@@ -1450,6 +1481,8 @@ function renderCandidateProfiles() {
       try { localStorage.setItem("jobTracker.selectedCandidateProfileId", state.selectedCandidateProfileId); } catch (_) { /* storage may be disabled */ }
       clearVisibleDiscoveryResults();
       state.discoveryInboxJobs = [];
+      state.discoveryInboxSelected.clear();
+      state.discoveryInboxBulkMessage = "";
       await Promise.all([loadAll(), loadDiscoveryInbox(true)]);
     };
   }
@@ -1465,6 +1498,8 @@ async function selectCandidateProfile(profileId) {
   state.selectedCandidateProfileId = String(profileId);
   try { localStorage.setItem("jobTracker.selectedCandidateProfileId", state.selectedCandidateProfileId); } catch (_) { /* storage may be disabled */ }
   state.discoveryInboxJobs = [];
+  state.discoveryInboxSelected.clear();
+  state.discoveryInboxBulkMessage = "";
   clearVisibleDiscoveryResults();
   renderCandidateProfiles();
   await renderCandidateProfileDocuments();
@@ -3396,6 +3431,10 @@ function renderDiscoveryDiagnostics(diagnostics, visibleCount, totalCount) {
   if (diagnostics.review_reason_counts && Object.keys(diagnostics.review_reason_counts).length) {
     const reasons = Object.entries(diagnostics.review_reason_counts).map(([reason, count]) => `${reason.replaceAll("_", " ")}: ${Number(count)}`).join(" | ");
     details.push(`<li><strong>Review-required reasons:</strong> ${escapeHtml(reasons)}</li>`);
+  }
+  if (diagnostics.exclusion_reason_counts && Object.keys(diagnostics.exclusion_reason_counts).length) {
+    const reasons = Object.entries(diagnostics.exclusion_reason_counts).map(([reason, count]) => `${reason.replaceAll("_", " ")}: ${Number(count)}`).join(" | ");
+    details.push(`<li><strong>Confirmed exclusion reasons:</strong> ${escapeHtml(reasons)}</li>`);
   }
   details.push(`<li><strong>Visible after local filters:</strong> ${Number(visibleCount || 0)}</li>`);
   details.push(`<li><strong>Hidden by local filters:</strong> ${hiddenByLocalFilters}</li>`);
