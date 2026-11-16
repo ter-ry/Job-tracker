@@ -87,6 +87,29 @@ def test_short_result_set_is_not_called_provider_exhaustion_and_failures_are_vis
     assert failed["attempted_queries_exhausted"] is False
 
 
+def test_linkedin_failure_does_not_stop_later_indeed_batches(monkeypatch):
+    calls = []
+
+    def fake_fetch(**kwargs):
+        calls.append((kwargs["keywords"], tuple(kwargs["enabled_sources"])))
+        index = len(calls)
+        return {
+            "jobs": [{"source_job_id": f"indeed-{index}", "title": "Registered Early Childhood Educator", "company": "Example", "location": "Toronto, ON", "source": "indeed", "job_url": f"https://example.test/{index}"}],
+            "errors": {"linkedin": "TimeoutError: provider timed out"} if index == 1 else {},
+            "source_counts": {"indeed": 1}, "source_diagnostics": {}, "source_snapshots": {},
+        }
+
+    monkeypatch.setattr("app.fetch_jobspy_jobs", fake_fetch)
+    result = fetch_discovery_jobs_for_search(
+        _search(keywords="Registered Early Childhood Educator; RECE", enabled_sources=["linkedin", "indeed"], requested_target=3),
+        qualifying_predicate=lambda _raw: True,
+    )
+    assert len(result["jobs"]) == 3
+    assert calls[0][1] == ("linkedin", "indeed")
+    assert all("linkedin" not in sources for _, sources in calls[1:])
+    assert result["errors"]["linkedin"].startswith("TimeoutError")
+
+
 def test_final_eligibility_mode_does_not_stop_at_preliminary_target(monkeypatch):
     """The API must normalize/finally qualify all planned batches first.
 
