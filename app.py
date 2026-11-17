@@ -9310,10 +9310,11 @@ def resolve_discovery_location_context(
     lookup_result: dict[str, Any]
     postal_fallback_location = ""
     if postal:
-        profile_location = text(profile.get("home_location_normalized"))
-        if profile_location:
-            postal_fallback_location = normalize_discovery_city_region(profile_location, fallback=profile_location)
-        elif normalized_postal.startswith("M"):
+        # The search postal code belongs to this search. Never silently
+        # substitute an unrelated saved home city when its lookup fails.
+        # A Toronto postal prefix can safely narrow provider keyword search
+        # to Toronto, but this is NOT a postal-centroid distance estimate.
+        if normalized_postal.startswith("M"):
             postal_fallback_location = "Toronto, ON"
     if lookup_input:
         lookup_result = geocode_location_value(lookup_input, lookup_type="search", profile=profile, provider=provider, use_cache=use_cache)
@@ -10350,11 +10351,20 @@ def discovery_target_assessment(job: dict[str, Any], search: dict[str, Any]) -> 
         evidence_content = any(text(job.get(key)) for key in ("job_description", "required_skills", "preferred_skills", "responsibilities"))
         if not evidence_content:
             return "review_required", "The provider supplied no usable requirements; experience and technical fit cannot be verified."
-        if clamp_int_default(search.get("distance"), 0, 0, 1000) and "remote" not in text(job.get("remote_type")).lower():
-            if text(job.get("distance_radius_status")).lower() == "unknown":
-                return "review_required", "The workplace distance is unverified; the selected radius cannot be enforced."
         if text(job.get("qualification_match_status")).lower() == "unavailable":
             return "review_required", "Qualifications could not be assessed from the posting evidence."
+        if clamp_int_default(search.get("distance"), 0, 0, 1000) and "remote" not in text(job.get("remote_type")).lower():
+            if text(job.get("distance_radius_status")).lower() == "unknown":
+                # Respect the user's explicit location-confidence selection.
+                # City/region matches can be reviewed in Apply Broadly, but
+                # they are NEVER represented as verified within the radius.
+                # Strict radius keeps the exact same record in Needs Review.
+                if search.get("geographic_match_mode") == "strict":
+                    return "review_required", "Exact workplace distance is unverified under strict-radius matching."
+                return "provisional", (
+                    "Relevant technical role with an unverified commute. The provider's city/region location "
+                    "does not establish that the workplace is within the selected radius."
+                )
 
     if broad_software:
         return "provisional", "Plausible software role with usable posting evidence; review résumé compatibility before applying."
