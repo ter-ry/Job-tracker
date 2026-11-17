@@ -25,10 +25,13 @@ def _job(**changes):
 
 
 def test_topbox_like_unknown_seniority_is_provisional_not_senior_mismatch():
-    status, reason = app.discovery_target_assessment(_job(), _search())
+    # A usable posting description permits provisional review when seniority
+    # is unstated. A title-only provider row instead belongs in Needs Review.
+    candidate = _job(job_description="Build and maintain Python applications and unit tests.", remote_type="Remote")
+    status, reason = app.discovery_target_assessment(candidate, _search())
     assert status == "provisional"
     assert "not stated" in reason
-    assert app.discovery_target_eligible(_job(), _search())
+    assert app.discovery_target_eligible(candidate, _search())
 
 
 def test_explicit_senior_and_confirmed_excess_years_are_hard_blockers():
