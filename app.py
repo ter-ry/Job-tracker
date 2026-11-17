@@ -10033,10 +10033,24 @@ def apply_discovery_search_constraints(
         # workplace distance is actually established.
         job_location = normalize_space(text(job.get("location")))
         postal_only = bool(re.fullmatch(r"[A-Z]\d[A-Z]\s?\d[A-Z]\d", job_location, re.IGNORECASE))
-        if search_location and (int(job.get("distance_km") or 9999) < 9999 or not postal_only) and outside_requested_location(job, search_location):
+        search_province = province_code_from_text(search_location)
+        advertised_province = province_code_from_text(job_location)
+        confirmed_province_conflict = bool(search_province and advertised_province and search_province != advertised_province)
+        # A Toronto city label is a provider SEARCH AREA, not the edge of a
+        # 20 km circle around a postal code. North York, Markham and Vaughan
+        # may all be relevant. With a radius configured, do not hard-exclude
+        # a job merely because its city string differs from "Toronto".
+        # Only a known province conflict or verified out-of-radius distance
+        # can establish geographic ineligibility at this stage.
+        city_scope_mismatch = not max_distance_km and (int(job.get("distance_km") or 9999) < 9999 or not postal_only) and outside_requested_location(job, search_location)
+        if search_location and (confirmed_province_conflict or city_scope_mismatch):
             job["location_search_eligible"] = False
             job["application_priority_score"] = 0
-            job.setdefault("application_priority_reasons", []).append("Excluded because the confirmed job location is outside the requested hybrid/on-site search area.")
+            job.setdefault("application_priority_reasons", []).append(
+                "Excluded because the confirmed province is outside the requested search region."
+                if confirmed_province_conflict else
+                "Excluded because the confirmed job location is outside the requested search area."
+            )
         elif max_distance_km and "remote" not in text(job.get("remote_type")).lower() and clamp_int(job.get("distance_km"), 0, 9999) >= 9999:
             job["distance_radius_status"] = "unknown"
             job["geographic_eligibility"] = "provisional" if geographic_match_mode == "provisional" else "unverified"
@@ -10263,7 +10277,7 @@ def discovery_exclusion_reason_bucket(job: dict[str, Any]) -> str:
         return "confirmed_unrelated_or_management"
     if "salary" in reason and "minimum" in reason:
         return "confirmed_salary_below_minimum"
-    if "canadian" in reason or "ontario" in reason or "eligib" in reason:
+    if "canadian" in reason or "ontario" in reason or "province" in reason or "search area" in reason or "eligib" in reason:
         return "confirmed_geographic_ineligibility"
     return "other_confirmed_hard_exclusion"
 
