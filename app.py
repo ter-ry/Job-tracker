@@ -68,6 +68,7 @@ from sources.jobspy_source import (
     fetch_jobspy_jobs,
     requirement_phrase_evidence,
 )
+from sources.ats_source import fetch_employer_direct_jobs
 from sources.provider_runtime import ProviderCircuitBreaker
 from tailoring import generate_tailored_resume_draft
 from tailoring_pipeline import (
@@ -101,7 +102,7 @@ _ASYNC_DISCOVERY_LOCK = threading.Lock()
 MAX_FETCH_BYTES = 1_200_000
 # Google remains a backend compatibility key for historical diagnostics, but
 # is intentionally not exposed as a selectable source in the UI.
-DISCOVERY_SOURCES = ["linkedin", "indeed", "zip_recruiter", "glassdoor"]
+DISCOVERY_SOURCES = ["linkedin", "indeed", "zip_recruiter", "glassdoor", "employer_direct"]
 GENERATED_APPLICATIONS_DIRNAME = "generated_applications"
 SEMANTIC_CACHE_DIRNAME = "semantic_cache"
 RESTORABLE_SHORTLIST_STATUSES = {"Archived", "Rejected", "Saved", "Drafting"}
@@ -2948,6 +2949,7 @@ def create_app() -> Flask:
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         started = datetime.now().isoformat()
+        jobspy_sources = [source for source in enabled_sources if source != "employer_direct"]
         fetched = fetch_jobspy_jobs(
             keywords=keywords,
             location=location_context["discovery_location"],
@@ -2956,10 +2958,15 @@ def create_app() -> Flask:
             job_type=None,
             results_wanted=5,
             hours_old=168,
-            enabled_sources=enabled_sources,
+            enabled_sources=jobspy_sources,
             country_indeed="Canada",
             fetch_linkedin_description=False,
-        )
+        ) if jobspy_sources else {"jobs": [], "errors": {}, "source_counts": {}, "source_diagnostics": {}, "source_snapshots": {}}
+        if "employer_direct" in enabled_sources:
+            direct = fetch_employer_direct_jobs(max_jobs=50)
+            fetched["jobs"].extend(direct.get("jobs", []))
+            for key in ("errors", "source_counts", "source_diagnostics", "source_snapshots"):
+                fetched[key].update(direct.get(key, {}))
         return jsonify(
             {
                 "ok": True,
@@ -9475,16 +9482,56 @@ def fetch_discovery_jobs_for_search(
     planned_batches = [batch for batch in all_planned_batches if batch not in completed]
     completed_this_run: list[dict[str, str]] = []
     providers = [normalize_space(source).lower() for source in search["enabled_sources"]]
-    all_work_items = {(provider, location, query) for location, query in all_planned_batches for provider in providers}
+    jobspy_providers = [source for source in providers if source != "employer_direct"]
+    ats_work_item = ("employer_direct", "__employer_registry__", "all_boards")
+    all_work_items = {(provider, location, query) for location, query in all_planned_batches for provider in jobspy_providers}
+    if "employer_direct" in providers:
+        all_work_items.add(ats_work_item)
     completed_work_items = set(completed_by_provider)
     completed_work_items.update((provider, location, query) for location, query in completed for provider in providers)
     attempted_work_items: set[tuple[str, str, str]] = set()
     failed_work_items: set[tuple[str, str, str]] = set()
-    active_sources = list(search["enabled_sources"])
+    active_sources = [source for source in search["enabled_sources"] if source != "employer_direct"]
     # Scope the breaker to this attempt. A continuation can retry a source,
     # but a repeatedly failing source cannot consume every remaining batch.
     circuit_breaker = ProviderCircuitBreaker()
+    # Employer boards list their published jobs without keyword searches.
+    # One bounded ATS scan is a single resumable work item; do not make eight
+    # identical API requests for eight JobSpy keyword variants.
+    if "employer_direct" in providers and ats_work_item not in completed_work_items:
+        direct_result = fetch_employer_direct_jobs(max_jobs=min(250, int(search.get("total_cap") or 250)))
+        attempted_work_items.add(ats_work_item)
+        combined["errors"].update(direct_result.get("errors", {}))
+        combined["source_counts"].update(direct_result.get("source_counts", {}))
+        combined["source_diagnostics"].update(direct_result.get("source_diagnostics", {}))
+        combined["source_snapshots"].update(direct_result.get("source_snapshots", {}))
+        if on_provider_update is not None:
+            on_provider_update({
+                "location": "__employer_registry__", "keywords": "all_boards",
+                "source": "employer_direct",
+                "jobs": direct_result.get("jobs", []),
+                "errors": direct_result.get("errors", {}),
+                "source_diagnostics": direct_result.get("source_diagnostics", {}),
+            })
+        for raw in direct_result.get("jobs", []):
+            key = text(raw.get("source_job_id") or raw.get("job_url")).lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged.append(raw)
+            if qualification_probe is not None and qualification_probe(raw):
+                qualified_count += 1
+                if target_matches is not None and qualified_count >= target_matches:
+                    target_reached = True
+        if direct_result.get("errors"):
+            failed_work_items.add(ats_work_item)
+        else:
+            completed_work_items.add(ats_work_item)
+            completed_this_run.append({"provider": "employer_direct", "location": "__employer_registry__", "keywords": "all_boards"})
+
     for batch_index, (location, keyword_query) in enumerate(planned_batches):
+        if target_reached:
+            break
         elapsed = time.monotonic() - started
         if elapsed >= DISCOVERY_OVERALL_TIMEOUT_SECONDS:
             combined["errors"]["overall"] = f"Discovery timed out after {DISCOVERY_OVERALL_TIMEOUT_SECONDS}s before all locations completed."
@@ -9585,7 +9632,7 @@ def fetch_discovery_jobs_for_search(
     pending_work_items = all_work_items - completed_work_items
     completed_query_keys = {
         (location, query) for location, query in all_planned_batches
-        if all((provider, location, query) in completed_work_items for provider in providers)
+        if all((provider, location, query) in completed_work_items for provider in jobspy_providers)
     }
     pending_query_keys = [batch for batch in all_planned_batches if batch not in completed_query_keys]
     retryable_work_items = sorted(failed_work_items)
@@ -9600,8 +9647,8 @@ def fetch_discovery_jobs_for_search(
     combined["retryable_work_items"] = [{"provider": provider, "location": location, "keywords": query} for provider, location, query in retryable_work_items]
     combined["target_reached"] = target_reached
     combined["probe_qualifying_count"] = qualified_count
-    combined["planned_queries_completed"] = pending_batches == 0 and not combined.get("errors") and not target_reached
-    combined["continuation_available"] = not target_reached and (bool(combined.get("errors")) or pending_batches > 0)
+    combined["planned_queries_completed"] = pending_batches == 0 and not pending_work_items and not combined.get("errors") and not target_reached
+    combined["continuation_available"] = not target_reached and (bool(combined.get("errors")) or bool(pending_work_items) or pending_batches > 0)
     combined["continuation_index"] = len(completed_query_keys)
     combined["attempted_queries_exhausted"] = bool(combined["planned_queries_completed"])
     # A short provider page is not proof of total provider exhaustion. It only
