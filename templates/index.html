@@ -199,6 +199,7 @@
               <button class="button ghost beta-secondary" type="button" id="save-current-discovery-search">Save current search</button>
               <button class="button ghost beta-secondary" type="button" id="discovery-test-sources">Test job sources</button>
               <button class="button ghost beta-secondary" type="button" id="discovery-recalculate-distances">Recalculate distances</button>
+              <button class="button ghost beta-secondary" type="button" id="discovery-re-evaluate">Re-evaluate stored history</button>
             </div>
             <div class="compatibility-fields" aria-hidden="true">
               <select id="discovery-search-mode"><option value="shortlist">shortlist</option></select>
@@ -499,6 +500,7 @@
             <p id="candidate-profile-form-error" class="risk high" role="alert" hidden></p>
             <div class="grid three">
               <label>Profile label<input id="candidate-profile-name" required placeholder="Software Engineering"></label>
+              <label>Workflow<select id="candidate-profile-workflow"><option value="software">Software / SWE</option><option value="ece">ECE</option></select></label>
               <label>Identity mode<select id="candidate-profile-identity-mode"><option value="shared">Use active profile identity</option><option value="distinct">Use a distinct applicant identity</option></select></label>
               <label>Applicant name<input id="candidate-profile-applicant-name" placeholder="Required for distinct identity"></label>
               <label>Email<input id="candidate-profile-applicant-email" type="email"></label>

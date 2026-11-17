@@ -101,6 +101,27 @@ def wait_for_server(timeout: float = 30.0) -> bool:
     return False
 
 
+def open_browser_or_report(url: str, data_dir: Path) -> bool:
+    """Open the app when possible and leave an actionable fallback when not."""
+    try:
+        opened = bool(webbrowser.open(url, new=1))
+    except Exception as exc:  # browser registration can fail on locked-down Windows hosts
+        opened = False
+        error = f"Automatic browser launch failed: {exc}"
+    else:
+        error = "Automatic browser launch returned no success status."
+    if opened:
+        return True
+    status = data_dir / "startup-status.txt"
+    status.write_text(
+        "Job Tracker is running, but the browser did not open automatically.\n"
+        f"Open this address manually: {url}\n{error}\n",
+        encoding="utf-8",
+    )
+    print(f"Job Tracker is ready at {url}. Automatic browser launch failed; open the address manually.")
+    return False
+
+
 def stop_waitress_server(server: object, server_thread: threading.Thread) -> None:
     # Closing the listener alone does not wake Waitress while a browser keeps
     # an accepted keep-alive connection open. Close those channels before
@@ -137,7 +158,7 @@ def launch() -> int:
     lock = SingleInstance(data_dir / "instance.lock")
     if not lock.acquire():
         if server_is_healthy():
-            webbrowser.open(f"http://{HOST}:{PORT}/")
+            open_browser_or_report(f"http://{HOST}:{PORT}/", data_dir)
             return 0
         return 2
     atexit.register(lock.close)
@@ -155,7 +176,7 @@ def launch() -> int:
     server_thread.start()
     if not wait_for_server():
         return 3
-    webbrowser.open(f"http://{HOST}:{PORT}/")
+    open_browser_or_report(f"http://{HOST}:{PORT}/", data_dir)
     server_thread.join()
     server.close()
     return 0

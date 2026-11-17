@@ -168,6 +168,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("csv-import-form").addEventListener("submit", importCsv);
   document.getElementById("discovery-test-sources").addEventListener("click", testJobSources);
   document.getElementById("discovery-recalculate-distances")?.addEventListener("click", recalculateDiscoveryDistances);
+  document.getElementById("discovery-re-evaluate")?.addEventListener("click", reEvaluateDiscoveryHistory);
   document.getElementById("save-current-discovery-search").addEventListener("click", saveCurrentDiscoverySearch);
   document.getElementById("refresh-shortlist").addEventListener("click", loadAll);
   document.getElementById("toggle-advanced-features")?.addEventListener("click", toggleAdvancedFeatures);
@@ -1245,6 +1246,7 @@ async function runSavedSearch(id) {
 }
 
 function discoveryInboxCategory(job) {
+  if (String(job.discovery_inbox_category || "") === "requalified") return "requalified";
   if (String(job.status || "") === "Applied" || String(job.discovery_state || "") === "applied") return "applied";
   if (["ignored", "skipped"].includes(String(job.discovery_state || ""))) return "skipped";
   if (String(job.discovery_state || "") === "saved") return "saved";
@@ -1260,7 +1262,7 @@ function renderDiscoveryInbox(jobs) {
     const button = document.getElementById(`inbox-bulk-${action}`);
     if (button) button.disabled = Boolean(state.discoveryInboxBulkAction);
   });
-  const labels = { all_relevant: "All Relevant", new_actionable: "New Opportunities", review_required: "Needs Review", saved: "Saved", applied: "Applied", skipped: "Skipped", all_discovered: "All Discovered" };
+  const labels = { all_relevant: "All Relevant", new_actionable: "New Opportunities", review_required: "Needs Review", requalified: "Requalified Since Update", saved: "Saved", applied: "Applied", skipped: "Skipped", all_discovered: "All Discovered" };
   const counts = jobs.reduce((result, job) => {
     const category = job.discovery_inbox_category || discoveryInboxCategory(job);
     result[category] = (result[category] || 0) + 1;
@@ -1338,17 +1340,33 @@ async function loadDiscoveryInbox(force = false) {
   } catch (error) { target.textContent = error.message; }
 }
 
+async function reEvaluateDiscoveryHistory() {
+  try {
+    const result = await api.send("/api/discovery/re-evaluate", "POST", discoveryApplicantActionPayload());
+    toast(`${Number(result.count || 0)} historical job(s) requalified. Previous decisions were preserved.`);
+    await loadDiscoveryInbox(true);
+    state.discoveryInboxCategory = "requalified";
+    renderDiscoveryInbox(state.discoveryInboxJobs);
+  } catch (error) { toast(error.message); }
+}
+
 function updateInboxLocalJob(id, updates) {
   const job = state.discoveryInboxJobs.find((item) => Number(item.id) === Number(id));
   if (job) Object.assign(job, updates, { discovery_inbox_category: discoveryInboxCategory({ ...job, ...updates }) });
   renderDiscoveryInbox(state.discoveryInboxJobs);
 }
+function discoveryApplicantActionPayload() {
+  return {
+    applicant_profile_id: value("discovery-profile") || state.selectedCandidateProfileId || "",
+    workflow: value("discovery-workflow") || state.discoveryWorkflow || "software",
+  };
+}
 async function reviewInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/review`, "POST", {}); updateInboxLocalJob(id, { discovery_state: "reviewed" }); } catch (error) { toast(error.message); } }
-async function ignoreInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/ignore`, "POST", { candidate_profile_id: value("discovery-profile") || state.selectedCandidateProfileId || "" }); updateInboxLocalJob(id, { discovery_state: "ignored" }); } catch (error) { toast(error.message); } }
-async function restoreInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/restore`, "POST", { candidate_profile_id: value("discovery-profile") || state.selectedCandidateProfileId || "" }); updateInboxLocalJob(id, { discovery_state: "new", status: "Discovered" }); toast("Job restored to new matches"); } catch (error) { toast(error.message); } }
-async function applyInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/applied`, "POST", { applicant_profile_id: value("discovery-profile") || state.selectedCandidateProfileId || "" }); toast("Marked applied for the selected applicant."); updateInboxLocalJob(id, { discovery_state: "applied" }); } catch (error) { toast(error.message); } }
+async function ignoreInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/ignore`, "POST", discoveryApplicantActionPayload()); updateInboxLocalJob(id, { discovery_state: "ignored" }); } catch (error) { toast(error.message); } }
+async function restoreInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/restore`, "POST", discoveryApplicantActionPayload()); updateInboxLocalJob(id, { discovery_state: "new", status: "Discovered" }); toast("Job restored to new matches"); } catch (error) { toast(error.message); } }
+async function applyInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/applied`, "POST", discoveryApplicantActionPayload()); toast("Marked applied for the selected applicant."); updateInboxLocalJob(id, { discovery_state: "applied" }); } catch (error) { toast(error.message); } }
 async function saveInboxJob(id) {
-  try { await api.send(`/api/discovery/inbox/${id}/save`, "POST", { applicant_profile_id: value("discovery-profile") || state.selectedCandidateProfileId || "" }); toast("Saved for the selected applicant"); updateInboxLocalJob(id, { discovery_state: "saved" }); }
+  try { await api.send(`/api/discovery/inbox/${id}/save`, "POST", discoveryApplicantActionPayload()); toast("Saved for the selected applicant"); updateInboxLocalJob(id, { discovery_state: "saved" }); }
   catch (error) { toast(error.message); }
 }
 
@@ -1378,6 +1396,7 @@ function showCandidateProfileForm(profile = null) {
   document.getElementById("candidate-profile-name").value = profile?.name || "";
   document.getElementById("candidate-profile-name").disabled = Boolean(profile);
   document.getElementById("candidate-profile-identity-mode").value = profile?.identity_mode || "shared";
+  document.getElementById("candidate-profile-workflow").value = profile?.workflow || "software";
   document.getElementById("candidate-profile-applicant-name").value = profile?.applicant_name || "";
   document.getElementById("candidate-profile-applicant-email").value = profile?.applicant_email || "";
   document.getElementById("candidate-profile-applicant-phone").value = profile?.applicant_phone || "";
@@ -1420,6 +1439,7 @@ async function saveCandidateProfile(event) {
   }
   const payload = {
     name: value("candidate-profile-name"),
+    workflow: value("candidate-profile-workflow") || "software",
     identity_mode: value("candidate-profile-identity-mode"),
     applicant_name: value("candidate-profile-applicant-name"),
     applicant_email: value("candidate-profile-applicant-email"),
@@ -1494,7 +1514,7 @@ function renderCandidateProfiles() {
   }
   list.innerHTML = state.candidateProfiles.map((profile) => `
     <article class="candidate-profile-card ${String(profile.id) === state.selectedCandidateProfileId ? "selected" : ""}">
-      <div><h3>${escapeHtml(profile.name)}</h3><p class="muted">${profile.identity_mode === "distinct" ? escapeHtml(profile.applicant_name || "Distinct identity not set") : "Uses active profile identity"}</p></div>
+      <div><h3>${escapeHtml(profile.name)}</h3><p class="muted">${profile.workflow === "ece" ? "ECE workflow" : "Software / SWE workflow"} · ${profile.identity_mode === "distinct" ? escapeHtml(profile.applicant_name || "Distinct identity not set") : "Uses active profile identity"}</p></div>
       <div class="actions compact"><button class="button small ghost" type="button" onclick="selectCandidateProfile(${profile.id})">Manage documents</button><button class="button small ghost" type="button" onclick='showCandidateProfileForm(${JSON.stringify(profile).replaceAll("'", "&#39;")})'>Edit identity</button></div>
     </article>`).join("");
   renderCandidateProfileDocuments();
@@ -4005,7 +4025,7 @@ async function saveDiscoveryJob(jobKey) {
   if (!job) return;
   if (!job.id) { toast("This result has no durable discovery identity; run the search again."); return; }
   try {
-    await api.send(`/api/discovery/inbox/${job.id}/save`, "POST", { candidate_profile_id: value("discovery-profile") || state.selectedCandidateProfileId || "" });
+    await api.send(`/api/discovery/inbox/${job.id}/save`, "POST", discoveryApplicantActionPayload());
     removeActiveDiscoveryJob(jobKey, "saved");
     toast(`${job.company || "Job"} saved for later`);
     renderDiscoveryResults(state.discoveryMeta || {});
@@ -4019,7 +4039,7 @@ async function applyDiscoveryJob(jobKey) {
   const job = state.discoveryResults.find((item) => discoveryJobKey(item) === String(jobKey));
   if (!job || !job.id) { toast("This result has no durable discovery identity; run the search again."); return; }
   try {
-    const applied = await api.send(`/api/discovery/inbox/${job.id}/applied`, "POST", { candidate_profile_id: value("discovery-profile") || state.selectedCandidateProfileId || "" });
+    const applied = await api.send(`/api/discovery/inbox/${job.id}/applied`, "POST", discoveryApplicantActionPayload());
     removeActiveDiscoveryJob(jobKey, "applied");
     toast(`Marked applied on ${applied.date_applied || "today"}`);
     renderDiscoveryResults(state.discoveryMeta || {});
@@ -4031,7 +4051,7 @@ async function skipDiscoveryJob(jobKey) {
   const job = state.discoveryResults.find((item) => discoveryJobKey(item) === String(jobKey));
   if (!job || !job.id) { toast("This result has no durable discovery identity; run the search again."); return; }
   try {
-    await api.send(`/api/discovery/inbox/${job.id}/ignore`, "POST", { candidate_profile_id: value("discovery-profile") || state.selectedCandidateProfileId || "" });
+    await api.send(`/api/discovery/inbox/${job.id}/ignore`, "POST", discoveryApplicantActionPayload());
     removeActiveDiscoveryJob(jobKey, "ignored");
     toast(`${job.company || "Job"} skipped`);
     renderDiscoveryResults(state.discoveryMeta || {});
@@ -4347,7 +4367,7 @@ async function hideDiscoveryJob(jobKey) {
   const job = state.discoveryResults.find((item) => discoveryJobKey(item) === String(jobKey));
   if (!job || !job.id) { toast("This result has no durable discovery identity; run the search again."); return; }
   try {
-    await api.send(`/api/discovery/inbox/${job.id}/ignore`, "POST", { candidate_profile_id: value("discovery-profile") || state.selectedCandidateProfileId || "" });
+    await api.send(`/api/discovery/inbox/${job.id}/ignore`, "POST", discoveryApplicantActionPayload());
     job.hidden = true;
     toast(`${job.company || "Job"} skipped`);
     renderDiscoveryResults({ jobs: state.discoveryResults, total: state.discoveryResults.filter((item) => !item.hidden).length, source_counts: countDiscoverySources(state.discoveryResults), errors: {} });

@@ -683,6 +683,7 @@ def create_app() -> Flask:
             applicant_email=text(payload.get("applicant_email")),
             applicant_phone=text(payload.get("applicant_phone")),
             applicant_location=text(payload.get("applicant_location")),
+            workflow=(text(payload.get("workflow")) or ("ece" if re.search(r"\bece\b|early childhood", name, re.I) else "software")),
         )
         return jsonify({"id": profile_id}), 201
 
@@ -697,6 +698,7 @@ def create_app() -> Flask:
                 applicant_email=text(payload.get("applicant_email")) if "applicant_email" in payload else None,
                 applicant_phone=text(payload.get("applicant_phone")) if "applicant_phone" in payload else None,
                 applicant_location=text(payload.get("applicant_location")) if "applicant_location" in payload else None,
+                workflow=text(payload.get("workflow")) if "workflow" in payload else None,
             )
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
@@ -2057,6 +2059,34 @@ def create_app() -> Flask:
         get_db().commit()
         return jsonify({"ok": True})
 
+    @app.post("/api/discovery/re-evaluate")
+    def re_evaluate_discovery_history() -> Response:
+        """Recheck stored exclusions without changing the user's decisions."""
+        payload = request.get_json(silent=True) or {}
+        workflow = discovery_workflow(payload)
+        try:
+            applicant_id = validate_discovery_applicant(payload, workflow)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        rows = query_db("SELECT * FROM jobs WHERE discovery_first_seen_at <> '' AND discovery_result_category = 'excluded'")
+        changed = []
+        db = get_db()
+        for row in rows:
+            item = job_to_dict(row, include_legacy_details=False)
+            category, reason = discovery_result_category(item, text(item.get("discovery_remote_preference")))
+            if category == "excluded":
+                continue
+            db.execute(
+                """INSERT OR REPLACE INTO discovery_requalifications(job_id, applicant_profile_id, reason)
+                   VALUES (?, ?, ?)""",
+                [int(row["id"]), applicant_id, f"Requalified by current matching rules: {reason or category}"],
+            )
+            item["discovery_inbox_category"] = "requalified"
+            item["requalified_reason"] = reason or category
+            changed.append(item)
+        db.commit()
+        return jsonify({"count": len(changed), "jobs": changed, "message": "History re-evaluated; prior Seen, Saved, Applied and Skipped decisions were preserved."})
+
     @app.get("/api/discovery/inbox")
     def discovery_inbox() -> Response:
         include_history = as_bool(request.args.get("include_history"))
@@ -2092,12 +2122,19 @@ def create_app() -> Flask:
                 item["applicant_discovery_state"] = state
             if applicant_id and not include_history and state in {"skipped", "saved", "applied"}:
                 continue
+            requalified = query_db(
+                "SELECT reason FROM discovery_requalifications WHERE job_id = ? AND applicant_profile_id = ?",
+                [int(row["id"]), applicant_id], one=True,
+            ) if applicant_id else None
             if text(item.get("status")) == "Applied" or text(item.get("discovery_state")) == "applied":
                 category = "applied"
             elif text(item.get("discovery_state")) in {"ignored", "skipped"}:
                 category = "skipped"
             elif text(item.get("discovery_state")) == "saved":
                 category = "saved"
+            elif requalified:
+                category = "requalified"
+                item["requalified_reason"] = text(requalified["reason"])
             elif text(item.get("discovery_result_category")) == "excluded":
                 category = "excluded"
             elif text(item.get("discovery_result_category")) == "review_required":
@@ -2124,6 +2161,12 @@ def create_app() -> Flask:
             return jsonify({"error": "Discovered job not found"}), 404
         payload = request.get_json(silent=True) or {}
         profile_id = applicant_profile_id(payload)
+        workflow = normalize_space(text(payload.get("workflow"))).lower()
+        if workflow in {"software", "ece"}:
+            try:
+                validate_discovery_applicant(payload, workflow)
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
         if profile_id:
             set_applicant_discovery_state(job_id, profile_id, "skipped")
         else:
@@ -2138,6 +2181,12 @@ def create_app() -> Flask:
             return jsonify({"error": "Discovered job not found"}), 404
         payload = request.get_json(silent=True) or {}
         profile_id = applicant_profile_id(payload)
+        workflow = normalize_space(text(payload.get("workflow"))).lower()
+        if workflow in {"software", "ece"}:
+            try:
+                validate_discovery_applicant(payload, workflow)
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
         if profile_id:
             get_db().execute("DELETE FROM discovery_applicant_states WHERE job_id = ? AND applicant_profile_id = ?", [job_id, profile_id])
             # Explicit restore/resurface is the only route that permits a
@@ -2155,6 +2204,13 @@ def create_app() -> Flask:
         if row is None:
             return jsonify({"error": "Discovered job not found"}), 404
         profile_id = applicant_profile_id(request.get_json(silent=True) or {})
+        payload = request.get_json(silent=True) or {}
+        workflow = normalize_space(text(payload.get("workflow"))).lower()
+        if workflow in {"software", "ece"}:
+            try:
+                validate_discovery_applicant(payload, workflow)
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
         if profile_id:
             set_applicant_discovery_state(job_id, profile_id, "saved")
         else:
@@ -2169,6 +2225,12 @@ def create_app() -> Flask:
             return jsonify({"error": "Discovered job not found"}), 404
         payload = request.get_json(silent=True) or {}
         profile_id = applicant_profile_id(payload)
+        workflow = normalize_space(text(payload.get("workflow"))).lower()
+        if workflow in {"software", "ece"}:
+            try:
+                validate_discovery_applicant(payload, workflow)
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
         applied_date = text(payload.get("date_applied")) or date.today().isoformat()
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", applied_date):
             return jsonify({"error": "date_applied must use YYYY-MM-DD"}), 400
@@ -2425,6 +2487,10 @@ def create_app() -> Flask:
 
         try:
             search = discovery_search_config(payload)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        try:
+            validate_discovery_applicant(payload, discovery_workflow(payload, search))
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         if search["search_mode"] == "shortlist" and not text(payload.get("candidate_profile_id")):
@@ -3148,6 +3214,35 @@ def applicant_profile_id(payload: Any = None) -> int:
     return clamp_int(payload.get("applicant_profile_id") or payload.get("candidate_profile_id"), 0, 10**9)
 
 
+def discovery_workflow(payload: dict[str, Any] | None = None, search: dict[str, Any] | None = None) -> str:
+    payload = payload or {}
+    search = search or {}
+    explicit = normalize_space(text(payload.get("workflow"))).lower()
+    if explicit in {"software", "ece"}:
+        return explicit
+    occupation = normalize_space(text(search.get("occupation") or payload.get("occupation"))).lower()
+    return "ece" if occupation == "early childhood educator" else "software"
+
+
+def validate_discovery_applicant(payload: dict[str, Any], workflow: str) -> int:
+    """Require an explicitly workflow-compatible applicant for discovery."""
+    profile_id = applicant_profile_id(payload)
+    if not profile_id:
+        if workflow == "ece":
+            if query_db("SELECT 1 FROM candidate_profiles LIMIT 1", one=True) is not None:
+                raise ValueError("Select an ECE applicant profile before searching or taking ECE actions.")
+        return 0
+    row = query_db("SELECT id, workflow FROM candidate_profiles WHERE id = ?", [profile_id], one=True)
+    if row is None:
+        if workflow == "software":
+            return profile_id
+        raise ValueError("The selected applicant profile was not found.")
+    stored_workflow = text(row["workflow"]).lower() or "software"
+    if stored_workflow != workflow:
+        raise ValueError(f"The selected applicant is configured for {stored_workflow.upper()} jobs, not {workflow.upper()}.")
+    return profile_id
+
+
 def _async_discovery_progress(result: dict[str, Any] | None = None, requested_target: int = 50) -> dict[str, Any]:
     result = result or {}
     progress = result.get("search_progress") if isinstance(result.get("search_progress"), dict) else {}
@@ -3312,6 +3407,8 @@ def _run_async_discovery_search(search_id: str, payload: dict[str, Any]) -> None
 
 
 def enqueue_async_discovery_search(payload: dict[str, Any]) -> dict[str, Any]:
+    search = discovery_search_config(payload)
+    validate_discovery_applicant(payload, discovery_workflow(payload, search))
     search_id = uuid.uuid4().hex
     target = clamp_int_default(payload.get("new_matching_target", payload.get("shortlist_size")), 50, 1, 500)
     db = get_db()
@@ -10657,6 +10754,8 @@ def init_db() -> None:
     )
     repair_malformed_saved_salaries()
     run_migrations(db)
+    from db.migrations import ensure_candidate_workflow_column
+    ensure_candidate_workflow_column(db)
     db.execute(f"PRAGMA user_version = {CURRENT_DB_SCHEMA_VERSION}")
     db.commit()
     _INITIALIZED_DATABASE_PATH = DB_PATH.resolve()
