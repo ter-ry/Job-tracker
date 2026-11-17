@@ -3512,7 +3512,7 @@ def _run_async_discovery_search(search_id: str, payload: dict[str, Any]) -> None
                 "postprocessing_seconds": diagnostics.get("postprocessing_seconds", 0),
                 "persistence_seconds": diagnostics.get("persistence_seconds", 0),
             }
-            _update_async_discovery(search_id, status=status, progress_json={**progress, "timings": timings, "diagnostics": diagnostics}, continuation_available=continuation, termination_reason=termination, timings_json=timings, error_json=errors)
+            _update_async_discovery(search_id, status=status, progress_json={**progress, "continuation_available": continuation, "timings": timings, "diagnostics": diagnostics}, continuation_available=continuation, termination_reason=termination, timings_json=timings, error_json=errors)
     except Exception as exc:
         with app.app_context():
             _update_async_discovery(search_id, status="failed", termination_reason="worker_failure", error_json={"worker": str(exc)})
@@ -4074,6 +4074,9 @@ def run_discovery_pipeline(
         "attempted_query_batches": fetched.get("attempted_query_batches", []),
         "completed_query_batches": fetched.get("completed_query_batches", []),
         "pending_query_batches": fetched.get("pending_query_batches", []),
+        "continuation_available": bool(fetched.get("continuation_available")),
+        "continuation_index": int(fetched.get("continuation_index") or 0),
+        "pending_work_items": fetched.get("pending_work_items", []),
         "countrywide_region_queries": fetched.get("countrywide_region_queries", []),
         "duplicates_removed": duplicates_in_search,
         "duplicates_in_search": duplicates_in_search,
@@ -4147,7 +4150,10 @@ def run_discovery_pipeline(
             "confirmed_excluded": len(excluded_jobs),
             "requested_target": requested_target,
             "target_unmet_reason": metadata["target_unmet_reason"],
-            "incomplete": bool(fetched.get("errors")),
+            "incomplete": bool(fetched.get("errors") or fetched.get("continuation_available")),
+            "continuation_available": bool(fetched.get("continuation_available")),
+            "continuation_index": int(fetched.get("continuation_index") or 0),
+            "pending_query_batches": fetched.get("pending_query_batches", []),
         },
         "errors": fetched.get("errors", {}),
         "source_counts": fetched.get("source_counts", {}),
