@@ -3340,7 +3340,14 @@ function renderDiscoveryResults(result) {
       || 50
   );
   const noNewReason = progress.no_new_reason || diagnostics.target_unmet_reason || "";
-  const sourceFailureCount = Object.keys(errors).length || Object.values(sourceDiagnostics).filter((info) => info?.attempted && info.success === false).length;
+  // Overall 75s search-budget exhaustion is not a failed Indeed/Glassdoor provider.
+  const failedSources = new Set(
+    Object.entries(sourceDiagnostics).filter(([, info]) => info?.attempted && ["blocked", "timed_out", "unavailable", "unsupported", "failed"].includes(String(info?.state || info?.provider_status))).map(([name]) => name)
+  );
+  Object.keys(errors).filter((name) => ["linkedin", "indeed", "zip_recruiter", "glassdoor"].includes(name)).forEach((name) => failedSources.add(name));
+  const sourceFailureCount = failedSources.size;
+  const reviewCount = Number(progress.review_required ?? diagnostics.review_required_count ?? 0);
+  const searchBudgetReached = Boolean(errors.overall || errors.budget);
   const continuation = continuationContract();
   const unsupportedCriteria = state.discoveryMeta?.unsupportedCriteria || [];
   const continueButton = continuation && progress.continuation_available
@@ -3371,7 +3378,9 @@ function renderDiscoveryResults(result) {
       <p class="muted">${profileFreeResults ? "Score basis: posting evidence only; no résumé used." : `Qualification evidence: ${escapeHtml(evidenceProfileName)}`}</p>
       ${unsupportedCriteria.length ? `<p class="warning-text">${escapeHtml(unsupportedCriteria.join(" and "))} was requested, but this backend response did not confirm that control. Results were not locally relabeled as filtered.</p>` : ""}
       ${errorText}
+      ${searchBudgetReached ? '<p class="warning-text">The overall search time budget was reached. Already fetched Indeed/Glassdoor results were kept. This is a partial search, not a provider failure.</p>' : ""}
       ${noNewReason ? `<p class="warning-text" data-discovery-no-new-reason>Why the requested target was not reached: ${escapeHtml(noNewReason)}</p>` : ""}
+      ${reviewCount > 0 ? `<p class="muted">${reviewCount} additional jobs need review (for example, missing posting evidence or uncertain location). They are not counted as verified matches.</p><button class="button ghost small" type="button" data-open-discovery-review>Inspect ${reviewCount} Needs Review jobs</button>` : ""}
       ${continueButton}
     </div>
     ${rawSummary}
@@ -3384,6 +3393,13 @@ function renderDiscoveryResults(result) {
       else if (button.dataset.discoveryAction === "skip") skipDiscoveryJob(button.dataset.jobKey);
       else hideDiscoveryJob(button.dataset.jobKey);
     });
+  });
+  container.querySelector("[data-open-discovery-review]")?.addEventListener("click", async () => {
+    state.discoveryInboxCategory = "review_required";
+    state.discoveryInboxPage = 0;
+    setDiscoverySection("saved");
+    await loadDiscoveryInbox(true);
+    document.getElementById("discovery-inbox")?.scrollIntoView({ behavior: "smooth", block: "start" });
   });
   container.querySelector("[data-discovery-continue]")?.addEventListener("click", continueDiscoverySearch);
 }
