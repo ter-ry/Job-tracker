@@ -2938,7 +2938,7 @@ class JobAssistantTest(unittest.TestCase):
 
     def test_discovery_actions_are_scoped_to_the_selected_applicant(self):
         swe = self.client.post("/api/candidate-profiles", json={"name": "SWE QA"}).get_json()
-        ece = self.client.post("/api/candidate-profiles", json={"name": "ECE QA"}).get_json()
+        ece = self.client.post("/api/candidate-profiles", json={"name": "Second SWE QA", "workflow": "software"}).get_json()
         job = self.client.post("/api/jobs", json={
             "company": "Shared Vacancy", "title": "Junior Developer", "location": "Toronto, ON",
             "url": "https://example.test/shared", "source": "indeed", "job_description": "Python",

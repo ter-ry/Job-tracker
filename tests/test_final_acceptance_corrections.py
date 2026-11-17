@@ -52,7 +52,10 @@ def test_server_authoritatively_rejects_wrong_missing_and_unknown_applicants(tmp
     unknown = client.post(f"/api/discovery/inbox/{job_id}/save", json={"applicant_profile_id": 99999, "workflow": "software"})
     assert unknown.status_code == 400
 
-    inferred = client.post(f"/api/discovery/inbox/{job_id}/save", json={"applicant_profile_id": ece})
+    cross_workflow_omitted = client.post(f"/api/discovery/inbox/{job_id}/save", json={"applicant_profile_id": ece})
+    assert cross_workflow_omitted.status_code == 400
+    ece_job_id = _stored_job(client, occupation="early childhood educator")
+    inferred = client.post(f"/api/discovery/inbox/{ece_job_id}/save", json={"applicant_profile_id": ece})
     assert inferred.status_code == 200
     review_wrong = client.post(f"/api/discovery/inbox/{job_id}/review", json={"applicant_profile_id": swe, "workflow": "ece"})
     assert review_wrong.status_code == 400
@@ -90,3 +93,22 @@ def test_qa_status_and_reset_are_isolated_and_visible(tmp_path, monkeypatch):
     assert client.get("/api/candidate-profiles").get_json() == []
     monkeypatch.delenv("JOB_TRACKER_QA_MODE")
     assert client.post("/api/qa/reset").status_code == 403
+
+
+def test_async_seen_requires_matching_applicant_and_rejects_forged_ids(tmp_path, monkeypatch):
+    client = _isolated_client(tmp_path, monkeypatch)
+    swe = _profile(client, "SWE", "software")
+    ece = _profile(client, "ECE", "ece")
+    with app_module.app.app_context():
+        job = app_module.normalize_job_payload({"source": "fixture", "source_job_id": "seen-owner", "title": "Junior Software Developer", "company": "Example", "location": "Toronto, ON", "job_url": "https://example.test/seen-owner"})
+        job_id = app_module.persist_discovery_jobs([job], None, None)["new_job_ids"][0]
+        event = {**job, "id": job_id, "result_stage": "qualified", "discovery_result_category": "actionable"}
+        app_module.get_db().execute(
+            "INSERT INTO discovery_async_searches(search_id, applicant_profile_id, search_json, results_json, next_sequence) VALUES (?, ?, ?, ?, ?)",
+            ["seen-owner-search", swe, app_module.dumps_json({"keywords": "software developer", "location": "Toronto, ON", "workflow": "software", "applicant_profile_id": swe}), app_module.dumps_json([event]), 1],
+        )
+        app_module.get_db().commit()
+    assert client.post("/api/discovery/searches/seen-owner-search/delivered", json={"applicant_profile_id": ece, "job_ids": [job_id]}).status_code == 403
+    assert client.post("/api/discovery/searches/seen-owner-search/delivered", json={"job_ids": [job_id]}).status_code == 400
+    matching = client.post("/api/discovery/searches/seen-owner-search/delivered", json={"applicant_profile_id": swe, "workflow": "software", "job_ids": [job_id, 999999]}).get_json()
+    assert matching["acknowledged"] == 1

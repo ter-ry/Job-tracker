@@ -633,13 +633,22 @@ def create_app() -> Flask:
         if os.environ.get("JOB_TRACKER_QA_MODE") != "1":
             return jsonify({"error": "QA reset is available only in an explicit disposable QA session."}), 403
         global _INITIALIZED_DATABASE_PATH, _LAST_MIGRATION_BACKUP
+        active = get_db().execute("SELECT COUNT(*) FROM discovery_async_searches WHERE status IN ('queued', 'running')").fetchone()[0]
+        if active:
+            return jsonify({"error": "QA reset is blocked while discovery searches are active.", "active_searches": int(active)}), 409
         db = g.pop("db", None)
         if db is not None:
             db.close()
-        for suffix in ("", "-wal", "-shm"):
-            path = Path(f"{DB_PATH}{suffix}")
-            if path.exists():
-                path.unlink()
+        # Remove the complete disposable state (profiles, documents, caches
+        # and history), but retain the live instance lock held by the launcher.
+        for child in list(DATA_DIR.iterdir()) if DATA_DIR.exists() else []:
+            if child.name == "instance.lock":
+                continue
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
         _INITIALIZED_DATABASE_PATH = None
         _LAST_MIGRATION_BACKUP = None
         return jsonify({"ok": True, "message": "Disposable QA database reset; production data was not touched."})
@@ -2024,12 +2033,25 @@ def create_app() -> Flask:
             return jsonify({"error": "Async discovery search not found"}), 404
         payload = request.get_json(silent=True) or {}
         search_payload = parse_json_object(row.get("search_json"))
-        try:
-            validate_discovery_applicant(payload or search_payload, discovery_workflow(payload, discovery_search_config(search_payload)))
-        except (ValueError, TypeError) as exc:
-            return jsonify({"error": str(exc)}), 400
+        stored_profile_id = int(row.get("applicant_profile_id") or 0)
+        supplied_profile_id = applicant_profile_id(payload)
+        legacy_profileless_store = stored_profile_id and query_db("SELECT 1 FROM candidate_profiles LIMIT 1", one=True) is None
+        if stored_profile_id and supplied_profile_id and supplied_profile_id != stored_profile_id:
+            return jsonify({"error": "Delivery acknowledgement belongs to a different applicant profile."}), 403
+        if stored_profile_id and not supplied_profile_id and not legacy_profileless_store:
+            return jsonify({"error": "Applicant profile is required to acknowledge Seen results for an applicant-specific search."}), 400
+        if legacy_profileless_store and not supplied_profile_id:
+            validated_profile_id = stored_profile_id
+        else:
+            effective_payload = payload if supplied_profile_id or text(payload.get("workflow")) else search_payload
+            try:
+                validated_profile_id = validate_discovery_applicant(effective_payload, discovery_workflow(effective_payload, discovery_search_config(search_payload)))
+            except (ValueError, TypeError) as exc:
+                return jsonify({"error": str(exc)}), 400
+        if validated_profile_id != stored_profile_id:
+            return jsonify({"error": "Delivery acknowledgement belongs to a different applicant profile."}), 403
         job_ids = payload.get("job_ids") if isinstance(payload.get("job_ids"), list) else []
-        profile_id = int(row.get("applicant_profile_id") or 0)
+        profile_id = validated_profile_id
         # A browser may only acknowledge the final, actionable rows emitted by
         # this search.  Do not let a stale tab (or a forged request) suppress
         # unrelated vacancies from a later New Opportunities queue.
@@ -2211,7 +2233,11 @@ def create_app() -> Flask:
             validate_discovery_applicant(payload, discovery_workflow(payload, dict(row)))
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
-        get_db().execute("UPDATE jobs SET discovery_state = 'reviewed', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
+        profile_id = applicant_profile_id(payload)
+        if profile_id:
+            set_applicant_discovery_state(job_id, profile_id, "reviewed")
+        else:
+            get_db().execute("UPDATE jobs SET discovery_state = 'reviewed', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
         get_db().commit()
         return jsonify(job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)))
 
@@ -2223,9 +2249,9 @@ def create_app() -> Flask:
         payload = request.get_json(silent=True) or {}
         profile_id = applicant_profile_id(payload)
         workflow = normalize_space(text(payload.get("workflow"))).lower()
-        if workflow in {"software", "ece"}:
+        if profile_id or workflow in {"software", "ece"}:
             try:
-                validate_discovery_applicant(payload, workflow)
+                validate_discovery_applicant(payload, discovery_workflow(payload, dict(row)))
             except ValueError as exc:
                 return jsonify({"error": str(exc)}), 400
         if profile_id:
@@ -2243,9 +2269,9 @@ def create_app() -> Flask:
         payload = request.get_json(silent=True) or {}
         profile_id = applicant_profile_id(payload)
         workflow = normalize_space(text(payload.get("workflow"))).lower()
-        if workflow in {"software", "ece"}:
+        if profile_id or workflow in {"software", "ece"}:
             try:
-                validate_discovery_applicant(payload, workflow)
+                validate_discovery_applicant(payload, discovery_workflow(payload, dict(row)))
             except ValueError as exc:
                 return jsonify({"error": str(exc)}), 400
         if profile_id:
@@ -2267,9 +2293,9 @@ def create_app() -> Flask:
         profile_id = applicant_profile_id(request.get_json(silent=True) or {})
         payload = request.get_json(silent=True) or {}
         workflow = normalize_space(text(payload.get("workflow"))).lower()
-        if workflow in {"software", "ece"}:
+        if profile_id or workflow in {"software", "ece"}:
             try:
-                validate_discovery_applicant(payload, workflow)
+                validate_discovery_applicant(payload, discovery_workflow(payload, dict(row)))
             except ValueError as exc:
                 return jsonify({"error": str(exc)}), 400
         if profile_id:
@@ -2287,9 +2313,9 @@ def create_app() -> Flask:
         payload = request.get_json(silent=True) or {}
         profile_id = applicant_profile_id(payload)
         workflow = normalize_space(text(payload.get("workflow"))).lower()
-        if workflow in {"software", "ece"}:
+        if profile_id or workflow in {"software", "ece"}:
             try:
-                validate_discovery_applicant(payload, workflow)
+                validate_discovery_applicant(payload, discovery_workflow(payload, dict(row)))
             except ValueError as exc:
                 return jsonify({"error": str(exc)}), 400
         applied_date = text(payload.get("date_applied")) or date.today().isoformat()
@@ -3281,7 +3307,7 @@ def discovery_workflow(payload: dict[str, Any] | None = None, search: dict[str, 
     explicit = normalize_space(text(payload.get("workflow"))).lower()
     if explicit in {"software", "ece"}:
         return explicit
-    occupation = normalize_space(text(search.get("occupation") or payload.get("occupation"))).lower()
+    occupation = normalize_space(text(search.get("occupation") or search.get("discovery_occupation") or payload.get("occupation") or payload.get("discovery_occupation"))).lower()
     return "ece" if occupation == "early childhood educator" else "software"
 
 
@@ -3300,12 +3326,13 @@ def validate_discovery_applicant(payload: dict[str, Any], workflow: str) -> int:
         return 0
     row = query_db("SELECT id, workflow FROM candidate_profiles WHERE id = ?", [profile_id], one=True)
     if row is None:
+        if workflow == "software" and query_db("SELECT 1 FROM candidate_profiles LIMIT 1", one=True) is None:
+            # Compatibility for historical profileless presentation IDs. New
+            # applicant-aware databases reject unknown identities below.
+            return profile_id
         raise ValueError("The selected applicant profile was not found.")
     stored_workflow = text(row["workflow"]).lower() or "software"
-    explicit_workflow = normalize_space(text(payload.get("workflow"))).lower()
-    if explicit_workflow and stored_workflow != explicit_workflow:
-        raise ValueError(f"The selected applicant is configured for {stored_workflow.upper()} jobs, not {explicit_workflow.upper()}.")
-    if stored_workflow != workflow and explicit_workflow:
+    if stored_workflow != workflow:
         raise ValueError(f"The selected applicant is configured for {stored_workflow.upper()} jobs, not {workflow.upper()}.")
     return profile_id
 

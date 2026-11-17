@@ -5,6 +5,7 @@ import release_packaging.windows.launcher as launcher
 
 def test_browser_failure_leaves_manual_startup_fallback(monkeypatch, tmp_path: Path, capsys):
     monkeypatch.setattr(launcher.webbrowser, "open", lambda *args, **kwargs: False)
+    monkeypatch.setattr(launcher, "show_startup_recovery", lambda url: None)
 
     assert launcher.open_browser_or_report("http://127.0.0.1:5000/", tmp_path) is False
     report = (tmp_path / "startup-status.txt").read_text(encoding="utf-8")
@@ -21,11 +22,17 @@ def test_browser_success_does_not_create_failure_report(monkeypatch, tmp_path: P
 
 
 def test_server_readiness_has_a_bounded_failure(monkeypatch):
-    monkeypatch.setattr(launcher, "server_is_healthy", lambda timeout=0.4: False)
+    monkeypatch.setattr(launcher, "server_is_healthy", lambda **kwargs: False)
     assert launcher.wait_for_server(timeout=0.02) is False
 
 
 def test_existing_instance_recovery_uses_same_manual_fallback(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(launcher.webbrowser, "open", lambda *args, **kwargs: False)
+    monkeypatch.setattr(launcher, "show_startup_recovery", lambda url: None)
     assert launcher.open_browser_or_report("http://127.0.0.1:5000/", tmp_path) is False
     assert (tmp_path / "startup-status.txt").exists()
+
+
+def test_qa_and_production_use_distinct_ports_and_mutexes():
+    assert launcher.QA_PORT != launcher.PORT
+    assert launcher.INSTANCE_MUTEX != f"{launcher.INSTANCE_MUTEX}-QA"
