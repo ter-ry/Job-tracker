@@ -623,6 +623,27 @@ def create_app() -> Flask:
             app_version=APP_VERSION, exit_token=os.environ.get("JOB_TRACKER_EXIT_TOKEN", ""),
         )
 
+    @app.get("/api/qa/status")
+    def qa_status() -> Response:
+        active = os.environ.get("JOB_TRACKER_QA_MODE") == "1"
+        return jsonify({"active": active, "data_dir": str(DATA_DIR) if active else "", "message": "Disposable QA mode active; production data is isolated." if active else "Production data mode active."})
+
+    @app.post("/api/qa/reset")
+    def qa_reset() -> Response:
+        if os.environ.get("JOB_TRACKER_QA_MODE") != "1":
+            return jsonify({"error": "QA reset is available only in an explicit disposable QA session."}), 403
+        global _INITIALIZED_DATABASE_PATH, _LAST_MIGRATION_BACKUP
+        db = g.pop("db", None)
+        if db is not None:
+            db.close()
+        for suffix in ("", "-wal", "-shm"):
+            path = Path(f"{DB_PATH}{suffix}")
+            if path.exists():
+                path.unlink()
+        _INITIALIZED_DATABASE_PATH = None
+        _LAST_MIGRATION_BACKUP = None
+        return jsonify({"ok": True, "message": "Disposable QA database reset; production data was not touched."})
+
     @app.post("/api/app/exit")
     def exit_app() -> Response:
         """Stop a packaged local instance after same-origin/token validation."""
@@ -1513,7 +1534,11 @@ def create_app() -> Flask:
                 selected = resolve_tailoring_resume_profile({"candidate_profile_id": request.args.get("candidate_profile_id"), "resume_id": request.args.get("resume_id")})
                 evidence_profile = selected["profile"]
             except ValueError as exc:
-                return jsonify({"error": str(exc)}), 400
+                # Inbox/history remains usable without a résumé.  ECE is
+                # explicitly résumé-independent, and SWE users may inspect
+                # stored jobs before uploading a document.
+                if "no base" not in str(exc).lower() and "resume" not in str(exc).lower() and "résumé" not in str(exc).lower():
+                    return jsonify({"error": str(exc)}), 400
         statuses = _preparation_statuses([int(row["id"]) for row in rows])
         return jsonify([
             job_to_dict(row, evidence_profile, include_legacy_details=False, preparation_status=statuses.get(int(row["id"])))
@@ -1998,6 +2023,11 @@ def create_app() -> Flask:
         if row is None:
             return jsonify({"error": "Async discovery search not found"}), 404
         payload = request.get_json(silent=True) or {}
+        search_payload = parse_json_object(row.get("search_json"))
+        try:
+            validate_discovery_applicant(payload or search_payload, discovery_workflow(payload, discovery_search_config(search_payload)))
+        except (ValueError, TypeError) as exc:
+            return jsonify({"error": str(exc)}), 400
         job_ids = payload.get("job_ids") if isinstance(payload.get("job_ids"), list) else []
         profile_id = int(row.get("applicant_profile_id") or 0)
         # A browser may only acknowledge the final, actionable rows emitted by
@@ -2068,13 +2098,23 @@ def create_app() -> Flask:
             applicant_id = validate_discovery_applicant(payload, workflow)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
-        rows = query_db("SELECT * FROM jobs WHERE discovery_first_seen_at <> '' AND discovery_result_category = 'excluded'")
+        requested_occupation = "early childhood educator" if workflow == "ece" else "software developer"
+        rows = query_db(
+            """SELECT DISTINCT j.* FROM jobs j
+               LEFT JOIN discovery_applicant_states s ON s.job_id = j.id AND s.applicant_profile_id = ?
+               LEFT JOIN discovery_applicant_presentations p ON p.job_id = j.id AND p.applicant_profile_id = ?
+               WHERE j.discovery_first_seen_at <> ''
+                 AND j.discovery_result_category IN ('excluded', 'review_required')
+                 AND (j.candidate_profile_id = 0 OR j.candidate_profile_id = ? OR s.job_id IS NOT NULL OR p.job_id IS NOT NULL)
+                 AND (j.discovery_occupation = ? OR j.discovery_occupation = '' OR j.discovery_occupation IS NULL)""",
+            [applicant_id, applicant_id, applicant_id, requested_occupation],
+        )
         changed = []
         db = get_db()
         for row in rows:
             item = job_to_dict(row, include_legacy_details=False)
             category, reason = discovery_result_category(item, text(item.get("discovery_remote_preference")))
-            if category == "excluded":
+            if category != "actionable":
                 continue
             db.execute(
                 """INSERT OR REPLACE INTO discovery_requalifications(job_id, applicant_profile_id, reason)
@@ -2090,18 +2130,29 @@ def create_app() -> Flask:
     @app.get("/api/discovery/inbox")
     def discovery_inbox() -> Response:
         include_history = as_bool(request.args.get("include_history"))
+        requested_category = text(request.args.get("category")).lower()
         applicant_id = applicant_profile_id(request.args)
         query = "SELECT * FROM jobs WHERE discovery_first_seen_at <> ''"
         query_args: list[Any] = []
+        if requested_category == "requalified":
+            query = """SELECT j.* FROM jobs j
+                       JOIN discovery_requalifications r ON r.job_id = j.id AND r.applicant_profile_id = ?
+                       WHERE j.discovery_first_seen_at <> ''"""
+            query_args.append(applicant_id)
         if applicant_id:
             # History is applicant-scoped. Include source rows owned by this
             # applicant plus explicit presentation/state records, never another
             # applicant's discoveries merely because they share a title or URL.
-            query += " AND (candidate_profile_id = 0 OR candidate_profile_id = ? OR EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = jobs.id AND p.applicant_profile_id = ?) OR EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = jobs.id AND s.applicant_profile_id = ?))"
+            table_alias = "j." if requested_category == "requalified" else ""
+            query += f" AND ({table_alias}candidate_profile_id = 0 OR {table_alias}candidate_profile_id = ? OR EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = {table_alias}id AND p.applicant_profile_id = ?) OR EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = {table_alias}id AND s.applicant_profile_id = ?))"
             query_args.extend([applicant_id, applicant_id, applicant_id])
         if not include_history and not applicant_id:
             query += " AND discovery_state NOT IN ('ignored', 'saved', 'applied') AND status NOT IN ('Applied', 'shortlisted')"
-        query += " ORDER BY discovery_state = 'new' DESC, discovery_last_seen_at DESC, id DESC LIMIT 500"
+        page_size = clamp_int_default(request.args.get("page_size"), 500, 1, 500)
+        page = clamp_int_default(request.args.get("page"), 0, 0, 100000)
+        order_alias = "j." if requested_category == "requalified" else ""
+        query += f" ORDER BY {order_alias}discovery_state = 'new' DESC, {order_alias}discovery_last_seen_at DESC, {order_alias}id DESC LIMIT ? OFFSET ?"
+        query_args.extend([page_size, page * page_size])
         rows = query_db(
             query, query_args
         )
@@ -2111,7 +2162,9 @@ def create_app() -> Flask:
                 selected = resolve_tailoring_resume_profile({"candidate_profile_id": request.args.get("candidate_profile_id"), "resume_id": request.args.get("resume_id")})
                 evidence_profile = selected["profile"]
             except ValueError as exc:
-                return jsonify({"error": str(exc)}), 400
+                message = str(exc).lower()
+                if "no base" not in message and "resume" not in message and "résumé" not in message:
+                    return jsonify({"error": str(exc)}), 400
         statuses = _preparation_statuses([int(row["id"]) for row in rows])
         jobs = []
         for row in rows:
@@ -2126,7 +2179,10 @@ def create_app() -> Flask:
                 "SELECT reason FROM discovery_requalifications WHERE job_id = ? AND applicant_profile_id = ?",
                 [int(row["id"]), applicant_id], one=True,
             ) if applicant_id else None
-            if text(item.get("status")) == "Applied" or text(item.get("discovery_state")) == "applied":
+            if requested_category == "requalified" and requalified:
+                category = "requalified"
+                item["requalified_reason"] = text(requalified["reason"])
+            elif text(item.get("status")) == "Applied" or text(item.get("discovery_state")) == "applied":
                 category = "applied"
             elif text(item.get("discovery_state")) in {"ignored", "skipped"}:
                 category = "skipped"
@@ -2150,6 +2206,11 @@ def create_app() -> Flask:
         row = query_db("SELECT * FROM jobs WHERE id = ? AND discovery_first_seen_at <> ''", [job_id], one=True)
         if row is None:
             return jsonify({"error": "Discovered job not found"}), 404
+        payload = request.get_json(silent=True) or {}
+        try:
+            validate_discovery_applicant(payload, discovery_workflow(payload, dict(row)))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         get_db().execute("UPDATE jobs SET discovery_state = 'reviewed', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
         get_db().commit()
         return jsonify(job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)))
@@ -3225,7 +3286,12 @@ def discovery_workflow(payload: dict[str, Any] | None = None, search: dict[str, 
 
 
 def validate_discovery_applicant(payload: dict[str, Any], workflow: str) -> int:
-    """Require an explicitly workflow-compatible applicant for discovery."""
+    """Authoritatively validate the selected applicant for every discovery action.
+
+    A missing workflow is accepted only for legacy shared-history actions.  If a
+    profile is supplied, its stored workflow is the authority; an explicit
+    conflicting workflow is rejected and a missing one is filled from it.
+    """
     profile_id = applicant_profile_id(payload)
     if not profile_id:
         if workflow == "ece":
@@ -3234,11 +3300,12 @@ def validate_discovery_applicant(payload: dict[str, Any], workflow: str) -> int:
         return 0
     row = query_db("SELECT id, workflow FROM candidate_profiles WHERE id = ?", [profile_id], one=True)
     if row is None:
-        if workflow == "software":
-            return profile_id
         raise ValueError("The selected applicant profile was not found.")
     stored_workflow = text(row["workflow"]).lower() or "software"
-    if stored_workflow != workflow:
+    explicit_workflow = normalize_space(text(payload.get("workflow"))).lower()
+    if explicit_workflow and stored_workflow != explicit_workflow:
+        raise ValueError(f"The selected applicant is configured for {stored_workflow.upper()} jobs, not {explicit_workflow.upper()}.")
+    if stored_workflow != workflow and explicit_workflow:
         raise ValueError(f"The selected applicant is configured for {stored_workflow.upper()} jobs, not {workflow.upper()}.")
     return profile_id
 

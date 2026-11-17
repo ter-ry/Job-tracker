@@ -142,7 +142,7 @@ def test_async_worker_does_not_mark_results_presented_before_delivery(monkeypatc
 
         monkeypatch.setattr(app_module, "run_discovery_pipeline", fake_pipeline)
         client = app_module.app.test_client()
-        response = client.post("/api/discovery/searches", json={"keywords": "software developer", "applicant_profile_id": 11, "new_matching_target": 1})
+        response = client.post("/api/discovery/searches", json={"keywords": "software developer", "new_matching_target": 1})
         search_id = response.get_json()["search_id"]
         for _ in range(80):
             final = client.get(f"/api/discovery/searches/{search_id}").get_json()

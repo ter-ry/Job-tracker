@@ -118,8 +118,19 @@ def open_browser_or_report(url: str, data_dir: Path) -> bool:
         f"Open this address manually: {url}\n{error}\n",
         encoding="utf-8",
     )
+    show_startup_recovery(url)
     print(f"Job Tracker is ready at {url}. Automatic browser launch failed; open the address manually.")
     return False
+
+
+def show_startup_recovery(url: str) -> None:
+    """Show a visible recovery prompt when the browser cannot be opened."""
+    if os.name != "nt":
+        return
+    try:
+        ctypes.windll.user32.MessageBoxW(None, f"Job Tracker is running. Open this address manually:\n\n{url}", "Job Tracker browser startup", 0x40)
+    except Exception:
+        return
 
 
 def stop_waitress_server(server: object, server_thread: threading.Thread) -> None:
@@ -148,7 +159,12 @@ def launch() -> int:
     # launcher. The provider runtime uses Windows spawn and never re-enters
     # launch() recursively.
     multiprocessing.freeze_support()
-    data_dir = default_data_dir()
+    qa_mode = "--qa" in sys.argv or os.environ.get("JOB_TRACKER_QA_MODE") == "1"
+    if qa_mode:
+        os.environ["JOB_TRACKER_QA_MODE"] = "1"
+        data_dir = default_data_dir() / "QA Session"
+    else:
+        data_dir = default_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
     os.environ["JOB_TRACKER_DATA_DIR"] = str(data_dir)
     os.environ.setdefault("JOB_TRACKER_BIND_HOST", HOST)
