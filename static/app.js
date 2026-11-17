@@ -264,16 +264,25 @@ async function loadQAStatus() {
   try {
     const status = await api.get("/api/qa/status");
     const banner = document.getElementById("qa-session-banner");
-    if (!banner || !status.active) return;
-    banner.hidden = false;
-    setText("qa-session-message", status.message);
+    if (!banner) return;
+    banner.hidden = !status.active;
+    if (status.active) setText("qa-session-message", status.message);
   } catch (_) { /* compatibility with older installations */ }
 }
 
 async function resetQASession() {
-  if (!window.confirm("Reset only this disposable QA session? Production data will not be touched.")) return;
-  try { await api.send("/api/qa/reset", "POST", {}); toast("Disposable QA session reset"); await loadAll(); }
-  catch (error) { toast(error.message); }
+  try {
+    const status = await api.get("/api/qa/status");
+    if (!status.active || !String(status.data_dir || "").includes("QA Session")) {
+      toast("Reset blocked: this server is not running an isolated QA Session.");
+      await loadQAStatus();
+      return;
+    }
+    if (!window.confirm("Reset only this disposable QA session? Production data will not be touched.")) return;
+    await api.send("/api/qa/reset", "POST", {});
+    toast("Disposable QA session reset");
+    await loadAll();
+  } catch (error) { toast(error.message); }
 }
 
 async function exitJobTracker() {
@@ -2770,7 +2779,7 @@ async function restoreLatestDiscoverySearch() {
     const latest = await api.get("/api/discovery/results/latest");
     if (!latest.found || !Array.isArray(latest.jobs)) return;
     const metadata = latest.metadata || {};
-    state.discoveryResults = latest.jobs;
+    state.discoveryResults = latest.jobs.filter((job) => job.discovery_result_category === "actionable");
     state.discoverySearchKey = latest.search_key || "";
     state.discoverySearchCriteria = latest.search || {};
     applyDiscoverySearchCriteriaToControls(state.discoverySearchCriteria);
@@ -2930,7 +2939,7 @@ function mergeProgressiveDiscoveryJobs(jobs = [], removedIdentities = []) {
   removed.forEach((identity) => byIdentity.delete(identity));
   const merged = [...byIdentity.values()];
   state.discoveryExcludedResults = merged.filter((job) => job.discovery_result_category === "excluded");
-  state.discoveryResults = merged.filter((job) => job.discovery_result_category !== "excluded");
+  state.discoveryResults = merged.filter((job) => job.discovery_result_category === "actionable");
   state.discoveryAllResults = state.discoveryResults.slice();
 }
 
@@ -3069,7 +3078,7 @@ async function searchDiscovery(event, continuation = false) {
     const result = await api.send("/api/discovery/jobspy", "POST", criteria);
     const responseJobs = result.jobs || [...(result.matching_jobs || result.technical_shortlist || []), ...(result.review_required_jobs || [])];
     state.discoveryExcludedResults = responseJobs.filter((job) => job.discovery_result_category === "excluded");
-    state.discoveryAllResults = responseJobs.filter((job) => job.discovery_result_category !== "excluded");
+    state.discoveryAllResults = responseJobs.filter((job) => job.discovery_result_category === "actionable");
     state.discoveryResults = state.discoveryAllResults.slice();
     state.discoverySearchKey = result.search_key || "";
     state.discoveryContinuationIndex = Number(result.search_progress?.continuation_index ?? result.diagnostics?.continuation_index ?? 0);
@@ -3169,7 +3178,7 @@ async function continueDiscoverySearch() {
     }
     const jobs = result.jobs || [];
     const merged = [...state.discoveryResults, ...jobs].filter((job, index, all) => all.findIndex((candidate) => discoveryJobKey(candidate) === discoveryJobKey(job)) === index);
-    state.discoveryResults = merged.filter((job) => job.discovery_result_category !== "excluded");
+    state.discoveryResults = merged.filter((job) => job.discovery_result_category === "actionable");
     state.discoveryAllResults = state.discoveryResults.slice();
     state.discoveryMeta = { ...state.discoveryMeta, total: result.total || state.discoveryMeta.total, visible_total: state.discoveryResults.length, diagnostics: result.diagnostics || state.discoveryMeta.diagnostics, search_progress: result.search_progress || state.discoveryMeta.search_progress, errors: result.errors || {}, continuation: result.continuation || result.continue_search || null };
     renderDiscoveryResults(state.discoveryMeta);
@@ -3409,21 +3418,27 @@ function renderDiscoveryOriginSummary() {
   const element = document.getElementById("discovery-distance-origin-summary");
   if (!element) return;
   const diagnostics = state.discoveryMeta?.diagnostics || {};
-  const origin = diagnostics.saved_origin || diagnostics.distance_origin || diagnostics.distance_origin_input || diagnostics.origin_input_redacted || state.discoverySearchCriteria?.distance_origin || state.discoverySearchCriteria?.distance_origin_input || "";
+  const search = diagnostics.search_criteria || state.discoverySearchCriteria || {};
+  const fallbackPostal = /^[A-Z]\d[A-Z]\s?\d[A-Z]\d$/i.test(String(search.location || "").trim()) ? String(search.location).trim() : "";
+  const origin = diagnostics.saved_origin || diagnostics.distance_origin || diagnostics.distance_origin_input || diagnostics.origin_input_redacted || search.distance_origin || search.distance_origin_input || fallbackPostal || "";
+  const status = String(diagnostics.origin_geocode_status || (typeof origin === "object" ? origin.status : "") || "unresolved").toLowerCase();
   if (origin) {
-    const label = typeof origin === "object" ? (origin.normalized || origin.input || "configured origin") : origin;
-    const precision = diagnostics.origin_precision || origin.precision || "approximate";
-    const status = diagnostics.origin_geocode_status || origin.status || "resolved";
-    element.textContent = `Distance calculated from: ${label} (${precision}, ${status}).`;
+    const label = typeof origin === "object" ? (origin.normalized || origin.input || "requested location") : origin;
+    const precision = diagnostics.origin_precision || (typeof origin === "object" ? origin.precision : "") || "approximate";
+    if (["saved", "cached", "resolved"].includes(status)) {
+      element.textContent = `Distance origin: ${label} (${precision}, verified). Unconfirmed workplaces remain provisional.`;
+    } else {
+      element.textContent = `Distance origin requested: ${label} (${status}). Radius cannot be verified until geocoding succeeds.`;
+    }
     return;
   }
   const profile = state.profile || {};
   if (!hasDiscoveryOrigin()) {
-    element.textContent = "Distance calculated from: not configured. Save a home postal code or location in Profile.";
+    element.textContent = "Distance origin not resolved. Set a postal-code search origin or save your home location in Profile; distances are unverified.";
     return;
   }
   const precision = profile.home_location_precision || "approximate";
-  element.textContent = `Distance calculated from: configured home location (${precision})`;
+  element.textContent = `Distance origin: configured home location (${precision}).`;
 }
 
 function renderDiscoveryDiagnostics(diagnostics, visibleCount, totalCount) {
