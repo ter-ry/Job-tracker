@@ -223,3 +223,45 @@ def test_wrong_postal_result_stays_rejected_even_with_addressdetails(monkeypatch
     monkeypatch.setattr(app_module.urllib.request, "urlopen", lambda request, timeout: Response())
     lookup = app_module.NominatimGeocodingProvider().geocode("M2J 0B6, Canada")
     assert not app_module.geocode_matches_canadian_location("M2J 0B6", lookup)
+
+
+def test_neighbouring_gta_municipalities_are_not_excluded_before_radius_evidence():
+    for advertised in ("North York, ON", "Markham, ON", "Vaughan, ON", "Scarborough, ON"):
+        posting = {
+            "location": advertised, "remote_type": "On-site",
+            "distance_km": 9999, "distance_confidence": 0,
+            "application_priority_score": 80,
+        }
+        evaluated = app_module.apply_discovery_search_constraints(
+            posting, "", "Toronto, ON", 20, "provisional"
+        )
+        assert evaluated["location_search_eligible"] is True, advertised
+        assert evaluated["distance_radius_status"] == "unknown", advertised
+        assert evaluated["geographic_eligibility"] == "provisional", advertised
+
+
+def test_strict_radius_keeps_nearby_city_without_distance_in_needs_review():
+    posting = {
+        "location": "Markham, ON", "remote_type": "On-site",
+        "distance_km": 9999, "distance_confidence": 0,
+    }
+    evaluated = app_module.apply_discovery_search_constraints(
+        posting, "", "Toronto, ON", 20, "strict"
+    )
+    assert evaluated["distance_radius_status"] == "unknown"
+    assert evaluated["geographic_eligibility"] == "unverified"
+    assert evaluated["location_search_eligible"] is None
+
+
+def test_confirmed_other_province_or_outside_radius_still_excluded():
+    posting = {"location": "Vancouver, BC", "remote_type": "On-site", "distance_km": 9999}
+    other_province = app_module.apply_discovery_search_constraints(
+        posting, "", "Toronto, ON", 20, "provisional"
+    )
+    assert other_province["location_search_eligible"] is False
+    assert "province" in " ".join(other_province["application_priority_reasons"]).lower()
+
+    far = {"location": "Markham, ON", "remote_type": "On-site", "distance_km": 27, "distance_confidence": 90}
+    outside = app_module.apply_discovery_search_constraints(far, "", "Toronto, ON", 20, "provisional")
+    assert outside["distance_radius_status"] == "outside_radius"
+    assert outside["location_search_eligible"] is False
