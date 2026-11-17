@@ -43,6 +43,9 @@ def test_async_search_acknowledges_and_persists_results(monkeypatch):
         assert body["progress"]["qualifying_matches"] == 1
         assert body["jobs"][0]["result_sequence"] == 0
         assert body["continuation_available"] is True
+        # The browser's Continue Search button reads the progress payload,
+        # not only the standalone database continuation flag.
+        assert body["progress"]["continuation_available"] is True
 
 
 def test_async_cancel_preserves_cancelled_state(monkeypatch):
