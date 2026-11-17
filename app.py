@@ -1953,6 +1953,12 @@ def create_app() -> Flask:
             and text(item.get("result_stage")) != "excluded"
         ]
         visible.sort(key=lambda item: int(item.get("result_sequence") or 0))
+        removed_identities = sorted(
+            _async_discovery_client_identity(item)
+            for item in latest_by_identity.values()
+            if int(item.get("result_sequence") or 0) >= after
+            and text(item.get("result_stage")) == "excluded"
+        )
         return jsonify({
             "search_id": search_id,
             "status": text(row.get("status")) or "queued",
@@ -1964,6 +1970,7 @@ def create_app() -> Flask:
             # absent result list.
             "provider_states": progress.get("provider_states") if isinstance(progress.get("provider_states"), dict) else {},
             "jobs": visible,
+            "removed_identities": removed_identities,
             "next_sequence": int(row.get("next_sequence") or 0),
             "continuation_available": bool(row.get("continuation_available")),
             "termination_reason": text(row.get("termination_reason")),
@@ -3194,6 +3201,15 @@ def _async_discovery_result_identity(job: dict[str, Any]) -> str:
     if url:
         return f"url:{url}"
     return "row:" + "|".join(normalize_space(text(job.get(name))).casefold() for name in ("company", "title", "location"))
+
+
+def _async_discovery_client_identity(job: dict[str, Any]) -> str:
+    """Identity format shared with the browser's discoveryJobKey()."""
+    source = normalize_space(text(job.get("source") or job.get("source_name") or "jobspy")).casefold()
+    identity = normalize_space(text(job.get("source_job_id") or job.get("application_url") or job.get("url")))
+    if not identity:
+        identity = "|".join(normalize_space(text(job.get(name))) for name in ("company", "title", "location"))
+    return f"{source}|{identity}".casefold().strip()
 
 
 def _append_async_discovery_results(search_id: str, jobs: list[dict[str, Any]]) -> int:
@@ -9859,14 +9875,14 @@ def plausible_software_role(job: dict[str, Any]) -> bool:
     role_type = normalize_space(text(job.get("role_type"))).lower()
     if re.search(r"\b(manager|director|vice president|vp|head of|chief)\b", title):
         return False
-    if role_type in ACTIONABLE_DISCOVERY_ROLE_FAMILIES:
-        return True
     # A technology keyword alone is not a job family. For example, an
     # academic-assistant posting may mention Python and data science while
     # being unrelated to software employment. Require an engineering/developer
     # role signal when the normalized provider family is unavailable.
-    if re.search(r"\b(academic assistant|teaching assistant|instructor|teacher|faculty|professor|tutor|research|analyst|recruiter|recruitment|human resources|administrator|coordinator)\b", title):
+    if re.search(r"\b(academic assistant|teaching assistant|instructor|teacher|faculty|professor|tutor|research assistant|researcher|recruiter|recruitment|human resources|administrator|coordinator)\b", title):
         return False
+    if role_type in ACTIONABLE_DISCOVERY_ROLE_FAMILIES:
+        return True
     return bool(re.search(r"\b(software engineer|software developer|developer|engineer|full[ -]?stack|front[ -]?end|back[ -]?end|qa automation|test automation|devops|cloud engineer|api engineer|integration engineer|automation engineer|platform engineer|sdet)\b", title))
 
 
@@ -9902,6 +9918,14 @@ def discovery_hard_exclusion_reason(job: dict[str, Any], search: dict[str, Any] 
         return ""
     analysis = job.get("qualification_fit_seniority") or {}
     required = analysis.get("required_experience") or {}
+    # The provider-shaped path may retain the authoritative extracted
+    # requirement in experience_requirements while the résumé-fit summary has
+    # no required_experience member. Both structures must feed the same hard
+    # policy; a missing summary field must not downgrade a confirmed posting.
+    if not isinstance(required, dict) or required.get("minimum") is None:
+        extracted_required = (job.get("experience_requirements") or {}).get("required")
+        if isinstance(extracted_required, dict):
+            required = extracted_required
     try:
         minimum = float(required.get("minimum")) if isinstance(required, dict) and required.get("minimum") is not None else None
     except (TypeError, ValueError):

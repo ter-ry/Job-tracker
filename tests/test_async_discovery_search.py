@@ -154,6 +154,84 @@ def test_async_worker_does_not_mark_results_presented_before_delivery(monkeypatc
             assert not app_module.applicant_presented_discovery_job(job_id, 11)
 
 
+def test_async_exclusion_tombstone_removes_visible_result_but_keeps_history():
+    with tempfile.TemporaryDirectory() as directory:
+        app_module.DATA_DIR = Path(directory)
+        app_module.DB_PATH = app_module.DATA_DIR / "tombstone.sqlite"
+        app_module.app.config.update(TESTING=True)
+        client = app_module.app.test_client()
+        client.get("/api/health")
+        with app_module.app.app_context():
+            job = app_module.normalize_job_payload({
+                "source": "Indeed", "source_job_id": "tombstone-1",
+                "title": "Software Engineer II (Full Stack)", "company": "TD",
+                "location": "Toronto, ON", "job_url": "https://example.test/tombstone-1",
+            })
+            app_module.persist_discovery_jobs([job], None, None)
+            event = {**job, "id": job["id"], "source": "Indeed", "result_stage": "qualified", "discovery_result_category": "actionable"}
+            app_module.get_db().execute(
+                "INSERT INTO discovery_async_searches (search_id, applicant_profile_id, results_json, next_sequence) VALUES (?, ?, ?, ?)",
+                ["tombstone-search", 7, app_module.dumps_json([event]), 1],
+            )
+            app_module.get_db().commit()
+        initial = client.get("/api/discovery/searches/tombstone-search?after=0").get_json()
+        assert [item["source_job_id"] for item in initial["jobs"]] == ["tombstone-1"]
+        with app_module.app.app_context():
+            app_module._append_async_discovery_results(
+                "tombstone-search",
+                [{**job, "id": job["id"], "source": "Indeed", "result_stage": "excluded", "discovery_result_category": "excluded", "discovery_result_reason": "Confirmed required experience exceeds maximum."}],
+            )
+        update = client.get("/api/discovery/searches/tombstone-search?after=1").get_json()
+        assert update["jobs"] == []
+        assert update["removed_identities"] == ["indeed|tombstone-1"]
+        with app_module.app.app_context():
+            assert app_module.query_db("SELECT id FROM jobs WHERE id = ?", [job["id"]], one=True) is not None
+
+
+def test_async_raw_provider_td_requirement_is_excluded_and_persisted(monkeypatch, tmp_path):
+    """Real async worker path must not depend on precomputed seniority fields."""
+    app_module.DATA_DIR = Path(tmp_path)
+    app_module.DB_PATH = app_module.DATA_DIR / "raw-async.sqlite"
+    app_module.app.config.update(TESTING=True)
+    raw = {
+        "source": "indeed", "source_job_id": "td-async-raw",
+        "title": "Software Engineer II (Full Stack)", "company": "TD",
+        "location": "Toronto, ON", "job_url": "https://example.test/td-async-raw",
+        "description": "Minimum qualifications: 5+ years of professional software engineering experience.",
+        "job_type": "full-time",
+    }
+    monkeypatch.setattr(app_module, "fetch_discovery_jobs_for_search", lambda *args, **kwargs: {
+        "jobs": [raw], "errors": {}, "source_counts": {"indeed": 1},
+        "source_diagnostics": {"indeed": {"state": "completed", "result_count": 1}},
+        "source_snapshots": {}, "attempted_query_batches": [],
+        "completed_query_batches": [], "pending_query_batches": [],
+    })
+    monkeypatch.setattr(
+        app_module, "geocode_discovery_job",
+        lambda job, *_args, **_kwargs: ({**job, "distance_km": 9999, "location_search_eligible": True}, {"ok": False}),
+    )
+    client = app_module.app.test_client()
+    search_id = client.post("/api/discovery/searches", json={
+        "keywords": "software developer", "location": "Toronto, ON",
+        "enabled_sources": ["indeed"], "search_mode": "shortlist",
+        "occupation": "software developer", "match_policy": "apply_broadly",
+        "seniority": "entry_level,junior", "maximum_required_years": 3,
+        "new_matching_target": 1,
+    }).get_json()["search_id"]
+    for _ in range(100):
+        final = client.get(f"/api/discovery/searches/{search_id}?after=0").get_json()
+        if final["status"] in {"completed", "completed_with_errors", "failed"}:
+            break
+        time.sleep(0.01)
+    assert final["status"] == "completed"
+    assert final["jobs"] == []
+    assert final["progress"]["confirmed_excluded"] == 1
+    with app_module.app.app_context():
+        row = app_module.query_db("SELECT discovery_result_category, job_description FROM jobs WHERE source_job_id = ?", ["td-async-raw"], one=True)
+        assert row["discovery_result_category"] == "excluded"
+        assert "5+ years" in row["job_description"]
+
+
 def test_named_search_keeps_legacy_saved_search_contract():
     with tempfile.TemporaryDirectory() as directory:
         app_module.DATA_DIR = Path(directory)

@@ -1,5 +1,7 @@
 """Deterministic regressions for the private-beta search reliability fixes."""
 
+from pathlib import Path
+
 import app
 
 
@@ -158,3 +160,76 @@ def test_ci76_owner_swe_examples_do_not_leak_through_apply_broadly_fallbacks():
     assert app.plausible_software_role(academic) is False
     assert app.plausible_software_role(amex) is True
     assert app.discovery_result_category(amex)[0] != "excluded"
+
+
+def test_raw_provider_text_drives_td_five_year_exclusion_without_injected_analysis(monkeypatch, tmp_path):
+    """Exercise provider payload -> extraction -> scoring -> final policy."""
+    raw = {
+        "source": "indeed",
+        "source_job_id": "td-raw-five-years",
+        "title": "Software Engineer II (Full Stack)",
+        "company": "TD",
+        "location": "Toronto, ON",
+        "job_url": "https://ca.indeed.com/viewjob?jk=td-raw-five-years",
+        "description": (
+            "Minimum qualifications: 5+ years of professional software engineering "
+            "experience. Build and maintain full-stack applications with Python and React."
+        ),
+        "job_type": "full-time",
+    }
+    converted = app.jobspy_result_to_job_payload(raw)
+    assert "required_experience" not in converted
+    assert "qualification_fit_seniority" not in converted
+    assert "5+ years" in converted["job_description"]
+
+    monkeypatch.setattr(app, "DATA_DIR", Path(tmp_path))
+    monkeypatch.setattr(app, "DB_PATH", Path(tmp_path) / "raw-td.sqlite")
+    client = app.app.test_client()
+    client.get("/api/health")
+    fetched = {
+        "jobs": [raw], "errors": {}, "source_counts": {"indeed": 1},
+        "source_diagnostics": {"indeed": {"state": "completed", "result_count": 1}},
+        "source_snapshots": {}, "attempted_query_batches": [],
+        "completed_query_batches": [], "pending_query_batches": [],
+    }
+    monkeypatch.setattr(app, "fetch_discovery_jobs_for_search", lambda *args, **kwargs: fetched)
+    monkeypatch.setattr(
+        app, "geocode_discovery_job",
+        lambda job, *_args, **_kwargs: ({**job, "distance_km": 9999, "location_search_eligible": True}, {"ok": False}),
+    )
+    payload = {
+        "keywords": "software developer",
+        "location": "Toronto, ON",
+        "enabled_sources": ["indeed"],
+        "search_mode": "shortlist",
+        "occupation": "software developer",
+        "match_policy": "apply_broadly",
+        "seniority": "entry_level,junior",
+        "maximum_required_years": 3,
+        "new_matching_target": 3,
+    }
+    with app.app.app_context():
+        result = app.run_discovery_pipeline(payload)
+    assert result["jobs"] == []
+    assert result["excluded_jobs"][0]["source_job_id"] == "td-raw-five-years"
+    excluded = result["excluded_jobs"][0]
+    assert excluded["discovery_result_category"] == "excluded"
+    assert excluded["qualification_fit_seniority"]["detected_level"] == "intermediate"
+    assert excluded["experience_requirements"]["required"]["minimum"] == 5
+    assert excluded["experience_requirements"]
+    with app.app.app_context():
+        row = app.query_db("SELECT discovery_result_category, job_description FROM jobs WHERE source_job_id = ?", ["td-raw-five-years"], one=True)
+        assert row["discovery_result_category"] == "excluded"
+        assert "5+ years" in row["job_description"]
+
+
+def test_academic_titles_are_rejected_even_when_provider_role_family_is_software():
+    search = _search(match_policy="apply_broadly")
+    for title in (
+        "Academic Assistant, Python Programming and Data Science",
+        "Instructor, Software Programming",
+        "Teacher, Computer Science",
+    ):
+        job = _swe_policy_job(title, "Teach students using Python and software tools.", role_type="software developer")
+        assert app.plausible_software_role(job) is False
+        assert app.discovery_target_assessment(job, search)[0] == "ineligible"

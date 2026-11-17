@@ -2864,12 +2864,14 @@ function setDiscoveryView(view) {
   renderDiscoveryResults(state.discoveryMeta || {});
 }
 
-function mergeProgressiveDiscoveryJobs(jobs = []) {
+function mergeProgressiveDiscoveryJobs(jobs = [], removedIdentities = []) {
   const incoming = Array.isArray(jobs) ? jobs : [];
+  const removed = new Set((Array.isArray(removedIdentities) ? removedIdentities : []).map((item) => String(item).toLowerCase()));
   // A provider-normalized event is deliberately replaced by the later,
   // authoritative qualification event for the same vacancy.
   const byIdentity = new Map();
   [...(state.discoveryResults || []), ...incoming].forEach((job) => byIdentity.set(discoveryJobKey(job), job));
+  removed.forEach((identity) => byIdentity.delete(identity));
   const merged = [...byIdentity.values()];
   state.discoveryExcludedResults = merged.filter((job) => job.discovery_result_category === "excluded");
   state.discoveryResults = merged.filter((job) => job.discovery_result_category !== "excluded");
@@ -2913,7 +2915,7 @@ async function pollProgressiveDiscoverySearch(searchId, after = 0) {
   while (state.discoveryActiveSearchId === String(searchId)) {
     const payload = await api.get(`/api/discovery/searches/${encodeURIComponent(searchId)}?after=${sequence}`);
     const incomingJobs = payload.new_jobs || payload.jobs || payload.results || [];
-    mergeProgressiveDiscoveryJobs(incomingJobs);
+    mergeProgressiveDiscoveryJobs(incomingJobs, payload.removed_identities || []);
     sequence = Number(payload.next_sequence ?? payload.progress?.next_sequence ?? sequence);
     state.discoveryContinuationIndex = sequence;
     state.discoveryMeta = {
