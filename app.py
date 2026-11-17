@@ -2610,12 +2610,7 @@ def create_app() -> Flask:
         search["discovery_location"] = location_context["discovery_location"]
         search["location_resolution_method"] = location_context["resolution_method"]
         search["location_geocode"] = location_context["lookup"]
-        if location_context.get("distance_origin_lookup", {}).get("ok"):
-            origin_result = location_context["distance_origin_lookup"]
-            origin = {"input": origin_result.get("original_input"), "normalized": origin_result.get("normalized_query"), "latitude": origin_result.get("latitude"), "longitude": origin_result.get("longitude"), "provider": origin_result.get("provider"), "confidence": origin_result.get("confidence"), "precision": origin_result.get("precision"), "geocoded_at": origin_result.get("geocoded_at"), "status": origin_result.get("status"), "error": origin_result.get("error", ""), "cached": origin_result.get("cached", False), "failure_reasons": origin_result.get("failure_reasons", [])}
-        elif search.get("distance_origin_input"):
-            origin_lookup = location_context.get("distance_origin_lookup") or {}
-            origin = {"input": search["distance_origin_input"], "normalized": search["distance_origin_input"], "provider": origin_lookup.get("provider", ""), "status": origin_lookup.get("status") or "unresolved", "precision": "unknown", "error": origin_lookup.get("error") or "The requested private distance origin could not be resolved.", "failure_reasons": origin_lookup.get("failure_reasons", [])}
+        origin = resolve_search_distance_origin(location_context, origin)
 
         search["keywords"] = keywords
         prior_metadata = prior_run.get("metadata") if isinstance(prior_run.get("metadata"), dict) else {}
@@ -3946,12 +3941,7 @@ def run_discovery_pipeline(
         "location_resolution_method": location_context["resolution_method"],
         "location_geocode": location_context["lookup"],
     })
-    if location_context.get("distance_origin_lookup", {}).get("ok"):
-        origin_result = location_context["distance_origin_lookup"]
-        origin = {"input": origin_result.get("original_input"), "normalized": origin_result.get("normalized_query"), "latitude": origin_result.get("latitude"), "longitude": origin_result.get("longitude"), "provider": origin_result.get("provider"), "confidence": origin_result.get("confidence"), "precision": origin_result.get("precision"), "geocoded_at": origin_result.get("geocoded_at"), "status": origin_result.get("status"), "error": origin_result.get("error", ""), "cached": origin_result.get("cached", False), "failure_reasons": origin_result.get("failure_reasons", [])}
-    elif search.get("distance_origin_input"):
-        origin_lookup = location_context.get("distance_origin_lookup") or {}
-        origin = {"input": search["distance_origin_input"], "normalized": search["distance_origin_input"], "provider": origin_lookup.get("provider", ""), "status": origin_lookup.get("status") or "unresolved", "precision": "unknown", "error": origin_lookup.get("error") or "The requested private distance origin could not be resolved.", "failure_reasons": origin_lookup.get("failure_reasons", [])}
+    origin = resolve_search_distance_origin(location_context, origin)
     search["keywords"] = keywords
     fetched = fetch_discovery_jobs_for_search(search, country_indeed="Canada", on_provider_update=on_provider_update)
     seen_jobs: list[dict[str, Any]] = []
@@ -4122,6 +4112,8 @@ def run_discovery_pipeline(
         "persisted": persisted,
         "auto_preparation_queued": auto_preparation_queued,
         "filtered": filtered,
+        "distance_origin": search.get("distance_origin"),
+        "origin_precision": origin.get("precision"),
         "origin_geocode_status": origin.get("status"),
         "origin_geocode_error": text(origin.get("error")),
         "origin_geocode_failure_reasons": origin.get("failure_reasons", []),
@@ -9239,6 +9231,38 @@ def normalize_discovery_city_region(display_name: str, fallback: str = "") -> st
     return city or raw
 
 
+def resolve_search_distance_origin(location_context: dict[str, Any], fallback_origin: dict[str, Any]) -> dict[str, Any]:
+    """Do not silently substitute a home address for an unresolvable search postal origin."""
+    lookup = location_context.get("distance_origin_lookup") or {}
+    if not lookup:
+        return fallback_origin
+    requested = text(location_context.get("distance_origin"))
+    if lookup.get("ok"):
+        return {
+            "input": lookup.get("original_input") or requested,
+            "normalized": lookup.get("normalized_query") or requested,
+            "latitude": lookup.get("latitude"),
+            "longitude": lookup.get("longitude"),
+            "provider": lookup.get("provider"),
+            "confidence": lookup.get("confidence"),
+            "precision": lookup.get("precision"),
+            "geocoded_at": lookup.get("geocoded_at"),
+            "status": lookup.get("status") or "saved",
+            "error": lookup.get("error", ""),
+            "cached": lookup.get("cached", False),
+            "failure_reasons": lookup.get("failure_reasons", []),
+        }
+    return {
+        "input": requested,
+        "normalized": lookup.get("normalized_query") or requested,
+        "provider": lookup.get("provider", ""),
+        "status": lookup.get("status") or "unresolved",
+        "precision": "unknown",
+        "error": lookup.get("error") or "Search-origin geocoding failed; distance cannot be verified.",
+        "failure_reasons": lookup.get("failure_reasons", []),
+    }
+
+
 def resolve_discovery_location_context(
     raw_location: str,
     profile: dict[str, str] | None = None,
@@ -10087,16 +10111,20 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
 
 
 def plausible_software_role(job: dict[str, Any]) -> bool:
-    """Apply Broadly admits related technical IC roles, never management-only work."""
+    """Plausible software IC work, not every job with developer in its name."""
     title = normalize_space(text(job.get("title"))).lower()
     role_type = normalize_space(text(job.get("role_type"))).lower()
     if re.search(r"\b(manager|director|vice president|vp|head of|chief)\b", title):
         return False
-    # A technology keyword alone is not a job family. For example, an
-    # academic-assistant posting may mention Python and data science while
-    # being unrelated to software employment. Require an engineering/developer
-    # role signal when the normalized provider family is unavailable.
     if re.search(r"\b(academic assistant|teaching assistant|instructor|teacher|faculty|professor|tutor|research assistant|researcher|recruiter|recruitment|human resources|administrator|coordinator)\b", title):
+        return False
+    # A title that explicitly says it is not development work is not a SWE
+    # match merely because the provider classified it as a 'developer' role.
+    if re.search(r"\b(?:not\s+(?:a\s+)?developer|production\s+support)\b", title):
+        return False
+    nonsoftware_industries = r"\b(?:packaging|sustainability|food\s+product|industrial\s+design|manufacturing|fashion\s+product|cosmetic\s+product)\b"
+    software_signal = r"\b(?:software|web|application|cloud|api|platform|computer|automation|systems|backend|frontend|full[ -]?stack)\b"
+    if re.search(nonsoftware_industries, title) and not re.search(software_signal, title):
         return False
     if role_type in ACTIONABLE_DISCOVERY_ROLE_FAMILIES:
         return True
@@ -10280,29 +10308,56 @@ def discovery_is_clear_senior_role(job: dict[str, Any], search: dict[str, Any]) 
 
 
 def discovery_target_assessment(job: dict[str, Any], search: dict[str, Any]) -> tuple[str, str]:
-    """Return verified, provisional, or ineligible without treating absence as proof."""
+    """Count only evidence-backed opportunities as new; retain uncertainty for review."""
     hard_reason = discovery_hard_exclusion_reason(job, search)
     if hard_reason:
         return "ineligible", hard_reason
-    if search.get("match_policy") == "apply_broadly" and search.get("search_mode") == "shortlist":
-        if not plausible_software_role(job):
-            return "ineligible", "Confirmed unrelated or management-only occupation is outside the Apply Broadly scope."
-        return "provisional", "Apply Broadly retains this plausible technical role; verify requirements before applying."
     if discovery_is_clear_senior_role(job, search):
         return "ineligible", "Confirmed seniority or required experience is outside the selected early-career target."
+
     selected_levels = {item.strip().replace("-", "_") for item in text(search.get("seniority")).lower().split(",") if item.strip()}
     analysis = job.get("qualification_fit_seniority") or {}
     level = text(analysis.get("detected_level") or job.get("seniority_level")).lower().replace("-", "_")
-    required = analysis.get("required_experience") or {}
+    required = analysis.get("required_experience") or (job.get("experience_requirements") or {}).get("required") or {}
     try:
-        minimum = float(required.get("minimum")) if isinstance(required, dict) and required.get("minimum") is not None else 0
+        minimum = float(required.get("minimum")) if isinstance(required, dict) and required.get("minimum") is not None else None
     except (TypeError, ValueError):
-        minimum = 0
-    if minimum > float(search.get("maximum_required_years") or 3):
+        minimum = None
+    maximum = float(search.get("maximum_required_years") if search.get("maximum_required_years") not in (None, "") else 3)
+    if minimum is not None and minimum > maximum:
         return "ineligible", "Confirmed required professional experience exceeds the selected maximum."
+
     unknown_levels = {"", "unknown", "ambiguous", "unverified"}
     if selected_levels and "any" not in selected_levels and level not in unknown_levels and level not in selected_levels:
         return "ineligible", "Confirmed seniority is outside the selected discovery seniority levels."
+
+    broad_software = search.get("match_policy") == "apply_broadly" and search.get("search_mode") == "shortlist"
+    if broad_software and not plausible_software_role(job):
+        return "ineligible", "Confirmed unrelated or management-only occupation is outside the Apply Broadly software scope."
+
+    if search.get("search_mode") == "shortlist":
+        ambiguous = analysis.get("ambiguous_experience") or (job.get("experience_requirements") or {}).get("ambiguous") or []
+        for item in ambiguous:
+            try:
+                ambiguous_minimum = float(item.get("minimum")) if isinstance(item, dict) else 0
+            except (TypeError, ValueError):
+                ambiguous_minimum = 0
+            if ambiguous_minimum > maximum:
+                return "review_required", (
+                    f"A possible {ambiguous_minimum:g}-year experience requirement exceeds the {maximum:g}-year maximum; "
+                    "confirm the employer's actual required years before including this result."
+                )
+        evidence_content = any(text(job.get(key)) for key in ("job_description", "required_skills", "preferred_skills", "responsibilities"))
+        if not evidence_content:
+            return "review_required", "The provider supplied no usable requirements; experience and technical fit cannot be verified."
+        if clamp_int_default(search.get("distance"), 0, 0, 1000) and "remote" not in text(job.get("remote_type")).lower():
+            if text(job.get("distance_radius_status")).lower() == "unknown":
+                return "review_required", "The workplace distance is unverified; the selected radius cannot be enforced."
+        if text(job.get("qualification_match_status")).lower() == "unavailable":
+            return "review_required", "Qualifications could not be assessed from the posting evidence."
+
+    if broad_software:
+        return "provisional", "Plausible software role with usable posting evidence; review résumé compatibility before applying."
     if level in unknown_levels:
         return "provisional", "Seniority is not stated; title and hard requirements are compatible, but this is not a verified junior role."
     return "verified", "Confirmed eligible: stated seniority and required experience meet the selected target."
