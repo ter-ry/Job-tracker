@@ -3260,6 +3260,7 @@ function sourceLabel(source) {
     indeed: "Indeed",
     zip_recruiter: "ZipRecruiter",
     glassdoor: "Glassdoor",
+    employer_direct: "Employer Direct",
     google: "Legacy provider",
   }[source] || source;
 }
