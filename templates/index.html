@@ -7,6 +7,7 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
   </head>
   <body>
+    <aside id="qa-session-banner" class="nested-panel risk high" hidden role="status"><strong>DISPOSABLE QA MODE</strong> <span id="qa-session-message">Production data is isolated.</span> <button class="button ghost small" id="qa-reset" type="button">Reset QA session</button></aside>
     <header class="topbar">
       <div>
         <p class="eyebrow">Local-first workflow assistant</p>
@@ -199,6 +200,7 @@
               <button class="button ghost beta-secondary" type="button" id="save-current-discovery-search">Save current search</button>
               <button class="button ghost beta-secondary" type="button" id="discovery-test-sources">Test job sources</button>
               <button class="button ghost beta-secondary" type="button" id="discovery-recalculate-distances">Recalculate distances</button>
+              <button class="button ghost beta-secondary" type="button" id="discovery-re-evaluate">Re-evaluate stored history</button>
             </div>
             <div class="compatibility-fields" aria-hidden="true">
               <select id="discovery-search-mode"><option value="shortlist">shortlist</option></select>
@@ -280,7 +282,7 @@
 
           <section class="panel discovery-inbox-panel discovery-view-saved">
             <div class="panel-header"><div><h2>Jobs Inbox</h2><p class="muted helper">New, review, saved, applied, skipped and history stay applicant-specific.</p></div><div class="actions compact"><button class="button ghost small" type="button" id="inbox-bulk-save">Save selected</button><button class="button ghost small" type="button" id="inbox-bulk-skip">Skip selected</button><button class="button ghost small" type="button" id="inbox-bulk-applied">Confirm selected Applied</button><button class="button ghost small" type="button" id="refresh-discovery-inbox">Refresh</button></div></div>
-            <div id="discovery-inbox-filters" class="actions compact" role="tablist" aria-label="Discovery inbox status"></div>
+            <nav id="discovery-inbox-filters" class="actions compact" role="tablist" aria-label="Jobs Inbox views"><span class="muted">All Relevant · New Opportunities · Needs Review · Saved · Applied · Skipped · All Discovered</span></nav>
             <div id="discovery-inbox" class="generated-output empty">No discovered opportunities yet.</div>
           </section>
 
@@ -499,6 +501,7 @@
             <p id="candidate-profile-form-error" class="risk high" role="alert" hidden></p>
             <div class="grid three">
               <label>Profile label<input id="candidate-profile-name" required placeholder="Software Engineering"></label>
+              <label>Workflow<select id="candidate-profile-workflow"><option value="software">Software / SWE</option><option value="ece">ECE</option></select></label>
               <label>Identity mode<select id="candidate-profile-identity-mode"><option value="shared">Use active profile identity</option><option value="distinct">Use a distinct applicant identity</option></select></label>
               <label>Applicant name<input id="candidate-profile-applicant-name" placeholder="Required for distinct identity"></label>
               <label>Email<input id="candidate-profile-applicant-email" type="email"></label>

@@ -246,7 +246,7 @@ class JobAssistantTest(unittest.TestCase):
             {"title": "Software Engineer", "job_description": "Required: 3+ years of professional software development experience."},
             evidence_profile={"target_seniority_levels": "junior, intermediate", "resume_text": "Built Python projects."},
         )
-        self.assertEqual(unverified["experience_requirements"]["candidate_years_status"], "unverified from selected résumé")
+        self.assertEqual(unverified["experience_requirements"]["candidate_years_status"], "résumé loaded; professional years are not explicitly quantified")
         self.assertEqual(unverified["experience_requirements"]["fit_status"], "unverified")
 
     def test_cached_home_coordinates_are_rejected_by_canadian_region(self):
@@ -994,9 +994,10 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(result["discovery_profile_independent"], 1)
         self.assertEqual({item["value"] for item in result["benefits"]}, {"PTO", "dental", "vision"})
         self.assertEqual(result["salary"], "CAD $25.86/hour")
-        self.assertEqual(self.client.post(f"/api/discovery/inbox/{result['id']}/save", json={}).status_code, 200)
-        applied = self.client.post(f"/api/discovery/inbox/{result['id']}/applied", json={}).get_json()
-        self.assertEqual(applied["status"], "Applied")
+        self.assertEqual(self.client.post(f"/api/discovery/inbox/{result['id']}/save", json={"applicant_profile_id": profile["id"], "workflow": "ece"}).status_code, 200)
+        applied = self.client.post(f"/api/discovery/inbox/{result['id']}/applied", json={"applicant_profile_id": profile["id"], "workflow": "ece"}).get_json()
+        self.assertEqual(applied["applicant_discovery_state"], "applied")
+        self.assertEqual(applied["status"], "Discovered")
         self.assertEqual(applied["candidate_profile_id"], profile["id"])
 
     def test_candidate_profile_creation_is_committed_and_returned_by_list_endpoint(self):
@@ -1012,6 +1013,41 @@ class JobAssistantTest(unittest.TestCase):
         saved = next(profile for profile in profiles.get_json() if profile["id"] == profile_id)
         self.assertEqual(saved["name"], "Software Engineering")
         self.assertEqual(saved["identity_mode"], "shared")
+
+    def test_selected_swe_resume_docx_is_loaded_as_discovery_evidence(self):
+        profile = self.client.post(
+            "/api/candidate-profiles",
+            json={"name": "Synthetic SWE", "identity_mode": "distinct", "applicant_name": "SWE Candidate"},
+        ).get_json()
+        document = Document()
+        document.add_heading("SWE Candidate", level=1)
+        document.add_heading("Summary", level=2)
+        document.add_paragraph("Early-career software developer building Python services.")
+        document.add_heading("Experience", level=2)
+        document.add_paragraph("Built Python and Flask REST APIs backed by SQL and automated tests.")
+        document.add_heading("Skills", level=2)
+        document.add_paragraph("Python, Flask, SQL, REST APIs, JavaScript")
+        buffer = io.BytesIO()
+        document.save(buffer)
+        upload = self.client.post(
+            f"/api/candidate-profiles/{profile['id']}/resumes/upload",
+            data={"file": (io.BytesIO(buffer.getvalue()), "synthetic-swe.docx"), "is_default": "true"},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(upload.status_code, 201, upload.get_data(as_text=True))
+        with app_module.app.app_context():
+            selected = app_module.resolve_discovery_evidence_profile({
+                "search_mode": "shortlist", "candidate_profile_id": profile["id"],
+            })
+        self.assertEqual(selected["_candidate_profile_id"], str(profile["id"]))
+        self.assertIn("Python", selected["key_skills"])
+        self.assertIn("Flask REST APIs", selected["work_experience"])
+        fit = app_module.build_qualification_fit(
+            {"title": "Junior Backend Developer", "job_description": "Python, Flask and SQL required."},
+            selected,
+        )
+        self.assertEqual(fit["qualification_evidence_profile_id"], str(profile["id"]))
+        self.assertNotEqual(fit["qualification_evidence_source"], "")
 
     def test_tailoring_studio_analyzes_selected_resume_and_applies_copy_edit(self):
         self.client.post("/api/profile", json={"name": "Terry Mak", "email": "terry@example.com"})
@@ -2870,8 +2906,9 @@ class JobAssistantTest(unittest.TestCase):
             ],
             "errors": {}, "source_counts": {"linkedin": 1, "indeed": 2}, "source_diagnostics": {}, "source_snapshots": {},
         }
+        profile = self.client.post("/api/candidate-profiles", json={"name": "SWE persistence", "workflow": "software"}).get_json()
         with patch.object(app_module, "fetch_jobspy_jobs", return_value=fake):
-            first = self.client.post("/api/discovery/jobspy", json={"keywords": "software developer", "enabled_sources": ["linkedin", "indeed"]}).get_json()
+            first = self.client.post("/api/discovery/jobspy", json={"keywords": "software developer", "enabled_sources": ["linkedin", "indeed"], "applicant_profile_id": profile["id"], "workflow": "software"}).get_json()
             by_title = {job["title"]: job for job in first["jobs"]}
             self.assertTrue(all(job.get("id") for job in by_title.values()))
             persisted = {job["title"]: job for job in self.client.get("/api/jobs").get_json()}
@@ -2880,22 +2917,29 @@ class JobAssistantTest(unittest.TestCase):
             save_id = by_title["Junior React Developer"]["id"]
             skip_id = by_title["Python Developer"]["id"]
             apply_id = by_title["Backend Developer"]["id"]
-            saved_response = self.client.post(f"/api/discovery/inbox/{save_id}/save", json={})
+            saved_response = self.client.post(f"/api/discovery/inbox/{save_id}/save", json={"applicant_profile_id": profile["id"], "workflow": "software"})
             self.assertEqual(saved_response.status_code, 200)
-            self.assertEqual(saved_response.get_json()["status"], "Saved")
-            self.assertEqual(self.client.post(f"/api/discovery/inbox/{skip_id}/ignore", json={}).status_code, 200)
-            applied = self.client.post(f"/api/discovery/inbox/{apply_id}/applied", json={}).get_json()
-            self.assertEqual(applied["status"], "Applied")
-            self.assertTrue(applied["date_applied"])
-            second = self.client.post("/api/discovery/jobspy", json={"keywords": "software developer", "enabled_sources": ["linkedin", "indeed"]}).get_json()
+            self.assertEqual(saved_response.get_json()["applicant_discovery_state"], "saved")
+            self.assertEqual(saved_response.get_json()["status"], "Discovered")
+            self.assertEqual(self.client.post(f"/api/discovery/inbox/{skip_id}/ignore", json={"applicant_profile_id": profile["id"], "workflow": "software"}).status_code, 200)
+            applied = self.client.post(f"/api/discovery/inbox/{apply_id}/applied", json={"applicant_profile_id": profile["id"], "workflow": "software"}).get_json()
+            self.assertEqual(applied["applicant_discovery_state"], "applied")
+            self.assertEqual(applied["status"], "Discovered")
+            with app_module.app.app_context():
+                applicant_application = app_module.query_db(
+                    "SELECT date_applied FROM discovery_applicant_states WHERE job_id = ? AND applicant_profile_id = ?",
+                    [apply_id, profile["id"]], one=True,
+                )
+            self.assertTrue(applicant_application["date_applied"])
+            second = self.client.post("/api/discovery/jobspy", json={"keywords": "software developer", "enabled_sources": ["linkedin", "indeed"], "applicant_profile_id": profile["id"], "workflow": "software"}).get_json()
 
         self.assertEqual(second["jobs"], [])
-        history = self.client.get("/api/discovery/inbox?include_history=1").get_json()
+        history = self.client.get(f"/api/discovery/inbox?include_history=1&applicant_profile_id={profile['id']}").get_json()
         categories = {item["title"]: item["discovery_inbox_category"] for item in history}
         self.assertEqual(categories["Junior React Developer"], "saved")
         self.assertEqual(categories["Python Developer"], "skipped")
         self.assertEqual(categories["Backend Developer"], "applied")
-        self.assertEqual(self.client.get("/api/discovery/inbox").get_json(), [])
+        self.assertEqual(self.client.get(f"/api/discovery/inbox?applicant_profile_id={profile['id']}").get_json(), [])
         row = next(item for item in history if item["title"] == "Backend Developer")
         self.assertEqual(row["url"], "https://example.test/apply")
         self.assertEqual(row["date_applied"], applied["date_applied"])
@@ -2903,10 +2947,11 @@ class JobAssistantTest(unittest.TestCase):
 
     def test_discovery_actions_are_scoped_to_the_selected_applicant(self):
         swe = self.client.post("/api/candidate-profiles", json={"name": "SWE QA"}).get_json()
-        ece = self.client.post("/api/candidate-profiles", json={"name": "ECE QA"}).get_json()
+        ece = self.client.post("/api/candidate-profiles", json={"name": "Second SWE QA", "workflow": "software"}).get_json()
         job = self.client.post("/api/jobs", json={
             "company": "Shared Vacancy", "title": "Junior Developer", "location": "Toronto, ON",
             "url": "https://example.test/shared", "source": "indeed", "job_description": "Python",
+            "discovery_occupation": "software developer",
             "discovery_first_seen_at": "2026-11-13T00:00:00", "discovery_last_seen_at": "2026-11-13T00:00:00",
         }).get_json()
         self.assertEqual(self.client.post(f"/api/discovery/inbox/{job['id']}/ignore", json={"applicant_profile_id": swe["id"]}).status_code, 200)
@@ -2938,19 +2983,20 @@ class JobAssistantTest(unittest.TestCase):
             "jobs": [{"source_job_id": "saved-1", "title": "Backend Developer", "company": "Acme", "location": "Toronto, Ontario", "source": "linkedin", "job_url": "https://example.com/acme/1", "description": "Python SQL backend", "remote_type": "Hybrid"}],
             "errors": {}, "source_counts": {"linkedin": 1}, "source_diagnostics": {"linkedin": {"success": True}}, "source_snapshots": {},
         }
-        search = self.client.post("/api/discovery/searches", json={"name": "Backend", "keywords": "backend developer", "location": "Toronto, Ontario", "enabled_sources": ["linkedin"]}).get_json()
+        profile = self.client.post("/api/candidate-profiles", json={"name": "SWE saved search", "workflow": "software"}).get_json()
+        search = self.client.post("/api/discovery/searches", json={"name": "Backend", "keywords": "backend developer", "location": "Toronto, Ontario", "enabled_sources": ["linkedin"], "search_mode": "title"}).get_json()
         location = {"original_input": "Toronto, Ontario", "normalized_input": "Toronto, Ontario", "distance_origin": "Toronto, Ontario", "discovery_location": "Toronto, ON", "resolution_method": "test", "lookup": {}}
         with patch.object(app_module, "get_geocoding_provider", return_value=provider), patch.object(app_module, "resolve_discovery_location_context", return_value=location), patch.object(app_module, "fetch_jobspy_jobs", return_value=fake):
             first = self.client.post(f"/api/discovery/searches/{search['id']}/run")
             self.assertEqual(first.status_code, 200, first.get_json())
             self.assertEqual(first.get_json()["persisted"]["new"], 1)
             job = self.client.get("/api/discovery/inbox").get_json()[0]
-            self.client.post(f"/api/discovery/inbox/{job['id']}/review")
+            self.client.post(f"/api/discovery/inbox/{job['id']}/review", json={"applicant_profile_id": profile["id"], "workflow": "software"})
             second = self.client.post(f"/api/discovery/searches/{search['id']}/run")
         self.assertEqual(second.status_code, 200)
         self.assertEqual(second.get_json()["persisted"]["duplicate"], 1)
-        refreshed = self.client.get("/api/discovery/inbox").get_json()[0]
-        self.assertEqual(refreshed["discovery_state"], "reviewed")
+        refreshed = self.client.get(f"/api/discovery/inbox?applicant_profile_id={profile['id']}").get_json()[0]
+        self.assertEqual(refreshed["applicant_discovery_state"], "reviewed")
         self.assertEqual(len(self.client.get("/api/discovery/runs").get_json()), 2)
 
     def test_discovery_scheduler_is_disabled_until_explicitly_enabled(self):

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import atexit
 import ctypes
+import json
 import multiprocessing
 import os
 from pathlib import Path
 import threading
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -15,6 +17,7 @@ import webbrowser
 
 HOST = "127.0.0.1"
 PORT = 5000
+QA_PORT = 5001
 APPDATA_FOLDER = "Job Tracker"
 INSTANCE_MUTEX = "JobTrackerInstance"
 
@@ -79,36 +82,84 @@ class SingleInstance:
         self.handle = None
 
 
-def local_health_url() -> str:
-    return f"http://{HOST}:{PORT}/api/health"
+def local_health_url(port: int = PORT) -> str:
+    return f"http://{HOST}:{port}/api/health"
 
 
-def server_is_healthy(timeout: float = 0.4) -> bool:
+def server_is_healthy(timeout: float = 0.4, port: int = PORT, qa_mode: bool | None = None) -> bool:
     try:
-        with urllib.request.urlopen(local_health_url(), timeout=timeout) as response:
-            return response.status == 200
+        with urllib.request.urlopen(local_health_url(port), timeout=timeout) as response:
+            if response.status != 200:
+                return False
+        if qa_mode is None:
+            return True
+        with urllib.request.urlopen(f"http://{HOST}:{port}/api/qa/status", timeout=timeout) as response:
+            status = json.loads(response.read().decode("utf-8"))
+        return bool(status.get("active")) == qa_mode
     except (OSError, urllib.error.URLError):
         return False
 
 
-def wait_for_server(timeout: float = 30.0) -> bool:
+def wait_for_server(timeout: float = 30.0, port: int = PORT, qa_mode: bool | None = None) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if server_is_healthy():
+        if server_is_healthy(port=port, qa_mode=qa_mode):
             return True
         time.sleep(0.15)
     return False
+
+
+def open_browser_or_report(url: str, data_dir: Path) -> bool:
+    """Open the app when possible and leave an actionable fallback when not."""
+    try:
+        opened = bool(webbrowser.open(url, new=1))
+    except Exception as exc:  # browser registration can fail on locked-down Windows hosts
+        opened = False
+        error = f"Automatic browser launch failed: {exc}"
+    else:
+        error = "Automatic browser launch returned no success status."
+    if opened:
+        return True
+    status = data_dir / "startup-status.txt"
+    status.write_text(
+        "Job Tracker is running, but the browser did not open automatically.\n"
+        f"Open this address manually: {url}\n{error}\n",
+        encoding="utf-8",
+    )
+    show_startup_recovery(url)
+    print(f"Job Tracker is ready at {url}. Automatic browser launch failed; open the address manually.")
+    return False
+
+
+def show_startup_recovery(url: str) -> None:
+    """Show a visible recovery prompt when the browser cannot be opened."""
+    if os.name != "nt":
+        return
+    try:
+        ctypes.windll.user32.MessageBoxW(None, f"Job Tracker is running. Open this address manually:\n\n{url}", "Job Tracker browser startup", 0x40)
+    except Exception:
+        return
 
 
 def stop_waitress_server(server: object, server_thread: threading.Thread) -> None:
     # Closing the listener alone does not wake Waitress while a browser keeps
     # an accepted keep-alive connection open. Close those channels before
     # waiting, otherwise launch() can remain blocked on the server thread.
-    server.close()
-    from waitress import wasyncore
+    try:
+        server.close()
+        from waitress import wasyncore
 
-    wasyncore.close_all(server._map)
-    server_thread.join(timeout=5)
+        wasyncore.close_all(server._map)
+        server_thread.join(timeout=5)
+    finally:
+        # The authenticated exit request is the frozen application's process
+        # boundary.  A Windows Waitress worker can retain a native handle even
+        # after the listener and thread have been closed, so always terminate
+        # the packaged process after bounded cleanup.  This also guarantees the
+        # smoke and installer lifecycle gates cannot hang on a half-shutdown
+        # executable.
+        if getattr(sys, "frozen", False):
+            os._exit(0)
 
 
 def launch() -> int:
@@ -116,25 +167,34 @@ def launch() -> int:
     # launcher. The provider runtime uses Windows spawn and never re-enters
     # launch() recursively.
     multiprocessing.freeze_support()
-    data_dir = default_data_dir()
+    qa_mode = "--qa" in sys.argv or os.environ.get("JOB_TRACKER_QA_MODE") == "1"
+    runtime_port = QA_PORT if qa_mode else PORT
+    if qa_mode:
+        os.environ["JOB_TRACKER_QA_MODE"] = "1"
+        data_dir = default_data_dir() / "QA Session"
+    else:
+        data_dir = default_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
     os.environ["JOB_TRACKER_DATA_DIR"] = str(data_dir)
     os.environ.setdefault("JOB_TRACKER_BIND_HOST", HOST)
-    os.environ.setdefault("JOB_TRACKER_PORT", str(PORT))
+    os.environ["JOB_TRACKER_PORT"] = str(runtime_port)
     os.environ.setdefault("JOB_TRACKER_EXIT_TOKEN", os.urandom(32).hex())
 
-    lock = SingleInstance(data_dir / "instance.lock")
+    mutex_name = f"{INSTANCE_MUTEX}-QA" if qa_mode else INSTANCE_MUTEX
+    lock = SingleInstance(data_dir / "instance.lock", mutex_name=mutex_name)
     if not lock.acquire():
-        if server_is_healthy():
-            webbrowser.open(f"http://{HOST}:{PORT}/")
+        if server_is_healthy(port=runtime_port, qa_mode=qa_mode):
+            open_browser_or_report(f"http://{HOST}:{runtime_port}/", data_dir)
             return 0
+        if qa_mode:
+            show_startup_recovery(f"QA mode could not start because port {runtime_port} or the QA instance is already in use. Production was not opened.")
         return 2
     atexit.register(lock.close)
 
     from waitress import create_server
     from app import app
 
-    server = create_server(app, host=HOST, port=PORT, threads=8, ident="JobTracker")
+    server = create_server(app, host=HOST, port=runtime_port, threads=8, ident="JobTracker-QA" if qa_mode else "JobTracker")
     server_thread = threading.Thread(
         target=server.run,
         daemon=True,
@@ -142,9 +202,10 @@ def launch() -> int:
 
     app.config["JOB_TRACKER_SHUTDOWN"] = lambda: stop_waitress_server(server, server_thread)
     server_thread.start()
-    if not wait_for_server():
+    if not wait_for_server(port=runtime_port, qa_mode=qa_mode):
+        show_startup_recovery(f"Job Tracker server readiness failed on http://{HOST}:{runtime_port}/")
         return 3
-    webbrowser.open(f"http://{HOST}:{PORT}/")
+    open_browser_or_report(f"http://{HOST}:{runtime_port}/", data_dir)
     server_thread.join()
     server.close()
     return 0

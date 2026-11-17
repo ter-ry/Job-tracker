@@ -180,6 +180,26 @@ def _migration_009_skill_confirmation_metadata(db: sqlite3.Connection) -> None:
             db.execute(f"ALTER TABLE keyword_memory ADD COLUMN {name} {definition}")
 
 
+def ensure_candidate_workflow_column(db: sqlite3.Connection) -> None:
+    """Add workflow metadata without advancing the established schema 14."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'candidate_profiles'").fetchone():
+        return
+    existing = {row[1] for row in db.execute("PRAGMA table_info(candidate_profiles)")}
+    if "workflow" not in existing:
+        db.execute("ALTER TABLE candidate_profiles ADD COLUMN workflow TEXT NOT NULL DEFAULT 'software'")
+    db.execute("UPDATE candidate_profiles SET workflow = 'software' WHERE workflow IS NULL OR workflow = ''")
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS discovery_requalifications (
+            job_id INTEGER NOT NULL,
+            applicant_profile_id INTEGER NOT NULL DEFAULT 0,
+            requalified_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            reason TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY(job_id, applicant_profile_id),
+            FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+        )"""
+    )
+
+
 def _migration_010_tailoring_revision_history(db: sqlite3.Connection) -> None:
     existing = {row[1] for row in db.execute("PRAGMA table_info(tailoring_drafts)")}
     if "revision_history_json" not in existing:
@@ -355,5 +375,10 @@ def run_migrations(db: sqlite3.Connection) -> int:
             migration(db)
         db.execute("INSERT INTO schema_migrations(version, name) VALUES (?, ?)", (version, name))
         db.execute(f"PRAGMA user_version = {version}")
+    db.commit()
+    # This metadata addition intentionally does not advance the deployed
+    # schema-14 version, so standalone profile stores receive the same safe
+    # compatibility column as the full application.
+    ensure_candidate_workflow_column(db)
     db.commit()
     return int(db.execute("PRAGMA user_version").fetchone()[0])

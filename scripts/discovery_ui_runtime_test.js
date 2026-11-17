@@ -58,6 +58,37 @@ async function main() {
   }
   assert.deepStrictEqual(calls.map((path) => path.split("/").at(-1)), ["save", "applied", "ignore"]);
 
+  // Best Match preserves junior-first eligibility tiers even when an
+  // intermediate role has a higher numeric score.
+  await page.evaluate(() => {
+    state.discoveryView = "cards";
+    state.discoveryPreferences = { filters: {}, sort: { field: "application_priority_score", direction: "desc" } };
+    state.discoveryResults = [
+      { id: 9201, title: "Intermediate Developer", company: "High Score", application_priority_score: 98, qualification_fit_seniority: { detected_level: "intermediate" }, discovery_result_category: "actionable" },
+      { id: 9202, title: "Junior Developer", company: "Junior First", application_priority_score: 42, qualification_fit_seniority: { detected_level: "junior" }, discovery_result_category: "actionable" },
+    ];
+    state.discoveryAllResults = state.discoveryResults.slice();
+    renderDiscoveryResults({ total: 2, source_counts: {}, diagnostics: {} });
+  });
+  const bestMatchTitles = await page.locator("#discovery-results .discovery-card h3").allTextContents();
+  assert.deepStrictEqual(bestMatchTitles.slice(0, 2), ["Junior Developer", "Intermediate Developer"]);
+
+  // A later async exclusion must remove a vacancy that was already rendered,
+  // including the Fast Apply queue, while the server retains its history row.
+  await page.evaluate(() => {
+    const tombstone = { id: 9301, source: "Indeed", source_job_id: "tombstone-1", title: "TD Software Engineer II", company: "TD", location: "Toronto, ON", discovery_result_category: "actionable", result_stage: "qualified", application_priority_score: 90 };
+    state.discoveryResults = [tombstone];
+    state.discoveryAllResults = [tombstone];
+    renderDiscoveryResults({ total: 1, diagnostics: {} });
+    mergeProgressiveDiscoveryJobs([], ["indeed|tombstone-1"]);
+    renderDiscoveryResults({ total: 1, diagnostics: {} });
+    renderFastApply();
+  });
+  assert.strictEqual(await page.locator("#discovery-results").getByText("TD Software Engineer II").count(), 0);
+  assert.strictEqual(await page.locator("#fast-apply-current").getByText("TD Software Engineer II").count(), 0);
+  const removedState = await page.evaluate(() => ({ results: state.discoveryResults.length, all: state.discoveryAllResults.length }));
+  assert.deepStrictEqual(removedState, { results: 0, all: 0 });
+
   let pollCount = 0;
   await page.route("**/api/discovery/searches/runtime-ui*", async (route) => {
     pollCount += 1;

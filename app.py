@@ -25,7 +25,7 @@ import zipfile
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 from xml.etree import ElementTree
 import platform
 import warnings
@@ -157,6 +157,7 @@ DISCOVERY_TASK_NAME = "Job Tracker Discovery"
 # an uncooperative upstream scraper can be force-stopped.
 DISCOVERY_PROVIDER_TIMEOUT_SECONDS = 20
 DISCOVERY_OVERALL_TIMEOUT_SECONDS = 75
+DISCOVERY_MIN_PROVIDER_BUDGET_SECONDS = 3
 TESTED_DEPENDENCY_VERSIONS = {
     "python-jobspy": "1.4.1",
     "pandas": "2.3.3",
@@ -622,6 +623,36 @@ def create_app() -> Flask:
             app_version=APP_VERSION, exit_token=os.environ.get("JOB_TRACKER_EXIT_TOKEN", ""),
         )
 
+    @app.get("/api/qa/status")
+    def qa_status() -> Response:
+        active = os.environ.get("JOB_TRACKER_QA_MODE") == "1"
+        return jsonify({"active": active, "data_dir": str(DATA_DIR) if active else "", "message": "Disposable QA mode active; production data is isolated." if active else "Production data mode active."})
+
+    @app.post("/api/qa/reset")
+    def qa_reset() -> Response:
+        if os.environ.get("JOB_TRACKER_QA_MODE") != "1":
+            return jsonify({"error": "QA reset is available only in an explicit disposable QA session."}), 403
+        global _INITIALIZED_DATABASE_PATH, _LAST_MIGRATION_BACKUP
+        active = get_db().execute("SELECT COUNT(*) FROM discovery_async_searches WHERE status IN ('queued', 'running')").fetchone()[0]
+        if active:
+            return jsonify({"error": "QA reset is blocked while discovery searches are active.", "active_searches": int(active)}), 409
+        db = g.pop("db", None)
+        if db is not None:
+            db.close()
+        # Remove the complete disposable state (profiles, documents, caches
+        # and history), but retain the live instance lock held by the launcher.
+        for child in list(DATA_DIR.iterdir()) if DATA_DIR.exists() else []:
+            if child.name == "instance.lock":
+                continue
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        _INITIALIZED_DATABASE_PATH = None
+        _LAST_MIGRATION_BACKUP = None
+        return jsonify({"ok": True, "message": "Disposable QA database reset; production data was not touched."})
+
     @app.post("/api/app/exit")
     def exit_app() -> Response:
         """Stop a packaged local instance after same-origin/token validation."""
@@ -682,6 +713,7 @@ def create_app() -> Flask:
             applicant_email=text(payload.get("applicant_email")),
             applicant_phone=text(payload.get("applicant_phone")),
             applicant_location=text(payload.get("applicant_location")),
+            workflow=(text(payload.get("workflow")) or ("ece" if re.search(r"\bece\b|early childhood", name, re.I) else "software")),
         )
         return jsonify({"id": profile_id}), 201
 
@@ -696,6 +728,7 @@ def create_app() -> Flask:
                 applicant_email=text(payload.get("applicant_email")) if "applicant_email" in payload else None,
                 applicant_phone=text(payload.get("applicant_phone")) if "applicant_phone" in payload else None,
                 applicant_location=text(payload.get("applicant_location")) if "applicant_location" in payload else None,
+                workflow=text(payload.get("workflow")) if "workflow" in payload else None,
             )
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
@@ -1510,7 +1543,11 @@ def create_app() -> Flask:
                 selected = resolve_tailoring_resume_profile({"candidate_profile_id": request.args.get("candidate_profile_id"), "resume_id": request.args.get("resume_id")})
                 evidence_profile = selected["profile"]
             except ValueError as exc:
-                return jsonify({"error": str(exc)}), 400
+                # Inbox/history remains usable without a résumé.  ECE is
+                # explicitly résumé-independent, and SWE users may inspect
+                # stored jobs before uploading a document.
+                if "no base" not in str(exc).lower() and "resume" not in str(exc).lower() and "résumé" not in str(exc).lower():
+                    return jsonify({"error": str(exc)}), 400
         statuses = _preparation_statuses([int(row["id"]) for row in rows])
         return jsonify([
             job_to_dict(row, evidence_profile, include_legacy_details=False, preparation_status=statuses.get(int(row["id"])))
@@ -1943,8 +1980,21 @@ def create_app() -> Flask:
             previous = latest_by_identity.get(identity)
             if previous is None or int(item.get("result_sequence") or 0) >= int(previous.get("result_sequence") or 0):
                 latest_by_identity[identity] = item
-        visible = [item for item in latest_by_identity.values() if int(item.get("result_sequence") or 0) >= after]
+        # An exclusion event is a durable tombstone for an older actionable
+        # event. Keep it in history/diagnostics, but never expose it as an
+        # inbox result after the vacancy becomes hard-ineligible.
+        visible = [
+            item for item in latest_by_identity.values()
+            if int(item.get("result_sequence") or 0) >= after
+            and text(item.get("result_stage")) != "excluded"
+        ]
         visible.sort(key=lambda item: int(item.get("result_sequence") or 0))
+        removed_identities = sorted(
+            _async_discovery_client_identity(item)
+            for item in latest_by_identity.values()
+            if int(item.get("result_sequence") or 0) >= after
+            and text(item.get("result_stage")) == "excluded"
+        )
         return jsonify({
             "search_id": search_id,
             "status": text(row.get("status")) or "queued",
@@ -1956,6 +2006,7 @@ def create_app() -> Flask:
             # absent result list.
             "provider_states": progress.get("provider_states") if isinstance(progress.get("provider_states"), dict) else {},
             "jobs": visible,
+            "removed_identities": removed_identities,
             "next_sequence": int(row.get("next_sequence") or 0),
             "continuation_available": bool(row.get("continuation_available")),
             "termination_reason": text(row.get("termination_reason")),
@@ -1981,8 +2032,26 @@ def create_app() -> Flask:
         if row is None:
             return jsonify({"error": "Async discovery search not found"}), 404
         payload = request.get_json(silent=True) or {}
+        search_payload = parse_json_object(row.get("search_json"))
+        stored_profile_id = int(row.get("applicant_profile_id") or 0)
+        supplied_profile_id = applicant_profile_id(payload)
+        legacy_profileless_store = stored_profile_id and query_db("SELECT 1 FROM candidate_profiles LIMIT 1", one=True) is None
+        if stored_profile_id and supplied_profile_id and supplied_profile_id != stored_profile_id:
+            return jsonify({"error": "Delivery acknowledgement belongs to a different applicant profile."}), 403
+        if stored_profile_id and not supplied_profile_id and not legacy_profileless_store:
+            return jsonify({"error": "Applicant profile is required to acknowledge Seen results for an applicant-specific search."}), 400
+        if legacy_profileless_store and not supplied_profile_id:
+            validated_profile_id = stored_profile_id
+        else:
+            effective_payload = payload if supplied_profile_id or text(payload.get("workflow")) else search_payload
+            try:
+                validated_profile_id = validate_discovery_applicant(effective_payload, discovery_workflow(effective_payload, discovery_search_config(search_payload)))
+            except (ValueError, TypeError) as exc:
+                return jsonify({"error": str(exc)}), 400
+        if validated_profile_id != stored_profile_id:
+            return jsonify({"error": "Delivery acknowledgement belongs to a different applicant profile."}), 403
         job_ids = payload.get("job_ids") if isinstance(payload.get("job_ids"), list) else []
-        profile_id = int(row.get("applicant_profile_id") or 0)
+        profile_id = validated_profile_id
         # A browser may only acknowledge the final, actionable rows emitted by
         # this search.  Do not let a stale tab (or a forged request) suppress
         # unrelated vacancies from a later New Opportunities queue.
@@ -2042,21 +2111,70 @@ def create_app() -> Flask:
         get_db().commit()
         return jsonify({"ok": True})
 
+    @app.post("/api/discovery/re-evaluate")
+    def re_evaluate_discovery_history() -> Response:
+        """Recheck stored exclusions without changing the user's decisions."""
+        payload = request.get_json(silent=True) or {}
+        workflow = discovery_workflow(payload)
+        try:
+            applicant_id = validate_discovery_applicant(payload, workflow)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        requested_occupation = "early childhood educator" if workflow == "ece" else "software developer"
+        rows = query_db(
+            """SELECT DISTINCT j.* FROM jobs j
+               LEFT JOIN discovery_applicant_states s ON s.job_id = j.id AND s.applicant_profile_id = ?
+               LEFT JOIN discovery_applicant_presentations p ON p.job_id = j.id AND p.applicant_profile_id = ?
+               WHERE j.discovery_first_seen_at <> ''
+                 AND j.discovery_result_category IN ('excluded', 'review_required')
+                 AND (j.candidate_profile_id = 0 OR j.candidate_profile_id = ? OR s.job_id IS NOT NULL OR p.job_id IS NOT NULL)
+                 AND (j.discovery_occupation = ? OR j.discovery_occupation = '' OR j.discovery_occupation IS NULL)""",
+            [applicant_id, applicant_id, applicant_id, requested_occupation],
+        )
+        changed = []
+        db = get_db()
+        for row in rows:
+            item = job_to_dict(row, include_legacy_details=False)
+            category, reason = discovery_result_category(item, text(item.get("discovery_remote_preference")))
+            if category != "actionable":
+                continue
+            db.execute(
+                """INSERT OR REPLACE INTO discovery_requalifications(job_id, applicant_profile_id, reason)
+                   VALUES (?, ?, ?)""",
+                [int(row["id"]), applicant_id, f"Requalified by current matching rules: {reason or category}"],
+            )
+            item["discovery_inbox_category"] = "requalified"
+            item["requalified_reason"] = reason or category
+            changed.append(item)
+        db.commit()
+        return jsonify({"count": len(changed), "jobs": changed, "message": "History re-evaluated; prior Seen, Saved, Applied and Skipped decisions were preserved."})
+
     @app.get("/api/discovery/inbox")
     def discovery_inbox() -> Response:
         include_history = as_bool(request.args.get("include_history"))
+        requested_category = text(request.args.get("category")).lower()
         applicant_id = applicant_profile_id(request.args)
         query = "SELECT * FROM jobs WHERE discovery_first_seen_at <> ''"
         query_args: list[Any] = []
+        if requested_category == "requalified":
+            query = """SELECT j.* FROM jobs j
+                       JOIN discovery_requalifications r ON r.job_id = j.id AND r.applicant_profile_id = ?
+                       WHERE j.discovery_first_seen_at <> ''"""
+            query_args.append(applicant_id)
         if applicant_id:
             # History is applicant-scoped. Include source rows owned by this
             # applicant plus explicit presentation/state records, never another
             # applicant's discoveries merely because they share a title or URL.
-            query += " AND (candidate_profile_id = 0 OR candidate_profile_id = ? OR EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = jobs.id AND p.applicant_profile_id = ?) OR EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = jobs.id AND s.applicant_profile_id = ?))"
+            table_alias = "j." if requested_category == "requalified" else ""
+            query += f" AND ({table_alias}candidate_profile_id = 0 OR {table_alias}candidate_profile_id = ? OR EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = {table_alias}id AND p.applicant_profile_id = ?) OR EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = {table_alias}id AND s.applicant_profile_id = ?))"
             query_args.extend([applicant_id, applicant_id, applicant_id])
         if not include_history and not applicant_id:
             query += " AND discovery_state NOT IN ('ignored', 'saved', 'applied') AND status NOT IN ('Applied', 'shortlisted')"
-        query += " ORDER BY discovery_state = 'new' DESC, discovery_last_seen_at DESC, id DESC LIMIT 500"
+        page_size = clamp_int_default(request.args.get("page_size"), 500, 1, 500)
+        page = clamp_int_default(request.args.get("page"), 0, 0, 100000)
+        order_alias = "j." if requested_category == "requalified" else ""
+        query += f" ORDER BY {order_alias}discovery_state = 'new' DESC, {order_alias}discovery_last_seen_at DESC, {order_alias}id DESC LIMIT ? OFFSET ?"
+        query_args.extend([page_size, page * page_size])
         rows = query_db(
             query, query_args
         )
@@ -2066,7 +2184,9 @@ def create_app() -> Flask:
                 selected = resolve_tailoring_resume_profile({"candidate_profile_id": request.args.get("candidate_profile_id"), "resume_id": request.args.get("resume_id")})
                 evidence_profile = selected["profile"]
             except ValueError as exc:
-                return jsonify({"error": str(exc)}), 400
+                message = str(exc).lower()
+                if "no base" not in message and "resume" not in message and "résumé" not in message:
+                    return jsonify({"error": str(exc)}), 400
         statuses = _preparation_statuses([int(row["id"]) for row in rows])
         jobs = []
         for row in rows:
@@ -2077,12 +2197,22 @@ def create_app() -> Flask:
                 item["applicant_discovery_state"] = state
             if applicant_id and not include_history and state in {"skipped", "saved", "applied"}:
                 continue
-            if text(item.get("status")) == "Applied":
+            requalified = query_db(
+                "SELECT reason FROM discovery_requalifications WHERE job_id = ? AND applicant_profile_id = ?",
+                [int(row["id"]), applicant_id], one=True,
+            ) if applicant_id else None
+            if requested_category == "requalified" and requalified:
+                category = "requalified"
+                item["requalified_reason"] = text(requalified["reason"])
+            elif text(item.get("status")) == "Applied" or text(item.get("discovery_state")) == "applied":
                 category = "applied"
             elif text(item.get("discovery_state")) in {"ignored", "skipped"}:
                 category = "skipped"
             elif text(item.get("discovery_state")) == "saved":
                 category = "saved"
+            elif requalified:
+                category = "requalified"
+                item["requalified_reason"] = text(requalified["reason"])
             elif text(item.get("discovery_result_category")) == "excluded":
                 category = "excluded"
             elif text(item.get("discovery_result_category")) == "review_required":
@@ -2098,9 +2228,21 @@ def create_app() -> Flask:
         row = query_db("SELECT * FROM jobs WHERE id = ? AND discovery_first_seen_at <> ''", [job_id], one=True)
         if row is None:
             return jsonify({"error": "Discovered job not found"}), 404
-        get_db().execute("UPDATE jobs SET discovery_state = 'reviewed', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
+        payload = request.get_json(silent=True) or {}
+        try:
+            validate_discovery_action_owner(row, payload)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        profile_id = applicant_profile_id(payload)
+        if profile_id:
+            set_applicant_discovery_state(job_id, profile_id, "reviewed")
+        else:
+            get_db().execute("UPDATE jobs SET discovery_state = 'reviewed', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
         get_db().commit()
-        return jsonify(job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)))
+        result = job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True))
+        if profile_id:
+            result["applicant_discovery_state"] = applicant_discovery_state(job_id, profile_id)
+        return jsonify(result)
 
     @app.post("/api/discovery/inbox/<int:job_id>/ignore")
     def ignore_discovery_job(job_id: int) -> Response:
@@ -2109,6 +2251,10 @@ def create_app() -> Flask:
             return jsonify({"error": "Discovered job not found"}), 404
         payload = request.get_json(silent=True) or {}
         profile_id = applicant_profile_id(payload)
+        try:
+            validate_discovery_action_owner(row, payload)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         if profile_id:
             set_applicant_discovery_state(job_id, profile_id, "skipped")
         else:
@@ -2123,6 +2269,10 @@ def create_app() -> Flask:
             return jsonify({"error": "Discovered job not found"}), 404
         payload = request.get_json(silent=True) or {}
         profile_id = applicant_profile_id(payload)
+        try:
+            validate_discovery_action_owner(row, payload)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         if profile_id:
             get_db().execute("DELETE FROM discovery_applicant_states WHERE job_id = ? AND applicant_profile_id = ?", [job_id, profile_id])
             # Explicit restore/resurface is the only route that permits a
@@ -2140,12 +2290,20 @@ def create_app() -> Flask:
         if row is None:
             return jsonify({"error": "Discovered job not found"}), 404
         profile_id = applicant_profile_id(request.get_json(silent=True) or {})
+        payload = request.get_json(silent=True) or {}
+        try:
+            validate_discovery_action_owner(row, payload)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         if profile_id:
             set_applicant_discovery_state(job_id, profile_id, "saved")
         else:
             get_db().execute("UPDATE jobs SET status = 'Saved', discovery_state = 'saved', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
         get_db().commit()
-        return jsonify(job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)))
+        result = job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True))
+        if profile_id:
+            result["applicant_discovery_state"] = applicant_discovery_state(job_id, profile_id)
+        return jsonify(result)
 
     @app.post("/api/discovery/inbox/<int:job_id>/applied")
     def apply_discovery_job(job_id: int) -> Response:
@@ -2154,6 +2312,10 @@ def create_app() -> Flask:
             return jsonify({"error": "Discovered job not found"}), 404
         payload = request.get_json(silent=True) or {}
         profile_id = applicant_profile_id(payload)
+        try:
+            validate_discovery_action_owner(row, payload)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         applied_date = text(payload.get("date_applied")) or date.today().isoformat()
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", applied_date):
             return jsonify({"error": "date_applied must use YYYY-MM-DD"}), 400
@@ -2162,7 +2324,10 @@ def create_app() -> Flask:
         else:
             get_db().execute("UPDATE jobs SET status = 'Applied', date_applied = ?, discovery_state = 'applied', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [applied_date, job_id])
         get_db().commit()
-        return jsonify(job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)))
+        result = job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True))
+        if profile_id:
+            result["applicant_discovery_state"] = applicant_discovery_state(job_id, profile_id)
+        return jsonify(result)
 
     @app.get("/api/preparation/queue")
     def preparation_queue() -> Response:
@@ -2412,6 +2577,10 @@ def create_app() -> Flask:
             search = discovery_search_config(payload)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
+        try:
+            validate_discovery_applicant(payload, discovery_workflow(payload, search))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         if search["search_mode"] == "shortlist" and not text(payload.get("candidate_profile_id")):
             return jsonify({"error": "Select a candidate résumé profile for the technical shortlist."}), 400
         search["progressive_acquisition"] = True
@@ -2513,6 +2682,8 @@ def create_app() -> Flask:
             clean["discovery_profile_independent"] = int(search["profile_independent"])
             clean["discovery_search_mode"] = search["search_mode"]
             clean["discovery_match_policy"] = search["match_policy"]
+            clean["discovery_maximum_required_years"] = search.get("maximum_required_years")
+            clean["discovery_seniority"] = search.get("seniority")
             clean["title_match_mode"] = search["title_match_mode"]
             if search["search_mode"] == "title":
                 clean["occupation_match_type"], clean["title_match_score"] = classify_title_match(
@@ -2573,6 +2744,11 @@ def create_app() -> Flask:
         for item in jobs:
             category = item.get("discovery_result_category") or "review_required"
             category_counts[category] = category_counts.get(category, 0) + 1
+        exclusion_reason_counts: dict[str, int] = {}
+        for item in jobs:
+            if item.get("discovery_result_category") == "excluded":
+                bucket = discovery_exclusion_reason_bucket(item)
+                exclusion_reason_counts[bucket] = exclusion_reason_counts.get(bucket, 0) + 1
         excluded_count = category_counts.get("excluded", 0)
         outside_radius_count = sum(1 for item in jobs if text(item.get("distance_radius_status")) == "outside_radius")
         unknown_distance_count = sum(1 for item in jobs if text(item.get("distance_radius_status")) == "unknown")
@@ -2627,6 +2803,7 @@ def create_app() -> Flask:
             "distance_origin": search["distance_origin"],
             "location_resolution_method": search["location_resolution_method"],
             "remote_result_groups": category_counts,
+            "exclusion_reason_counts": exclusion_reason_counts,
         }
         if jobs:
             jobs = sort_discovery_jobs(
@@ -2640,7 +2817,6 @@ def create_app() -> Flask:
             )
         jobs = jobs[: search["total_cap"]]
         manual_run_id = create_discovery_run(None, "manual")
-        persisted = persist_discovery_jobs(jobs, None, manual_run_id)
         selected_applicant_id = applicant_profile_id(payload)
         for item in jobs:
             hydrate_discovery_identity(item)
@@ -2667,8 +2843,13 @@ def create_app() -> Flask:
         for item in target_review_jobs:
             item["discovery_result_category"] = "review_required"
             item["discovery_result_reason"] = discovery_target_ineligibility_reason(item, search)
+        for item in ordered:
+            item["recommendation_eligible"] = item.get("discovery_result_category") == "actionable"
         matching_jobs = [item for item in ordered if item.get("discovery_result_category") == "actionable"]
         review_required_jobs = [item for item in ordered if item.get("discovery_result_category") not in {"actionable", "excluded"}]
+        # Persist only after the final hard and target gates have run. This
+        # prevents stale actionable rows from surviving a stricter recheck.
+        persisted = persist_discovery_jobs(ordered, None, manual_run_id)
         new_matching_jobs = matching_jobs[:requested_target]
         # The response is unified: actionable new matches first, followed by a
         # separately labelled review queue. Excluded jobs never enter it.
@@ -2782,6 +2963,7 @@ def create_app() -> Flask:
             hours_old=168,
             enabled_sources=enabled_sources,
             country_indeed="Canada",
+            fetch_linkedin_description=False,
         )
         return jsonify(
             {
@@ -3120,6 +3302,67 @@ def applicant_profile_id(payload: Any = None) -> int:
     return clamp_int(payload.get("applicant_profile_id") or payload.get("candidate_profile_id"), 0, 10**9)
 
 
+def discovery_workflow(payload: dict[str, Any] | None = None, search: dict[str, Any] | None = None) -> str:
+    payload = payload or {}
+    search = search or {}
+    explicit = normalize_space(text(payload.get("workflow"))).lower()
+    if explicit in {"software", "ece"}:
+        return explicit
+    occupation = normalize_space(text(search.get("occupation") or search.get("discovery_occupation") or payload.get("occupation") or payload.get("discovery_occupation"))).lower()
+    return "ece" if occupation == "early childhood educator" else "software"
+
+
+def validate_discovery_applicant(payload: dict[str, Any], workflow: str) -> int:
+    """Authoritatively validate the selected applicant for every discovery action.
+
+    A missing workflow is accepted only for legacy shared-history actions.  If a
+    profile is supplied, its stored workflow is the authority; an explicit
+    conflicting workflow is rejected and a missing one is filled from it.
+    """
+    profile_id = applicant_profile_id(payload)
+    if not profile_id:
+        if workflow == "ece":
+            if query_db("SELECT 1 FROM candidate_profiles LIMIT 1", one=True) is not None:
+                raise ValueError("Select an ECE applicant profile before searching or taking ECE actions.")
+        return 0
+    row = query_db("SELECT id, workflow FROM candidate_profiles WHERE id = ?", [profile_id], one=True)
+    if row is None:
+        if workflow == "software" and query_db("SELECT 1 FROM candidate_profiles LIMIT 1", one=True) is None:
+            # Compatibility for historical profileless presentation IDs. New
+            # applicant-aware databases reject unknown identities below.
+            return profile_id
+        raise ValueError("The selected applicant profile was not found.")
+    stored_workflow = text(row["workflow"]).lower() or "software"
+    if stored_workflow != workflow:
+        raise ValueError(f"The selected applicant is configured for {stored_workflow.upper()} jobs, not {workflow.upper()}.")
+    return profile_id
+
+
+def validate_discovery_action_owner(row: Any, payload: dict[str, Any] | None = None) -> int:
+    """Validate an existing-job action against trusted stored discovery metadata."""
+    payload = payload or {}
+    profile_id = applicant_profile_id(payload)
+    explicit_workflow = normalize_space(text(payload.get("workflow"))).lower()
+    occupation = normalize_space(text(row["discovery_occupation"] if "discovery_occupation" in row.keys() else "")).lower()
+    known_workflow = "ece" if occupation == "early childhood educator" else "software" if occupation else ""
+    if known_workflow:
+        if explicit_workflow and explicit_workflow != known_workflow:
+            raise ValueError(f"This stored discovery is a {known_workflow.upper()} job; the requested workflow is not compatible.")
+        if not profile_id:
+            raise ValueError("Select the compatible applicant profile before acting on this discovery.")
+        return validate_discovery_applicant({**payload, "workflow": known_workflow}, known_workflow)
+    # A blank occupation is retained only for genuinely old profileless rows.
+    # Once candidate profiles exist, callers cannot turn an unknown legacy row
+    # into an applicant-specific action by omitting ownership fields.
+    if not profile_id and not explicit_workflow:
+        return 0
+    if query_db("SELECT 1 FROM candidate_profiles LIMIT 1", one=True) is not None:
+        raise ValueError("This legacy profileless discovery cannot be assigned to a modern applicant without trusted workflow metadata.")
+    if explicit_workflow and explicit_workflow != "software":
+        raise ValueError("Legacy profileless discoveries support only the software compatibility workflow.")
+    return profile_id
+
+
 def _async_discovery_progress(result: dict[str, Any] | None = None, requested_target: int = 50) -> dict[str, Any]:
     result = result or {}
     progress = result.get("search_progress") if isinstance(result.get("search_progress"), dict) else {}
@@ -3173,6 +3416,15 @@ def _async_discovery_result_identity(job: dict[str, Any]) -> str:
     if url:
         return f"url:{url}"
     return "row:" + "|".join(normalize_space(text(job.get(name))).casefold() for name in ("company", "title", "location"))
+
+
+def _async_discovery_client_identity(job: dict[str, Any]) -> str:
+    """Identity format shared with the browser's discoveryJobKey()."""
+    source = normalize_space(text(job.get("source") or job.get("source_name") or "jobspy")).casefold()
+    identity = normalize_space(text(job.get("source_job_id") or job.get("application_url") or job.get("url")))
+    if not identity:
+        identity = "|".join(normalize_space(text(job.get(name))) for name in ("company", "title", "location"))
+    return f"{source}|{identity}".casefold().strip()
 
 
 def _append_async_discovery_results(search_id: str, jobs: list[dict[str, Any]]) -> int:
@@ -3245,7 +3497,14 @@ def _run_async_discovery_search(search_id: str, payload: dict[str, Any]) -> None
                 return
             jobs = result.get("jobs") if isinstance(result.get("jobs"), list) else []
             # Only persisted, final, applicant-unseen rows are actionable.
-            _append_async_discovery_results(search_id, [{**job, "result_stage": "qualified"} for job in jobs])
+            # Exclusions are emitted as tombstones so an older actionable
+            # cursor event cannot resurrect a vacancy after re-evaluation.
+            excluded_jobs = result.get("excluded_jobs") if isinstance(result.get("excluded_jobs"), list) else []
+            _append_async_discovery_results(
+                search_id,
+                ([{**job, "result_stage": "qualified"} for job in jobs]
+                 + [{**job, "result_stage": "excluded"} for job in excluded_jobs]),
+            )
             progress = _async_discovery_progress(result, int(payload.get("new_matching_target") or payload.get("shortlist_size") or 50))
             diagnostics = result.get("diagnostics") if isinstance(result.get("diagnostics"), dict) else {}
             continuation = bool(diagnostics.get("continuation_available") or (result.get("search_progress") or {}).get("continuation_available"))
@@ -3268,6 +3527,8 @@ def _run_async_discovery_search(search_id: str, payload: dict[str, Any]) -> None
 
 
 def enqueue_async_discovery_search(payload: dict[str, Any]) -> dict[str, Any]:
+    search = discovery_search_config(payload)
+    validate_discovery_applicant(payload, discovery_workflow(payload, search))
     search_id = uuid.uuid4().hex
     target = clamp_int_default(payload.get("new_matching_target", payload.get("shortlist_size")), 50, 1, 500)
     db = get_db()
@@ -3486,6 +3747,8 @@ def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, ru
                 "description_fetched_at", "last_verified_at", "workplace_address", "workplace_postal_code",
                 "workplace_evidence", "workplace_evidence_source", "workplace_precision", "workplace_confidence",
                 "workplace_alternatives_json", "remote_classification_conflict", "warnings",
+                "discovery_result_category", "discovery_result_reason", "recommendation_eligible",
+                "discovery_match_status", "discovery_match_explanation",
             }
             updates = {column: job.get(column, "") for column in assessment_columns if column in JOB_COLUMNS}
             for column, value in updates.items():
@@ -3705,6 +3968,8 @@ def run_discovery_pipeline(
         clean["discovery_profile_independent"] = int(search["profile_independent"])
         clean["discovery_search_mode"] = search["search_mode"]
         clean["discovery_match_policy"] = search["match_policy"]
+        clean["discovery_maximum_required_years"] = search.get("maximum_required_years")
+        clean["discovery_seniority"] = search.get("seniority")
         clean["title_match_mode"] = search["title_match_mode"]
         clean["discovery_include_internships"] = bool(search.get("include_internships"))
         if search["search_mode"] == "title":
@@ -3759,7 +4024,6 @@ def run_discovery_pipeline(
         jobs.append(clean)
     capped_count = max(0, len(jobs) - search["total_cap"])
     jobs = sort_discovery_jobs(jobs, "application_priority_score", "desc", "", "asc", "remote_after_local", "last")[: search["total_cap"]]
-    persisted = persist_discovery_jobs(jobs, search_id, run_id)
     requested_target = int(search.get("requested_target") or 50)
     ordered = list(jobs)
     target_review_jobs = [item for item in ordered if item.get("discovery_result_category") == "actionable" and not discovery_target_eligible(item, search)]
@@ -3769,6 +4033,11 @@ def run_discovery_pipeline(
     for item in target_review_jobs:
         item["discovery_result_category"] = "review_required"
         item["discovery_result_reason"] = discovery_target_ineligibility_reason(item, search)
+    for item in ordered:
+        item["recommendation_eligible"] = item.get("discovery_result_category") == "actionable"
+    # Persist only after the final hard and target gates have run. This keeps
+    # the durable row, async cursor, and inbox category consistent.
+    persisted = persist_discovery_jobs(ordered, search_id, run_id)
     selected_applicant_id = applicant_profile_id(payload)
     eligible_unpresented: list[dict[str, Any]] = []
     previously_presented_count = 0
@@ -3798,6 +4067,10 @@ def run_discovery_pipeline(
     for item in review_required_jobs:
         bucket = discovery_reason_bucket(item)
         review_reason_counts[bucket] = review_reason_counts.get(bucket, 0) + 1
+    exclusion_reason_counts: dict[str, int] = {}
+    for item in excluded_jobs:
+        bucket = discovery_exclusion_reason_bucket(item)
+        exclusion_reason_counts[bucket] = exclusion_reason_counts.get(bucket, 0) + 1
     # Find Jobs intentionally exposes only the bounded, qualified new queue.
     # Everything else remains durably discoverable in history/diagnostics.
     jobs = matching_jobs
@@ -3828,6 +4101,7 @@ def run_discovery_pipeline(
         "disqualified_count": len(excluded_jobs),
         "review_required_count": len(review_required_jobs),
         "review_reason_counts": review_reason_counts,
+        "exclusion_reason_counts": exclusion_reason_counts,
         "new_matching_count": len(matching_jobs),
         "eligible_previously_presented_count": previously_presented_count,
         "eligible_already_actioned_count": already_actioned_count,
@@ -3841,6 +4115,7 @@ def run_discovery_pipeline(
         "raw_jobs_returned": len(fetched.get("jobs", [])),
         "displayed_jobs": len(jobs),
         "display_jobs": jobs,
+        "excluded_jobs": excluded_jobs,
         # Retained for older clients; this is an early reliable-salary filter,
         # not the final eligibility/exclusion count.
         "filtered_by_saved_search": filtered,
@@ -3857,6 +4132,7 @@ def run_discovery_pipeline(
     save_discovery_debug_run(search_key, {**payload, "search_id": search_id}, metadata, fetched.get("source_snapshots", {}))
     return {
         "jobs": jobs,
+        "excluded_jobs": excluded_jobs,
         "matching_jobs": matching_jobs,
         "review_required_jobs": review_required_jobs,
         "search_progress": {
@@ -3868,6 +4144,7 @@ def run_discovery_pipeline(
             "disqualified": len(excluded_jobs),
             "review_required": len(review_required_jobs),
             "review_reason_counts": review_reason_counts,
+            "exclusion_reason_counts": exclusion_reason_counts,
             "new_matching_jobs": len(matching_jobs),
             "previously_presented": previously_presented_count,
             "already_actioned": already_actioned_count,
@@ -7835,9 +8112,15 @@ def _software_title_match(title_text: str, terms: list[str], match_mode: str) ->
 
 def _ece_title_match(title_text: str, terms: list[str], match_mode: str) -> tuple[str, int]:
     exact_blockers = r"\b(?:sales|representative|manager|director|supervisor|assistant|aide|coordinator|administrator|instructor|faculty|therapist)\b"
+    # A classroom context must not wash out a supervisory, administrative, or
+    # unrelated occupational title.  This guard applies to both exact and
+    # related matching; otherwise titles such as "Early Childhood Educator
+    # Supervisor" fall through to the related-role branch.
+    if re.search(exact_blockers, title_text):
+        return "uncertain", 0
     exact_terms = [term for term in terms if term not in {"early childhood education", "registered early childhood education"}]
     has_exact = any(re.search(rf"(?<![a-z]){re.escape(term)}(?![a-z])", title_text) for term in exact_terms)
-    if has_exact and not re.search(exact_blockers, title_text):
+    if has_exact:
         return "exact", 100
     early_context = re.search(r"\b(?:early childhood|early years|preschool|daycare|childcare|child care)\b", title_text)
     educator_role = re.search(r"\b(?:educator|teacher|worker)\b", title_text)
@@ -8971,7 +9254,11 @@ def resolve_discovery_location_context(
     normalized_postal = normalize_canadian_postal_code(postal) if postal else ""
     private_origin = normalize_space(distance_origin_input)
     distance_origin = normalize_canadian_postal_code(extract_canadian_postal_code(private_origin)) if extract_canadian_postal_code(private_origin) else private_origin or normalized_postal or normalized_input
-    distance_origin_lookup = geocode_location_value(private_origin, lookup_type="distance_origin", profile=profile, provider=provider, use_cache=use_cache) if private_origin else {}
+    # A postal-code search is also a valid approximate origin when the user
+    # has not supplied a separate home/commute origin. Keep this distinct from
+    # the search-area geocode and label it with postal precision.
+    origin_lookup_input = private_origin or normalized_postal
+    distance_origin_lookup = geocode_location_value(origin_lookup_input, lookup_type="distance_origin", profile=profile, provider=provider, use_cache=use_cache) if origin_lookup_input else {}
     lookup_input = normalized_postal or normalized_input
     if is_countrywide_search_location(normalized_input):
         return {
@@ -9106,10 +9393,17 @@ def fetch_discovery_jobs_for_search(
         qualification_probe = qualifying_predicate
     if target_matches is None and qualification_probe is not None and stop_when_target:
         target_matches = clamp_int(search.get("requested_target"), 0, 10000) or None
+    completed_records = [item for item in search.get("completed_query_batches", []) if isinstance(item, dict)]
+    # Legacy records without a provider mean the whole batch completed. New
+    # records retain provider identity so a healthy Indeed batch never hides a
+    # failed LinkedIn retry on continuation.
     completed = {
         (text(item.get("location")), text(item.get("keywords")))
-        for item in search.get("completed_query_batches", [])
-        if isinstance(item, dict)
+        for item in completed_records if not text(item.get("provider"))
+    }
+    completed_by_provider = {
+        (normalize_space(text(item.get("provider"))).lower(), text(item.get("location")), text(item.get("keywords")))
+        for item in completed_records if text(item.get("provider"))
     }
     continuation_index = clamp_int(search.get("continuation_index"), 0, 1000)
     # Keep the first acquisition page at the user-selected per-source budget;
@@ -9125,13 +9419,19 @@ def fetch_discovery_jobs_for_search(
     qualified_count = 0
     pending_batches = 0
     all_planned_batches = [(location, query) for location in locations for query in queries]
-    # Compatibility for the earlier index-only contract.  Persisted batch
-    # records take precedence because they survive a server restart and do not
-    # accidentally skip failed work.
-    if not completed and continuation_index:
+    # Compatibility for the earlier index-only contract. It is safe only when
+    # no provider-specific records exist; otherwise a numeric cursor could
+    # promote partial work into a false all-provider completion.
+    if not completed and not completed_by_provider and continuation_index:
         completed = set(all_planned_batches[:continuation_index])
     planned_batches = [batch for batch in all_planned_batches if batch not in completed]
     completed_this_run: list[dict[str, str]] = []
+    providers = [normalize_space(source).lower() for source in search["enabled_sources"]]
+    all_work_items = {(provider, location, query) for location, query in all_planned_batches for provider in providers}
+    completed_work_items = set(completed_by_provider)
+    completed_work_items.update((provider, location, query) for location, query in completed for provider in providers)
+    attempted_work_items: set[tuple[str, str, str]] = set()
+    failed_work_items: set[tuple[str, str, str]] = set()
     active_sources = list(search["enabled_sources"])
     # Scope the breaker to this attempt. A continuation can retry a source,
     # but a repeatedly failing source cannot consume every remaining batch.
@@ -9141,7 +9441,13 @@ def fetch_discovery_jobs_for_search(
         if elapsed >= DISCOVERY_OVERALL_TIMEOUT_SECONDS:
             combined["errors"]["overall"] = f"Discovery timed out after {DISCOVERY_OVERALL_TIMEOUT_SECONDS}s before all locations completed."
             break
-        remaining_budget = max(1, int(DISCOVERY_OVERALL_TIMEOUT_SECONDS - elapsed))
+        remaining_budget = max(0, int(DISCOVERY_OVERALL_TIMEOUT_SECONDS - elapsed))
+        if remaining_budget < DISCOVERY_MIN_PROVIDER_BUDGET_SECONDS:
+            combined["errors"]["budget"] = (
+                f"Discovery stopped with {remaining_budget}s remaining; the next provider request was not started."
+            )
+            combined["pending_budget"] = True
+            break
         attempted.append({"location": location, "keywords": keyword_query})
         def provider_update(source: str, provider_result: dict[str, Any]) -> None:
             if on_provider_update is None:
@@ -9157,6 +9463,11 @@ def fetch_discovery_jobs_for_search(
 
         if not active_sources:
             break
+        batch_sources = [source for source in active_sources if (normalize_space(source).lower(), location, keyword_query) not in completed_work_items]
+        # Every currently active provider already completed this batch. There
+        # is no new work item to write and, crucially, no providerless record.
+        if not batch_sources:
+            continue
         # Redistribute the original aggregate share only among providers still
         # working in this attempt; never increase the configured total budget.
         configured_cap = int(search.get("per_source_cap") or search["request_per_source_cap"])
@@ -9166,11 +9477,13 @@ def fetch_discovery_jobs_for_search(
             keywords=keyword_query, location=location, distance=search["distance"],
             remote_preference=search["remote_preference"], job_type=None,
             results_wanted=per_region, hours_old=search["hours_old"],
-            enabled_sources=active_sources, country_indeed=country_indeed,
+            enabled_sources=batch_sources, country_indeed=country_indeed,
             provider_timeout_seconds=min(DISCOVERY_PROVIDER_TIMEOUT_SECONDS, remaining_budget),
             circuit_breaker=circuit_breaker,
+            fetch_linkedin_description=False,
             on_provider_update=provider_update,
         )
+        attempted_work_items.update((normalize_space(source).lower(), location, keyword_query) for source in batch_sources)
         if result.get("errors"):
             # Do not repeatedly hammer a provider that has already reported a
             # timeout/block/rate-limit in this acquisition run.
@@ -9209,29 +9522,39 @@ def fetch_discovery_jobs_for_search(
         # this attempt, but continue later distinct batches for every provider
         # that remains healthy (for example Indeed after LinkedIn times out).
         failed_sources = {normalize_space(source).lower() for source in result.get("errors", {})}
+        failed_work_items.update((normalize_space(source).lower(), location, keyword_query) for source in batch_sources if normalize_space(source).lower() in failed_sources)
         active_sources = [source for source in active_sources if normalize_space(source).lower() not in failed_sources]
-        completed_this_run.append({"location": location, "keywords": keyword_query})
+        successful_sources = [source for source in batch_sources if normalize_space(source).lower() not in failed_sources]
+        for source in successful_sources:
+            provider = normalize_space(source).lower()
+            completed_work_items.add((provider, location, keyword_query))
+            completed_this_run.append({"location": location, "keywords": keyword_query, "provider": source})
         if target_reached:
             break
     combined["jobs"] = merged
     combined["keyword_queries"] = [query for _, query in planned_batches]
     combined["attempted_query_batches"] = attempted
-    # A failed batch itself is pending: it was attempted for diagnostics, but
-    # not completed and must be retried by a continuation request.
-    pending_start = len(completed_this_run)
-    pending_batches = max(0, len(planned_batches) - pending_start)
-    combined["completed_query_batches"] = [
-        {"location": location, "keywords": keyword}
-        for location, keyword in all_planned_batches if (location, keyword) in completed
-    ] + completed_this_run
+    pending_work_items = all_work_items - completed_work_items
+    completed_query_keys = {
+        (location, query) for location, query in all_planned_batches
+        if all((provider, location, query) in completed_work_items for provider in providers)
+    }
+    pending_query_keys = [batch for batch in all_planned_batches if batch not in completed_query_keys]
+    retryable_work_items = sorted(failed_work_items)
+    pending_batches = len(pending_query_keys)
+    combined["completed_query_batches"] = completed_records + completed_this_run
     combined["pending_query_batches"] = [
-        {"location": location, "keywords": query} for location, query in planned_batches[pending_start:]
+        {"location": location, "keywords": query} for location, query in pending_query_keys
     ]
+    combined["attempted_work_items"] = [{"provider": provider, "location": location, "keywords": query} for provider, location, query in sorted(attempted_work_items)]
+    combined["completed_work_items"] = [{"provider": provider, "location": location, "keywords": query} for provider, location, query in sorted(completed_work_items)]
+    combined["pending_work_items"] = [{"provider": provider, "location": location, "keywords": query} for provider, location, query in sorted(pending_work_items)]
+    combined["retryable_work_items"] = [{"provider": provider, "location": location, "keywords": query} for provider, location, query in retryable_work_items]
     combined["target_reached"] = target_reached
     combined["probe_qualifying_count"] = qualified_count
     combined["planned_queries_completed"] = pending_batches == 0 and not combined.get("errors") and not target_reached
     combined["continuation_available"] = not target_reached and (bool(combined.get("errors")) or pending_batches > 0)
-    combined["continuation_index"] = len(completed) + len(completed_this_run)
+    combined["continuation_index"] = len(completed_query_keys)
     combined["attempted_queries_exhausted"] = bool(combined["planned_queries_completed"])
     # A short provider page is not proof of total provider exhaustion. It only
     # proves that the currently planned distinct query batch was short.
@@ -9708,12 +10031,22 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
     target_role_families = ACTIONABLE_DISCOVERY_ROLE_FAMILIES
     search_mode = text(job.get("discovery_search_mode")).lower() or "legacy"
     broad = text(job.get("discovery_match_policy")) == "apply_broadly"
+    # Apply the user-selected SWE hard gates before any location, remote, or
+    # provisional-review branch. Otherwise unresolved geography can turn a
+    # confirmed senior role into a Needs Review opportunity.
+    hard_reason = discovery_hard_exclusion_reason(job)
+    if hard_reason:
+        return "excluded", hard_reason
     if text(job.get("role_type")).lower() == "intern" and not bool(job.get("discovery_include_internships")):
         return "excluded", "Internships are excluded by the selected search preference."
     if normalize_space(text(remote_preference)).lower() != "remote":
         if text(job.get("posting_availability")).lower() == "confirmed_closed":
             return "excluded", "Posting is confirmed closed."
         if text(job.get("distance_radius_status")).lower() == "outside_radius":
+            # A stale or relabelled radius status is not evidence of a hard
+            # exclusion when the workplace distance was never verified.
+            if clamp_int(job.get("distance_confidence"), 0, 100) <= 0:
+                return "review_required", "The radius label is unverified because workplace distance evidence is missing."
             return "excluded", "Confirmed workplace distance is outside the requested radius."
         if text(job.get("distance_radius_status")).lower() == "unknown" and text(job.get("geographic_eligibility")).lower() != "provisional":
             return "review_required", "Exact workplace distance could not be verified under strict-radius matching."
@@ -9759,12 +10092,22 @@ def plausible_software_role(job: dict[str, Any]) -> bool:
     role_type = normalize_space(text(job.get("role_type"))).lower()
     if re.search(r"\b(manager|director|vice president|vp|head of|chief)\b", title):
         return False
+    # A technology keyword alone is not a job family. For example, an
+    # academic-assistant posting may mention Python and data science while
+    # being unrelated to software employment. Require an engineering/developer
+    # role signal when the normalized provider family is unavailable.
+    if re.search(r"\b(academic assistant|teaching assistant|instructor|teacher|faculty|professor|tutor|research assistant|researcher|recruiter|recruitment|human resources|administrator|coordinator)\b", title):
+        return False
     if role_type in ACTIONABLE_DISCOVERY_ROLE_FAMILIES:
         return True
-    return bool(re.search(r"\b(software|full[ -]?stack|front[ -]?end|back[ -]?end|python|qa automation|test automation|devops|cloud|api|integration|automation|platform)\b", title))
+    return bool(re.search(r"\b(software engineer|software developer|developer|engineer|full[ -]?stack|front[ -]?end|back[ -]?end|qa automation|test automation|devops|cloud engineer|api engineer|integration engineer|automation engineer|platform engineer|sdet)\b", title))
 
 
 def apply_broadly_reason(job: dict[str, Any]) -> str:
+    hard_reason = discovery_hard_exclusion_reason(job)
+    if hard_reason:
+        job["discovery_fit_label"] = "Not eligible"
+        return hard_reason
     analysis = job.get("qualification_fit_seniority") or {}
     required = analysis.get("required_experience") or {}
     years = required.get("minimum") if isinstance(required, dict) else None
@@ -9778,6 +10121,52 @@ def apply_broadly_reason(job: dict[str, Any]) -> str:
         return "Relevant technical role; match is not fully assessed from the selected résumé evidence."
     job["discovery_fit_label"] = "Strong fit"
     return "Relevant technical role ranked by likely fit."
+
+
+def discovery_hard_exclusion_reason(job: dict[str, Any], search: dict[str, Any] | None = None) -> str:
+    """Apply the same non-negotiable SWE gates to sync and async discovery.
+
+    Missing or ambiguous evidence remains reviewable.  Only explicit required
+    experience and title/seniority evidence can make this a hard exclusion.
+    """
+    search = search or {}
+    occupation = normalize_space(text(job.get("discovery_occupation") or job.get("occupation"))).lower()
+    if occupation and occupation not in {"software developer", "software development", "swe", "software engineer"}:
+        return ""
+    analysis = job.get("qualification_fit_seniority") or {}
+    required = analysis.get("required_experience") or {}
+    # The provider-shaped path may retain the authoritative extracted
+    # requirement in experience_requirements while the résumé-fit summary has
+    # no required_experience member. Both structures must feed the same hard
+    # policy; a missing summary field must not downgrade a confirmed posting.
+    if not isinstance(required, dict) or required.get("minimum") is None:
+        extracted_required = (job.get("experience_requirements") or {}).get("required")
+        if isinstance(extracted_required, dict):
+            required = extracted_required
+    try:
+        minimum = float(required.get("minimum")) if isinstance(required, dict) and required.get("minimum") is not None else None
+    except (TypeError, ValueError):
+        minimum = None
+    configured_max = search.get("maximum_required_years")
+    if configured_max in (None, ""):
+        configured_max = job.get("discovery_maximum_required_years")
+    try:
+        maximum = float(configured_max) if configured_max not in (None, "") else None
+    except (TypeError, ValueError):
+        maximum = None
+    if minimum is not None and maximum is not None and minimum > maximum:
+        return f"Confirmed required experience starts at {minimum:g} years, above the selected maximum of {maximum:g}."
+
+    selected = normalize_space(text(search.get("seniority") or job.get("discovery_seniority"))).lower().replace("-", "_")
+    junior_target = not selected or any(token in selected.split(",") for token in ("junior", "entry_level", "entry"))
+    if junior_target and not any(token in selected.split(",") for token in ("intermediate", "senior", "lead", "manager", "director", "any")):
+        level = text(analysis.get("detected_level") or job.get("seniority_level")).lower().replace("-", "_")
+        title = normalize_space(text(job.get("title"))).lower()
+        if level in {"senior", "lead", "manager", "director"} or re.search(r"\b(?:senior|sr\.?|staff|principal|lead|manager|director|head of)\b", title):
+            return "Confirmed seniority is outside the selected junior/entry-level target."
+        if bool(analysis.get("management_role")):
+            return "Confirmed management responsibility is outside the selected junior/entry-level target."
+    return ""
 
 
 def discovery_reason_bucket(job: dict[str, Any]) -> str:
@@ -9799,6 +10188,67 @@ def discovery_reason_bucket(job: dict[str, Any]) -> str:
     if not text(job.get("qualification_evidence_source")):
         return "unknown_resume_evidence"
     return "other_review_required"
+
+
+def discovery_exclusion_reason_bucket(job: dict[str, Any]) -> str:
+    """Return one auditable hard-exclusion reason for diagnostics.
+
+    Missing evidence is deliberately not an exclusion.  Only facts already
+    classified as hard blockers are counted here so an uncertain posting can
+    remain available in the review queue.
+    """
+    reason = normalize_space(text(job.get("discovery_result_reason"))).lower()
+    if text(job.get("posting_availability")).lower() in {"closed", "expired", "removed"} or any(token in reason for token in ("closed", "expired", "no longer available")):
+        return "closed_or_unavailable"
+    radius_status = text(job.get("distance_radius_status")).lower()
+    if radius_status == "outside_radius":
+        if text(job.get("distance_confidence")) not in {"", "0", "unknown"}:
+            return "confirmed_outside_radius"
+        return "unverified_location_not_hard_exclusion"
+    if "internship" in reason or text(job.get("role_type")).lower() == "internship":
+        return "internship_not_requested"
+    if "role family" in reason or "occupation" in reason or "unrelated" in reason or "management" in reason:
+        return "confirmed_unrelated_or_management"
+    if "salary" in reason and "minimum" in reason:
+        return "confirmed_salary_below_minimum"
+    if "canadian" in reason or "ontario" in reason or "eligib" in reason:
+        return "confirmed_geographic_ineligibility"
+    return "other_confirmed_hard_exclusion"
+
+
+def discovery_diagnostic_breakdown(items: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize a discovery replay without collapsing review into exclusion.
+
+    This is intentionally a pure diagnostic helper.  It lets acceptance
+    reports show the exact reason buckets for a representative replay while
+    retaining every posting and avoiding any mutation of applicant data.
+    """
+    category_counts: dict[str, int] = {}
+    exclusion_reason_counts: dict[str, int] = {}
+    review_reason_counts: dict[str, int] = {}
+    previously_presented = 0
+    new_count = 0
+    for item in items:
+        category = text(item.get("discovery_result_category")) or "new"
+        category_counts[category] = category_counts.get(category, 0) + 1
+        if category == "excluded":
+            bucket = discovery_exclusion_reason_bucket(item)
+            exclusion_reason_counts[bucket] = exclusion_reason_counts.get(bucket, 0) + 1
+        elif category in {"review_required", "adjacent_opportunity"}:
+            bucket = discovery_reason_bucket(item)
+            review_reason_counts[bucket] = review_reason_counts.get(bucket, 0) + 1
+        if as_bool(item.get("previously_presented")):
+            previously_presented += 1
+        elif category == "new":
+            new_count += 1
+    return {
+        "category_counts": category_counts,
+        "exclusion_reason_counts": exclusion_reason_counts,
+        "review_reason_counts": review_reason_counts,
+        "previously_presented": previously_presented,
+        "new_count": new_count,
+        "total": sum(category_counts.values()),
+    }
 
 
 def title_search_result_category(job: dict[str, Any]) -> tuple[str, str]:
@@ -9831,13 +10281,16 @@ def discovery_is_clear_senior_role(job: dict[str, Any], search: dict[str, Any]) 
 
 def discovery_target_assessment(job: dict[str, Any], search: dict[str, Any]) -> tuple[str, str]:
     """Return verified, provisional, or ineligible without treating absence as proof."""
+    hard_reason = discovery_hard_exclusion_reason(job, search)
+    if hard_reason:
+        return "ineligible", hard_reason
     if search.get("match_policy") == "apply_broadly" and search.get("search_mode") == "shortlist":
         if not plausible_software_role(job):
             return "ineligible", "Confirmed unrelated or management-only occupation is outside the Apply Broadly scope."
         return "provisional", "Apply Broadly retains this plausible technical role; verify requirements before applying."
     if discovery_is_clear_senior_role(job, search):
         return "ineligible", "Confirmed seniority or required experience is outside the selected early-career target."
-    selected_levels = set(text(search.get("seniority")).split(","))
+    selected_levels = {item.strip().replace("-", "_") for item in text(search.get("seniority")).lower().split(",") if item.strip()}
     analysis = job.get("qualification_fit_seniority") or {}
     level = text(analysis.get("detected_level") or job.get("seniority_level")).lower().replace("-", "_")
     required = analysis.get("required_experience") or {}
@@ -9913,7 +10366,9 @@ def discovery_sort_value(job: dict[str, Any], field: str, direction: str = "desc
         return (normalize_space(text(job.get("seniority_level"))).lower(), normalize_space(text(job.get("company"))).lower())
     if field in {"match_score", "overall_score", "application_priority_score", "score"}:
         score_value = clamp_int(job.get("match_score") if field == "match_score" else job.get("application_priority_score") if field == "application_priority_score" else job.get("overall_score"), 0, 100)
-        return ((-score_value if direction == "desc" else score_value), normalize_space(text(job.get("company"))).lower(), normalize_space(text(job.get("title"))).lower())
+        level = text((job.get("qualification_fit_seniority") or {}).get("detected_level") or job.get("seniority_level")).lower().replace("-", "_")
+        tier = 0 if level in {"entry_level", "junior", "internship"} else 1 if level == "intermediate" else 2
+        return (tier, (-score_value if direction == "desc" else score_value), normalize_space(text(job.get("company"))).lower(), normalize_space(text(job.get("title"))).lower())
     if field == "deadline":
         deadline = text(job.get("deadline")) or "9999-12-31"
         return (deadline if direction == "asc" else "".join(chr(255 - ord(ch)) for ch in deadline), normalize_space(text(job.get("company"))).lower())
@@ -10419,6 +10874,8 @@ def init_db() -> None:
     )
     repair_malformed_saved_salaries()
     run_migrations(db)
+    from db.migrations import ensure_candidate_workflow_column
+    ensure_candidate_workflow_column(db)
     db.execute(f"PRAGMA user_version = {CURRENT_DB_SCHEMA_VERSION}")
     db.commit()
     _INITIALIZED_DATABASE_PATH = DB_PATH.resolve()
@@ -11417,6 +11874,13 @@ def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any
             "Confirmed missing core technology: " + ", ".join(technical_compatibility["required_no_experience"][:5]) + "."
         )
     label = "Review required — non-target role family" if non_target_role else "Insufficient requirement evidence" if insufficient_mandatory_evidence else "Stretch opportunity" if stretch or score < 60 else "Strong qualification match" if score >= 75 else "Review qualification fit"
+    resume_text_available = bool(profile.get("_resume_text") or profile.get("resume_text") or profile.get("_resume_sections"))
+    candidate_years = explicit_professional_years(profile)
+    resume_evidence_status = (
+        "resume_loaded_years_verified" if candidate_years is not None else
+        "resume_loaded_years_unquantified" if resume_text_available or evidence else
+        "resume_unavailable"
+    )
     return {
         "qualification_match_status": "assessed" if mandatory_score is not None else "partial_evidence",
         "qualification_fit_score": clamp_int(score, 0, 100),
@@ -11433,8 +11897,8 @@ def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any
             "required": analysis.get("required_experience"),
             "preferred": analysis.get("preferred_experience"),
             "ambiguous": analysis.get("ambiguous_experience", []),
-            "candidate_professional_years": explicit_professional_years(profile),
-            "candidate_years_status": "verified from explicit résumé evidence" if explicit_professional_years(profile) is not None else "unverified from selected résumé",
+            "candidate_professional_years": candidate_years,
+            "candidate_years_status": "verified from explicit résumé evidence" if candidate_years is not None else "résumé loaded; professional years are not explicitly quantified" if resume_evidence_status == "resume_loaded_years_unquantified" else "selected résumé evidence is unavailable",
             "fit_status": (
                 "unverified" if explicit_professional_years(profile) is None and (required_experience or analysis.get("detected_level") != "unknown") else
                 "stretch" if stretch else
@@ -11447,6 +11911,7 @@ def build_qualification_fit(job: dict[str, Any], evidence_profile: dict[str, Any
         "qualification_evidence_profile_id": profile.get("id") or profile.get("_candidate_profile_id") or "",
         "qualification_evidence_profile_name": "No résumé selected — title search" if as_bool(job.get("discovery_profile_independent")) else profile.get("_candidate_profile_name") or "Active Profile",
         "qualification_evidence_source": "No résumé selected; qualification is optional for occupation title search" if as_bool(job.get("discovery_profile_independent")) else "selected candidate profile résumé DOCX, structured experience, projects, education, and skills" if profile.get("_candidate_profile_id") else "active Profile résumé text and structured evidence",
+        "resume_evidence_status": resume_evidence_status,
         "qualification_fit_seniority": seniority,
         "application_priority_score": priority,
         "application_priority_reasons": priority_reasons,

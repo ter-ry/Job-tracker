@@ -152,8 +152,8 @@ class P0EvidenceHistoryTests(unittest.TestCase):
         related = {"title": "Senior Python API Developer", "role_type": "software developer", "discovery_search_mode": "shortlist", "discovery_match_policy": "apply_broadly", "qualification_fit_seniority": {"required_experience": {"minimum": 6}}, "application_priority_score": 22}
         unrelated = {"title": "Finance Analyst", "role_type": "finance", "discovery_search_mode": "shortlist", "discovery_match_policy": "apply_broadly"}
         manager = {"title": "Engineering Manager", "role_type": "software developer", "discovery_search_mode": "shortlist", "discovery_match_policy": "apply_broadly"}
-        self.assertEqual(app_module.discovery_result_category(related)[0], "actionable")
-        self.assertEqual(related["discovery_fit_label"], "Stretch")
+        self.assertEqual(app_module.discovery_result_category(related)[0], "excluded")
+        self.assertNotEqual(related.get("discovery_fit_label"), "Strong fit")
         self.assertEqual(app_module.discovery_result_category(unrelated)[0], "excluded")
         self.assertEqual(app_module.discovery_result_category(manager)[0], "excluded")
 

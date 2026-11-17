@@ -25,16 +25,18 @@ class CandidateProfileStore:
         applicant_email: str = "",
         applicant_phone: str = "",
         applicant_location: str = "",
+        workflow: str = "software",
     ) -> int:
         cursor = self.db.execute(
             """INSERT INTO candidate_profiles(
                 name, description, is_active, identity_mode, applicant_name,
-                applicant_email, applicant_phone, applicant_location
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                applicant_email, applicant_phone, applicant_location, workflow
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 name.strip(), description.strip(), 1 if not self.list_profiles() else 0,
                 identity_mode if identity_mode in {"shared", "distinct"} else "shared",
                 applicant_name.strip(), applicant_email.strip(), applicant_phone.strip(), applicant_location.strip(),
+                workflow if workflow in {"software", "ece"} else "software",
             ),
         )
         self.db.commit()
@@ -44,12 +46,14 @@ class CandidateProfileStore:
         existing = self.db.execute("SELECT * FROM candidate_profiles WHERE id = ?", (profile_id,)).fetchone()
         if existing is None:
             raise ValueError("Candidate profile was not found")
-        allowed = {"identity_mode", "applicant_name", "applicant_email", "applicant_phone", "applicant_location"}
+        allowed = {"identity_mode", "applicant_name", "applicant_email", "applicant_phone", "applicant_location", "workflow"}
         updates = {key: value for key, value in fields.items() if key in allowed and value is not None}
         if "identity_mode" in updates and updates["identity_mode"] not in {"shared", "distinct"}:
             raise ValueError("identity_mode must be shared or distinct")
         if updates.get("identity_mode") == "distinct" and not updates.get("applicant_name", existing["applicant_name"]):
             raise ValueError("Distinct identity requires applicant_name")
+        if "workflow" in updates and updates["workflow"] not in {"software", "ece"}:
+            raise ValueError("workflow must be software or ece")
         if updates:
             assignments = ", ".join(f"{key} = ?" for key in updates)
             self.db.execute(

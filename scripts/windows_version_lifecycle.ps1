@@ -91,10 +91,21 @@ function Stop-Version([bool]$supportsCleanExit) {
     Set-Phase "stop process $($script:appProcess.Id) clean=$supportsCleanExit"
     if ($supportsCleanExit) {
         $headers = @{ 'X-Job-Tracker-Exit-Token' = $env:JOB_TRACKER_EXIT_TOKEN }
-        $result = Invoke-RestMethod "$base/api/app/exit" -Method Post -Headers $headers -TimeoutSec 10
-        if ($result.status -ne 'shutting_down') { throw 'Installed app did not acknowledge clean shutdown' }
+        $result = $null
+        try {
+            $result = Invoke-RestMethod "$base/api/app/exit" -Method Post -Headers $headers -TimeoutSec 10
+        } catch {
+            # The authenticated shutdown closes Waitress keep-alive channels
+            # immediately after writing the status line. PowerShell may report
+            # ResponseEnded even though the process is already exiting. Accept
+            # that transport-level truncation only if the process subsequently
+            # exits within the normal bound; otherwise preserve the failure.
+            Write-Warning "Shutdown response ended before JSON completed: $($_.Exception.Message)"
+        }
+        if ($result -and $result.status -ne 'shutting_down') { throw 'Installed app did not acknowledge clean shutdown' }
         if (!$script:appProcess.WaitForExit(15000)) { throw 'Installed app did not exit cleanly' }
         if ($script:appProcess.ExitCode -ne 0) { throw "Installed app exited with $($script:appProcess.ExitCode)" }
+        Write-Host "[lifecycle] clean shutdown confirmed pid=$($script:appProcess.Id) exit=$($script:appProcess.ExitCode) response=$([bool]$result)"
     } else {
         # The historical ci.8 binary has no exit endpoint. Stop only this
         # disposable process after its committed HTTP writes have completed.
