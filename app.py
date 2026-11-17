@@ -2610,12 +2610,7 @@ def create_app() -> Flask:
         search["discovery_location"] = location_context["discovery_location"]
         search["location_resolution_method"] = location_context["resolution_method"]
         search["location_geocode"] = location_context["lookup"]
-        if location_context.get("distance_origin_lookup", {}).get("ok"):
-            origin_result = location_context["distance_origin_lookup"]
-            origin = {"input": origin_result.get("original_input"), "normalized": origin_result.get("normalized_query"), "latitude": origin_result.get("latitude"), "longitude": origin_result.get("longitude"), "provider": origin_result.get("provider"), "confidence": origin_result.get("confidence"), "precision": origin_result.get("precision"), "geocoded_at": origin_result.get("geocoded_at"), "status": origin_result.get("status"), "error": origin_result.get("error", ""), "cached": origin_result.get("cached", False), "failure_reasons": origin_result.get("failure_reasons", [])}
-        elif search.get("distance_origin_input"):
-            origin_lookup = location_context.get("distance_origin_lookup") or {}
-            origin = {"input": search["distance_origin_input"], "normalized": search["distance_origin_input"], "provider": origin_lookup.get("provider", ""), "status": origin_lookup.get("status") or "unresolved", "precision": "unknown", "error": origin_lookup.get("error") or "The requested private distance origin could not be resolved.", "failure_reasons": origin_lookup.get("failure_reasons", [])}
+        origin = resolve_search_distance_origin(location_context, origin)
 
         search["keywords"] = keywords
         prior_metadata = prior_run.get("metadata") if isinstance(prior_run.get("metadata"), dict) else {}
@@ -3517,7 +3512,7 @@ def _run_async_discovery_search(search_id: str, payload: dict[str, Any]) -> None
                 "postprocessing_seconds": diagnostics.get("postprocessing_seconds", 0),
                 "persistence_seconds": diagnostics.get("persistence_seconds", 0),
             }
-            _update_async_discovery(search_id, status=status, progress_json={**progress, "timings": timings, "diagnostics": diagnostics}, continuation_available=continuation, termination_reason=termination, timings_json=timings, error_json=errors)
+            _update_async_discovery(search_id, status=status, progress_json={**progress, "continuation_available": continuation, "timings": timings, "diagnostics": diagnostics}, continuation_available=continuation, termination_reason=termination, timings_json=timings, error_json=errors)
     except Exception as exc:
         with app.app_context():
             _update_async_discovery(search_id, status="failed", termination_reason="worker_failure", error_json={"worker": str(exc)})
@@ -3946,12 +3941,7 @@ def run_discovery_pipeline(
         "location_resolution_method": location_context["resolution_method"],
         "location_geocode": location_context["lookup"],
     })
-    if location_context.get("distance_origin_lookup", {}).get("ok"):
-        origin_result = location_context["distance_origin_lookup"]
-        origin = {"input": origin_result.get("original_input"), "normalized": origin_result.get("normalized_query"), "latitude": origin_result.get("latitude"), "longitude": origin_result.get("longitude"), "provider": origin_result.get("provider"), "confidence": origin_result.get("confidence"), "precision": origin_result.get("precision"), "geocoded_at": origin_result.get("geocoded_at"), "status": origin_result.get("status"), "error": origin_result.get("error", ""), "cached": origin_result.get("cached", False), "failure_reasons": origin_result.get("failure_reasons", [])}
-    elif search.get("distance_origin_input"):
-        origin_lookup = location_context.get("distance_origin_lookup") or {}
-        origin = {"input": search["distance_origin_input"], "normalized": search["distance_origin_input"], "provider": origin_lookup.get("provider", ""), "status": origin_lookup.get("status") or "unresolved", "precision": "unknown", "error": origin_lookup.get("error") or "The requested private distance origin could not be resolved.", "failure_reasons": origin_lookup.get("failure_reasons", [])}
+    origin = resolve_search_distance_origin(location_context, origin)
     search["keywords"] = keywords
     fetched = fetch_discovery_jobs_for_search(search, country_indeed="Canada", on_provider_update=on_provider_update)
     seen_jobs: list[dict[str, Any]] = []
@@ -4084,6 +4074,9 @@ def run_discovery_pipeline(
         "attempted_query_batches": fetched.get("attempted_query_batches", []),
         "completed_query_batches": fetched.get("completed_query_batches", []),
         "pending_query_batches": fetched.get("pending_query_batches", []),
+        "continuation_available": bool(fetched.get("continuation_available")),
+        "continuation_index": int(fetched.get("continuation_index") or 0),
+        "pending_work_items": fetched.get("pending_work_items", []),
         "countrywide_region_queries": fetched.get("countrywide_region_queries", []),
         "duplicates_removed": duplicates_in_search,
         "duplicates_in_search": duplicates_in_search,
@@ -4122,6 +4115,8 @@ def run_discovery_pipeline(
         "persisted": persisted,
         "auto_preparation_queued": auto_preparation_queued,
         "filtered": filtered,
+        "distance_origin": search.get("distance_origin"),
+        "origin_precision": origin.get("precision"),
         "origin_geocode_status": origin.get("status"),
         "origin_geocode_error": text(origin.get("error")),
         "origin_geocode_failure_reasons": origin.get("failure_reasons", []),
@@ -4155,7 +4150,10 @@ def run_discovery_pipeline(
             "confirmed_excluded": len(excluded_jobs),
             "requested_target": requested_target,
             "target_unmet_reason": metadata["target_unmet_reason"],
-            "incomplete": bool(fetched.get("errors")),
+            "incomplete": bool(fetched.get("errors") or fetched.get("continuation_available")),
+            "continuation_available": bool(fetched.get("continuation_available")),
+            "continuation_index": int(fetched.get("continuation_index") or 0),
+            "pending_query_batches": fetched.get("pending_query_batches", []),
         },
         "errors": fetched.get("errors", {}),
         "source_counts": fetched.get("source_counts", {}),
@@ -8524,7 +8522,10 @@ class NominatimGeocodingProvider(GeocodingProvider):
     name = "nominatim"
 
     def geocode(self, query: str, *, country: str = "Canada") -> dict[str, Any]:
-        params = {"format": "jsonv2", "limit": 5, "q": query}
+        # Request postal fields: without addressdetails Nominatim's JSON
+        # results generally omit 'address.postcode', causing valid exact
+        # postal queries to fail the strict Canadian postal comparison.
+        params = {"format": "jsonv2", "limit": 5, "q": query, "addressdetails": 1}
         if country.lower() == "canada":
             params["countrycodes"] = "ca"
         url = f"https://nominatim.openstreetmap.org/search?{urlencode(params)}"
@@ -8533,7 +8534,21 @@ class NominatimGeocodingProvider(GeocodingProvider):
             payload = json.loads(response.read().decode("utf-8"))
         if not isinstance(payload, list) or not payload:
             raise ValueError("No geocoding match found")
+        requested_postal = extract_canadian_postal_code(query)
+        # A Nominatim result at rank 1 might be a nearby address or an
+        # unrelated city. Prefer an explicitly matching returned postal code,
+        # never a generic Toronto coordinate offered for a six-character code.
         match = payload[0]
+        if requested_postal:
+            exact = [
+                item for item in payload if isinstance(item, dict)
+                and extract_canadian_postal_code(
+                    text((item.get("address") or {}).get("postcode")) if isinstance(item.get("address"), dict)
+                    else ""
+                ) == requested_postal
+            ]
+            if exact:
+                match = exact[0]
         return {
             "latitude": float(match.get("lat")),
             "longitude": float(match.get("lon")),
@@ -9239,6 +9254,38 @@ def normalize_discovery_city_region(display_name: str, fallback: str = "") -> st
     return city or raw
 
 
+def resolve_search_distance_origin(location_context: dict[str, Any], fallback_origin: dict[str, Any]) -> dict[str, Any]:
+    """Do not silently substitute a home address for an unresolvable search postal origin."""
+    lookup = location_context.get("distance_origin_lookup") or {}
+    if not lookup:
+        return fallback_origin
+    requested = text(location_context.get("distance_origin"))
+    if lookup.get("ok"):
+        return {
+            "input": lookup.get("original_input") or requested,
+            "normalized": lookup.get("normalized_query") or requested,
+            "latitude": lookup.get("latitude"),
+            "longitude": lookup.get("longitude"),
+            "provider": lookup.get("provider"),
+            "confidence": lookup.get("confidence"),
+            "precision": lookup.get("precision"),
+            "geocoded_at": lookup.get("geocoded_at"),
+            "status": lookup.get("status") or "saved",
+            "error": lookup.get("error", ""),
+            "cached": lookup.get("cached", False),
+            "failure_reasons": lookup.get("failure_reasons", []),
+        }
+    return {
+        "input": requested,
+        "normalized": lookup.get("normalized_query") or requested,
+        "provider": lookup.get("provider", ""),
+        "status": lookup.get("status") or "unresolved",
+        "precision": "unknown",
+        "error": lookup.get("error") or "Search-origin geocoding failed; distance cannot be verified.",
+        "failure_reasons": lookup.get("failure_reasons", []),
+    }
+
+
 def resolve_discovery_location_context(
     raw_location: str,
     profile: dict[str, str] | None = None,
@@ -9286,10 +9333,11 @@ def resolve_discovery_location_context(
     lookup_result: dict[str, Any]
     postal_fallback_location = ""
     if postal:
-        profile_location = text(profile.get("home_location_normalized"))
-        if profile_location:
-            postal_fallback_location = normalize_discovery_city_region(profile_location, fallback=profile_location)
-        elif normalized_postal.startswith("M"):
+        # The search postal code belongs to this search. Never silently
+        # substitute an unrelated saved home city when its lookup fails.
+        # A Toronto postal prefix can safely narrow provider keyword search
+        # to Toronto, but this is NOT a postal-centroid distance estimate.
+        if normalized_postal.startswith("M"):
             postal_fallback_location = "Toronto, ON"
     if lookup_input:
         lookup_result = geocode_location_value(lookup_input, lookup_type="search", profile=profile, provider=provider, use_cache=use_cache)
@@ -9985,10 +10033,24 @@ def apply_discovery_search_constraints(
         # workplace distance is actually established.
         job_location = normalize_space(text(job.get("location")))
         postal_only = bool(re.fullmatch(r"[A-Z]\d[A-Z]\s?\d[A-Z]\d", job_location, re.IGNORECASE))
-        if search_location and (int(job.get("distance_km") or 9999) < 9999 or not postal_only) and outside_requested_location(job, search_location):
+        search_province = province_code_from_text(search_location)
+        advertised_province = province_code_from_text(job_location)
+        confirmed_province_conflict = bool(search_province and advertised_province and search_province != advertised_province)
+        # A Toronto city label is a provider SEARCH AREA, not the edge of a
+        # 20 km circle around a postal code. North York, Markham and Vaughan
+        # may all be relevant. With a radius configured, do not hard-exclude
+        # a job merely because its city string differs from "Toronto".
+        # Only a known province conflict or verified out-of-radius distance
+        # can establish geographic ineligibility at this stage.
+        city_scope_mismatch = not max_distance_km and (int(job.get("distance_km") or 9999) < 9999 or not postal_only) and outside_requested_location(job, search_location)
+        if search_location and (confirmed_province_conflict or city_scope_mismatch):
             job["location_search_eligible"] = False
             job["application_priority_score"] = 0
-            job.setdefault("application_priority_reasons", []).append("Excluded because the confirmed job location is outside the requested hybrid/on-site search area.")
+            job.setdefault("application_priority_reasons", []).append(
+                "Excluded because the confirmed province is outside the requested search region."
+                if confirmed_province_conflict else
+                "Excluded because the confirmed job location is outside the requested search area."
+            )
         elif max_distance_km and "remote" not in text(job.get("remote_type")).lower() and clamp_int(job.get("distance_km"), 0, 9999) >= 9999:
             job["distance_radius_status"] = "unknown"
             job["geographic_eligibility"] = "provisional" if geographic_match_mode == "provisional" else "unverified"
@@ -10087,16 +10149,20 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
 
 
 def plausible_software_role(job: dict[str, Any]) -> bool:
-    """Apply Broadly admits related technical IC roles, never management-only work."""
+    """Plausible software IC work, not every job with developer in its name."""
     title = normalize_space(text(job.get("title"))).lower()
     role_type = normalize_space(text(job.get("role_type"))).lower()
     if re.search(r"\b(manager|director|vice president|vp|head of|chief)\b", title):
         return False
-    # A technology keyword alone is not a job family. For example, an
-    # academic-assistant posting may mention Python and data science while
-    # being unrelated to software employment. Require an engineering/developer
-    # role signal when the normalized provider family is unavailable.
     if re.search(r"\b(academic assistant|teaching assistant|instructor|teacher|faculty|professor|tutor|research assistant|researcher|recruiter|recruitment|human resources|administrator|coordinator)\b", title):
+        return False
+    # A title that explicitly says it is not development work is not a SWE
+    # match merely because the provider classified it as a 'developer' role.
+    if re.search(r"\b(?:not\s+(?:a\s+)?developer|production\s+support)\b", title):
+        return False
+    nonsoftware_industries = r"\b(?:packaging|sustainability|food\s+product|industrial\s+design|manufacturing|fashion\s+product|cosmetic\s+product)\b"
+    software_signal = r"\b(?:software|web|application|cloud|api|platform|computer|automation|systems|backend|frontend|full[ -]?stack)\b"
+    if re.search(nonsoftware_industries, title) and not re.search(software_signal, title):
         return False
     if role_type in ACTIONABLE_DISCOVERY_ROLE_FAMILIES:
         return True
@@ -10211,7 +10277,7 @@ def discovery_exclusion_reason_bucket(job: dict[str, Any]) -> str:
         return "confirmed_unrelated_or_management"
     if "salary" in reason and "minimum" in reason:
         return "confirmed_salary_below_minimum"
-    if "canadian" in reason or "ontario" in reason or "eligib" in reason:
+    if "canadian" in reason or "ontario" in reason or "province" in reason or "search area" in reason or "eligib" in reason:
         return "confirmed_geographic_ineligibility"
     return "other_confirmed_hard_exclusion"
 
@@ -10280,29 +10346,65 @@ def discovery_is_clear_senior_role(job: dict[str, Any], search: dict[str, Any]) 
 
 
 def discovery_target_assessment(job: dict[str, Any], search: dict[str, Any]) -> tuple[str, str]:
-    """Return verified, provisional, or ineligible without treating absence as proof."""
+    """Count only evidence-backed opportunities as new; retain uncertainty for review."""
     hard_reason = discovery_hard_exclusion_reason(job, search)
     if hard_reason:
         return "ineligible", hard_reason
-    if search.get("match_policy") == "apply_broadly" and search.get("search_mode") == "shortlist":
-        if not plausible_software_role(job):
-            return "ineligible", "Confirmed unrelated or management-only occupation is outside the Apply Broadly scope."
-        return "provisional", "Apply Broadly retains this plausible technical role; verify requirements before applying."
     if discovery_is_clear_senior_role(job, search):
         return "ineligible", "Confirmed seniority or required experience is outside the selected early-career target."
+
     selected_levels = {item.strip().replace("-", "_") for item in text(search.get("seniority")).lower().split(",") if item.strip()}
     analysis = job.get("qualification_fit_seniority") or {}
     level = text(analysis.get("detected_level") or job.get("seniority_level")).lower().replace("-", "_")
-    required = analysis.get("required_experience") or {}
+    required = analysis.get("required_experience") or (job.get("experience_requirements") or {}).get("required") or {}
     try:
-        minimum = float(required.get("minimum")) if isinstance(required, dict) and required.get("minimum") is not None else 0
+        minimum = float(required.get("minimum")) if isinstance(required, dict) and required.get("minimum") is not None else None
     except (TypeError, ValueError):
-        minimum = 0
-    if minimum > float(search.get("maximum_required_years") or 3):
+        minimum = None
+    maximum = float(search.get("maximum_required_years") if search.get("maximum_required_years") not in (None, "") else 3)
+    if minimum is not None and minimum > maximum:
         return "ineligible", "Confirmed required professional experience exceeds the selected maximum."
+
     unknown_levels = {"", "unknown", "ambiguous", "unverified"}
     if selected_levels and "any" not in selected_levels and level not in unknown_levels and level not in selected_levels:
         return "ineligible", "Confirmed seniority is outside the selected discovery seniority levels."
+
+    broad_software = search.get("match_policy") == "apply_broadly" and search.get("search_mode") == "shortlist"
+    if broad_software and not plausible_software_role(job):
+        return "ineligible", "Confirmed unrelated or management-only occupation is outside the Apply Broadly software scope."
+
+    if search.get("search_mode") == "shortlist":
+        ambiguous = analysis.get("ambiguous_experience") or (job.get("experience_requirements") or {}).get("ambiguous") or []
+        for item in ambiguous:
+            try:
+                ambiguous_minimum = float(item.get("minimum")) if isinstance(item, dict) else 0
+            except (TypeError, ValueError):
+                ambiguous_minimum = 0
+            if ambiguous_minimum > maximum:
+                return "review_required", (
+                    f"A possible {ambiguous_minimum:g}-year experience requirement exceeds the {maximum:g}-year maximum; "
+                    "confirm the employer's actual required years before including this result."
+                )
+        evidence_content = any(text(job.get(key)) for key in ("job_description", "required_skills", "preferred_skills", "responsibilities"))
+        if not evidence_content:
+            return "review_required", "The provider supplied no usable requirements; experience and technical fit cannot be verified."
+        if text(job.get("qualification_match_status")).lower() == "unavailable":
+            return "review_required", "Qualifications could not be assessed from the posting evidence."
+        if clamp_int_default(search.get("distance"), 0, 0, 1000) and "remote" not in text(job.get("remote_type")).lower():
+            if text(job.get("distance_radius_status")).lower() == "unknown":
+                # Respect the user's explicit location-confidence selection.
+                # City/region matches can be reviewed in Apply Broadly, but
+                # they are NEVER represented as verified within the radius.
+                # Strict radius keeps the exact same record in Needs Review.
+                if search.get("geographic_match_mode") == "strict":
+                    return "review_required", "Exact workplace distance is unverified under strict-radius matching."
+                return "provisional", (
+                    "Relevant technical role with an unverified commute. The provider's city/region location "
+                    "does not establish that the workplace is within the selected radius."
+                )
+
+    if broad_software:
+        return "provisional", "Plausible software role with usable posting evidence; review résumé compatibility before applying."
     if level in unknown_levels:
         return "provisional", "Seniority is not stated; title and hard requirements are compatible, but this is not a verified junior role."
     return "verified", "Confirmed eligible: stated seniority and required experience meet the selected target."
