@@ -8516,7 +8516,10 @@ class NominatimGeocodingProvider(GeocodingProvider):
     name = "nominatim"
 
     def geocode(self, query: str, *, country: str = "Canada") -> dict[str, Any]:
-        params = {"format": "jsonv2", "limit": 5, "q": query}
+        # Request postal fields: without addressdetails Nominatim's JSON
+        # results generally omit 'address.postcode', causing valid exact
+        # postal queries to fail the strict Canadian postal comparison.
+        params = {"format": "jsonv2", "limit": 5, "q": query, "addressdetails": 1}
         if country.lower() == "canada":
             params["countrycodes"] = "ca"
         url = f"https://nominatim.openstreetmap.org/search?{urlencode(params)}"
@@ -8525,7 +8528,21 @@ class NominatimGeocodingProvider(GeocodingProvider):
             payload = json.loads(response.read().decode("utf-8"))
         if not isinstance(payload, list) or not payload:
             raise ValueError("No geocoding match found")
+        requested_postal = extract_canadian_postal_code(query)
+        # A Nominatim result at rank 1 might be a nearby address or an
+        # unrelated city. Prefer an explicitly matching returned postal code,
+        # never a generic Toronto coordinate offered for a six-character code.
         match = payload[0]
+        if requested_postal:
+            exact = [
+                item for item in payload if isinstance(item, dict)
+                and extract_canadian_postal_code(
+                    text((item.get("address") or {}).get("postcode")) if isinstance(item.get("address"), dict)
+                    else ""
+                ) == requested_postal
+            ]
+            if exact:
+                match = exact[0]
         return {
             "latitude": float(match.get("lat")),
             "longitude": float(match.get("lon")),
