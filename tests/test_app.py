@@ -2567,6 +2567,22 @@ class JobAssistantTest(unittest.TestCase):
         second = {"source": "indeed", "source_job_id": "70075bfc7b7c2f68", "company": "ExaSystems", "title": "Full Stack Developer", "location": "Mississauga, ON"}
         self.assertFalse(app_module.dedupe_match(first, second))
 
+    def test_distinct_verified_cross_provider_ids_do_not_merge_without_shared_url(self):
+        first = {"source": "indeed", "source_job_id": "indeed-1", "company": "Example", "title": "Software Engineer", "location": "Toronto, ON", "url": "https://ca.indeed.com/viewjob?jk=indeed-1"}
+        second = {"source": "employer_direct", "source_job_id": "greenhouse:example:2", "company": "Example", "title": "Software Engineer", "location": "Toronto, ON", "url": "https://boards.greenhouse.io/example/jobs/2"}
+        assert not app_module.dedupe_match(first, second)
+
+    def test_shared_canonical_application_url_merges_provider_records(self):
+        first = {"source": "indeed", "source_job_id": "indeed-1", "company": "Example", "title": "Software Engineer", "location": "Toronto, ON", "url": "https://example.test/jobs/1?utm_source=indeed"}
+        second = {"source": "employer_direct", "source_job_id": "greenhouse:example:2", "company": "Example", "title": "Software Engineer", "location": "Toronto, ON", "url": "https://example.test/jobs/1"}
+        assert app_module.dedupe_match(first, second)
+
+    def test_source_links_are_retained_when_a_vacancy_is_seen_again(self):
+        first = {"url": "https://ca.indeed.com/viewjob?jk=one", "application_url": "https://ca.indeed.com/viewjob?jk=one"}
+        second = {"url": "https://jobs.example.test/roles/one", "application_url": "https://jobs.example.test/roles/one"}
+        links = app_module.merge_source_links(existing={"url": first["url"], "application_url": first["application_url"], "source_links_json": "[]"}, incoming=second)
+        self.assertEqual(links, [first["url"], second["url"]])
+
     def test_hybrid_prose_overrides_boolean_remote_without_provider_work_model(self):
         row = {"is_remote": True, "location": "Mississauga, ON", "description": "Hybrid remote in Mississauga, ON L5L 5Y1."}
         self.assertEqual(jobspy_source.infer_remote_type(row), "Hybrid")
@@ -2840,10 +2856,12 @@ class JobAssistantTest(unittest.TestCase):
 
         body = response.get_json()
         self.assertEqual(body["total"], 2)
-        self.assertEqual(body["visible_total"], 1)
-        self.assertEqual(body["duplicates"], 1)
+        # Distinct verified provider IDs remain distinct when URLs do not
+        # prove that the postings are the same vacancy.
+        self.assertEqual(body["visible_total"], 2)
+        self.assertEqual(body["duplicates"], 0)
         self.assertEqual(body["diagnostics"]["already_saved_matches"], 1)
-        self.assertTrue(body["jobs"][0]["already_saved"])
+        self.assertTrue(any(job["already_saved"] for job in body["jobs"]))
 
     def test_discovered_result_can_save_to_tracker_and_prevent_future_duplicate_button(self):
         fake = {

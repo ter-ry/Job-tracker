@@ -53,6 +53,7 @@ def test_employer_board_endpoints_are_public_read_only():
     assert ats_source._url(BOARDS[0]) == "https://api.lever.co/v0/postings/policyme?mode=json"
     assert ats_source._url(BOARDS[1]) == "https://api.ashbyhq.com/posting-api/job-board/wealthsimple"
     assert ats_source._url(BOARDS[2]) == "https://boards-api.greenhouse.io/v1/boards/greenhouse/jobs?content=true"
+    assert ats_source._url({"kind": "smartrecruiters", "slug": "d2l", "company": "D2L"}) == "https://api.smartrecruiters.com/v1/companies/d2l/postings?limit=100"
 
 
 def test_rejects_untrusted_board_identifier():
@@ -104,6 +105,42 @@ def test_all_failed_boards_report_failure_not_empty_success():
     assert result["jobs"] == []
     assert result["source_diagnostics"]["employer_direct"]["state"] == "unavailable"
     assert "employer_direct" in result["errors"]
+
+
+def test_smartrecruiters_rows_keep_requisition_url_and_description():
+    board = {"kind": "smartrecruiters", "slug": "d2l", "company": "D2L"}
+    payload = {"postings": [{
+        "id": "req-42", "name": "Junior Software Developer",
+        "location": {"city": "Toronto", "region": "Ontario", "country": "Canada"},
+        "ref": "https://jobs.smartrecruiters.com/D2L/req-42",
+        "releasedDate": "2026-11-17T00:00:00Z",
+        "jobAd": {"sections": {"jobDescription": {"title": "About", "text": "Build Python services."}}},
+    }]}
+    job = ats_source._row(board, payload["postings"][0])
+    assert job is not None
+    assert job["source_job_id"] == "smartrecruiters:d2l:req-42"
+    assert job["job_url"] == "https://jobs.smartrecruiters.com/D2L/req-42"
+    assert "Build Python services" in job["description"]
+
+
+def test_board_diagnostics_separate_fetched_usable_excluded_and_duplicate_counts():
+    board = {"kind": "lever", "slug": "policyme", "company": "PolicyMe"}
+    feed = [{
+        "id": "one", "text": "Backend Engineer", "categories": {"location": "Toronto, Ontario, Canada"},
+        "hostedUrl": "https://jobs.lever.co/policyme/one",
+    }, {
+        "id": "us", "text": "Backend Engineer", "categories": {"location": "Austin, Texas, United States"},
+        "hostedUrl": "https://jobs.lever.co/policyme/us",
+    }, {
+        "id": "one", "text": "Backend Engineer", "categories": {"location": "Toronto, Ontario, Canada"},
+        "hostedUrl": "https://jobs.lever.co/policyme/one",
+    }]
+    result = ats_source.fetch_employer_direct_jobs(boards=(board,), fetch_json=lambda *_args, **_kwargs: feed)
+    diag = result["source_diagnostics"]["employer_direct"]
+    assert diag["fetched_count"] == 3
+    assert diag["usable_count"] == 1
+    assert diag["excluded_count"] == 1
+    assert diag["duplicate_count"] == 1
 
 
 def _search(**overrides):

@@ -18,8 +18,10 @@ from html.parser import HTMLParser
 from typing import Any
 
 
-# Verified employer-facing career board URL patterns, 17 Nov 2026.
-# Board names are kept editable in code until a separate owner registry UI ships.
+# Public employer board identifiers used by the direct-discovery pilot.  A
+# board is counted as working only when its feed responds and yields usable
+# Canadian/remote postings; failed or empty boards remain visible in the
+# diagnostics instead of being presented as coverage.
 DEFAULT_BOARDS: tuple[dict[str, str], ...] = (
     {"kind": "lever", "slug": "policyme", "company": "PolicyMe"},
     {"kind": "lever", "slug": "achievers", "company": "Achievers"},
@@ -28,8 +30,19 @@ DEFAULT_BOARDS: tuple[dict[str, str], ...] = (
     {"kind": "lever", "slug": "getmaple", "company": "Maple"},
     {"kind": "lever", "slug": "applydigital", "company": "Apply Digital"},
     {"kind": "lever", "slug": "ttecdigital", "company": "TTEC Digital"},
+    {"kind": "lever", "slug": "koho", "company": "KOHO Financial"},
+    {"kind": "lever", "slug": "humi", "company": "Humi"},
     {"kind": "ashby", "slug": "wealthsimple", "company": "Wealthsimple"},
-    {"kind": "greenhouse", "slug": "greenhouse", "company": "Greenhouse"},
+    {"kind": "ashby", "slug": "clearco", "company": "Clearco"},
+    {"kind": "greenhouse", "slug": "shopify", "company": "Shopify"},
+    {"kind": "greenhouse", "slug": "hopper", "company": "Hopper"},
+    {"kind": "greenhouse", "slug": "ritual", "company": "Ritual"},
+    {"kind": "greenhouse", "slug": "ecobee", "company": "ecobee"},
+    {"kind": "greenhouse", "slug": "pointclickcare", "company": "PointClickCare"},
+    {"kind": "smartrecruiters", "slug": "d2l", "company": "D2L"},
+    {"kind": "smartrecruiters", "slug": "thinkific", "company": "Thinkific"},
+    {"kind": "smartrecruiters", "slug": "pointclickcare", "company": "PointClickCare"},
+    {"kind": "smartrecruiters", "slug": "loblaw", "company": "Loblaw Digital"},
 )
 
 MAX_RESPONSE_BYTES = 2_000_000
@@ -63,6 +76,8 @@ def _url(board: dict[str, str]) -> str:
         return f"https://api.ashbyhq.com/posting-api/job-board/{slug}"
     if kind == "greenhouse":
         return f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true"
+    if kind == "smartrecruiters":
+        return f"https://api.smartrecruiters.com/v1/companies/{slug}/postings?limit=100"
     raise ValueError(f"Unsupported public careers-board API: {kind}")
 
 
@@ -112,6 +127,25 @@ def _row(board: dict[str, str], entry: dict[str, Any]) -> dict[str, Any] | None:
         id_value = entry.get("id")
         link = entry.get("absolute_url")
         posted = entry.get("updated_at") or ""
+        work_arrangement = ""
+    elif kind == "smartrecruiters":
+        title = entry.get("name") or entry.get("title")
+        location = entry.get("location") or {}
+        if isinstance(location, dict):
+            loc = ", ".join(str(location.get(key) or "") for key in ("city", "region", "country") if location.get(key))
+        else:
+            loc = location
+        job_ad = entry.get("jobAd") if isinstance(entry.get("jobAd"), dict) else {}
+        sections = job_ad.get("sections") if isinstance(job_ad.get("sections"), dict) else {}
+        description = " ".join(
+            plain(section.get("title") or "") + " " + plain(section.get("text") or "")
+            for section in sections.values() if isinstance(section, dict)
+        ).strip()
+        id_value = entry.get("id") or entry.get("refNumber")
+        link = entry.get("ref")
+        if not link and isinstance(entry.get("jobAd"), dict):
+            link = entry["jobAd"].get("applyUrl")
+        posted = entry.get("releasedDate") or entry.get("createdOn") or ""
         work_arrangement = ""
     else:
         return None
@@ -176,18 +210,22 @@ def fetch_employer_direct_jobs(
                 if not isinstance(entries, list):
                     raise ValueError("ATS response did not contain a job list")
                 accepted = 0
+                excluded = 0
+                duplicates = 0
                 for entry in entries:
                     if not isinstance(entry, dict):
                         continue
                     job = _row(board, entry)
                     if job is None or not _local_relevance(job):
+                        excluded += 1
                         continue
                     if job["source_job_id"] in seen:
+                        duplicates += 1
                         continue
                     seen.add(job["source_job_id"])
                     all_rows.append(job)
                     accepted += 1
-                board_outcomes.append({"board": f"{board['kind']}:{board['slug']}", "state": "working", "jobs": accepted})
+                board_outcomes.append({"board": f"{board['kind']}:{board['slug']}", "state": "working" if accepted else "no_results", "raw": len(entries), "jobs": accepted, "excluded": excluded, "duplicates": duplicates})
             except Exception as exc:
                 board_outcomes.append({"board": f"{board['kind']}:{board['slug']}", "state": "failed", "error": f"{type(exc).__name__}: {exc}"[:180]})
     all_rows.sort(key=lambda item: (item["company"].lower(), item["title"].lower(), item["source_job_id"]))
@@ -197,7 +235,11 @@ def fetch_employer_direct_jobs(
     state = "working" if all_rows else "no_results" if successful else "unavailable"
     diagnostic = {
         "source": "employer_direct", "attempted": bool(boards), "state": state,
-        "provider_status": state, "result_count": len(all_rows), "raw_records_row_count": len(all_rows),
+        "provider_status": state, "result_count": len(all_rows), "raw_records_row_count": sum(int(item.get("raw") or 0) for item in board_outcomes),
+        "fetched_count": sum(int(item.get("raw") or 0) for item in board_outcomes),
+        "usable_count": len(all_rows),
+        "excluded_count": sum(int(item.get("excluded") or 0) for item in board_outcomes),
+        "duplicate_count": sum(int(item.get("duplicates") or 0) for item in board_outcomes),
         "description_available_count": sum(bool(row["description"]) for row in all_rows),
         "boards_attempted": len(board_outcomes), "boards_succeeded": successful, "boards_failed": failures,
         "board_outcomes": sorted(board_outcomes, key=lambda item: item["board"]),

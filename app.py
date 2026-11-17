@@ -424,6 +424,7 @@ JOB_COLUMNS = {
     "preferred_skills": "TEXT NOT NULL DEFAULT ''",
     "responsibilities": "TEXT NOT NULL DEFAULT ''",
     "application_url": "TEXT NOT NULL DEFAULT ''",
+    "source_links_json": "TEXT NOT NULL DEFAULT '[]'",
     "skills_match_score": "INTEGER NOT NULL DEFAULT 0",
     "role_match_score": "INTEGER NOT NULL DEFAULT 0",
     "location_score": "INTEGER NOT NULL DEFAULT 0",
@@ -3728,6 +3729,25 @@ def discovery_ontario_eligibility(job: dict[str, Any]) -> tuple[str, str]:
     return "unknown", "The posting confirms Canada, but not Ontario-specific eligibility."
 
 
+def merge_source_links(*, existing: sqlite3.Row | dict[str, Any] | None, incoming: dict[str, Any]) -> list[str]:
+    """Keep every verified provider/application URL for one vacancy."""
+    links: set[str] = set()
+    existing_data = dict(existing) if existing is not None else {}
+    for item in parse_json_array(existing_data.get("source_links_json")):
+        value = text(item.get("url")) if isinstance(item, dict) else text(item)
+        if value.startswith("http"):
+            links.add(value)
+    for item in (existing_data.get("url"), existing_data.get("application_url"), incoming.get("url"), incoming.get("application_url")):
+        value = text(item)
+        if value.startswith("http"):
+            links.add(value)
+    for item in parse_json_array(incoming.get("source_links_json")):
+        value = text(item.get("url")) if isinstance(item, dict) else text(item)
+        if value.startswith("http"):
+            links.add(value)
+    return sorted(links, key=str.casefold)
+
+
 def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, run_id: int | None) -> dict[str, Any]:
     now = datetime.now().isoformat(timespec="seconds")
     counts: dict[str, Any] = {"new": 0, "duplicate": 0, "new_job_ids": []}
@@ -3751,8 +3771,12 @@ def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, ru
                 "workplace_alternatives_json", "remote_classification_conflict", "warnings",
                 "discovery_result_category", "discovery_result_reason", "recommendation_eligible",
                 "discovery_match_status", "discovery_match_explanation",
+                "source_links_json",
             }
             updates = {column: job.get(column, "") for column in assessment_columns if column in JOB_COLUMNS}
+            if "source_links_json" in JOB_COLUMNS:
+                links = merge_source_links(existing=match, incoming=job)
+                updates["source_links_json"] = dumps_json(links)
             for column, value in updates.items():
                 if isinstance(value, (dict, list, tuple)):
                     updates[column] = dumps_json(value, sort_keys=True)
@@ -7473,7 +7497,14 @@ def dedupe_keys(job: dict[str, Any], source_job_id: Any = "") -> set[str]:
 
 
 def dedupe_match(first: dict[str, Any], second: dict[str, Any]) -> bool:
-    """Match vacancies without merging distinct IDs from one provider."""
+    """Match vacancies conservatively across providers.
+
+    A verified source identifier is authoritative within a provider.  When
+    two providers expose different identifiers, a shared canonical URL is the
+    only automatic cross-source proof; company/title/location alone is not
+    enough because employers can advertise concurrent vacancies with the same
+    wording.
+    """
     first_profile = clamp_int(first.get("candidate_profile_id"), 0, 10**9)
     second_profile = clamp_int(second.get("candidate_profile_id"), 0, 10**9)
     if first_profile and second_profile and first_profile != second_profile:
@@ -7488,6 +7519,13 @@ def dedupe_match(first: dict[str, Any], second: dict[str, Any]) -> bool:
     second_source = normalize_dedupe_text(second.get("source"))
     if first_id and second_id and first_source and first_source == second_source:
         return first_id == second_id
+    if bool(first_id) != bool(second_id):
+        # A provider supplied a verified requisition ID while the other row
+        # did not.  Company/title/location is insufficient evidence to merge
+        # that provider vacancy into a profileless/manual row.
+        return False
+    if first_id and second_id and first_id != second_id:
+        return False
     return bool(dedupe_keys(first, first_id) & dedupe_keys(second, second_id) & {
         key for key in dedupe_keys(first, first_id) if key.startswith("ctl:")
     })
@@ -11446,6 +11484,12 @@ def normalize_job_payload(payload: dict[str, Any]) -> dict[str, Any]:
         existing=payload_for_extraction,
     )
     clean = {column: text(payload_for_extraction.get(column, extracted.get(column, ""))) for column in JOB_COLUMNS}
+    source_links = payload.get("source_links_json", payload.get("source_links", []))
+    if not isinstance(source_links, list):
+        source_links = parse_json_array(source_links)
+    links = [text(item.get("url")) if isinstance(item, dict) else text(item) for item in source_links]
+    links.extend([text(payload.get("url")), text(payload.get("application_url"))])
+    clean["source_links_json"] = dumps_json(sorted({link for link in links if link.startswith("http")}, key=str.casefold))
     clean["candidate_profile_id"] = str(clamp_int(payload.get("candidate_profile_id"), 0, 10**9))
     alternatives_value = payload.get("workplace_alternatives", payload.get("workplace_alternatives_json", extracted.get("workplace_alternatives_json", "[]")))
     alternatives = parse_json_array(alternatives_value) if not isinstance(alternatives_value, list) else [item for item in alternatives_value if isinstance(item, dict)]
@@ -11620,6 +11664,9 @@ def job_to_dict(
     data["opportunity_score_reasons"] = parse_json_values(data.get("opportunity_score_reasons"))
     data["data_quality_flags"] = parse_json_values(data.get("data_quality_flags"))
     data["workplace_alternatives"] = parse_json_array(data.get("workplace_alternatives_json"))
+    data["source_links"] = parse_json_array(data.get("source_links_json"))
+    if not data["source_links"]:
+        data["source_links"] = sorted({text(data.get("url")), text(data.get("application_url"))} - {""}, key=str.casefold)
     if not data["workplace_alternatives"] and text(data.get("workplace_address")):
         data["workplace_alternatives"] = [{
             "address": text(data.get("workplace_address")),

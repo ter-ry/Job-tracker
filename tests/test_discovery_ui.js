@@ -32,7 +32,7 @@ assert.doesNotMatch(js, /renderGroup\("Verified matches"/);
 assert.doesNotMatch(js, /renderGroup\("Provisional matches"/);
 assert.doesNotMatch(js, /renderGroup\("Review required"/);
 assert.match(js, /state\.discoveryExcludedResults = responseJobs\.filter/);
-assert.match(js, /job\.discovery_result_category !== "excluded"/);
+assert.match(js, /state\.discoveryResults = merged\.filter\(\(job\) => job\.discovery_result_category === "actionable"\)/);
 
 // Actions are applicant-scoped and update local state immediately.
 for (const endpoint of ["/save", "/applied", "/ignore"]) {
