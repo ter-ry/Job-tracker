@@ -2230,7 +2230,7 @@ def create_app() -> Flask:
             return jsonify({"error": "Discovered job not found"}), 404
         payload = request.get_json(silent=True) or {}
         try:
-            validate_discovery_applicant(payload, discovery_workflow(payload, dict(row)))
+            validate_discovery_action_owner(row, payload)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         profile_id = applicant_profile_id(payload)
@@ -2239,7 +2239,10 @@ def create_app() -> Flask:
         else:
             get_db().execute("UPDATE jobs SET discovery_state = 'reviewed', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
         get_db().commit()
-        return jsonify(job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)))
+        result = job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True))
+        if profile_id:
+            result["applicant_discovery_state"] = applicant_discovery_state(job_id, profile_id)
+        return jsonify(result)
 
     @app.post("/api/discovery/inbox/<int:job_id>/ignore")
     def ignore_discovery_job(job_id: int) -> Response:
@@ -2248,12 +2251,10 @@ def create_app() -> Flask:
             return jsonify({"error": "Discovered job not found"}), 404
         payload = request.get_json(silent=True) or {}
         profile_id = applicant_profile_id(payload)
-        workflow = normalize_space(text(payload.get("workflow"))).lower()
-        if profile_id or workflow in {"software", "ece"}:
-            try:
-                validate_discovery_applicant(payload, discovery_workflow(payload, dict(row)))
-            except ValueError as exc:
-                return jsonify({"error": str(exc)}), 400
+        try:
+            validate_discovery_action_owner(row, payload)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         if profile_id:
             set_applicant_discovery_state(job_id, profile_id, "skipped")
         else:
@@ -2268,12 +2269,10 @@ def create_app() -> Flask:
             return jsonify({"error": "Discovered job not found"}), 404
         payload = request.get_json(silent=True) or {}
         profile_id = applicant_profile_id(payload)
-        workflow = normalize_space(text(payload.get("workflow"))).lower()
-        if profile_id or workflow in {"software", "ece"}:
-            try:
-                validate_discovery_applicant(payload, discovery_workflow(payload, dict(row)))
-            except ValueError as exc:
-                return jsonify({"error": str(exc)}), 400
+        try:
+            validate_discovery_action_owner(row, payload)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         if profile_id:
             get_db().execute("DELETE FROM discovery_applicant_states WHERE job_id = ? AND applicant_profile_id = ?", [job_id, profile_id])
             # Explicit restore/resurface is the only route that permits a
@@ -2292,18 +2291,19 @@ def create_app() -> Flask:
             return jsonify({"error": "Discovered job not found"}), 404
         profile_id = applicant_profile_id(request.get_json(silent=True) or {})
         payload = request.get_json(silent=True) or {}
-        workflow = normalize_space(text(payload.get("workflow"))).lower()
-        if profile_id or workflow in {"software", "ece"}:
-            try:
-                validate_discovery_applicant(payload, discovery_workflow(payload, dict(row)))
-            except ValueError as exc:
-                return jsonify({"error": str(exc)}), 400
+        try:
+            validate_discovery_action_owner(row, payload)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         if profile_id:
             set_applicant_discovery_state(job_id, profile_id, "saved")
         else:
             get_db().execute("UPDATE jobs SET status = 'Saved', discovery_state = 'saved', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
         get_db().commit()
-        return jsonify(job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)))
+        result = job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True))
+        if profile_id:
+            result["applicant_discovery_state"] = applicant_discovery_state(job_id, profile_id)
+        return jsonify(result)
 
     @app.post("/api/discovery/inbox/<int:job_id>/applied")
     def apply_discovery_job(job_id: int) -> Response:
@@ -2312,12 +2312,10 @@ def create_app() -> Flask:
             return jsonify({"error": "Discovered job not found"}), 404
         payload = request.get_json(silent=True) or {}
         profile_id = applicant_profile_id(payload)
-        workflow = normalize_space(text(payload.get("workflow"))).lower()
-        if profile_id or workflow in {"software", "ece"}:
-            try:
-                validate_discovery_applicant(payload, discovery_workflow(payload, dict(row)))
-            except ValueError as exc:
-                return jsonify({"error": str(exc)}), 400
+        try:
+            validate_discovery_action_owner(row, payload)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         applied_date = text(payload.get("date_applied")) or date.today().isoformat()
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", applied_date):
             return jsonify({"error": "date_applied must use YYYY-MM-DD"}), 400
@@ -2326,7 +2324,10 @@ def create_app() -> Flask:
         else:
             get_db().execute("UPDATE jobs SET status = 'Applied', date_applied = ?, discovery_state = 'applied', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [applied_date, job_id])
         get_db().commit()
-        return jsonify(job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)))
+        result = job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True))
+        if profile_id:
+            result["applicant_discovery_state"] = applicant_discovery_state(job_id, profile_id)
+        return jsonify(result)
 
     @app.get("/api/preparation/queue")
     def preparation_queue() -> Response:
@@ -3334,6 +3335,31 @@ def validate_discovery_applicant(payload: dict[str, Any], workflow: str) -> int:
     stored_workflow = text(row["workflow"]).lower() or "software"
     if stored_workflow != workflow:
         raise ValueError(f"The selected applicant is configured for {stored_workflow.upper()} jobs, not {workflow.upper()}.")
+    return profile_id
+
+
+def validate_discovery_action_owner(row: Any, payload: dict[str, Any] | None = None) -> int:
+    """Validate an existing-job action against trusted stored discovery metadata."""
+    payload = payload or {}
+    profile_id = applicant_profile_id(payload)
+    explicit_workflow = normalize_space(text(payload.get("workflow"))).lower()
+    occupation = normalize_space(text(row["discovery_occupation"] if "discovery_occupation" in row.keys() else "")).lower()
+    known_workflow = "ece" if occupation == "early childhood educator" else "software" if occupation else ""
+    if known_workflow:
+        if explicit_workflow and explicit_workflow != known_workflow:
+            raise ValueError(f"This stored discovery is a {known_workflow.upper()} job; the requested workflow is not compatible.")
+        if not profile_id:
+            raise ValueError("Select the compatible applicant profile before acting on this discovery.")
+        return validate_discovery_applicant({**payload, "workflow": known_workflow}, known_workflow)
+    # A blank occupation is retained only for genuinely old profileless rows.
+    # Once candidate profiles exist, callers cannot turn an unknown legacy row
+    # into an applicant-specific action by omitting ownership fields.
+    if not profile_id and not explicit_workflow:
+        return 0
+    if query_db("SELECT 1 FROM candidate_profiles LIMIT 1", one=True) is not None:
+        raise ValueError("This legacy profileless discovery cannot be assigned to a modern applicant without trusted workflow metadata.")
+    if explicit_workflow and explicit_workflow != "software":
+        raise ValueError("Legacy profileless discoveries support only the software compatibility workflow.")
     return profile_id
 
 

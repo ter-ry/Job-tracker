@@ -47,7 +47,8 @@ def test_server_authoritatively_rejects_wrong_missing_and_unknown_applicants(tmp
 
     wrong = client.post(f"/api/discovery/inbox/{job_id}/save", json={"applicant_profile_id": swe, "workflow": "ece"})
     assert wrong.status_code == 400
-    assert "configured for SOFTWARE" in wrong.get_json()["error"]
+    assert "stored discovery is a SOFTWARE job" in wrong.get_json()["error"]
+    assert client.post(f"/api/discovery/inbox/{job_id}/save", json={"applicant_profile_id": ece, "workflow": "software"}).status_code == 400
 
     unknown = client.post(f"/api/discovery/inbox/{job_id}/save", json={"applicant_profile_id": 99999, "workflow": "software"})
     assert unknown.status_code == 400
@@ -57,6 +58,7 @@ def test_server_authoritatively_rejects_wrong_missing_and_unknown_applicants(tmp
     ece_job_id = _stored_job(client, occupation="early childhood educator")
     inferred = client.post(f"/api/discovery/inbox/{ece_job_id}/save", json={"applicant_profile_id": ece})
     assert inferred.status_code == 200
+    assert client.post(f"/api/discovery/inbox/{ece_job_id}/save", json={"applicant_profile_id": swe, "workflow": "ece"}).status_code == 400
     review_wrong = client.post(f"/api/discovery/inbox/{job_id}/review", json={"applicant_profile_id": swe, "workflow": "ece"})
     assert review_wrong.status_code == 400
 
@@ -89,6 +91,13 @@ def test_qa_status_and_reset_are_isolated_and_visible(tmp_path, monkeypatch):
     assert client.get("/api/qa/status").get_json()["active"] is True
     assert "Disposable QA" in client.get("/api/qa/status").get_json()["message"]
     assert client.post("/api/candidate-profiles", json={"name": "QA", "workflow": "software"}).status_code == 201
+    with app_module.app.app_context():
+        app_module.get_db().execute("INSERT INTO discovery_async_searches(search_id, status) VALUES ('qa-active', 'running')")
+        app_module.get_db().commit()
+    assert client.post("/api/qa/reset").status_code == 409
+    with app_module.app.app_context():
+        app_module.get_db().execute("UPDATE discovery_async_searches SET status = 'completed' WHERE search_id = 'qa-active'")
+        app_module.get_db().commit()
     assert client.post("/api/qa/reset").status_code == 200
     assert client.get("/api/candidate-profiles").get_json() == []
     monkeypatch.delenv("JOB_TRACKER_QA_MODE")

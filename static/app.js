@@ -1292,12 +1292,11 @@ function renderDiscoveryInbox(jobs) {
   counts.all_relevant = jobs.filter((job) => ["new_actionable", "review_required", "requalified", "saved", "applied"].includes(job.discovery_inbox_category || discoveryInboxCategory(job))).length;
   const filters = document.getElementById("discovery-inbox-filters");
   if (filters) {
-    filters.innerHTML = Object.entries(labels).map(([category, label]) => `<button class="button ghost small ${state.discoveryInboxCategory === category ? "active" : ""}" type="button" data-inbox-category="${category}" ${state.discoveryInboxBulkAction ? "disabled" : ""}>${label} <span class="muted">${Number(counts[category] || 0)}</span></button>`).join("");
+    filters.innerHTML = Object.entries(labels).map(([category, label]) => { const partial = (category === "requalified" && state.discoveryInboxHasMore) || (category === "all_discovered" && jobs.length >= 500); const count = `${Number(counts[category] || 0)}${partial ? "+" : ""}`; return `<button class="button ghost small ${state.discoveryInboxCategory === category ? "active" : ""}" type="button" data-inbox-category="${category}" ${state.discoveryInboxBulkAction ? "disabled" : ""}>${label} <span class="muted">${count}</span></button>`; }).join("");
     filters.querySelectorAll("[data-inbox-category]").forEach((button) => button.addEventListener("click", async () => {
       state.discoveryInboxCategory = button.dataset.inboxCategory || "new_actionable";
       state.discoveryInboxPage = 0;
-      if (state.discoveryInboxCategory === "requalified") await loadDiscoveryInbox(true);
-      else renderDiscoveryInbox(state.discoveryInboxJobs);
+      await loadDiscoveryInbox(true);
     }));
   }
   const categoryFor = (job) => job.discovery_inbox_category || discoveryInboxCategory(job);
@@ -1394,7 +1393,7 @@ function discoveryApplicantActionPayload() {
     workflow: value("discovery-workflow") || state.discoveryWorkflow || "software",
   };
 }
-async function reviewInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/review`, "POST", {}); updateInboxLocalJob(id, { discovery_state: "reviewed" }); } catch (error) { toast(error.message); } }
+async function reviewInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/review`, "POST", discoveryApplicantActionPayload()); updateInboxLocalJob(id, { discovery_state: "reviewed" }); } catch (error) { toast(error.message); } }
 async function ignoreInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/ignore`, "POST", discoveryApplicantActionPayload()); updateInboxLocalJob(id, { discovery_state: "ignored" }); } catch (error) { toast(error.message); } }
 async function restoreInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/restore`, "POST", discoveryApplicantActionPayload()); updateInboxLocalJob(id, { discovery_state: "new", status: "Discovered" }); toast("Job restored to new matches"); } catch (error) { toast(error.message); } }
 async function applyInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/applied`, "POST", discoveryApplicantActionPayload()); toast("Marked applied for the selected applicant."); updateInboxLocalJob(id, { discovery_state: "applied" }); } catch (error) { toast(error.message); } }
@@ -1540,6 +1539,8 @@ function renderCandidateProfiles() {
       try { localStorage.setItem("jobTracker.selectedCandidateProfileId", state.selectedCandidateProfileId); } catch (_) { /* storage may be disabled */ }
       clearVisibleDiscoveryResults();
       state.discoveryInboxJobs = [];
+      state.discoveryInboxPage = 0;
+      state.discoveryInboxHasMore = false;
       state.discoveryInboxSelected.clear();
       state.discoveryInboxBulkMessage = "";
       await Promise.all([loadAll(), loadDiscoveryInbox(true)]);
@@ -1557,6 +1558,8 @@ async function selectCandidateProfile(profileId) {
   state.selectedCandidateProfileId = String(profileId);
   try { localStorage.setItem("jobTracker.selectedCandidateProfileId", state.selectedCandidateProfileId); } catch (_) { /* storage may be disabled */ }
   state.discoveryInboxJobs = [];
+  state.discoveryInboxPage = 0;
+  state.discoveryInboxHasMore = false;
   state.discoveryInboxSelected.clear();
   state.discoveryInboxBulkMessage = "";
   clearVisibleDiscoveryResults();
