@@ -2583,6 +2583,24 @@ class JobAssistantTest(unittest.TestCase):
         links = app_module.merge_source_links(existing={"url": first["url"], "application_url": first["application_url"], "source_links_json": "[]"}, incoming=second)
         self.assertEqual(links, [first["url"], second["url"]])
 
+    def test_persisted_cross_source_alias_survives_duplicate_discovery(self):
+        with app_module.app.app_context():
+            app_module.init_db()
+            first = app_module.normalize_job_payload({
+                "source": "indeed", "source_job_id": "indeed-1", "company": "Alias Co", "title": "Software Engineer",
+                "location": "Toronto, ON", "url": "https://jobs.alias.test/roles/one?utm_source=indeed",
+                "description": "Build software.", "discovery_first_seen_at": "2026-11-17T00:00:00",
+            })
+            second = app_module.normalize_job_payload({
+                "source": "employer_direct", "source_job_id": "greenhouse:alias:one", "company": "Alias Co", "title": "Software Engineer",
+                "location": "Toronto, ON", "url": "https://jobs.alias.test/roles/one",
+                "description": "Build software.", "discovery_first_seen_at": "2026-11-17T00:00:00",
+            })
+            self.assertEqual(app_module.persist_discovery_jobs([first], None, None)["new"], 1)
+            self.assertEqual(app_module.persist_discovery_jobs([second], None, None)["duplicate"], 1)
+        row = self.client.get("/api/jobs").get_json()[0]
+        self.assertEqual(set(row["source_links"]), {first["url"], second["url"]})
+
     def test_hybrid_prose_overrides_boolean_remote_without_provider_work_model(self):
         row = {"is_remote": True, "location": "Mississauga, ON", "description": "Hybrid remote in Mississauga, ON L5L 5Y1."}
         self.assertEqual(jobspy_source.infer_remote_type(row), "Hybrid")
@@ -2862,6 +2880,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(body["duplicates"], 0)
         self.assertEqual(body["diagnostics"]["already_saved_matches"], 1)
         self.assertTrue(any(job["already_saved"] for job in body["jobs"]))
+        self.assertTrue(any(job.get("possible_duplicate") for job in body["jobs"]))
 
     def test_discovered_result_can_save_to_tracker_and_prevent_future_duplicate_button(self):
         fake = {

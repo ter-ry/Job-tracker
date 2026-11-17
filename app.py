@@ -2726,6 +2726,17 @@ def create_app() -> Flask:
                 already_saved_matches += 1
                 clean["saved_job_id"] = int(existing_match["id"])
                 clean["saved_job_status"] = text(existing_match["status"])
+            else:
+                possible = find_possible_duplicate_match(clean)
+                if possible is not None:
+                    clean["possible_duplicate"] = True
+                    clean["possible_duplicate_job_id"] = int(possible["id"])
+                    warnings = list(clean.get("warnings") or [])
+                    warnings.append("Possible duplicate: same employer, title and location as another posting, but source identity or URL could not prove it is the same vacancy.")
+                    clean["warnings"] = warnings
+                    if clean.get("discovery_result_category") == "actionable":
+                        clean["discovery_result_category"] = "review_required"
+                        clean["discovery_result_reason"] = "Possible duplicate requires review; distinct requisitions are never merged automatically."
             seen_jobs.append(clean)
             jobs.append(clean)
 
@@ -3733,7 +3744,7 @@ def merge_source_links(*, existing: sqlite3.Row | dict[str, Any] | None, incomin
     """Keep every verified provider/application URL for one vacancy."""
     links: set[str] = set()
     existing_data = dict(existing) if existing is not None else {}
-    for item in parse_json_array(existing_data.get("source_links_json")):
+    for item in parse_json_values(existing_data.get("source_links_json")):
         value = text(item.get("url")) if isinstance(item, dict) else text(item)
         if value.startswith("http"):
             links.add(value)
@@ -3741,7 +3752,7 @@ def merge_source_links(*, existing: sqlite3.Row | dict[str, Any] | None, incomin
         value = text(item)
         if value.startswith("http"):
             links.add(value)
-    for item in parse_json_array(incoming.get("source_links_json")):
+    for item in parse_json_values(incoming.get("source_links_json")):
         value = text(item.get("url")) if isinstance(item, dict) else text(item)
         if value.startswith("http"):
             links.add(value)
@@ -4420,30 +4431,45 @@ def existing_job_dedupe_keys() -> set[str]:
     return keys
 
 
+def find_possible_duplicate_match(job: dict[str, Any]) -> sqlite3.Row | None:
+    """Find a same-looking vacancy that cannot be safely auto-merged."""
+    title = text(job.get("title")).lower()
+    company = normalize_dedupe_company(job.get("company"))
+    location = normalize_dedupe_location(job.get("location"))
+    if not title or not company or not location:
+        return None
+    rows = query_db("SELECT * FROM jobs WHERE lower(title) = ? LIMIT 100", [title])
+    for row in rows:
+        existing = dict(row)
+        if normalize_dedupe_company(existing.get("company")) != company:
+            continue
+        if normalize_dedupe_location(existing.get("location")) != location:
+            continue
+        if not dedupe_match(job, existing):
+            return row
+    return None
+
+
 def find_existing_job_match(job: dict[str, Any]) -> sqlite3.Row | None:
-    clauses: list[str] = []
-    args: list[Any] = []
     source_id = text(job.get("source_job_id"))
     source = text(job.get("source"))
     if source_id and source:
-        clauses.append("(source = ? AND source_job_id = ?)")
-        args.extend([source, source_id])
+        row = query_db("SELECT * FROM jobs WHERE source = ? AND source_job_id = ? LIMIT 1", [source, source_id], one=True)
+        if row is not None and dedupe_match(job, dict(row)):
+            return row
     urls = [text(job.get("url")), text(job.get("application_url"))]
     for column, value in (("url", urls[0]), ("application_url", urls[1])):
         if value:
-            clauses.append(f"{column} = ?")
-            args.append(value)
-    company = normalize_dedupe_company(job.get("company"))
+            row = query_db(f"SELECT * FROM jobs WHERE {column} = ? LIMIT 1", [value], one=True)
+            if row is not None and dedupe_match(job, dict(row)):
+                return row
     title = normalize_dedupe_text(job.get("title"))
-    location = normalize_dedupe_location(job.get("location"))
-    if company and title and location:
-        # This compound lookup is indexed and intentionally conservative: it
-        # is only a fallback when a stable provider ID or URL is unavailable.
-        clauses.append("(lower(company) = ? AND lower(title) = ? AND lower(location) = ?)")
-        args.extend([company, title, location])
-    if not clauses:
+    if not title:
         return None
-    rows = query_db(f"SELECT * FROM jobs WHERE {' OR '.join(clauses)} LIMIT 100", args)
+    # Legal suffixes and provider company aliases vary. Fetch the narrow
+    # title candidate set only after indexed identity lookups, then let
+    # dedupe_match validate the canonical URL or verified source ID.
+    rows = query_db("SELECT * FROM jobs WHERE lower(title) = ? LIMIT 100", [text(job.get("title")).lower()])
     shortlist = None
     for row in rows:
         existing = dict(row)
@@ -11486,7 +11512,7 @@ def normalize_job_payload(payload: dict[str, Any]) -> dict[str, Any]:
     clean = {column: text(payload_for_extraction.get(column, extracted.get(column, ""))) for column in JOB_COLUMNS}
     source_links = payload.get("source_links_json", payload.get("source_links", []))
     if not isinstance(source_links, list):
-        source_links = parse_json_array(source_links)
+        source_links = parse_json_values(source_links)
     links = [text(item.get("url")) if isinstance(item, dict) else text(item) for item in source_links]
     links.extend([text(payload.get("url")), text(payload.get("application_url"))])
     clean["source_links_json"] = dumps_json(sorted({link for link in links if link.startswith("http")}, key=str.casefold))
@@ -11664,7 +11690,7 @@ def job_to_dict(
     data["opportunity_score_reasons"] = parse_json_values(data.get("opportunity_score_reasons"))
     data["data_quality_flags"] = parse_json_values(data.get("data_quality_flags"))
     data["workplace_alternatives"] = parse_json_array(data.get("workplace_alternatives_json"))
-    data["source_links"] = parse_json_array(data.get("source_links_json"))
+    data["source_links"] = parse_json_values(data.get("source_links_json"))
     if not data["source_links"]:
         data["source_links"] = sorted({text(data.get("url")), text(data.get("application_url"))} - {""}, key=str.casefold)
     if not data["workplace_alternatives"] and text(data.get("workplace_address")):

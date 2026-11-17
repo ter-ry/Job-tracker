@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from sources import ats_source
 import app as app_module
+import urllib.error
 
 
 BOARDS = (
@@ -121,6 +122,84 @@ def test_smartrecruiters_rows_keep_requisition_url_and_description():
     assert job["source_job_id"] == "smartrecruiters:d2l:req-42"
     assert job["job_url"] == "https://jobs.smartrecruiters.com/D2L/req-42"
     assert "Build Python services" in job["description"]
+
+
+def test_smartrecruiters_listing_paginates_and_fetches_missing_detail(monkeypatch):
+    monkeypatch.setattr(ats_source, "SMARTRECRUITERS_PAGE_LIMIT", 2)
+    board = {"kind": "smartrecruiters", "slug": "d2l", "company": "D2L"}
+    def listing(number):
+        return {
+            "id": f"req-{number}", "name": f"Junior Software Developer {number}",
+            "location": {"city": "Toronto", "region": "Ontario", "country": "Canada"},
+            "ref": f"https://jobs.smartrecruiters.com/D2L/req-{number}",
+            "releasedDate": "2026-11-17T00:00:00Z",
+        }
+    pages = {
+        0: {"content": [listing(0), listing(1)], "offset": 0, "limit": 2, "totalFound": 5},
+        2: {"content": [listing(2), listing(3)], "offset": 2, "limit": 2, "totalFound": 5},
+        4: {"content": [listing(4)], "offset": 4, "limit": 2, "totalFound": 5},
+    }
+    def fetcher(url, timeout):
+        assert timeout > 0
+        if "postings/req-" in url:
+            number = url.rsplit("req-", 1)[1]
+            return {"id": f"req-{number}", "jobAd": {"sections": {"description": {"text": f"Requirements for {number}: Python and SQL."}}}}
+        offset = int(url.split("offset=", 1)[1])
+        return pages[offset]
+    result = ats_source.fetch_employer_direct_jobs(boards=(board,), fetch_json=fetcher, max_workers=1)
+    assert len(result["jobs"]) == 5
+    diag = result["source_diagnostics"]["employer_direct"]
+    assert diag["board_outcomes"][0]["pages"] == 3
+    assert diag["detail_attempted_count"] == 5
+    assert diag["detail_succeeded_count"] == 5
+    assert diag["description_available_count"] == 5
+
+
+def test_smartrecruiters_empty_response_is_no_results_not_failure():
+    board = {"kind": "smartrecruiters", "slug": "d2l", "company": "D2L"}
+    result = ats_source.fetch_employer_direct_jobs(
+        boards=(board,), fetch_json=lambda url, timeout: {"content": [], "offset": 0, "limit": 100, "totalFound": 0},
+    )
+    diag = result["source_diagnostics"]["employer_direct"]
+    assert result["jobs"] == []
+    assert diag["state"] == "no_results"
+    assert diag["boards_succeeded"] == 1
+    assert diag["boards_failed"] == 0
+    assert result["errors"] == {}
+
+
+def test_smartrecruiters_malformed_response_and_detail_failure_are_diagnosed():
+    board = {"kind": "smartrecruiters", "slug": "d2l", "company": "D2L"}
+    malformed = ats_source.fetch_employer_direct_jobs(boards=(board,), fetch_json=lambda url, timeout: {"jobs": []})
+    outcome = malformed["source_diagnostics"]["employer_direct"]["board_outcomes"][0]
+    assert outcome["state"] == "failed"
+    assert outcome["failure_class"] == "malformed_response"
+
+    entry = {"id": "req-1", "name": "Software Developer", "location": "Toronto, Ontario, Canada", "ref": "https://jobs.smartrecruiters.com/D2L/req-1"}
+    def detail_failure(url, timeout):
+        if "offset=" in url:
+            return {"content": [entry], "totalFound": 1}
+        raise TimeoutError("detail timed out")
+    result = ats_source.fetch_employer_direct_jobs(boards=(board,), fetch_json=detail_failure)
+    diag = result["source_diagnostics"]["employer_direct"]
+    assert len(result["jobs"]) == 1
+    assert diag["detail_failure_count"] == 1
+
+
+def test_proxy_tunnel_failure_is_distinct_from_employer_http_failure():
+    proxy = ats_source.fetch_employer_direct_jobs(
+        boards=(BOARDS[0],), fetch_json=lambda url, timeout: (_ for _ in ()).throw(
+            urllib.error.URLError("Tunnel connection failed: 403 Forbidden")
+        ),
+    )
+    assert proxy["source_diagnostics"]["employer_direct"]["board_outcomes"][0]["failure_class"] == "proxy_establishment_failure"
+
+    employer = ats_source.fetch_employer_direct_jobs(
+        boards=(BOARDS[0],), fetch_json=lambda url, timeout: (_ for _ in ()).throw(
+            urllib.error.HTTPError(url, 403, "Forbidden", {}, None)
+        ),
+    )
+    assert employer["source_diagnostics"]["employer_direct"]["board_outcomes"][0]["failure_class"] == "employer_http_403"
 
 
 def test_board_diagnostics_separate_fetched_usable_excluded_and_duplicate_counts():

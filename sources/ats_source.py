@@ -47,6 +47,9 @@ DEFAULT_BOARDS: tuple[dict[str, str], ...] = (
 
 MAX_RESPONSE_BYTES = 2_000_000
 USER_AGENT = "Job Tracker/0.0.0 (public employer job board reader)"
+SMARTRECRUITERS_PAGE_LIMIT = 100
+SMARTRECRUITERS_MAX_PAGES = 5
+SMARTRECRUITERS_MAX_DETAIL_REQUESTS = 25
 
 
 class _PlainText(HTMLParser):
@@ -90,6 +93,27 @@ def _get_json(url: str, *, timeout: int = 7) -> Any:
     if len(raw) > MAX_RESPONSE_BYTES:
         raise ValueError("ATS feed exceeds bounded response size")
     return json.loads(raw.decode("utf-8"))
+
+
+def _failure_class(exc: Exception) -> str:
+    """Classify transport failures without confusing proxy and board errors."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"employer_http_{exc.code}"
+    message = str(exc).lower()
+    if "tunnel connection failed" in message or "proxy" in message:
+        return "proxy_establishment_failure"
+    if isinstance(exc, urllib.error.URLError):
+        reason = str(getattr(exc, "reason", "")).lower()
+        if "tls" in reason or "ssl" in reason:
+            return "tls_failure"
+        if "name or service not known" in reason or "nodename" in reason or "dns" in reason:
+            return "dns_failure"
+        return "connection_failure"
+    if isinstance(exc, (json.JSONDecodeError, ValueError)):
+        return "malformed_response"
+    if isinstance(exc, TimeoutError) or "timed out" in message:
+        return "timeout"
+    return "request_failure"
 
 
 def _location(value: Any) -> str:
@@ -167,6 +191,41 @@ def _row(board: dict[str, str], entry: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _smartrecruiters_entries(
+    board: dict[str, str], fetcher: Any, timeout: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Fetch SmartRecruiters' content envelope with bounded pagination."""
+    entries: list[dict[str, Any]] = []
+    offset = 0
+    pages = 0
+    total_found: int | None = None
+    while pages < SMARTRECRUITERS_MAX_PAGES:
+        url = f"{_url(board)}&offset={offset}"
+        payload = fetcher(url, timeout=timeout)
+        if not isinstance(payload, dict) or not isinstance(payload.get("content"), list):
+            raise ValueError("SmartRecruiters response missing content list")
+        page = [item for item in payload["content"] if isinstance(item, dict)]
+        entries.extend(page)
+        pages += 1
+        raw_total = payload.get("totalFound")
+        if raw_total not in (None, ""):
+            try:
+                total_found = max(0, int(raw_total))
+            except (TypeError, ValueError):
+                raise ValueError("SmartRecruiters totalFound is not numeric")
+        if not page or (total_found is not None and offset + len(page) >= total_found) or len(page) < SMARTRECRUITERS_PAGE_LIMIT:
+            break
+        offset += len(page)
+    return entries, {"pages": pages, "offset": offset, "total_found": total_found}
+
+
+def _smartrecruiters_detail_url(board: dict[str, str], entry: dict[str, Any]) -> str:
+    identifier = entry.get("id") or entry.get("refNumber")
+    if not identifier:
+        return ""
+    return f"https://api.smartrecruiters.com/v1/companies/{board['slug']}/postings/{identifier}"
+
+
 def _local_relevance(job: dict[str, Any]) -> bool:
     """Restrict the pilot to Ontario/Canada or appropriately marked remote ads.
 
@@ -194,27 +253,52 @@ def fetch_employer_direct_jobs(
     board_outcomes: list[dict[str, Any]] = []
     seen: set[str] = set()
 
-    def fetch_board(board: dict[str, str]) -> tuple[dict[str, str], Any]:
-        return board, fetcher(_url(board), timeout=timeout)
+    def fetch_board(board: dict[str, str]) -> tuple[dict[str, str], list[dict[str, Any]], dict[str, Any]]:
+        if board["kind"] == "smartrecruiters":
+            entries, pagination = _smartrecruiters_entries(board, fetcher, timeout)
+            return board, entries, pagination
+        payload = fetcher(_url(board), timeout=timeout)
+        if board["kind"] == "lever":
+            entries = payload if isinstance(payload, list) else []
+        else:
+            entries = payload.get("jobs", []) if isinstance(payload, dict) else []
+        if not isinstance(entries, list):
+            raise ValueError("ATS response did not contain a job list")
+        return board, [item for item in entries if isinstance(item, dict)], {"pages": 1, "offset": 0, "total_found": len(entries)}
 
     with ThreadPoolExecutor(max_workers=min(max(1, max_workers), max(1, len(boards)))) as executor:
         futures = {executor.submit(fetch_board, board): board for board in boards}
         for future in as_completed(futures):
             board = futures[future]
             try:
-                _, payload = future.result()
-                if board["kind"] == "lever":
-                    entries = payload if isinstance(payload, list) else []
-                else:
-                    entries = payload.get("jobs", []) if isinstance(payload, dict) else []
-                if not isinstance(entries, list):
-                    raise ValueError("ATS response did not contain a job list")
+                _, entries, pagination = future.result()
                 accepted = 0
                 excluded = 0
                 duplicates = 0
+                detail_attempted = 0
+                detail_succeeded = 0
+                detail_failures = 0
                 for entry in entries:
                     if not isinstance(entry, dict):
                         continue
+                    sections = (entry.get("jobAd") or {}).get("sections", {}) if isinstance(entry.get("jobAd"), dict) else {}
+                    has_description = isinstance(sections, dict) and any(
+                        plain(section.get("text") or section.get("content") or "")
+                        for section in sections.values() if isinstance(section, dict)
+                    )
+                    if board["kind"] == "smartrecruiters" and not has_description:
+                        detail_url = _smartrecruiters_detail_url(board, entry)
+                        if detail_url and detail_attempted < SMARTRECRUITERS_MAX_DETAIL_REQUESTS:
+                            detail_attempted += 1
+                            try:
+                                detail = fetcher(detail_url, timeout=timeout)
+                                if isinstance(detail, dict):
+                                    merged_entry = dict(entry)
+                                    merged_entry.update(detail)
+                                    entry = merged_entry
+                                    detail_succeeded += 1
+                            except Exception:
+                                detail_failures += 1
                     job = _row(board, entry)
                     if job is None or not _local_relevance(job):
                         excluded += 1
@@ -225,14 +309,14 @@ def fetch_employer_direct_jobs(
                     seen.add(job["source_job_id"])
                     all_rows.append(job)
                     accepted += 1
-                board_outcomes.append({"board": f"{board['kind']}:{board['slug']}", "state": "working" if accepted else "no_results", "raw": len(entries), "jobs": accepted, "excluded": excluded, "duplicates": duplicates})
+                board_outcomes.append({"board": f"{board['kind']}:{board['slug']}", "state": "working" if accepted else "no_results", "raw": len(entries), "jobs": accepted, "excluded": excluded, "duplicates": duplicates, "pages": pagination.get("pages", 1), "total_found": pagination.get("total_found"), "detail_attempted": detail_attempted, "detail_succeeded": detail_succeeded, "detail_failures": detail_failures})
             except Exception as exc:
-                board_outcomes.append({"board": f"{board['kind']}:{board['slug']}", "state": "failed", "error": f"{type(exc).__name__}: {exc}"[:180]})
+                board_outcomes.append({"board": f"{board['kind']}:{board['slug']}", "state": "failed", "failure_class": _failure_class(exc), "error": f"{type(exc).__name__}: {exc}"[:180]})
     all_rows.sort(key=lambda item: (item["company"].lower(), item["title"].lower(), item["source_job_id"]))
     all_rows = all_rows[:max_jobs]
-    successful = sum(item["state"] == "working" for item in board_outcomes)
-    failures = len(board_outcomes) - successful
-    state = "working" if all_rows else "no_results" if successful else "unavailable"
+    responded = sum(item["state"] in {"working", "no_results"} for item in board_outcomes)
+    failures = sum(item["state"] == "failed" for item in board_outcomes)
+    state = "working" if all_rows else "no_results" if responded else "unavailable"
     diagnostic = {
         "source": "employer_direct", "attempted": bool(boards), "state": state,
         "provider_status": state, "result_count": len(all_rows), "raw_records_row_count": sum(int(item.get("raw") or 0) for item in board_outcomes),
@@ -241,14 +325,17 @@ def fetch_employer_direct_jobs(
         "excluded_count": sum(int(item.get("excluded") or 0) for item in board_outcomes),
         "duplicate_count": sum(int(item.get("duplicates") or 0) for item in board_outcomes),
         "description_available_count": sum(bool(row["description"]) for row in all_rows),
-        "boards_attempted": len(board_outcomes), "boards_succeeded": successful, "boards_failed": failures,
+        "detail_attempted_count": sum(int(item.get("detail_attempted") or 0) for item in board_outcomes),
+        "detail_succeeded_count": sum(int(item.get("detail_succeeded") or 0) for item in board_outcomes),
+        "detail_failure_count": sum(int(item.get("detail_failures") or 0) for item in board_outcomes),
+        "boards_attempted": len(board_outcomes), "boards_succeeded": responded, "boards_failed": failures,
         "board_outcomes": sorted(board_outcomes, key=lambda item: item["board"]),
         "duration_ms": int((time.monotonic() - started) * 1000),
-        "success": successful > 0,
+        "success": responded > 0,
     }
     return {
         "jobs": all_rows,
-        "errors": {"employer_direct": "Every configured public employer board failed."} if failures and not successful else {},
+        "errors": {"employer_direct": "Every configured public employer board failed."} if failures and not responded else {},
         "source_counts": {"employer_direct": len(all_rows)},
         "source_diagnostics": {"employer_direct": diagnostic},
         "source_snapshots": {"employer_direct": []},
