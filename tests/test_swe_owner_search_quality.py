@@ -163,3 +163,63 @@ def test_successful_postal_origin_preserves_coordinates_and_provenance():
     assert origin["latitude"] == 43.77
     assert origin["status"] == "cached"
     assert origin["precision"] == "postal"
+
+
+def test_nominatim_asks_for_postal_details_and_prefers_exact_candidate(monkeypatch):
+    import json
+
+    returned = [
+        {
+            "lat": "43.653", "lon": "-79.383", "display_name": "Toronto, Ontario, Canada",
+            "address": {"postcode": "M2J 0B5"}, "type": "postcode",
+        },
+        {
+            "lat": "43.770", "lon": "-79.350", "display_name": "M2J 0B6, Toronto, Ontario, Canada",
+            "address": {"postcode": "M2J 0B6"}, "type": "postcode",
+        },
+    ]
+    urls = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return json.dumps(returned).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        urls.append(request.full_url)
+        return Response()
+
+    monkeypatch.setattr(app_module.urllib.request, "urlopen", fake_urlopen)
+    lookup = app_module.NominatimGeocodingProvider().geocode("M2J 0B6, Canada")
+    assert "addressdetails=1" in urls[0]
+    assert lookup["postal_code"] == "M2J 0B6"
+    assert lookup["latitude"] == 43.77
+    assert app_module.geocode_matches_canadian_location("M2J 0B6", lookup)
+
+
+def test_wrong_postal_result_stays_rejected_even_with_addressdetails(monkeypatch):
+    import json
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return json.dumps([
+                {
+                    "lat": "43.653", "lon": "-79.383", "display_name": "Toronto, Ontario, Canada",
+                    "address": {"postcode": "M2J 0B5"}, "type": "postcode",
+                },
+            ]).encode("utf-8")
+
+    monkeypatch.setattr(app_module.urllib.request, "urlopen", lambda request, timeout: Response())
+    lookup = app_module.NominatimGeocodingProvider().geocode("M2J 0B6, Canada")
+    assert not app_module.geocode_matches_canadian_location("M2J 0B6", lookup)
