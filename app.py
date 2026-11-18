@@ -2156,7 +2156,7 @@ def create_app() -> Flask:
         include_history = as_bool(request.args.get("include_history"))
         requested_category = text(request.args.get("category")).lower()
         applicant_id = applicant_profile_id(request.args)
-        requested_search_id = clamp_int(request.args.get("search_id"), 0, 10**9)
+        requested_search_id = text(request.args.get("search_id"))
         query = "SELECT * FROM jobs WHERE discovery_first_seen_at <> ''"
         query_args: list[Any] = []
         if requested_category == "requalified":
@@ -2164,9 +2164,6 @@ def create_app() -> Flask:
                        JOIN discovery_requalifications r ON r.job_id = j.id AND r.applicant_profile_id = ?
                        WHERE j.discovery_first_seen_at <> ''"""
             query_args.append(applicant_id)
-        if requested_search_id:
-            query += " AND discovery_last_search_id = ?"
-            query_args.append(requested_search_id)
         if requested_category in {"new", "new_actionable"}:
             query += " AND discovery_result_category = 'actionable'"
         elif requested_category in {"review", "review_required"}:
@@ -2182,10 +2179,31 @@ def create_app() -> Flask:
             query_args.extend([applicant_id, applicant_id, applicant_id])
         if not include_history and not applicant_id:
             query += " AND discovery_state NOT IN ('ignored', 'saved', 'applied') AND status NOT IN ('Applied', 'shortlisted')"
+        membership_search = bool(requested_search_id and requested_category in {"review", "review_required", "new", "new_actionable", "excluded", "all_relevant"})
+        if membership_search:
+            query = """SELECT j.*, m.category AS search_membership_category,
+                              m.reason AS search_membership_reason
+                       FROM jobs j
+                       JOIN discovery_search_memberships m ON m.job_id = j.id
+                       WHERE j.discovery_first_seen_at <> ''
+                         AND m.search_execution_id = ?"""
+            query_args = [requested_search_id]
+            if applicant_id:
+                query += " AND (j.candidate_profile_id = 0 OR j.candidate_profile_id = ? OR EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = j.id AND p.applicant_profile_id = ?) OR EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = j.id AND s.applicant_profile_id = ?))"
+                query_args.extend([applicant_id, applicant_id, applicant_id])
+            if requested_category in {"review", "review_required"}:
+                query += " AND m.category = 'review_required'"
+            elif requested_category in {"new", "new_actionable"}:
+                query += " AND m.category = 'actionable'"
+            elif requested_category == "excluded":
+                query += " AND m.category = 'excluded'"
+            query += " ORDER BY j.discovery_last_seen_at DESC, j.id DESC"
         page_size = clamp_int_default(request.args.get("page_size"), 500, 1, 500)
         page = clamp_int_default(request.args.get("page"), 0, 0, 100000)
-        order_alias = "j." if requested_category == "requalified" else ""
-        query += f" ORDER BY {order_alias}discovery_state = 'new' DESC, {order_alias}discovery_last_seen_at DESC, {order_alias}id DESC LIMIT ? OFFSET ?"
+        if not membership_search:
+            order_alias = "j." if requested_category == "requalified" else ""
+            query += f" ORDER BY {order_alias}discovery_state = 'new' DESC, {order_alias}discovery_last_seen_at DESC, {order_alias}id DESC"
+        query += " LIMIT ? OFFSET ?"
         query_args.extend([page_size, page * page_size])
         rows = query_db(
             query, query_args
@@ -2213,6 +2231,11 @@ def create_app() -> Flask:
                 "SELECT reason FROM discovery_requalifications WHERE job_id = ? AND applicant_profile_id = ?",
                 [int(row["id"]), applicant_id], one=True,
             ) if applicant_id else None
+            membership_category = text(row["search_membership_category"]) if "search_membership_category" in row.keys() else ""
+            membership_reason = text(row["search_membership_reason"]) if "search_membership_reason" in row.keys() else ""
+            if membership_category:
+                item["discovery_result_category"] = membership_category
+                item["discovery_result_reason"] = membership_reason
             if requested_category == "requalified" and requalified:
                 category = "requalified"
                 item["requalified_reason"] = text(requalified["reason"])
@@ -2229,6 +2252,8 @@ def create_app() -> Flask:
                 category = "excluded"
             elif text(item.get("discovery_result_category")) == "review_required":
                 category = "review_required"
+            elif text(item.get("discovery_result_category")) == "actionable":
+                category = "new_actionable"
             elif text(item.get("discovery_result_category")) == "archived_low_priority":
                 category = "archived_low_priority"
             else:
@@ -3513,13 +3538,18 @@ def _run_async_discovery_search(search_id: str, payload: dict[str, Any]) -> None
                 )
 
             try:
-                result = run_discovery_pipeline(payload, on_provider_update=publish_provider_update)
+                result = run_discovery_pipeline(payload, on_provider_update=publish_provider_update, search_execution_id=search_id)
             except TypeError as exc:
-                # Existing extensions and the worker's independent tests may
-                # still provide the historical one-argument pipeline hook.
-                if "on_provider_update" not in str(exc):
+                # Existing extensions and worker tests may provide older
+                # pipeline hooks that do not accept the execution identifier.
+                if "search_execution_id" not in str(exc) and "on_provider_update" not in str(exc):
                     raise
-                result = run_discovery_pipeline(payload)
+                try:
+                    result = run_discovery_pipeline(payload, on_provider_update=publish_provider_update)
+                except TypeError as fallback_exc:
+                    if "on_provider_update" not in str(fallback_exc):
+                        raise
+                    result = run_discovery_pipeline(payload)
             latest = _async_discovery_row(search_id)
             if latest and int(latest.get("cancel_requested") or 0):
                 _update_async_discovery(search_id, status="cancelled", termination_reason="cancelled_by_user")
@@ -3857,6 +3887,34 @@ def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, ru
     return counts
 
 
+def persist_discovery_search_memberships(
+    search_execution_id: str | None, jobs: list[dict[str, Any]], applicant_profile_id: int,
+) -> None:
+    """Record immutable per-search classification without changing job history."""
+    execution_id = text(search_execution_id)
+    if not execution_id:
+        return
+    db = get_db()
+    for job in jobs:
+        job_id = clamp_int(job.get("id"), 0, 10**12)
+        if not job_id:
+            continue
+        category = text(job.get("discovery_result_category")) or "unclassified"
+        reason = text(job.get("discovery_result_reason"))
+        db.execute(
+            """INSERT INTO discovery_search_memberships
+               (search_execution_id, job_id, applicant_profile_id, category, reason)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(search_execution_id, job_id) DO UPDATE SET
+                 applicant_profile_id = excluded.applicant_profile_id,
+                 category = excluded.category,
+                 reason = excluded.reason,
+                 updated_at = CURRENT_TIMESTAMP""",
+            [execution_id, job_id, int(applicant_profile_id or 0), category, reason],
+        )
+    db.commit()
+
+
 def hydrate_discovery_identity(job: dict[str, Any]) -> dict[str, Any]:
     """Attach the durable job identity and hide states to a live result."""
     existing = find_existing_job_match(job)
@@ -3968,6 +4026,7 @@ def start_discovery_search_lease_heartbeat(search_id: int, owner: str) -> tuple[
 def run_discovery_pipeline(
     payload: dict[str, Any], *, search_id: int | None = None, run_id: int | None = None,
     on_provider_update: Callable[[dict[str, Any]], None] | None = None,
+    search_execution_id: str | None = None,
 ) -> dict[str, Any]:
     """Run the existing JobSpy, enrichment, scoring and dedupe pipeline.
 
@@ -4103,6 +4162,7 @@ def run_discovery_pipeline(
     # the durable row, async cursor, and inbox category consistent.
     persisted = persist_discovery_jobs(ordered, search_id, run_id)
     selected_applicant_id = applicant_profile_id(payload)
+    persist_discovery_search_memberships(search_execution_id, ordered, selected_applicant_id)
     eligible_unpresented: list[dict[str, Any]] = []
     previously_presented_count = 0
     already_actioned_count = 0
@@ -11013,6 +11073,20 @@ def init_db() -> None:
         )"""
     )
     db.execute("CREATE INDEX IF NOT EXISTS discovery_applicant_presentations_profile_idx ON discovery_applicant_presentations(applicant_profile_id, presented_at)")
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS discovery_search_memberships (
+            search_execution_id TEXT NOT NULL,
+            job_id INTEGER NOT NULL,
+            applicant_profile_id INTEGER NOT NULL DEFAULT 0,
+            category TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (search_execution_id, job_id),
+            FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+        )"""
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS discovery_search_memberships_category_idx ON discovery_search_memberships(search_execution_id, category)")
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS discovery_debug_runs (

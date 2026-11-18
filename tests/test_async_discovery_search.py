@@ -157,6 +157,47 @@ def test_async_worker_does_not_mark_results_presented_before_delivery(monkeypatc
             assert not app_module.applicant_presented_discovery_job(job_id, 11)
 
 
+def test_async_search_records_opaque_needs_review_membership_for_inbox(monkeypatch, tmp_path):
+    app_module.DATA_DIR = Path(tmp_path)
+    app_module.DB_PATH = app_module.DATA_DIR / "search-membership.sqlite"
+    app_module.app.config.update(TESTING=True)
+
+    def fake_pipeline(payload, *, on_provider_update=None, search_execution_id=None):
+        assert search_execution_id
+        with app_module.app.app_context():
+            jobs = []
+            for index in range(2):
+                job = app_module.normalize_job_payload({
+                    "source": "Indeed", "source_job_id": f"membership-{index}",
+                    "title": f"Developer {index}", "company": "Review Co",
+                    "location": "Toronto, ON", "job_url": f"https://example.test/membership-{index}",
+                    "discovery_result_category": "review_required",
+                    "discovery_result_reason": f"review reason {index}",
+                })
+                jobs.append(job)
+            app_module.persist_discovery_jobs(jobs, None, None)
+            app_module.persist_discovery_search_memberships(search_execution_id, jobs, 0)
+        return {
+            "jobs": jobs, "matching_jobs": [], "review_required_jobs": jobs,
+            "total": 2, "errors": {},
+            "search_progress": {"requested_target": 2, "new_matching_jobs": 0,
+                                 "review_required": 2, "raw_jobs_inspected": 2},
+        }
+
+    monkeypatch.setattr(app_module, "run_discovery_pipeline", fake_pipeline)
+    client = app_module.app.test_client()
+    search_id = client.post("/api/discovery/searches", json={"keywords": "developer"}).get_json()["search_id"]
+    for _ in range(100):
+        status = client.get(f"/api/discovery/searches/{search_id}").get_json()
+        if status["status"] in {"completed", "completed_with_errors", "failed"}:
+            break
+        time.sleep(0.01)
+    assert status["status"] == "completed"
+    review = client.get(f"/api/discovery/inbox?include_history=1&category=review_required&search_id={search_id}")
+    assert review.status_code == 200
+    assert {row["source_job_id"] for row in review.get_json()} == {"membership-0", "membership-1"}
+
+
 def test_async_exclusion_tombstone_removes_visible_result_but_keeps_history():
     with tempfile.TemporaryDirectory() as directory:
         app_module.DATA_DIR = Path(directory)

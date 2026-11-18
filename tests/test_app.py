@@ -2980,6 +2980,48 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(categories["Backend Developer"], "skipped")
         self.assertEqual(self.client.get("/api/discovery/inbox").get_json(), [])
 
+    def test_actionable_discovery_records_are_explicit_new_opportunities(self):
+        self.client.get("/api/health")
+        job = {
+            "company": "Actionable Co", "title": "Junior Software Developer",
+            "location": "Toronto, ON", "url": "https://example.test/actionable",
+            "source": "Indeed", "source_job_id": "actionable-1",
+            "job_description": "Build Python services.",
+            "discovery_result_category": "actionable",
+            "discovery_result_reason": "Verified match",
+        }
+        with app_module.app.app_context():
+            app_module.persist_discovery_jobs([job], None, None)
+        response = self.client.get("/api/discovery/inbox?include_history=1")
+        assert response.status_code == 200
+        row = next(item for item in response.get_json() if item["title"] == job["title"])
+        self.assertEqual(row["discovery_inbox_category"], "new_actionable")
+
+    def test_opaque_search_membership_limits_needs_review_to_that_search(self):
+        self.client.get("/api/health")
+        jobs = [
+            {
+                "company": "Review Co", "title": f"Software Developer {index}",
+                "location": "Toronto, ON", "url": f"https://example.test/review-{index}",
+                "source": "Indeed", "source_job_id": f"review-{index}",
+                "discovery_result_category": "review_required",
+                "discovery_result_reason": f"reason-{index}",
+            }
+            for index in range(3)
+        ]
+        with app_module.app.app_context():
+            app_module.persist_discovery_jobs(jobs, None, None)
+            app_module.persist_discovery_search_memberships("opaque-search-a", jobs[:2], 0)
+            app_module.persist_discovery_search_memberships("opaque-search-b", jobs[1:], 0)
+        first = self.client.get("/api/discovery/inbox?include_history=1&category=review_required&search_id=opaque-search-a")
+        second = self.client.get("/api/discovery/inbox?include_history=1&category=review_required&search_id=opaque-search-b")
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual({item["source_job_id"] for item in first.get_json()}, {"review-0", "review-1"})
+        self.assertEqual({item["source_job_id"] for item in second.get_json()}, {"review-1", "review-2"})
+        self.assertEqual({item["discovery_result_reason"] for item in first.get_json()}, {"reason-0", "reason-1"})
+        self.assertEqual(self.client.get("/api/discovery/inbox?include_history=1&category=review_required").status_code, 200)
+
     def test_live_discovery_persists_save_skip_and_applied_without_generation(self):
         fake = {
             "jobs": [
