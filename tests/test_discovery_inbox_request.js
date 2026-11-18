@@ -37,6 +37,6 @@ vm.runInNewContext(`${source.slice(start, end)}; this.loadDiscoveryInbox = loadD
   assert.strictEqual(cumulative.searchParams.get("category"), null);
   assert.strictEqual(cumulative.searchParams.get("search_id"), null);
 
-  assert.throws(() => context.discoveryInboxRequestUrl({ category: "all_relevant", searchId }), /Needs Review/);
+  assert.throws(() => context.discoveryInboxRequestUrl({ category: "saved", searchId }), /supported category/);
   console.log("discovery Inbox request flow passed");
 })().catch((error) => { console.error(error); process.exitCode = 1; });

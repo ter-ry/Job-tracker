@@ -72,11 +72,11 @@ assert.match(js, /candidateProfilesStatus = "error"/);
 assert.match(js, /Retry/);
 assert.match(js, /discoveryInboxSearchId/);
 assert.match(js, /function discoveryInboxRequestUrl/);
-assert.match(js, /params\.set\("category", "review_required"\)/);
+assert.match(js, /params\.set\("category", category\)/);
 assert.match(js, /params\.set\("search_id", String\(searchId\)\)/);
 assert.match(js, /Showing search/);
 assert.match(js, /Return to full Inbox/);
-assert.match(js, /category !== "review_required"/);
+assert.match(js, /supported category/);
 
 // Experience, salary, and workplace wording remain evidence-safe.
 for (const label of ["Detected seniority", "Required experience", "Preferred experience", "Applicant demonstrated experience", "Experience fit", "Technical compatibility"]) {

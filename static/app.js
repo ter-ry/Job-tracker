@@ -35,6 +35,7 @@ const state = {
   discoveryInboxPage: 0,
   discoveryInboxHasMore: false,
   discoveryInboxCounts: {},
+  discoveryInboxRuns: [],
   discoveryInboxSelected: new Set(),
   discoveryInboxBulkAction: "",
   discoveryInboxBulkMessage: "",
@@ -1304,6 +1305,15 @@ function renderDiscoveryInbox(jobs) {
   const filters = document.getElementById("discovery-inbox-filters");
   if (filters) {
     filters.innerHTML = Object.entries(labels).map(([category, label]) => { const scoped = Boolean(state.discoveryInboxSearchId); const countValue = scoped ? (category === state.discoveryInboxCategory ? jobs.length : "—") : (state.discoveryInboxCounts[category] ?? counts[category] ?? 0); const partial = !scoped && state.discoveryInboxHasMore && ["requalified", "presented", "excluded", "all_discovered"].includes(category); const count = `${countValue}${partial ? "+" : ""}`; return `<button class="button ghost small ${state.discoveryInboxCategory === category ? "active" : ""}" type="button" data-inbox-category="${category}" ${state.discoveryInboxBulkAction ? "disabled" : ""}>${label} <span class="muted">${count}</span></button>`; }).join("");
+    const runOptions = state.discoveryInboxRuns.map((run) => `<option value="${escapeAttribute(run.search_id)}">${escapeHtml(run.search_id.slice(0, 12))} · ${Number(run.review_count || 0)} review · ${Number(run.excluded_count || 0)} excluded</option>`).join("");
+    filters.innerHTML += runOptions ? `<label class="inbox-search-run">Search run <select data-inbox-search-run><option value="">All runs</option>${runOptions}</select></label>` : "";
+    filters.querySelector("[data-inbox-search-run]")?.addEventListener("change", async (event) => {
+      state.discoveryInboxSearchId = event.target.value || "";
+      state.discoveryInboxCategory = state.discoveryInboxSearchId ? "review_required" : "all_discovered";
+      state.discoveryInboxPage = 0;
+      state.discoveryInboxJobs = [];
+      await loadDiscoveryInbox(true);
+    });
     filters.querySelectorAll("[data-inbox-category]").forEach((button) => button.addEventListener("click", async () => {
       state.discoveryInboxCategory = button.dataset.inboxCategory || "new_actionable";
       state.discoveryInboxSearchId = "";
@@ -1340,7 +1350,7 @@ function renderDiscoveryInbox(jobs) {
     }
   }
   target.classList.toggle("empty", !visibleJobs.length);
-  target.innerHTML = visibleJobs.length ? visibleJobs.map((job) => { const category = categoryFor(job); const membership = job.search_membership_evidence || {}; const audit = category === "excluded" ? `<p><strong>Why excluded:</strong> ${escapeHtml(job.discovery_result_reason || "No exclusion reason recorded.")}</p><p class="muted">Rule: ${escapeHtml(membership.rule || job.discovery_exclusion_reason_bucket || "evidence-backed exclusion")}</p><button class="button ghost small" type="button" onclick="flagInboxReassessment(${job.id})">Flag for reassessment</button>` : ""; return `<article class="inbox-row"><label><input type="checkbox" data-inbox-select="${job.id}" ${state.discoveryInboxSelected.has(Number(job.id)) ? "checked" : ""}> Select</label><div><strong>${escapeHtml(job.title || "Untitled role")}</strong><span>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(resultWorkplaceLabel(job))}</span><span class="muted">${escapeHtml(job.work_arrangement || job.remote_type || "Unknown arrangement")} · ${escapeHtml(displaySalary(job))} · ${escapeHtml(resultDistanceLabel(job))}</span>${renderExperienceSummary(job)}<details><summary>${category === "excluded" ? "Exclusion evidence" : "Requirements and evidence"}</summary><span class="muted">Decision: ${escapeHtml(job.discovery_result_category || category)} · Reason: ${escapeHtml(job.discovery_result_reason || "Not recorded")} · Source: ${escapeHtml(job.source || membership.source || "Not available")} · Evidence: ${escapeHtml(job.qualification_evidence_source || membership.qualification_evidence_source || "Not available")} · Evidence confidence: ${escapeHtml(job.qualification_evidence_confidence || membership.qualification_evidence_confidence || "unverified")}</span>${membership.required_experience ? `<p class="muted">Required experience evidence: ${escapeHtml(JSON.stringify(membership.required_experience))}</p>` : ""}</details>${audit}</div><div class="row-actions">${category === "new_actionable" || category === "review_required" || category === "requalified" || category === "presented" ? `<button class="button ghost small" type="button" onclick="saveInboxJob(${job.id})">Save</button><button class="button ghost small" type="button" onclick="applyInboxJob(${job.id})">Confirm Applied</button><button class="button ghost small" type="button" onclick="ignoreInboxJob(${job.id})">Skip</button>` : category === "skipped" ? `<button class="button ghost small" type="button" onclick="restoreInboxJob(${job.id})">Restore</button>` : ""}${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open Original</a>` : ""}</div></article>`; }).join("") : `No ${(labels[state.discoveryInboxCategory] || "discovery").toLowerCase()} discovery records.`;
+  target.innerHTML = visibleJobs.length ? visibleJobs.map((job) => { const category = categoryFor(job); const membership = job.search_membership_evidence || {}; const flag = job.reassessment_flag; const audit = category === "excluded" ? `<p><strong>Why excluded:</strong> ${escapeHtml(job.discovery_result_reason || "No exclusion reason recorded.")}</p><p class="muted">Rule: ${escapeHtml(membership.rule || job.discovery_exclusion_reason_bucket || "evidence-backed exclusion")}</p><p class="muted">Reassessment: ${escapeHtml(flag?.status || "not flagged")}${flag?.note ? ` — ${escapeHtml(flag.note)}` : ""}</p><button class="button ghost small" type="button" onclick="flagInboxReassessment(${job.id})">Flag for reassessment</button><button class="button ghost small" type="button" onclick="reassessInboxJob(${job.id})">Reassess now</button>` : ""; return `<article class="inbox-row"><label><input type="checkbox" data-inbox-select="${job.id}" ${state.discoveryInboxSelected.has(Number(job.id)) ? "checked" : ""}> Select</label><div><strong>${escapeHtml(job.title || "Untitled role")}</strong><span>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(resultWorkplaceLabel(job))}</span><span class="muted">${escapeHtml(job.work_arrangement || job.remote_type || "Unknown arrangement")} · ${escapeHtml(displaySalary(job))} · ${escapeHtml(resultDistanceLabel(job))}</span>${renderExperienceSummary(job)}<details><summary>${category === "excluded" ? "Exclusion evidence" : "Requirements and evidence"}</summary><span class="muted">Decision: ${escapeHtml(job.discovery_result_category || category)} · Reason: ${escapeHtml(job.discovery_result_reason || "Not recorded")} · Source: ${escapeHtml(job.source || membership.source || "Not available")} · Evidence: ${escapeHtml(job.qualification_evidence_source || membership.qualification_evidence_source || "Not available")} · Evidence confidence: ${escapeHtml(job.qualification_evidence_confidence || membership.qualification_evidence_confidence || "unverified")}</span>${membership.required_experience ? `<p class="muted">Required experience evidence: ${escapeHtml(JSON.stringify(membership.required_experience))}</p>` : ""}</details>${audit}</div><div class="row-actions">${category === "new_actionable" || category === "review_required" || category === "requalified" || category === "presented" ? `<button class="button ghost small" type="button" onclick="saveInboxJob(${job.id})">Save</button><button class="button ghost small" type="button" onclick="applyInboxJob(${job.id})">Confirm Applied</button><button class="button ghost small" type="button" onclick="ignoreInboxJob(${job.id})">Skip</button>` : category === "skipped" ? `<button class="button ghost small" type="button" onclick="restoreInboxJob(${job.id})">Restore</button>` : ""}${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open Original</a>` : ""}</div></article>`; }).join("") : `No ${(labels[state.discoveryInboxCategory] || "discovery").toLowerCase()} discovery records.`;
   target.querySelectorAll("[data-inbox-select]").forEach((box) => box.addEventListener("change", () => { const id = Number(box.dataset.inboxSelect); if (box.checked) state.discoveryInboxSelected.add(id); else state.discoveryInboxSelected.delete(id); }));
 }
 
@@ -1370,8 +1380,8 @@ function discoveryInboxRequestUrl({ profileId = "", category = "all_relevant", s
   if (profileId) params.set("candidate_profile_id", String(profileId));
   params.set("include_history", "1");
   if (searchId) {
-    if (category !== "review_required") throw new Error("A search-scoped Inbox request must use Needs Review.");
-    params.set("category", "review_required");
+    if (!["review_required", "excluded", "new_actionable", "all_relevant"].includes(category)) throw new Error("A search-scoped Inbox request must use a supported category.");
+    params.set("category", category);
     params.set("search_id", String(searchId));
   } else if (["requalified", "presented", "excluded", "all_discovered"].includes(category)) {
     params.set("category", category === "all_discovered" ? "all_discovered" : category);
@@ -1402,11 +1412,13 @@ async function loadDiscoveryInbox(force = false, append = false) {
       pageSize: 500,
     });
     const selectedProfile = state.selectedCandidateProfileId ? String(state.selectedCandidateProfileId) : "";
-    const [jobs, counts] = await Promise.all([
+    const [jobs, counts, runs] = await Promise.all([
       api.get(jobsUrl),
       selectedProfile ? api.get(`/api/discovery/inbox/counts?candidate_profile_id=${encodeURIComponent(selectedProfile)}`) : Promise.resolve({}),
+      selectedProfile ? api.get(`/api/discovery/inbox/search-runs?candidate_profile_id=${encodeURIComponent(selectedProfile)}`) : Promise.resolve([]),
     ]);
     state.discoveryInboxCounts = counts && typeof counts === "object" && !Array.isArray(counts) ? counts : {};
+    state.discoveryInboxRuns = Array.isArray(runs) ? runs : [];
     // Shared discovery rows use candidate_profile_id=0; applicant-specific
     // state returned by the API is the ownership signal for those rows.
     const incoming = (Array.isArray(jobs) ? jobs : []).filter((job) => {
@@ -1427,6 +1439,11 @@ async function flagInboxReassessment(id) {
   const note = window.prompt("Why should this result be reassessed?", "The evidence or classification may be incorrect.");
   if (note === null) return;
   try { await api.send(`/api/discovery/inbox/${id}/flag-reassessment`, "POST", { ...discoveryApplicantActionPayload(), note }); toast("Flagged for evidence reassessment."); }
+  catch (error) { toast(error.message); }
+}
+
+async function reassessInboxJob(id) {
+  try { await api.send(`/api/discovery/inbox/${id}/reassess`, "POST", discoveryApplicantActionPayload()); toast("Evidence reassessed; prior decisions were preserved."); await loadDiscoveryInbox(true); }
   catch (error) { toast(error.message); }
 }
 

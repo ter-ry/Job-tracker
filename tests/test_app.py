@@ -3055,6 +3055,54 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(counts.get_json()["excluded"], 2)
         flagged = self.client.post(f"/api/discovery/inbox/{jobs[1]['id']}/flag-reassessment", json={"applicant_profile_id": profile["id"], "workflow": "software", "note": "Check source evidence"})
         self.assertEqual(flagged.status_code, 200)
+        reassessed = self.client.post(f"/api/discovery/inbox/{jobs[1]['id']}/reassess", json={"applicant_profile_id": profile["id"], "workflow": "software"})
+        self.assertEqual(reassessed.status_code, 200)
+        self.assertEqual(reassessed.get_json()["status"], "requalified")
+        refreshed = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=requalified&include_history=1").get_json()
+        refreshed_job = next(item for item in refreshed if item["id"] == jobs[1]["id"])
+        self.assertEqual(refreshed_job["reassessment_flag"]["status"], "requalified")
+
+    def test_presented_actionable_jobs_are_not_new_and_counts_match(self):
+        self.client.get("/api/health")
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Inbox owner", "workflow": "software"}).get_json()
+        job = {
+            "company": "Repeat Co", "title": "Junior Software Developer", "location": "Toronto, ON",
+            "url": "https://example.test/repeat", "source": "Indeed", "source_job_id": "repeat-1",
+            "discovery_result_category": "actionable", "discovery_result_reason": "Verified match",
+        }
+        with app_module.app.app_context():
+            app_module.persist_discovery_jobs([job], None, None)
+            app_module.mark_discovery_jobs_presented([job["id"]], profile["id"])
+        new_view = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=new_actionable&include_history=1")
+        presented = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=presented&include_history=1")
+        counts = self.client.get(f"/api/discovery/inbox/counts?candidate_profile_id={profile['id']}")
+        self.assertEqual(new_view.status_code, 200)
+        self.assertEqual(new_view.get_json(), [])
+        self.assertEqual(presented.get_json()[0]["discovery_inbox_category"], "presented")
+        self.assertEqual(counts.get_json()["new_actionable"], 0)
+        self.assertEqual(counts.get_json()["presented"], 1)
+        self.assertEqual(counts.get_json()["all_relevant"], 1)
+
+    def test_search_run_history_and_membership_evidence_are_immutable(self):
+        self.client.get("/api/health")
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Run audit", "workflow": "software"}).get_json()
+        job = {
+            "company": "Evidence Co", "title": "Software Developer", "location": "Toronto, ON",
+            "url": "https://example.test/evidence", "source": "Indeed", "source_job_id": "evidence-1",
+            "discovery_result_category": "excluded", "discovery_result_reason": "Original exclusion",
+            "discovery_occupation": "software developer", "qualification_evidence_source": "Original JD",
+        }
+        with app_module.app.app_context():
+            app_module.persist_discovery_jobs([job], None, None)
+            app_module.persist_discovery_search_memberships("d" * 32, [job], profile["id"])
+            job["discovery_result_reason"] = "Replay must not overwrite"
+            app_module.persist_discovery_search_memberships("d" * 32, [job], profile["id"])
+        runs = self.client.get(f"/api/discovery/inbox/search-runs?candidate_profile_id={profile['id']}")
+        scoped = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=excluded&search_id={'d' * 32}&include_history=1")
+        self.assertEqual(runs.status_code, 200)
+        self.assertEqual(runs.get_json()[0]["search_id"], "d" * 32)
+        self.assertEqual(runs.get_json()[0]["excluded_count"], 1)
+        self.assertEqual(scoped.get_json()[0]["search_membership_evidence"]["reason"], "Original exclusion")
 
     def test_live_discovery_persists_save_skip_and_applied_without_generation(self):
         fake = {
