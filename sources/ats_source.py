@@ -49,7 +49,8 @@ MAX_RESPONSE_BYTES = 2_000_000
 USER_AGENT = "Job Tracker/0.0.0 (public employer job board reader)"
 SMARTRECRUITERS_PAGE_LIMIT = 100
 SMARTRECRUITERS_MAX_PAGES = 5
-SMARTRECRUITERS_MAX_DETAIL_REQUESTS = 25
+SMARTRECRUITERS_MAX_DETAIL_REQUESTS = 10
+SMARTRECRUITERS_DETAIL_TIMEOUT = 3
 
 
 class _PlainText(HTMLParser):
@@ -199,6 +200,7 @@ def _smartrecruiters_entries(
     offset = 0
     pages = 0
     total_found: int | None = None
+    complete = False
     while pages < SMARTRECRUITERS_MAX_PAGES:
         url = f"{_url(board)}&offset={offset}"
         payload = fetcher(url, timeout=timeout)
@@ -214,9 +216,10 @@ def _smartrecruiters_entries(
             except (TypeError, ValueError):
                 raise ValueError("SmartRecruiters totalFound is not numeric")
         if not page or (total_found is not None and offset + len(page) >= total_found) or len(page) < SMARTRECRUITERS_PAGE_LIMIT:
+            complete = True
             break
         offset += len(page)
-    return entries, {"pages": pages, "offset": offset, "total_found": total_found}
+    return entries, {"pages": pages, "offset": offset, "total_found": total_found, "complete": complete}
 
 
 def _smartrecruiters_detail_url(board: dict[str, str], entry: dict[str, Any]) -> str:
@@ -264,7 +267,7 @@ def fetch_employer_direct_jobs(
             entries = payload.get("jobs", []) if isinstance(payload, dict) else []
         if not isinstance(entries, list):
             raise ValueError("ATS response did not contain a job list")
-        return board, [item for item in entries if isinstance(item, dict)], {"pages": 1, "offset": 0, "total_found": len(entries)}
+        return board, [item for item in entries if isinstance(item, dict)], {"pages": 1, "offset": 0, "total_found": len(entries), "complete": True}
 
     with ThreadPoolExecutor(max_workers=min(max(1, max_workers), max(1, len(boards)))) as executor:
         futures = {executor.submit(fetch_board, board): board for board in boards}
@@ -278,8 +281,15 @@ def fetch_employer_direct_jobs(
                 detail_attempted = 0
                 detail_succeeded = 0
                 detail_failures = 0
+                detail_budget_exhausted = False
                 for entry in entries:
                     if not isinstance(entry, dict):
+                        continue
+                    # The listing contains enough location data to reject
+                    # irrelevant postings before making any detail request.
+                    job = _row(board, entry)
+                    if job is None or not _local_relevance(job):
+                        excluded += 1
                         continue
                     sections = (entry.get("jobAd") or {}).get("sections", {}) if isinstance(entry.get("jobAd"), dict) else {}
                     has_description = isinstance(sections, dict) and any(
@@ -291,7 +301,7 @@ def fetch_employer_direct_jobs(
                         if detail_url and detail_attempted < SMARTRECRUITERS_MAX_DETAIL_REQUESTS:
                             detail_attempted += 1
                             try:
-                                detail = fetcher(detail_url, timeout=timeout)
+                                detail = fetcher(detail_url, timeout=min(timeout, SMARTRECRUITERS_DETAIL_TIMEOUT))
                                 if isinstance(detail, dict):
                                     merged_entry = dict(entry)
                                     merged_entry.update(detail)
@@ -299,17 +309,16 @@ def fetch_employer_direct_jobs(
                                     detail_succeeded += 1
                             except Exception:
                                 detail_failures += 1
-                    job = _row(board, entry)
-                    if job is None or not _local_relevance(job):
-                        excluded += 1
-                        continue
+                            job = _row(board, entry)
+                        elif detail_url:
+                            detail_budget_exhausted = True
                     if job["source_job_id"] in seen:
                         duplicates += 1
                         continue
                     seen.add(job["source_job_id"])
                     all_rows.append(job)
                     accepted += 1
-                board_outcomes.append({"board": f"{board['kind']}:{board['slug']}", "state": "working" if accepted else "no_results", "raw": len(entries), "jobs": accepted, "excluded": excluded, "duplicates": duplicates, "pages": pagination.get("pages", 1), "total_found": pagination.get("total_found"), "detail_attempted": detail_attempted, "detail_succeeded": detail_succeeded, "detail_failures": detail_failures})
+                board_outcomes.append({"board": f"{board['kind']}:{board['slug']}", "state": "working" if accepted else "no_results", "scan_state": "complete" if pagination.get("complete", True) else "partial", "raw": len(entries), "jobs": accepted, "excluded": excluded, "duplicates": duplicates, "pages": pagination.get("pages", 1), "total_found": pagination.get("total_found"), "detail_attempted": detail_attempted, "detail_succeeded": detail_succeeded, "detail_failures": detail_failures, "detail_budget_exhausted": detail_budget_exhausted})
             except Exception as exc:
                 board_outcomes.append({"board": f"{board['kind']}:{board['slug']}", "state": "failed", "failure_class": _failure_class(exc), "error": f"{type(exc).__name__}: {exc}"[:180]})
     all_rows.sort(key=lambda item: (item["company"].lower(), item["title"].lower(), item["source_job_id"]))
@@ -328,6 +337,8 @@ def fetch_employer_direct_jobs(
         "detail_attempted_count": sum(int(item.get("detail_attempted") or 0) for item in board_outcomes),
         "detail_succeeded_count": sum(int(item.get("detail_succeeded") or 0) for item in board_outcomes),
         "detail_failure_count": sum(int(item.get("detail_failures") or 0) for item in board_outcomes),
+        "partial_scan_count": sum(item.get("scan_state") == "partial" for item in board_outcomes),
+        "detail_budget_exhausted_count": sum(bool(item.get("detail_budget_exhausted")) for item in board_outcomes),
         "boards_attempted": len(board_outcomes), "boards_succeeded": responded, "boards_failed": failures,
         "board_outcomes": sorted(board_outcomes, key=lambda item: item["board"]),
         "duration_ms": int((time.monotonic() - started) * 1000),

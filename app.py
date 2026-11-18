@@ -2720,23 +2720,23 @@ def create_app() -> Flask:
                 clean["duplicate_in_search"] = True
                 duplicates_in_search += 1
                 continue
-            existing_match = find_existing_job_match(clean)
+            duplicate = assess_discovery_duplicate(clean)
+            existing_match = duplicate["row"] if duplicate["kind"] == "existing" else None
             if existing_match is not None:
                 clean["already_saved"] = True
                 already_saved_matches += 1
                 clean["saved_job_id"] = int(existing_match["id"])
                 clean["saved_job_status"] = text(existing_match["status"])
-            else:
-                possible = find_possible_duplicate_match(clean)
-                if possible is not None:
-                    clean["possible_duplicate"] = True
-                    clean["possible_duplicate_job_id"] = int(possible["id"])
-                    warnings = list(clean.get("warnings") or [])
-                    warnings.append("Possible duplicate: same employer, title and location as another posting, but source identity or URL could not prove it is the same vacancy.")
-                    clean["warnings"] = warnings
-                    if clean.get("discovery_result_category") == "actionable":
-                        clean["discovery_result_category"] = "review_required"
-                        clean["discovery_result_reason"] = "Possible duplicate requires review; distinct requisitions are never merged automatically."
+            elif duplicate["kind"] == "possible":
+                possible = duplicate["row"]
+                clean["possible_duplicate"] = True
+                clean["possible_duplicate_job_id"] = int(possible["id"])
+                warnings = list(clean.get("warnings") or [])
+                warnings.append("Possible duplicate: same employer, title and location as another posting, but source identity or URL could not prove it is the same vacancy.")
+                clean["warnings"] = warnings
+                if clean.get("discovery_result_category") == "actionable":
+                    clean["discovery_result_category"] = "review_required"
+                    clean["discovery_result_reason"] = "Possible duplicate requires review; distinct requisitions are never merged automatically."
             seen_jobs.append(clean)
             jobs.append(clean)
 
@@ -3799,6 +3799,11 @@ def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, ru
                    discovery_last_search_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
                 [now, int(search_id or 0), int(match["id"])],
             )
+            sync_job_source_aliases(db, int(match["id"]), {
+                **dict(match),
+                **job,
+                "source_links_json": updates.get("source_links_json", dict(match).get("source_links_json", "[]")),
+            })
             # Every returned discovery object needs the durable identity that
             # actions use, including a cross-source duplicate discovered in a
             # later run.
@@ -3830,6 +3835,7 @@ def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, ru
         job["saved_job_id"] = job_id
         job["saved_job_status"] = "Discovered"
         job["discovery_state"] = "new"
+        sync_job_source_aliases(db, job_id, clean)
         counts["new"] += 1
         counts["new_job_ids"].append(job_id)
     db.commit()
@@ -4046,12 +4052,23 @@ def run_discovery_pipeline(
         if any(dedupe_match(clean, seen) for seen in seen_jobs):
             duplicates_in_search += 1
             continue
-        existing_match = find_existing_job_match(clean)
+        duplicate = assess_discovery_duplicate(clean)
+        existing_match = duplicate["row"] if duplicate["kind"] == "existing" else None
         clean["already_saved"] = existing_match is not None
         if existing_match is not None:
             already_saved_matches += 1
             clean["saved_job_id"] = int(existing_match["id"])
             clean["saved_job_status"] = text(existing_match["status"])
+        elif duplicate["kind"] == "possible":
+            possible = duplicate["row"]
+            clean["possible_duplicate"] = True
+            clean["possible_duplicate_job_id"] = int(possible["id"])
+            clean["warnings"] = list(clean.get("warnings") or []) + [
+                "Possible duplicate: same employer, title and location as another posting, but source identity or URL could not prove it is the same vacancy."
+            ]
+            if clean.get("discovery_result_category") == "actionable":
+                clean["discovery_result_category"] = "review_required"
+                clean["discovery_result_reason"] = "Possible duplicate requires review; distinct requisitions are never merged automatically."
         seen_jobs.append(clean)
         jobs.append(clean)
     capped_count = max(0, len(jobs) - search["total_cap"])
@@ -4433,12 +4450,15 @@ def existing_job_dedupe_keys() -> set[str]:
 
 def find_possible_duplicate_match(job: dict[str, Any]) -> sqlite3.Row | None:
     """Find a same-looking vacancy that cannot be safely auto-merged."""
-    title = text(job.get("title")).lower()
+    title = normalize_dedupe_text(job.get("title"))
     company = normalize_dedupe_company(job.get("company"))
     location = normalize_dedupe_location(job.get("location"))
     if not title or not company or not location:
         return None
-    rows = query_db("SELECT * FROM jobs WHERE lower(title) = ? LIMIT 100", [title])
+    # The functional title index avoids the former 100-row ceiling.  The
+    # company/location checks remain in Python because provider naming and
+    # regional abbreviations are normalized differently.
+    rows = query_db("SELECT * FROM jobs WHERE lower(title) = ?", [text(job.get("title")).lower()])
     for row in rows:
         existing = dict(row)
         if normalize_dedupe_company(existing.get("company")) != company:
@@ -4450,6 +4470,17 @@ def find_possible_duplicate_match(job: dict[str, Any]) -> sqlite3.Row | None:
     return None
 
 
+def assess_discovery_duplicate(job: dict[str, Any]) -> dict[str, Any]:
+    """Apply exact and possible-duplicate rules consistently in every pipeline."""
+    existing = find_existing_job_match(job)
+    if existing is not None:
+        return {"kind": "existing", "row": existing}
+    possible = find_possible_duplicate_match(job)
+    if possible is not None:
+        return {"kind": "possible", "row": possible}
+    return {"kind": "new", "row": None}
+
+
 def find_existing_job_match(job: dict[str, Any]) -> sqlite3.Row | None:
     source_id = text(job.get("source_job_id"))
     source = text(job.get("source"))
@@ -4457,6 +4488,17 @@ def find_existing_job_match(job: dict[str, Any]) -> sqlite3.Row | None:
         row = query_db("SELECT * FROM jobs WHERE source = ? AND source_job_id = ? LIMIT 1", [source, source_id], one=True)
         if row is not None and dedupe_match(job, dict(row)):
             return row
+    # Canonical aliases are persisted separately so a third provider can find
+    # a vacancy through a URL that was secondary on the original sighting.
+    for alias_type, alias_value, _raw_value in job_source_aliases(job):
+        rows = query_db(
+            "SELECT j.* FROM job_source_aliases a JOIN jobs j ON j.id = a.job_id "
+            "WHERE a.alias_type = ? AND a.alias_value = ? ORDER BY j.id",
+            [alias_type, alias_value],
+        )
+        for row in rows:
+            if dedupe_match(job, dict(row)):
+                return row
     urls = [text(job.get("url")), text(job.get("application_url"))]
     for column, value in (("url", urls[0]), ("application_url", urls[1])):
         if value:
@@ -7522,6 +7564,46 @@ def dedupe_keys(job: dict[str, Any], source_job_id: Any = "") -> set[str]:
     return keys
 
 
+def source_link_values(job: dict[str, Any]) -> set[str]:
+    """Return canonical URLs from both primary fields and persisted aliases."""
+    values = {
+        canonical_url(text(job.get(field)))
+        for field in ("url", "application_url")
+    }
+    for item in parse_json_values(job.get("source_links_json", job.get("source_links", []))):
+        value = text(item.get("url")) if isinstance(item, dict) else text(item)
+        values.add(canonical_url(value))
+    return values - {""}
+
+
+def job_source_aliases(job: dict[str, Any]) -> list[tuple[str, str, str]]:
+    """Build durable, indexed aliases without treating title similarity as identity."""
+    aliases: set[tuple[str, str, str]] = set()
+    for value in source_link_values(job):
+        aliases.add(("canonical_url", value, value))
+    source = normalize_dedupe_text(job.get("source"))
+    source_id = normalize_dedupe_text(job.get("source_job_id"))
+    if source and source_id:
+        aliases.add(("source_identity", f"{source}:{source_id}", text(job.get("source_job_id"))))
+    return sorted(aliases)
+
+
+def sync_job_source_aliases(db: sqlite3.Connection, job_id: int, job: dict[str, Any] | sqlite3.Row) -> None:
+    for alias_type, alias_value, raw_value in job_source_aliases(dict(job)):
+        db.execute(
+            "INSERT OR IGNORE INTO job_source_aliases(job_id, alias_type, alias_value, raw_value) VALUES (?, ?, ?, ?)",
+            [int(job_id), alias_type, alias_value, raw_value],
+        )
+
+
+def rebuild_job_source_aliases(db: sqlite3.Connection) -> None:
+    """Backfill the additive alias index for existing databases safely."""
+    rows = db.execute("SELECT * FROM jobs").fetchall()
+    for row in rows:
+        sync_job_source_aliases(db, int(row["id"]), row)
+    db.commit()
+
+
 def dedupe_match(first: dict[str, Any], second: dict[str, Any]) -> bool:
     """Match vacancies conservatively across providers.
 
@@ -7535,8 +7617,8 @@ def dedupe_match(first: dict[str, Any], second: dict[str, Any]) -> bool:
     second_profile = clamp_int(second.get("candidate_profile_id"), 0, 10**9)
     if first_profile and second_profile and first_profile != second_profile:
         return False
-    first_urls = {canonical_url(text(first.get(field))) for field in ("url", "application_url")}
-    second_urls = {canonical_url(text(second.get(field))) for field in ("url", "application_url")}
+    first_urls = source_link_values(first)
+    second_urls = source_link_values(second)
     if (first_urls - {""}) & (second_urls - {""}):
         return True
     first_id = normalize_dedupe_text(first.get("source_job_id"))
@@ -10750,6 +10832,23 @@ def init_db() -> None:
     db.execute("CREATE INDEX IF NOT EXISTS jobs_url_idx ON jobs(url)")
     db.execute("CREATE INDEX IF NOT EXISTS jobs_application_url_idx ON jobs(application_url)")
     db.execute("CREATE INDEX IF NOT EXISTS jobs_company_title_location_idx ON jobs(company, title, location)")
+    db.execute("CREATE INDEX IF NOT EXISTS jobs_title_lower_idx ON jobs(lower(title))")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS job_source_aliases (
+            job_id INTEGER NOT NULL,
+            alias_type TEXT NOT NULL,
+            alias_value TEXT NOT NULL,
+            raw_value TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (job_id, alias_type, alias_value),
+            FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+        )
+        """
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS job_source_aliases_lookup_idx ON job_source_aliases(alias_type, alias_value)")
+    db.execute("CREATE INDEX IF NOT EXISTS job_source_aliases_job_idx ON job_source_aliases(job_id)")
+    rebuild_job_source_aliases(db)
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS profile (

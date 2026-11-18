@@ -2601,6 +2601,52 @@ class JobAssistantTest(unittest.TestCase):
         row = self.client.get("/api/jobs").get_json()[0]
         self.assertEqual(set(row["source_links"]), {first["url"], second["url"]})
 
+    def test_three_provider_discovery_resolves_persisted_secondary_alias(self):
+        with app_module.app.app_context():
+            app_module.init_db()
+            indeed = app_module.normalize_job_payload({
+                "source": "indeed", "source_job_id": "indeed-three", "company": "Three Source Co",
+                "title": "Software Engineer", "location": "Toronto, ON",
+                "url": "https://ca.indeed.com/viewjob?jk=three",
+                "source_links": ["https://careers.three.test/jobs/three"],
+            })
+            direct = app_module.normalize_job_payload({
+                "source": "employer_direct", "source_job_id": "greenhouse:three:three",
+                "company": "Three Source Co", "title": "Software Engineer", "location": "Toronto, ON",
+                "url": "https://careers.three.test/jobs/three",
+            })
+            glassdoor = app_module.normalize_job_payload({
+                "source": "glassdoor", "source_job_id": "glassdoor-three",
+                "company": "Three Source Co", "title": "Software Engineer", "location": "Toronto, ON",
+                "url": "https://www.glassdoor.ca/job-listing/three",
+                "application_url": "https://careers.three.test/jobs/three",
+            })
+            assert app_module.persist_discovery_jobs([indeed], None, None)["new"] == 1
+            assert app_module.persist_discovery_jobs([direct], None, None)["duplicate"] == 1
+            assert app_module.persist_discovery_jobs([glassdoor], None, None)["duplicate"] == 1
+            row = app_module.query_db("SELECT * FROM jobs WHERE source_job_id = ?", ["indeed-three"], one=True)
+            self.assertIsNotNone(row)
+            self.assertEqual(app_module.query_db("SELECT COUNT(*) AS count FROM jobs", one=True)["count"], 1)
+            self.assertEqual(len(app_module.query_db("SELECT * FROM job_source_aliases WHERE job_id = ?", [row["id"]])), 6)
+
+    def test_possible_duplicate_scans_more_than_one_hundred_same_title_records(self):
+        with app_module.app.app_context():
+            app_module.init_db()
+            for index in range(150):
+                job = app_module.normalize_job_payload({
+                    "source": "indeed", "source_job_id": f"history-{index}",
+                    "company": "Other Company", "title": "Software Engineer", "location": "Toronto, ON",
+                    "url": f"https://indeed.test/jobs/{index}",
+                })
+                app_module.persist_discovery_jobs([job], None, None)
+            target = app_module.normalize_job_payload({
+                "source": "employer_direct", "source_job_id": "direct-target",
+                "company": "Other Company", "title": "Software Engineer", "location": "Toronto, ON",
+                "url": "https://careers.other.test/jobs/target",
+            })
+            possible = app_module.find_possible_duplicate_match(target)
+            self.assertIsNotNone(possible)
+
     def test_hybrid_prose_overrides_boolean_remote_without_provider_work_model(self):
         row = {"is_remote": True, "location": "Mississauga, ON", "description": "Hybrid remote in Mississauga, ON L5L 5Y1."}
         self.assertEqual(jobspy_source.infer_remote_type(row), "Hybrid")

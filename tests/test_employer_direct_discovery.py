@@ -186,6 +186,49 @@ def test_smartrecruiters_malformed_response_and_detail_failure_are_diagnosed():
     assert diag["detail_failure_count"] == 1
 
 
+def test_smartrecruiters_filters_irrelevant_locations_before_detail_budget(monkeypatch):
+    monkeypatch.setattr(ats_source, "SMARTRECRUITERS_PAGE_LIMIT", 2)
+    monkeypatch.setattr(ats_source, "SMARTRECRUITERS_MAX_DETAIL_REQUESTS", 1)
+    board = {"kind": "smartrecruiters", "slug": "d2l", "company": "D2L"}
+    entries = [
+        {"id": "canada", "name": "Software Developer", "location": "Toronto, Ontario, Canada", "ref": "https://jobs.test/canada"},
+        {"id": "us", "name": "Software Developer", "location": "Austin, Texas, USA", "ref": "https://jobs.test/us"},
+        {"id": "canada-2", "name": "Software Developer", "location": "Mississauga, Ontario, Canada", "ref": "https://jobs.test/canada-2"},
+    ]
+    calls = []
+    def fetcher(url, timeout):
+        calls.append((url, timeout))
+        if "offset=" in url:
+            offset = int(url.split("offset=", 1)[1])
+            return {"content": entries[offset:offset + 2], "totalFound": 3}
+        return {"id": url.rsplit("/", 1)[1], "jobAd": {"sections": {"description": {"text": "Python requirements"}}}}
+    result = ats_source.fetch_employer_direct_jobs(boards=(board,), fetch_json=fetcher, max_workers=1)
+    diag = result["source_diagnostics"]["employer_direct"]
+    assert {job["source_job_id"] for job in result["jobs"]} == {"smartrecruiters:d2l:canada", "smartrecruiters:d2l:canada-2"}
+    detail_calls = [url for url, _timeout in calls if "/postings/" in url]
+    assert detail_calls == ["https://api.smartrecruiters.com/v1/companies/d2l/postings/canada"]
+    assert diag["board_outcomes"][0]["detail_budget_exhausted"] is True
+
+
+def test_smartrecruiters_max_pages_marks_incomplete_scan():
+    board = {"kind": "smartrecruiters", "slug": "d2l", "company": "D2L"}
+    original_limit = ats_source.SMARTRECRUITERS_PAGE_LIMIT
+    original_pages = ats_source.SMARTRECRUITERS_MAX_PAGES
+    ats_source.SMARTRECRUITERS_PAGE_LIMIT = 1
+    ats_source.SMARTRECRUITERS_MAX_PAGES = 2
+    try:
+        def fetcher(url, timeout):
+            offset = int(url.split("offset=", 1)[1])
+            return {"content": [{"id": str(offset), "name": "Developer", "location": "Toronto, Ontario, Canada", "ref": f"https://jobs.test/{offset}"}], "totalFound": 5}
+        result = ats_source.fetch_employer_direct_jobs(boards=(board,), fetch_json=fetcher, max_workers=1)
+        diag = result["source_diagnostics"]["employer_direct"]
+        assert diag["partial_scan_count"] == 1
+        assert diag["board_outcomes"][0]["scan_state"] == "partial"
+    finally:
+        ats_source.SMARTRECRUITERS_PAGE_LIMIT = original_limit
+        ats_source.SMARTRECRUITERS_MAX_PAGES = original_pages
+
+
 def test_proxy_tunnel_failure_is_distinct_from_employer_http_failure():
     proxy = ats_source.fetch_employer_direct_jobs(
         boards=(BOARDS[0],), fetch_json=lambda url, timeout: (_ for _ in ()).throw(

@@ -235,6 +235,48 @@ def test_async_raw_provider_td_requirement_is_excluded_and_persisted(monkeypatch
         assert "5+ years" in row["job_description"]
 
 
+def test_async_pipeline_marks_unproven_cross_source_duplicate_for_review(monkeypatch, tmp_path):
+    """The worker path must use the same duplicate policy as synchronous discovery."""
+    app_module.DATA_DIR = Path(tmp_path)
+    app_module.DB_PATH = app_module.DATA_DIR / "async-duplicates.sqlite"
+    app_module.app.config.update(TESTING=True)
+    current = {
+        "source": "Indeed", "source_job_id": "indeed-duplicate-1",
+        "title": "Junior Software Developer", "company": "Same Vacancy Co",
+        "location": "Toronto, ON", "job_url": "https://indeed.test/jobs/duplicate-1",
+        "description": "Build software applications with Python.", "job_type": "full-time",
+    }
+
+    def fetch(*_args, **_kwargs):
+        return {"jobs": [dict(current)], "errors": {}, "source_counts": {current["source"].lower(): 1},
+                "source_diagnostics": {}, "source_snapshots": {}, "attempted_query_batches": [],
+                "completed_query_batches": [], "pending_query_batches": []}
+
+    monkeypatch.setattr(app_module, "fetch_discovery_jobs_for_search", fetch)
+    monkeypatch.setattr(
+        app_module, "geocode_discovery_job",
+        lambda job, *_args, **_kwargs: ({**job, "distance_km": 2, "distance_confidence": 90,
+                                          "distance_radius_status": "within_radius",
+                                          "location_search_eligible": True}, {"ok": True}),
+    )
+    payload = {"keywords": "software developer", "location": "Toronto, ON", "enabled_sources": ["indeed"],
+               "search_mode": "shortlist", "occupation": "software developer", "match_policy": "apply_broadly",
+               "seniority": "entry_level,junior", "maximum_required_years": 3, "new_matching_target": 1}
+    with app_module.app.app_context():
+        app_module.init_db()
+        first = app_module.run_discovery_pipeline(payload)
+        assert first["persisted"]["new"] == 1
+        current.update({"source": "Employer Direct", "source_job_id": "greenhouse:same:1",
+                        "job_url": "https://careers.same.test/jobs/1"})
+        second = app_module.run_discovery_pipeline(payload)
+        assert second["persisted"]["new"] == 1
+        assert second["review_required_jobs"][0]["discovery_result_category"] == "review_required"
+        row = app_module.query_db("SELECT discovery_result_category, discovery_result_reason FROM jobs WHERE source_job_id = ?",
+                                  ["greenhouse:same:1"], one=True)
+        assert row["discovery_result_category"] == "review_required"
+        assert "Possible duplicate" in row["discovery_result_reason"]
+
+
 def test_named_search_keeps_legacy_saved_search_contract():
     with tempfile.TemporaryDirectory() as directory:
         app_module.DATA_DIR = Path(directory)
