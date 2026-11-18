@@ -3027,6 +3027,35 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(self.client.get(f"/api/discovery/inbox?include_history=1&search_id={'c' * 32}").status_code, 400)
         self.assertEqual(self.client.get("/api/discovery/inbox?include_history=1&category=review_required&search_id=not-hex").status_code, 400)
 
+    def test_presented_and_excluded_history_are_paginated_and_auditable(self):
+        self.client.get("/api/health")
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Audit applicant", "workflow": "software"}).get_json()
+        jobs = [
+            {
+                "company": "Audit Co", "title": f"Role {index}", "location": "Toronto, ON",
+                "url": f"https://example.test/audit-{index}", "source": "Indeed",
+                "source_job_id": f"audit-{index}", "discovery_result_category": "actionable" if index == 0 else "excluded",
+                "discovery_result_reason": "Confirmed unrelated occupation" if index else "Verified match",
+                "discovery_occupation": "software developer",
+                "qualification_evidence_source": "Original posting description",
+            }
+            for index in range(3)
+        ]
+        with app_module.app.app_context():
+            app_module.persist_discovery_jobs(jobs, None, None)
+            app_module.mark_discovery_jobs_presented([jobs[0]["id"]], profile["id"])
+        presented = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=presented&include_history=1&page_size=1")
+        excluded = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=excluded&include_history=1&page_size=2")
+        counts = self.client.get(f"/api/discovery/inbox/counts?candidate_profile_id={profile['id']}")
+        self.assertEqual(presented.status_code, 200)
+        self.assertEqual(presented.get_json()[0]["discovery_inbox_category"], "presented")
+        self.assertEqual(excluded.status_code, 200)
+        self.assertEqual(len(excluded.get_json()), 2)
+        self.assertEqual(counts.status_code, 200)
+        self.assertEqual(counts.get_json()["excluded"], 2)
+        flagged = self.client.post(f"/api/discovery/inbox/{jobs[1]['id']}/flag-reassessment", json={"applicant_profile_id": profile["id"], "workflow": "software", "note": "Check source evidence"})
+        self.assertEqual(flagged.status_code, 200)
+
     def test_live_discovery_persists_save_skip_and_applied_without_generation(self):
         fake = {
             "jobs": [

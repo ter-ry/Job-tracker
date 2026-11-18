@@ -2166,6 +2166,8 @@ def create_app() -> Flask:
                 return jsonify({"error": "Invalid discovery search ID."}), 400
             if requested_category not in {"review", "review_required", "new", "new_actionable", "excluded", "all_relevant"}:
                 return jsonify({"error": "A supported discovery Inbox category is required with search_id."}), 400
+        if requested_category == "presented" and not applicant_id:
+            return jsonify({"error": "candidate_profile_id is required for Presented / Seen history."}), 400
         query = "SELECT * FROM jobs WHERE discovery_first_seen_at <> ''"
         query_args: list[Any] = []
         if requested_category == "requalified":
@@ -2179,26 +2181,31 @@ def create_app() -> Flask:
             query += " AND discovery_result_category = 'review_required'"
         elif requested_category == "excluded":
             query += " AND discovery_result_category = 'excluded'"
+        elif requested_category == "presented":
+            query += " AND EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = jobs.id AND p.applicant_profile_id = ?)"
+            query_args.append(applicant_id)
         if applicant_id:
             # History is applicant-scoped. Include source rows owned by this
             # applicant plus explicit presentation/state records, never another
             # applicant's discoveries merely because they share a title or URL.
             table_alias = "j." if requested_category == "requalified" else ""
-            query += f" AND ({table_alias}candidate_profile_id = 0 OR {table_alias}candidate_profile_id = ? OR EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = {table_alias}id AND p.applicant_profile_id = ?) OR EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = {table_alias}id AND s.applicant_profile_id = ?))"
+            query += f" AND ({table_alias}candidate_profile_id IN ('', 0) OR {table_alias}candidate_profile_id = ? OR EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = {table_alias}id AND p.applicant_profile_id = ?) OR EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = {table_alias}id AND s.applicant_profile_id = ?))"
             query_args.extend([applicant_id, applicant_id, applicant_id])
         if not include_history and not applicant_id:
             query += " AND discovery_state NOT IN ('ignored', 'saved', 'applied') AND status NOT IN ('Applied', 'shortlisted')"
         membership_search = bool(requested_search_id and requested_category in {"review", "review_required", "new", "new_actionable", "excluded", "all_relevant"})
         if membership_search:
             query = """SELECT j.*, m.category AS search_membership_category,
-                              m.reason AS search_membership_reason
+                              m.reason AS search_membership_reason,
+                              m.evidence_json AS search_membership_evidence,
+                              m.criteria_json AS search_membership_criteria
                        FROM jobs j
                        JOIN discovery_search_memberships m ON m.job_id = j.id
                        WHERE j.discovery_first_seen_at <> ''
                          AND m.search_execution_id = ?"""
             query_args = [requested_search_id]
             if applicant_id:
-                query += " AND (j.candidate_profile_id = 0 OR j.candidate_profile_id = ? OR EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = j.id AND p.applicant_profile_id = ?) OR EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = j.id AND s.applicant_profile_id = ?))"
+                query += " AND (j.candidate_profile_id IN ('', 0) OR j.candidate_profile_id = ? OR EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = j.id AND p.applicant_profile_id = ?) OR EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = j.id AND s.applicant_profile_id = ?))"
                 query_args.extend([applicant_id, applicant_id, applicant_id])
             if requested_category in {"review", "review_required"}:
                 query += " AND m.category = 'review_required'"
@@ -2245,7 +2252,18 @@ def create_app() -> Flask:
             if membership_category:
                 item["discovery_result_category"] = membership_category
                 item["discovery_result_reason"] = membership_reason
-            if requested_category == "requalified" and requalified:
+                item["search_membership_evidence"] = parse_json_object(row["search_membership_evidence"]) if "search_membership_evidence" in row.keys() else {}
+                item["search_membership_criteria"] = parse_json_object(row["search_membership_criteria"]) if "search_membership_criteria" in row.keys() else {}
+            presentation = query_db(
+                "SELECT presented_at FROM discovery_applicant_presentations WHERE job_id = ? AND applicant_profile_id = ?",
+                [int(row["id"]), applicant_id], one=True,
+            ) if applicant_id else None
+            item["presented_to_applicant"] = bool(presentation)
+            item["presented_at"] = text(presentation["presented_at"]) if presentation else ""
+            item["applicant_lifecycle_state"] = text(applicant_discovery_state(int(row["id"]), applicant_id)) if applicant_id else text(item.get("discovery_state"))
+            if requested_category == "presented" and presentation:
+                category = "presented"
+            elif requested_category == "requalified" and requalified:
                 category = "requalified"
                 item["requalified_reason"] = text(requalified["reason"])
             elif text(item.get("status")) == "Applied" or text(item.get("discovery_state")) == "applied":
@@ -2273,6 +2291,49 @@ def create_app() -> Flask:
             item["discovery_inbox_category"] = category
             jobs.append(item)
         return jsonify(jobs)
+
+    @app.get("/api/discovery/inbox/counts")
+    def discovery_inbox_counts() -> Response:
+        applicant_id = applicant_profile_id(request.args)
+        if not applicant_id:
+            return jsonify({"error": "candidate_profile_id is required for applicant-specific Inbox counts."}), 400
+        base = "j.discovery_first_seen_at <> '' AND (j.candidate_profile_id IN ('', 0) OR j.candidate_profile_id = ? OR EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = j.id AND p.applicant_profile_id = ?) OR EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = j.id AND s.applicant_profile_id = ?))"
+        args = [applicant_id, applicant_id, applicant_id]
+        rows = query_db(f"SELECT j.id, j.discovery_result_category, EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = j.id AND p.applicant_profile_id = ?) AS presented, COALESCE((SELECT state FROM discovery_applicant_states s WHERE s.job_id = j.id AND s.applicant_profile_id = ?), '') AS applicant_state FROM jobs j WHERE {base}", [applicant_id, applicant_id, *args])
+        counts = {"all_discovered": 0, "new_actionable": 0, "review_required": 0, "excluded": 0, "presented": 0, "saved": 0, "applied": 0, "skipped": 0}
+        for row in rows:
+            counts["all_discovered"] += 1
+            if int(row["presented"] or 0): counts["presented"] += 1
+            state = text(row["applicant_state"])
+            if state == "saved": counts["saved"] += 1
+            elif state == "applied": counts["applied"] += 1
+            elif state in {"skipped", "ignored"}: counts["skipped"] += 1
+            category = text(row["discovery_result_category"])
+            if category == "actionable" and not int(row["presented"] or 0) and not state: counts["new_actionable"] += 1
+            elif category == "review_required": counts["review_required"] += 1
+            elif category == "excluded": counts["excluded"] += 1
+        return jsonify(counts)
+
+    @app.post("/api/discovery/inbox/<int:job_id>/flag-reassessment")
+    def flag_discovery_reassessment(job_id: int) -> Response:
+        row = query_db("SELECT * FROM jobs WHERE id = ? AND discovery_first_seen_at <> ''", [job_id], one=True)
+        if row is None:
+            return jsonify({"error": "Discovered job not found"}), 404
+        payload = request.get_json(silent=True) or {}
+        try:
+            validate_discovery_action_owner(row, payload)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        profile_id = applicant_profile_id(payload)
+        if not profile_id:
+            return jsonify({"error": "Applicant profile is required to flag a discovery for reassessment."}), 400
+        note = normalize_space(text(payload.get("note"))) or "Owner requested evidence reassessment."
+        get_db().execute(
+            "INSERT INTO discovery_reassessment_flags(job_id, applicant_profile_id, note, status) VALUES (?, ?, ?, 'open') ON CONFLICT(job_id, applicant_profile_id) DO UPDATE SET note = excluded.note, status = 'open', updated_at = CURRENT_TIMESTAMP",
+            [job_id, profile_id, note],
+        )
+        get_db().commit()
+        return jsonify({"ok": True, "job_id": job_id, "applicant_profile_id": profile_id, "status": "open", "note": note})
 
     @app.post("/api/discovery/inbox/<int:job_id>/review")
     def review_discovery_job(job_id: int) -> Response:
@@ -3910,16 +3971,36 @@ def persist_discovery_search_memberships(
             continue
         category = text(job.get("discovery_result_category")) or "unclassified"
         reason = text(job.get("discovery_result_reason"))
+        evidence = {
+            "rule": discovery_exclusion_reason_bucket(job) if category == "excluded" else discovery_reason_bucket(job),
+            "reason": reason,
+            "source": text(job.get("source")),
+            "source_job_id": text(job.get("source_job_id")),
+            "url": text(job.get("url")),
+            "application_url": text(job.get("application_url")),
+            "required_experience": job.get("experience_requirements") or job.get("qualification_fit_seniority") or {},
+            "qualification_evidence_source": text(job.get("qualification_evidence_source")),
+            "qualification_evidence_confidence": text(job.get("qualification_evidence_confidence")),
+        }
+        criteria = {
+            "occupation": text(job.get("discovery_occupation")),
+            "seniority": text(job.get("discovery_seniority")),
+            "maximum_required_years": job.get("discovery_maximum_required_years"),
+            "location_scope": text(job.get("discovery_location_scope")),
+            "remote_preference": text(job.get("discovery_remote_preference")),
+        }
         db.execute(
             """INSERT INTO discovery_search_memberships
-               (search_execution_id, job_id, applicant_profile_id, category, reason)
-               VALUES (?, ?, ?, ?, ?)
+               (search_execution_id, job_id, applicant_profile_id, category, reason, evidence_json, criteria_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(search_execution_id, job_id) DO UPDATE SET
                  applicant_profile_id = excluded.applicant_profile_id,
                  category = excluded.category,
                  reason = excluded.reason,
+                 evidence_json = excluded.evidence_json,
+                 criteria_json = excluded.criteria_json,
                  updated_at = CURRENT_TIMESTAMP""",
-            [execution_id, job_id, int(applicant_profile_id or 0), category, reason],
+            [execution_id, job_id, int(applicant_profile_id or 0), category, reason, dumps_json(evidence), dumps_json(criteria)],
         )
     db.commit()
 
@@ -11095,7 +11176,26 @@ def init_db() -> None:
             FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
         )"""
     )
+    ensure_columns(
+        "discovery_search_memberships",
+        {
+            "evidence_json": "TEXT NOT NULL DEFAULT '{}'",
+            "criteria_json": "TEXT NOT NULL DEFAULT '{}'",
+        },
+    )
     db.execute("CREATE INDEX IF NOT EXISTS discovery_search_memberships_category_idx ON discovery_search_memberships(search_execution_id, category)")
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS discovery_reassessment_flags (
+            job_id INTEGER NOT NULL,
+            applicant_profile_id INTEGER NOT NULL,
+            note TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'open',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(job_id, applicant_profile_id),
+            FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+        )"""
+    )
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS discovery_debug_runs (

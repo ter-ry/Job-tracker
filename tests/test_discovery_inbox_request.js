@@ -22,7 +22,7 @@ vm.runInNewContext(`${source.slice(start, end)}; this.loadDiscoveryInbox = loadD
 (async () => {
   const searchId = context.state.discoveryInboxSearchId;
   await context.loadDiscoveryInbox(true);
-  const scopedUrl = calls.pop();
+  const scopedUrl = calls.filter((url) => url.startsWith("/api/discovery/inbox?")).at(-1);
   const scoped = new URL(`http://localhost${scopedUrl}`);
   assert.strictEqual(scoped.searchParams.get("candidate_profile_id"), "7");
   assert.strictEqual(scoped.searchParams.get("category"), "review_required");
@@ -32,7 +32,7 @@ vm.runInNewContext(`${source.slice(start, end)}; this.loadDiscoveryInbox = loadD
   context.state.discoveryInboxCategory = "all_relevant";
   context.state.discoveryInboxSearchId = "";
   await context.loadDiscoveryInbox(true);
-  const cumulativeUrl = calls.pop();
+  const cumulativeUrl = calls.filter((url) => url.startsWith("/api/discovery/inbox?")).at(-1);
   const cumulative = new URL(`http://localhost${cumulativeUrl}`);
   assert.strictEqual(cumulative.searchParams.get("category"), null);
   assert.strictEqual(cumulative.searchParams.get("search_id"), null);

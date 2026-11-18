@@ -74,7 +74,7 @@ assert.match(js, /discoveryInboxSearchId/);
 assert.match(js, /function discoveryInboxRequestUrl/);
 assert.match(js, /params\.set\("category", "review_required"\)/);
 assert.match(js, /params\.set\("search_id", String\(searchId\)\)/);
-assert.match(js, /Showing this search only/);
+assert.match(js, /Showing search/);
 assert.match(js, /Return to full Inbox/);
 assert.match(js, /category !== "review_required"/);
 
