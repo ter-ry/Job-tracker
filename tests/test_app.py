@@ -3011,16 +3011,21 @@ class JobAssistantTest(unittest.TestCase):
         ]
         with app_module.app.app_context():
             app_module.persist_discovery_jobs(jobs, None, None)
-            app_module.persist_discovery_search_memberships("opaque-search-a", jobs[:2], 0)
-            app_module.persist_discovery_search_memberships("opaque-search-b", jobs[1:], 0)
-        first = self.client.get("/api/discovery/inbox?include_history=1&category=review_required&search_id=opaque-search-a")
-        second = self.client.get("/api/discovery/inbox?include_history=1&category=review_required&search_id=opaque-search-b")
+            app_module.persist_discovery_search_memberships("a" * 32, jobs[:2], 0)
+            app_module.persist_discovery_search_memberships("b" * 32, jobs[1:], 0)
+        first = self.client.get(f"/api/discovery/inbox?include_history=1&category=review_required&search_id={'a' * 32}")
+        second = self.client.get(f"/api/discovery/inbox?include_history=1&category=review_required&search_id={'b' * 32}")
         self.assertEqual(first.status_code, 200)
         self.assertEqual(second.status_code, 200)
         self.assertEqual({item["source_job_id"] for item in first.get_json()}, {"review-0", "review-1"})
         self.assertEqual({item["source_job_id"] for item in second.get_json()}, {"review-1", "review-2"})
         self.assertEqual({item["discovery_result_reason"] for item in first.get_json()}, {"reason-0", "reason-1"})
         self.assertEqual(self.client.get("/api/discovery/inbox?include_history=1&category=review_required").status_code, 200)
+
+    def test_incomplete_search_scoped_inbox_request_does_not_fall_back_to_history(self):
+        self.client.get("/api/health")
+        self.assertEqual(self.client.get(f"/api/discovery/inbox?include_history=1&search_id={'c' * 32}").status_code, 400)
+        self.assertEqual(self.client.get("/api/discovery/inbox?include_history=1&category=review_required&search_id=not-hex").status_code, 400)
 
     def test_live_discovery_persists_save_skip_and_applied_without_generation(self):
         fake = {

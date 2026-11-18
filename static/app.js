@@ -1357,6 +1357,24 @@ async function bulkInboxAction(action) {
   await loadDiscoveryInbox(true);
 }
 
+function discoveryInboxRequestUrl({ profileId = "", category = "all_relevant", searchId = "", page = 0, pageSize = 500 } = {}) {
+  const params = new URLSearchParams();
+  if (profileId) params.set("candidate_profile_id", String(profileId));
+  params.set("include_history", "1");
+  if (searchId) {
+    if (category !== "review_required") throw new Error("A search-scoped Inbox request must use Needs Review.");
+    params.set("category", "review_required");
+    params.set("search_id", String(searchId));
+  } else if (category === "requalified") {
+    params.set("category", "requalified");
+    params.set("page_size", String(pageSize));
+    params.set("page", String(page));
+  } else if (["new", "new_actionable", "review", "review_required", "excluded"].includes(category)) {
+    params.set("category", category);
+  }
+  return `/api/discovery/inbox?${params.toString()}`;
+}
+
 async function loadDiscoveryInbox(force = false, append = false) {
   const target = document.getElementById("discovery-inbox");
   if (!target) return;
@@ -1365,13 +1383,13 @@ async function loadDiscoveryInbox(force = false, append = false) {
     return;
   }
   try {
-    const profileQuery = state.selectedCandidateProfileId ? `?candidate_profile_id=${encodeURIComponent(state.selectedCandidateProfileId)}` : "";
-    const separator = profileQuery ? "&" : "?";
     const isRequalified = state.discoveryInboxCategory === "requalified";
-    const searchQuery = state.discoveryInboxSearchId && state.discoveryInboxCategory === "review_required" ? `${separator}search_id=${encodeURIComponent(state.discoveryInboxSearchId)}` : "";
-    const searchSeparator = searchQuery ? "&" : separator;
-    const categoryQuery = isRequalified ? `${searchSeparator}category=requalified&page_size=500&page=${state.discoveryInboxPage}` : "";
-    const jobs = await api.get(`/api/discovery/inbox${profileQuery}${searchQuery}${searchQuery ? "&" : separator}include_history=1${categoryQuery}`);
+    const jobs = await api.get(discoveryInboxRequestUrl({
+      profileId: state.selectedCandidateProfileId,
+      category: state.discoveryInboxCategory,
+      searchId: state.discoveryInboxSearchId,
+      page: state.discoveryInboxPage,
+    }));
     const selectedProfile = state.selectedCandidateProfileId ? String(state.selectedCandidateProfileId) : "";
     // Shared discovery rows use candidate_profile_id=0; applicant-specific
     // state returned by the API is the ownership signal for those rows.

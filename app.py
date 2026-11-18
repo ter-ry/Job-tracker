@@ -2157,6 +2157,15 @@ def create_app() -> Flask:
         requested_category = text(request.args.get("category")).lower()
         applicant_id = applicant_profile_id(request.args)
         requested_search_id = text(request.args.get("search_id"))
+        if requested_search_id:
+            # Async execution IDs are opaque hexadecimal values.  A search
+            # scoped request must name its membership category explicitly;
+            # never silently downgrade a malformed/incomplete request to the
+            # cumulative Inbox.
+            if not re.fullmatch(r"[0-9a-fA-F]{16,64}", requested_search_id):
+                return jsonify({"error": "Invalid discovery search ID."}), 400
+            if requested_category not in {"review", "review_required", "new", "new_actionable", "excluded", "all_relevant"}:
+                return jsonify({"error": "A supported discovery Inbox category is required with search_id."}), 400
         query = "SELECT * FROM jobs WHERE discovery_first_seen_at <> ''"
         query_args: list[Any] = []
         if requested_category == "requalified":
