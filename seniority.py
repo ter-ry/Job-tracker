@@ -245,7 +245,7 @@ def extract_experience_ranges(content: str) -> tuple[list[ExperienceRange], list
         required.append(ExperienceRange(0, 0, "required", "no experience required"))
 
     range_pattern = re.compile(
-        r"(?P<a>\d{1,2})(?:\s*(?:\+|\\\+|plus)|\s*(?:-|\\-|to|–)\s*(?P<b>\d{1,2})(?:\s*(?:\+|\\\+|plus))?)?\s*(?:years?|yrs?)"
+        r"(?P<a>\d{1,2})(?:\s*(?:\+|\\\+|plus)|\s*(?:-|\\-|to|–|—|‑)\s*(?P<b>\d{1,2})(?:\s*(?:\+|\\\+|plus))?)?\s*(?:years?|yrs?)"
         r"(?:\s+of)?\s+(?:professional\s+)?(?:work\s+)?(?:experience|development|engineering|programming|building|shipping|working|with\s+(?:children|families|software))?(?:\s+(?:experience|development|engineering|programming|building|shipping|working))?",
         re.I,
     )
@@ -309,6 +309,12 @@ def classify_experience_section(content: str, position: int) -> str:
 
 def is_false_experience_match(content: str, start: int, end: int) -> bool:
     snippet = content[max(0, start - 30) : min(len(content), end + 30)].lower()
+    local = content[max(0, start - 12) : min(len(content), end + 20)].lower()
+    # Age/eligibility requirements such as "must be 18+ years" are not
+    # professional experience, even when they appear under a generic
+    # requirements heading. Keep them out of required/preferred years.
+    if re.search(r"\b(?:age|aged|minimum\s+age|years?\s+old)\b", local) or (re.search(r"\b\d{1,2}\s*\+\s*years?\b", local) and re.search(r"\b(?:must\s+be|eligible|legal)\b", local)):
+        return True
     if re.search(r"\$\s*\d", snippet) or re.search(r"\bfor\s+\d{1,2}\s*(?:\+|\\\+)?\s*years?\s*,?\s*(?:we|our|the company)\b", snippet) or re.search(r"\b(?:for\s+)?(?:more\s+than|over)\s+\d{1,2}\s*years?\s+across\s+the\b", snippet) or re.search(r"\b(?:founded|operating|in business|history|mission)\b[^.\n]{0,45}\b\d{1,2}\s*years?\b", snippet) or re.search(r"\b\d{1,2}\s*years?\b[^.\n]{0,45}\b(?:founded|in business|history|company)\b", snippet) or any(term in snippet for term in ["salary", "per year", "annually", "version", "python 3", "team of", "people on", "joined us", "joined the team"]):
         return True
     number_match = re.search(r"\d{1,4}", content[start:end])

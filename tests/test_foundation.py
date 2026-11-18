@@ -13,6 +13,23 @@ class FoundationArchitectureTest(unittest.TestCase):
         analysis = analyze_job_seniority({"title": "Software Engineer", "job_description": "Requirements: 3+ years building and shipping production software."})
         self.assertEqual(analysis["required_experience"]["minimum"], 3)
 
+    def test_experience_parser_does_not_treat_age_as_professional_experience(self):
+        analysis = analyze_job_seniority({
+            "title": "Software Engineering Co-op",
+            "job_description": "Applicants must be 18+ years of age. Preferred: 3—5 years of software development experience.",
+        })
+        self.assertIsNone(analysis["required_experience"])
+        self.assertEqual(analysis["preferred_experience"]["minimum"], 3)
+        self.assertEqual(analysis["preferred_experience"]["maximum"], 5)
+
+    def test_experience_parser_keeps_ambiguous_range_context(self):
+        analysis = analyze_job_seniority({
+            "title": "Co-op Developer",
+            "job_description": "The company has 35+ years of history. Experience may be 3–5 years depending on placement.",
+        })
+        self.assertIsNone(analysis["required_experience"])
+        self.assertTrue(analysis["ambiguous_experience"])
+
     def test_migrations_are_versioned_and_repeatable(self):
         db = sqlite3.connect(":memory:")
         first = run_migrations(db)

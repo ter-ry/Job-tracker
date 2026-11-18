@@ -2156,6 +2156,7 @@ def create_app() -> Flask:
         include_history = as_bool(request.args.get("include_history"))
         requested_category = text(request.args.get("category")).lower()
         applicant_id = applicant_profile_id(request.args)
+        requested_search_id = clamp_int(request.args.get("search_id"), 0, 10**9)
         query = "SELECT * FROM jobs WHERE discovery_first_seen_at <> ''"
         query_args: list[Any] = []
         if requested_category == "requalified":
@@ -2163,6 +2164,15 @@ def create_app() -> Flask:
                        JOIN discovery_requalifications r ON r.job_id = j.id AND r.applicant_profile_id = ?
                        WHERE j.discovery_first_seen_at <> ''"""
             query_args.append(applicant_id)
+        if requested_search_id:
+            query += " AND discovery_last_search_id = ?"
+            query_args.append(requested_search_id)
+        if requested_category in {"new", "new_actionable"}:
+            query += " AND discovery_result_category = 'actionable'"
+        elif requested_category in {"review", "review_required"}:
+            query += " AND discovery_result_category = 'review_required'"
+        elif requested_category == "excluded":
+            query += " AND discovery_result_category = 'excluded'"
         if applicant_id:
             # History is applicant-scoped. Include source rows owned by this
             # applicant plus explicit presentation/state records, never another
@@ -2219,8 +2229,13 @@ def create_app() -> Flask:
                 category = "excluded"
             elif text(item.get("discovery_result_category")) == "review_required":
                 category = "review_required"
+            elif text(item.get("discovery_result_category")) == "archived_low_priority":
+                category = "archived_low_priority"
             else:
-                category = "new_actionable"
+                # Missing or stale categories are historical records, not
+                # recommendations. They must be re-evaluated explicitly
+                # before entering New or Needs Review.
+                category = "archived_unclassified"
             item["discovery_inbox_category"] = category
             jobs.append(item)
         return jsonify(jobs)
@@ -2854,7 +2869,7 @@ def create_app() -> Flask:
         for item in ordered:
             item["recommendation_eligible"] = item.get("discovery_result_category") == "actionable"
         matching_jobs = [item for item in ordered if item.get("discovery_result_category") == "actionable"]
-        review_required_jobs = [item for item in ordered if item.get("discovery_result_category") not in {"actionable", "excluded"}]
+        review_required_jobs = [item for item in ordered if item.get("discovery_result_category") == "review_required"]
         # Persist only after the final hard and target gates have run. This
         # prevents stale actionable rows from surviving a stricter recheck.
         persisted = persist_discovery_jobs(ordered, None, manual_run_id)
@@ -4071,8 +4086,8 @@ def run_discovery_pipeline(
                 clean["discovery_result_reason"] = "Possible duplicate requires review; distinct requisitions are never merged automatically."
         seen_jobs.append(clean)
         jobs.append(clean)
-    capped_count = max(0, len(jobs) - search["total_cap"])
-    jobs = sort_discovery_jobs(jobs, "application_priority_score", "desc", "", "asc", "remote_after_local", "last")[: search["total_cap"]]
+    capped_count = 0
+    jobs = sort_discovery_jobs(jobs, "application_priority_score", "desc", "", "asc", "remote_after_local", "last")
     requested_target = int(search.get("requested_target") or 50)
     ordered = list(jobs)
     target_review_jobs = [item for item in ordered if item.get("discovery_result_category") == "actionable" and not discovery_target_eligible(item, search)]
@@ -4110,7 +4125,7 @@ def run_discovery_pipeline(
     matching_jobs = eligible_unpresented[:requested_target]
     # Presentation is acknowledged only after the browser renders final rows;
     # a worker completing while a browser crashes must not silently hide jobs.
-    review_required_jobs = [item for item in ordered if item.get("discovery_result_category") not in {"actionable", "excluded"}]
+    review_required_jobs = [item for item in ordered if item.get("discovery_result_category") == "review_required"]
     excluded_jobs = [item for item in ordered if item.get("discovery_result_category") == "excluded"]
     review_reason_counts: dict[str, int] = {}
     for item in review_required_jobs:
@@ -4144,6 +4159,8 @@ def run_discovery_pipeline(
         "early_filter_reasons": early_filter_reasons,
         "excluded_count": len(excluded_jobs),
         "capped_count": capped_count,
+        "processing_cap": int(search.get("total_cap") or 0),
+        "pending_classification_count": 0,
         "visible_count": len(jobs),
         "requested_target": requested_target,
         "raw_jobs_inspected": len(fetched.get("jobs", [])),
@@ -10318,7 +10335,11 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
             return ("adjacent_opportunity", "Explore mode retained an adjacent role for manual review.") if search_mode == "explore" else ("review_required", "The stored role family is outside the selected software-developer target family.")
         seniority = job.get("qualification_fit_seniority") or {}
         if seniority.get("stretch_role") or (text(job.get("application_priority_score")).isdigit() and int(job.get("application_priority_score")) < 50):
-            return "review_required", "The posting expects experience or seniority that is not confirmed as aligned with the selected target."
+            if seniority.get("stretch_role"):
+                return "review_required", "The posting expects experience or seniority that is not confirmed as aligned with the selected target."
+            if text(job.get("qualification_evidence_source")):
+                return "archived_low_priority", "Relevant role retained in history because its verified technical priority is below the application threshold."
+            return "review_required", "Technical fit is uncertain because the posting evidence is incomplete."
         if text(job.get("distance_radius_status")).lower() == "unknown":
             return "actionable", "Title and hard requirements are suitable; workplace distance remains a provisional city/region match."
         return "actionable", "No remote-only restriction applies."
@@ -10336,7 +10357,11 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
             return ("adjacent_opportunity", "Explore mode retained an adjacent role for manual review.") if search_mode == "explore" else ("review_required", "The stored role family is outside the selected software-developer target family.")
         seniority = job.get("qualification_fit_seniority") or {}
         if seniority.get("stretch_role") or (text(job.get("application_priority_score")).isdigit() and int(job.get("application_priority_score")) < 50):
-            return "review_required", "The posting expects experience or seniority that is not confirmed as aligned with the selected target."
+            if seniority.get("stretch_role"):
+                return "review_required", "The posting expects experience or seniority that is not confirmed as aligned with the selected target."
+            if text(job.get("qualification_evidence_source")):
+                return "archived_low_priority", "Relevant role retained in history because its verified technical priority is below the application threshold."
+            return "review_required", "Technical fit is uncertain because the posting evidence is incomplete."
         return "actionable", "Remote arrangement and Canadian eligibility are supported by the posting data; commute distance does not apply."
     return "review_required", "Work arrangement or Canadian eligibility requires review."
 
