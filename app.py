@@ -2175,12 +2175,22 @@ def create_app() -> Flask:
                        JOIN discovery_requalifications r ON r.job_id = j.id AND r.applicant_profile_id = ?
                        WHERE j.discovery_first_seen_at <> ''"""
             query_args.append(applicant_id)
+        elif requested_category == "all_relevant":
+            query += " AND (discovery_result_category IN ('actionable', 'review_required')"
+            if applicant_id:
+                query += " OR EXISTS (SELECT 1 FROM discovery_requalifications r WHERE r.job_id = jobs.id AND r.applicant_profile_id = ?)"
+                query_args.append(applicant_id)
+                query += " OR EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = jobs.id AND s.applicant_profile_id = ? AND s.state IN ('saved', 'applied', 'reviewed'))"
+                query_args.append(applicant_id)
+                query += " OR (discovery_result_category IN ('actionable', 'review_required') AND EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = jobs.id AND p.applicant_profile_id = ?))"
+                query_args.append(applicant_id)
+            query += ")"
         if requested_category in {"new", "new_actionable"}:
             query += " AND discovery_result_category = 'actionable'"
             if applicant_id:
                 query += " AND NOT EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = jobs.id AND p.applicant_profile_id = ?)"
                 query_args.append(applicant_id)
-                query += " AND NOT EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = jobs.id AND s.applicant_profile_id = ? AND s.state IN ('saved', 'applied', 'skipped', 'ignored'))"
+                query += " AND NOT EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = jobs.id AND s.applicant_profile_id = ?)"
                 query_args.append(applicant_id)
         elif requested_category in {"review", "review_required"}:
             query += " AND discovery_result_category = 'review_required'"
@@ -2218,6 +2228,8 @@ def create_app() -> Flask:
                 query += " AND m.category = 'actionable'"
             elif requested_category == "excluded":
                 query += " AND m.category = 'excluded'"
+            elif requested_category == "all_relevant":
+                query += " AND m.category IN ('actionable', 'review_required')"
             query += " ORDER BY j.discovery_last_seen_at DESC, j.id DESC"
         page_size = clamp_int_default(request.args.get("page_size"), 500, 1, 500)
         page = clamp_int_default(request.args.get("page"), 0, 0, 100000)
@@ -2302,6 +2314,8 @@ def create_app() -> Flask:
                 category = "skipped"
             elif text(item.get("discovery_state")) == "saved":
                 category = "saved"
+            elif text(item.get("discovery_state")) == "reviewed":
+                category = "review_required"
             elif requalified:
                 category = "requalified"
                 item["requalified_reason"] = text(requalified["reason"])
@@ -2329,7 +2343,7 @@ def create_app() -> Flask:
             return jsonify({"error": "candidate_profile_id is required for applicant-specific Inbox counts."}), 400
         base = "j.discovery_first_seen_at <> '' AND (j.candidate_profile_id IN ('', 0) OR j.candidate_profile_id = ? OR EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = j.id AND p.applicant_profile_id = ?) OR EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = j.id AND s.applicant_profile_id = ?))"
         args = [applicant_id, applicant_id, applicant_id]
-        rows = query_db(f"SELECT j.id, j.discovery_result_category, EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = j.id AND p.applicant_profile_id = ?) AS presented, COALESCE((SELECT state FROM discovery_applicant_states s WHERE s.job_id = j.id AND s.applicant_profile_id = ?), '') AS applicant_state FROM jobs j WHERE {base}", [applicant_id, applicant_id, *args])
+        rows = query_db(f"SELECT j.id, j.discovery_result_category, EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = j.id AND p.applicant_profile_id = ?) AS presented, COALESCE((SELECT state FROM discovery_applicant_states s WHERE s.job_id = j.id AND s.applicant_profile_id = ?), '') AS applicant_state, EXISTS (SELECT 1 FROM discovery_requalifications r WHERE r.job_id = j.id AND r.applicant_profile_id = ?) AS requalified FROM jobs j WHERE {base}", [applicant_id, applicant_id, applicant_id, *args])
         counts = {"all_discovered": 0, "all_relevant": 0, "new_actionable": 0, "review_required": 0, "excluded": 0, "presented": 0, "saved": 0, "applied": 0, "skipped": 0}
         for row in rows:
             counts["all_discovered"] += 1
@@ -2340,10 +2354,10 @@ def create_app() -> Flask:
             elif state in {"skipped", "ignored"}: counts["skipped"] += 1
             category = text(row["discovery_result_category"])
             presented = int(row["presented"] or 0)
-            if category in {"actionable", "review_required"} or presented or state in {"saved", "applied"}:
+            if category in {"actionable", "review_required"} or int(row["requalified"] or 0) or state in {"saved", "applied", "reviewed"}:
                 counts["all_relevant"] += 1
             if category == "actionable" and not presented and not state: counts["new_actionable"] += 1
-            elif category == "review_required": counts["review_required"] += 1
+            elif category == "review_required" or state == "reviewed": counts["review_required"] += 1
             elif category == "excluded": counts["excluded"] += 1
         return jsonify(counts)
 
@@ -2420,9 +2434,13 @@ def create_app() -> Flask:
             return jsonify({"error": "Applicant profile is required to reassess a discovery."}), 400
         item = job_to_dict(row, include_legacy_details=False)
         category, reason = discovery_result_category(item, text(item.get("discovery_remote_preference")))
-        status = "requalified" if category == "actionable" else "reviewed"
+        description = text(item.get("job_description"))
+        evidence_source = text(item.get("qualification_evidence_source"))
+        evidence_confidence = text(item.get("qualification_evidence_confidence")).lower()
+        grounded = bool(description and len(description) >= 80 and evidence_source and evidence_confidence not in {"", "unknown", "unverified", "low"})
+        status = "requalified" if category == "actionable" and grounded else "reviewed"
         db = get_db()
-        if category == "actionable":
+        if status == "requalified":
             db.execute(
                 "INSERT OR REPLACE INTO discovery_requalifications(job_id, applicant_profile_id, reason) VALUES (?, ?, ?)",
                 [job_id, profile_id, f"Requalified by explicit evidence reassessment: {reason or category}"],
@@ -2432,7 +2450,7 @@ def create_app() -> Flask:
             [status, job_id, profile_id],
         )
         db.commit()
-        return jsonify({"ok": True, "job_id": job_id, "applicant_profile_id": profile_id, "status": status, "category": category, "reason": reason})
+        return jsonify({"ok": True, "job_id": job_id, "applicant_profile_id": profile_id, "status": status, "category": category if grounded else "review_required", "reason": reason, "evidence_grounded": grounded})
 
     @app.post("/api/discovery/inbox/<int:job_id>/review")
     def review_discovery_job(job_id: int) -> Response:

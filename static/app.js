@@ -1305,7 +1305,7 @@ function renderDiscoveryInbox(jobs) {
   const filters = document.getElementById("discovery-inbox-filters");
   if (filters) {
     filters.innerHTML = Object.entries(labels).map(([category, label]) => { const scoped = Boolean(state.discoveryInboxSearchId); const countValue = scoped ? (category === state.discoveryInboxCategory ? jobs.length : "—") : (state.discoveryInboxCounts[category] ?? counts[category] ?? 0); const partial = !scoped && state.discoveryInboxHasMore && ["requalified", "presented", "excluded", "all_discovered"].includes(category); const count = `${countValue}${partial ? "+" : ""}`; return `<button class="button ghost small ${state.discoveryInboxCategory === category ? "active" : ""}" type="button" data-inbox-category="${category}" ${state.discoveryInboxBulkAction ? "disabled" : ""}>${label} <span class="muted">${count}</span></button>`; }).join("");
-    const runOptions = state.discoveryInboxRuns.map((run) => `<option value="${escapeAttribute(run.search_id)}">${escapeHtml(run.search_id.slice(0, 12))} · ${Number(run.review_count || 0)} review · ${Number(run.excluded_count || 0)} excluded</option>`).join("");
+    const runOptions = state.discoveryInboxRuns.map((run) => `<option value="${escapeAttribute(run.search_id)}" ${state.discoveryInboxSearchId === run.search_id ? "selected" : ""}>${escapeHtml(run.search_id.slice(0, 12))} · ${Number(run.review_count || 0)} review · ${Number(run.excluded_count || 0)} excluded</option>`).join("");
     filters.innerHTML += runOptions ? `<label class="inbox-search-run">Search run <select data-inbox-search-run><option value="">All runs</option>${runOptions}</select></label>` : "";
     filters.querySelector("[data-inbox-search-run]")?.addEventListener("change", async (event) => {
       state.discoveryInboxSearchId = event.target.value || "";
@@ -1316,7 +1316,7 @@ function renderDiscoveryInbox(jobs) {
     });
     filters.querySelectorAll("[data-inbox-category]").forEach((button) => button.addEventListener("click", async () => {
       state.discoveryInboxCategory = button.dataset.inboxCategory || "new_actionable";
-      state.discoveryInboxSearchId = "";
+      if (!(state.discoveryInboxSearchId && ["review_required", "excluded", "new_actionable", "all_relevant"].includes(state.discoveryInboxCategory))) state.discoveryInboxSearchId = "";
       state.discoveryInboxPage = 0;
       await loadDiscoveryInbox(true);
     }));
@@ -1341,7 +1341,7 @@ function renderDiscoveryInbox(jobs) {
     });
     filters.querySelector("[data-inbox-select-visible]")?.addEventListener("click", () => { visibleIds.forEach((id) => state.discoveryInboxSelected.add(id)); renderDiscoveryInbox(state.discoveryInboxJobs); });
     filters.querySelector("[data-inbox-clear-selection]")?.addEventListener("click", () => { state.discoveryInboxSelected.clear(); renderDiscoveryInbox(state.discoveryInboxJobs); });
-    if (["requalified", "presented", "excluded", "all_discovered"].includes(state.discoveryInboxCategory) && state.discoveryInboxHasMore) {
+    if (["requalified", "presented", "excluded", "all_relevant", "all_discovered"].includes(state.discoveryInboxCategory) && state.discoveryInboxHasMore) {
       const next = document.createElement("button");
       next.className = "button ghost small";
       next.textContent = "Load more history";
@@ -1383,7 +1383,7 @@ function discoveryInboxRequestUrl({ profileId = "", category = "all_relevant", s
     if (!["review_required", "excluded", "new_actionable", "all_relevant"].includes(category)) throw new Error("A search-scoped Inbox request must use a supported category.");
     params.set("category", category);
     params.set("search_id", String(searchId));
-  } else if (["requalified", "presented", "excluded", "all_discovered"].includes(category)) {
+  } else if (["requalified", "presented", "excluded", "all_relevant", "all_discovered"].includes(category)) {
     params.set("category", category === "all_discovered" ? "all_discovered" : category);
     params.set("page_size", String(pageSize));
     params.set("page", String(page));
@@ -1403,7 +1403,7 @@ async function loadDiscoveryInbox(force = false, append = false) {
   try {
     if (force && !append) target.textContent = "Loading Inbox history…";
     const isRequalified = state.discoveryInboxCategory === "requalified";
-    const pagedCategory = ["requalified", "presented", "excluded", "all_discovered"].includes(state.discoveryInboxCategory);
+    const pagedCategory = ["requalified", "presented", "excluded", "all_relevant", "all_discovered"].includes(state.discoveryInboxCategory);
     const jobsUrl = discoveryInboxRequestUrl({
       profileId: state.selectedCandidateProfileId,
       category: state.discoveryInboxCategory,

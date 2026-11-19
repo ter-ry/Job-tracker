@@ -3057,10 +3057,11 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(flagged.status_code, 200)
         reassessed = self.client.post(f"/api/discovery/inbox/{jobs[1]['id']}/reassess", json={"applicant_profile_id": profile["id"], "workflow": "software"})
         self.assertEqual(reassessed.status_code, 200)
-        self.assertEqual(reassessed.get_json()["status"], "requalified")
-        refreshed = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=requalified&include_history=1").get_json()
+        self.assertEqual(reassessed.get_json()["status"], "reviewed")
+        self.assertFalse(reassessed.get_json()["evidence_grounded"])
+        refreshed = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=excluded&include_history=1").get_json()
         refreshed_job = next(item for item in refreshed if item["id"] == jobs[1]["id"])
-        self.assertEqual(refreshed_job["reassessment_flag"]["status"], "requalified")
+        self.assertEqual(refreshed_job["reassessment_flag"]["status"], "reviewed")
 
     def test_presented_actionable_jobs_are_not_new_and_counts_match(self):
         self.client.get("/api/health")
@@ -3103,6 +3104,37 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(runs.get_json()[0]["search_id"], "d" * 32)
         self.assertEqual(runs.get_json()[0]["excluded_count"], 1)
         self.assertEqual(scoped.get_json()[0]["search_membership_evidence"]["reason"], "Original exclusion")
+
+    def test_all_relevant_is_server_filtered_and_paginated_with_reviewed_state(self):
+        self.client.get("/api/health")
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Paging owner", "workflow": "software"}).get_json()
+        jobs = [
+            {
+                "company": "Paging Co", "title": f"Software Developer {index}", "location": "Toronto, ON",
+                "url": f"https://example.test/paging-{index}", "source": "Indeed", "source_job_id": f"paging-{index}",
+                "discovery_result_category": "actionable", "discovery_result_reason": "Verified match",
+                "candidate_profile_id": profile["id"], "discovery_occupation": "software developer",
+            }
+            for index in range(501)
+        ]
+        with app_module.app.app_context():
+            app_module.persist_discovery_jobs(jobs, None, None)
+        first = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=all_relevant&include_history=1&page_size=500&page=0")
+        second = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=all_relevant&include_history=1&page_size=500&page=1")
+        counts = self.client.get(f"/api/discovery/inbox/counts?candidate_profile_id={profile['id']}").get_json()
+        self.assertEqual(len(first.get_json()), 500)
+        self.assertEqual(len(second.get_json()), 1)
+        self.assertEqual(counts["all_relevant"], 501)
+        self.assertEqual(counts["new_actionable"], 501)
+        reviewed_id = jobs[0]["id"]
+        reviewed = self.client.post(f"/api/discovery/inbox/{reviewed_id}/review", json={"candidate_profile_id": profile["id"], "workflow": "software"})
+        self.assertEqual(reviewed.status_code, 200)
+        new_rows = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=new_actionable&include_history=1").get_json()
+        self.assertNotIn(reviewed_id, {item["id"] for item in new_rows})
+        reviewed_rows = []
+        for page in (0, 1):
+            reviewed_rows.extend(self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=all_relevant&include_history=1&page_size=500&page={page}").get_json())
+        self.assertEqual(next(item for item in reviewed_rows if item["id"] == reviewed_id)["discovery_inbox_category"], "review_required")
 
     def test_live_discovery_persists_save_skip_and_applied_without_generation(self):
         fake = {

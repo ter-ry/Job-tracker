@@ -34,7 +34,8 @@ vm.runInNewContext(`${source.slice(start, end)}; this.loadDiscoveryInbox = loadD
   await context.loadDiscoveryInbox(true);
   const cumulativeUrl = calls.filter((url) => url.startsWith("/api/discovery/inbox?")).at(-1);
   const cumulative = new URL(`http://localhost${cumulativeUrl}`);
-  assert.strictEqual(cumulative.searchParams.get("category"), null);
+  assert.strictEqual(cumulative.searchParams.get("category"), "all_relevant");
+  assert.strictEqual(cumulative.searchParams.get("page"), "0");
   assert.strictEqual(cumulative.searchParams.get("search_id"), null);
 
   assert.throws(() => context.discoveryInboxRequestUrl({ category: "saved", searchId }), /supported category/);
