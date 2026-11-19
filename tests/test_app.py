@@ -88,6 +88,10 @@ class JobAssistantTest(unittest.TestCase):
         self.tmpdir = tempfile.TemporaryDirectory()
         app_module.DATA_DIR = Path(self.tmpdir.name)
         app_module.DB_PATH = app_module.DATA_DIR / "test.sqlite"
+        # The application caches its initialized path process-wide. Reset it
+        # between disposable test databases so a Windows temp-path reuse can
+        # never make one fixture's rows visible to another test.
+        app_module._INITIALIZED_DATABASE_PATH = None
         app_module.app.config.update(TESTING=True)
         self.client = app_module.app.test_client()
 
