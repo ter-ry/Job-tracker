@@ -251,6 +251,21 @@ document.addEventListener("DOMContentLoaded", () => {
     setDiscoverySection("inbox");
     loadDiscoveryInbox(true);
   });
+  document.getElementById("open-applied-applications")?.addEventListener("click", () => {
+    document.querySelector('.tab[data-tab="tracker"]')?.click();
+    const filter = document.getElementById("status-filter");
+    if (filter) filter.value = "Applied";
+    renderJobs();
+  });
+  document.getElementById("open-ready-applications")?.addEventListener("click", () => {
+    document.querySelector('.tab[data-tab="discovery"]')?.click();
+    state.discoveryInboxCategory = "ready_to_apply";
+    state.discoveryInboxSearchId = "";
+    state.discoveryInboxPage = 0;
+    state.discoveryInboxJobs = [];
+    setDiscoverySection("inbox");
+    loadDiscoveryInbox(true);
+  });
   document.getElementById("toggle-discovery-scheduler").addEventListener("click", toggleDiscoveryScheduler);
   document.getElementById("refresh-discovery-task-status")?.addEventListener("click", loadDiscoveryTaskStatus);
   document.getElementById("csv-import-form").addEventListener("submit", importCsv);
@@ -447,7 +462,7 @@ async function loadAll({ skipProfiles = false } = {}) {
     const profileQuery = state.selectedCandidateProfileId ? `?candidate_profile_id=${encodeURIComponent(state.selectedCandidateProfileId)}` : "";
     const [jobs, dashboard, profile, systemHealth, evidence] = await Promise.all([
       api.get(`/api/jobs${profileQuery}`),
-      api.get("/api/dashboard"),
+      api.get(`/api/dashboard${profileQuery}`),
       api.get("/api/profile"),
       api.get("/api/health").catch((error) => ({ status: "error", summary: error.message })),
       api.get("/api/evidence").catch(() => []),
@@ -467,6 +482,15 @@ async function loadAll({ skipProfiles = false } = {}) {
     renderProfile(profile);
     renderCandidateProfiles();
     void loadHistoricalDuplicateMatches();
+    const selectedProfile = state.candidateProfiles.find((candidate) => String(candidate.id) === String(state.selectedCandidateProfileId));
+    const applicantLabel = document.getElementById("applications-selected-applicant");
+    if (applicantLabel) applicantLabel.textContent = selectedProfile ? `Applicant: ${selectedProfile.name || selectedProfile.display_name || `Profile ${selectedProfile.id}`}` : "Applicant: legacy shared history";
+    const appliedCount = document.getElementById("applications-applied-count");
+    if (appliedCount) appliedCount.textContent = String(jobs.filter((job) => (job.applicant_status || job.status) === "Applied").length);
+    const readyCount = document.getElementById("applications-ready-count");
+    if (readyCount && state.selectedCandidateProfileId) {
+      api.get(`/api/discovery/inbox/counts?candidate_profile_id=${encodeURIComponent(state.selectedCandidateProfileId)}`).then((counts) => { readyCount.textContent = String(counts.ready_to_apply ?? 0); }).catch(() => { readyCount.textContent = "—"; });
+     }
     renderTemplateStatus(profile);
     renderOllamaHealth({ status: "loading", summary: "Checking local AI status…" });
     renderEvidenceLibrary(evidence);
@@ -1516,7 +1540,7 @@ function discoveryInboxRequestUrl({ profileId = "", category = "all_relevant", s
     if (!["review_required", "excluded", "new_actionable", "all_relevant"].includes(category)) throw new Error("A search-scoped Inbox request must use a supported category.");
     params.set("category", category);
     params.set("search_id", String(searchId));
-  } else if (["requalified", "ready_to_apply", "presented", "excluded", "all_relevant", "all_discovered"].includes(category)) {
+  } else if (["requalified", "ready_to_apply", "presented", "saved", "applied", "skipped", "excluded", "all_relevant", "all_discovered"].includes(category)) {
     params.set("category", category === "all_discovered" ? "all_discovered" : category);
     params.set("page_size", String(pageSize));
     params.set("page", String(page));
@@ -1536,7 +1560,7 @@ async function loadDiscoveryInbox(force = false, append = false) {
   try {
     if (force && !append) target.textContent = "Loading Inbox history…";
     const isRequalified = state.discoveryInboxCategory === "requalified";
-    const pagedCategory = ["ready_to_apply", "requalified", "presented", "excluded", "all_relevant", "all_discovered"].includes(state.discoveryInboxCategory);
+    const pagedCategory = ["ready_to_apply", "requalified", "presented", "saved", "applied", "skipped", "excluded", "all_relevant", "all_discovered"].includes(state.discoveryInboxCategory);
     const jobsUrl = discoveryInboxRequestUrl({
       profileId: state.selectedCandidateProfileId,
       category: state.discoveryInboxCategory,
@@ -2018,7 +2042,7 @@ async function markPipelineApplied(id) {
   if (!window.confirm(`Mark ${job.title || "this job"} as applied?`)) return;
   state.pendingAppliedJobs.add(id);
   try {
-    const applied = await api.send(`/api/jobs/${id}/applied`, "POST", { date_applied: appliedDate });
+    const applied = await api.send(`/api/jobs/${id}/applied`, "POST", { date_applied: appliedDate, candidate_profile_id: state.selectedCandidateProfileId });
     const index = state.jobs.findIndex((item) => Number(item.id) === Number(id));
     if (index >= 0) state.jobs[index] = { ...state.jobs[index], ...applied };
     toast(`Marked applied on ${applied.date_applied || appliedDate}`);
@@ -2033,7 +2057,7 @@ async function markPipelineApplied(id) {
 
 async function savePipelineJob(id) {
   try {
-    const saved = await api.send(`/api/jobs/${id}/save`, "POST", {});
+    const saved = await api.send(`/api/jobs/${id}/save`, "POST", { candidate_profile_id: state.selectedCandidateProfileId });
     const index = state.jobs.findIndex((item) => Number(item.id) === Number(id));
     if (index >= 0) state.jobs[index] = { ...state.jobs[index], ...saved };
     toast("Saved for later");
@@ -2043,7 +2067,7 @@ async function savePipelineJob(id) {
 
 async function skipPipelineJob(id) {
   try {
-    await api.send(`/api/jobs/${id}/skip`, "POST", {});
+    await api.send(`/api/jobs/${id}/skip`, "POST", { candidate_profile_id: state.selectedCandidateProfileId });
     const index = state.jobs.findIndex((item) => Number(item.id) === Number(id));
     if (index >= 0) state.jobs[index] = { ...state.jobs[index], discovery_state: "ignored" };
     toast("Skipped; it remains available in history");
@@ -2270,7 +2294,7 @@ function renderJobs() {
     const salaryFilter = true;
     return (
       (!search || content.includes(search)) &&
-      (!status || job.status === status) &&
+      (!status || (job.applicant_status || job.status) === status) &&
       (!fit || Number(job.fit_score || 0) >= fit) &&
       (!role || job.role_type === role) &&
       (!remote || job.remote_type === remote) &&
@@ -2295,7 +2319,7 @@ function renderJobs() {
           <td>${escapeHtml(job.location || "")}<br><span class="muted">${escapeHtml(job.remote_type || "")}</span></td>
           <td>${scorePill(job.fit_score)}<div class="mini-breakdown">${miniBreakdown(job)}</div></td>
           <td>${riskLabel(job)}</td>
-          <td>${escapeHtml(job.status)}</td>
+          <td>${escapeHtml(job.applicant_status || job.status)}</td>
           <td>${escapeHtml(job.salary || "Missing")}</td>
           <td>${escapeHtml(job.deadline || "")}</td>
           <td>
@@ -2377,6 +2401,7 @@ function getPayload() {
     notes: value("notes"),
     job_description: savedDescription,
     paste_description: pastedDescription,
+    candidate_profile_id: state.selectedCandidateProfileId || "",
   };
 }
 

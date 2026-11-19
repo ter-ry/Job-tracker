@@ -1541,6 +1541,7 @@ def create_app() -> Flask:
     @app.get("/api/jobs")
     def list_jobs() -> Response:
         rows = query_db("SELECT * FROM jobs ORDER BY date_added DESC, id DESC")
+        selected_applicant_id = applicant_profile_id(request.args)
         evidence_profile = None
         if request.args.get("candidate_profile_id"):
             try:
@@ -1553,10 +1554,13 @@ def create_app() -> Flask:
                 if "no base" not in str(exc).lower() and "resume" not in str(exc).lower() and "résumé" not in str(exc).lower():
                     return jsonify({"error": str(exc)}), 400
         statuses = _preparation_statuses([int(row["id"]) for row in rows])
-        return jsonify([
-            job_to_dict(row, evidence_profile, include_legacy_details=False, preparation_status=statuses.get(int(row["id"])))
-            for row in rows
-        ])
+        result = []
+        for row in rows:
+            item = job_to_dict(row, evidence_profile, include_legacy_details=False, preparation_status=statuses.get(int(row["id"])))
+            if selected_applicant_id:
+                apply_applicant_lifecycle_to_job(item, selected_applicant_id)
+            result.append(item)
+        return jsonify(result)
 
     @app.post("/api/jobs/<int:job_id>/applied")
     def mark_job_applied(job_id: int) -> Response:
@@ -1565,31 +1569,56 @@ def create_app() -> Flask:
         if existing is None:
             return jsonify({"error": "Job not found"}), 404
         payload = request.get_json(silent=True) or {}
+        selected_applicant_id = applicant_profile_id(payload)
+        if selected_applicant_id or text(existing["discovery_first_seen_at"]):
+            try:
+                validate_discovery_action_owner(existing, payload)
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
         applied_date = text(payload.get("date_applied")) or text(existing["date_applied"]) or date.today().isoformat()
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", applied_date):
             return jsonify({"error": "date_applied must use YYYY-MM-DD"}), 400
-        get_db().execute(
-            """UPDATE jobs SET status = 'Applied', date_applied = ?,
-               discovery_state = CASE WHEN discovery_first_seen_at <> '' THEN 'applied' ELSE discovery_state END,
-               updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
-            [applied_date, job_id],
-        )
+        if selected_applicant_id:
+            set_applicant_discovery_state(job_id, selected_applicant_id, "applied", applied_date)
+        else:
+            get_db().execute(
+                """UPDATE jobs SET status = 'Applied', date_applied = ?,
+                   discovery_state = CASE WHEN discovery_first_seen_at <> '' THEN 'applied' ELSE discovery_state END,
+                   updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+                [applied_date, job_id],
+            )
         get_db().commit()
-        return jsonify(job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True), include_legacy_details=False))
+        result = job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True), include_legacy_details=False)
+        if selected_applicant_id:
+            apply_applicant_lifecycle_to_job(result, selected_applicant_id)
+        return jsonify(result)
 
     @app.post("/api/jobs/<int:job_id>/save")
     def save_job_for_later(job_id: int) -> Response:
         existing = query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)
         if existing is None:
             return jsonify({"error": "Job not found"}), 404
-        get_db().execute(
-            """UPDATE jobs SET status = 'Saved',
-               discovery_state = CASE WHEN discovery_first_seen_at <> '' THEN 'saved' ELSE discovery_state END,
-               updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
-            [job_id],
-        )
+        payload = request.get_json(silent=True) or {}
+        selected_applicant_id = applicant_profile_id(payload)
+        if selected_applicant_id or text(existing["discovery_first_seen_at"]):
+            try:
+                validate_discovery_action_owner(existing, payload)
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
+        if selected_applicant_id:
+            set_applicant_discovery_state(job_id, selected_applicant_id, "saved")
+        else:
+            get_db().execute(
+                """UPDATE jobs SET status = 'Saved',
+                   discovery_state = CASE WHEN discovery_first_seen_at <> '' THEN 'saved' ELSE discovery_state END,
+                   updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+                [job_id],
+            )
         get_db().commit()
-        return jsonify(job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True), include_legacy_details=False))
+        result = job_to_dict(query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True), include_legacy_details=False)
+        if selected_applicant_id:
+            apply_applicant_lifecycle_to_job(result, selected_applicant_id)
+        return jsonify(result)
 
     @app.post("/api/jobs/<int:job_id>/skip")
     def skip_job(job_id: int) -> Response:
@@ -1598,10 +1627,18 @@ def create_app() -> Flask:
             return jsonify({"error": "Job not found"}), 404
         payload = request.get_json(silent=True) or {}
         requested_profile = clamp_int(payload.get("candidate_profile_id"), 0, 10**9)
+        if requested_profile or text(existing["discovery_first_seen_at"]):
+            try:
+                validate_discovery_action_owner(existing, payload)
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
         stored_profile = clamp_int(existing["candidate_profile_id"], 0, 10**9)
         if stored_profile and requested_profile != stored_profile:
             return jsonify({"error": "This discovery result belongs to a different applicant profile."}), 409
-        get_db().execute("UPDATE jobs SET discovery_state = 'ignored', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
+        if requested_profile:
+            set_applicant_discovery_state(job_id, requested_profile, "ignored")
+        else:
+            get_db().execute("UPDATE jobs SET discovery_state = 'ignored', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
         get_db().commit()
         return jsonify({"ok": True, "candidate_profile_id": stored_profile or requested_profile})
 
@@ -1630,6 +1667,17 @@ def create_app() -> Flask:
         merged = job_to_dict(existing)
         merged.update(payload)
         clean = normalize_job_payload(merged)
+        selected_applicant_id = applicant_profile_id(payload)
+        if selected_applicant_id:
+            try:
+                validate_discovery_action_owner(existing, payload)
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
+        applicant_applied_date = text(payload.get("date_applied")) or date.today().isoformat()
+        if selected_applicant_id and text(payload.get("status")) == "Applied":
+            set_applicant_discovery_state(job_id, selected_applicant_id, "applied", applicant_applied_date)
+            clean["status"] = text(existing["status"])
+            clean["date_applied"] = text(existing["date_applied"])
         assignments = ", ".join([f"{column} = ?" for column in JOB_COLUMNS])
         get_db().execute(
             f"UPDATE jobs SET {assignments}, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -1637,7 +1685,10 @@ def create_app() -> Flask:
         )
         get_db().commit()
         job = query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)
-        return jsonify(job_to_dict(job))
+        result = job_to_dict(job)
+        if selected_applicant_id:
+            apply_applicant_lifecycle_to_job(result, selected_applicant_id)
+        return jsonify(result)
 
     @app.delete("/api/jobs/<int:job_id>")
     def delete_job(job_id: int) -> Response:
@@ -2540,6 +2591,13 @@ def create_app() -> Flask:
         elif requested_category == "presented":
             query += " AND EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = jobs.id AND p.applicant_profile_id = ?)"
             query_args.append(applicant_id)
+        elif requested_category in {"saved", "applied", "skipped"}:
+            if not applicant_id:
+                return jsonify({"error": "candidate_profile_id is required for applicant history."}), 400
+            states = {"saved": ("saved",), "applied": ("applied",), "skipped": ("skipped", "ignored")}[requested_category]
+            placeholders = ",".join("?" for _ in states)
+            query += f" AND EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = jobs.id AND s.applicant_profile_id = ? AND s.state IN ({placeholders}))"
+            query_args.extend([applicant_id, *states])
         if applicant_id:
             # History is applicant-scoped. Include source rows owned by this
             # applicant plus explicit presentation/state records, never another
@@ -2676,6 +2734,8 @@ def create_app() -> Flask:
             item["applicant_lifecycle_state"] = text(applicant_discovery_state(int(row["id"]), applicant_id)) if applicant_id else text(item.get("discovery_state"))
             if requested_category == "ready_to_apply":
                 category = "ready_to_apply"
+            elif requested_category in {"saved", "applied", "skipped"}:
+                category = requested_category
             elif requested_category == "presented" and presentation:
                 category = "presented"
             elif requested_category == "requalified" and requalified:
@@ -3820,10 +3880,13 @@ def create_app() -> Flask:
     def dashboard() -> Response:
         rows = query_db("SELECT * FROM jobs")
         statuses = _preparation_statuses([int(row["id"]) for row in rows])
-        jobs = [
-            job_to_dict(row, include_qualification=False, include_legacy_details=False, preparation_status=statuses.get(int(row["id"])))
-            for row in rows
-        ]
+        selected_applicant_id = applicant_profile_id(request.args)
+        jobs = []
+        for row in rows:
+            item = job_to_dict(row, include_qualification=False, include_legacy_details=False, preparation_status=statuses.get(int(row["id"])))
+            if selected_applicant_id:
+                apply_applicant_lifecycle_to_job(item, selected_applicant_id)
+            jobs.append(item)
         return jsonify(build_dashboard(jobs))
 
     @app.get("/export.csv")
@@ -4179,6 +4242,28 @@ def applicant_discovery_state(job_id: int, profile_id: int) -> str:
         [job_id, profile_id], one=True,
     )
     return text(row["state"]) if row else ""
+
+
+def apply_applicant_lifecycle_to_job(item: dict[str, Any], profile_id: int) -> dict[str, Any]:
+    """Overlay selected-applicant state without mutating the shared job row."""
+    if not profile_id or not item:
+        return item
+    row = query_db(
+        "SELECT state, date_applied FROM discovery_applicant_states WHERE job_id = ? AND applicant_profile_id = ?",
+        [int(item.get("id") or 0), profile_id], one=True,
+    )
+    if not row:
+        return item
+    state = text(row["state"])
+    labels = {"applied": "Applied", "saved": "Saved", "skipped": "Skipped", "ignored": "Skipped", "reviewed": "Needs Review"}
+    item["applicant_profile_id"] = profile_id
+    item["applicant_discovery_state"] = state
+    item["applicant_lifecycle_state"] = state
+    item["applicant_status"] = labels.get(state, state)
+    if state == "applied":
+        item["status"] = "Applied"
+        item["date_applied"] = text(row["date_applied"]) or text(item.get("date_applied"))
+    return item
 
 
 def set_applicant_discovery_state(job_id: int, profile_id: int, state: str, applied_date: str = "") -> None:

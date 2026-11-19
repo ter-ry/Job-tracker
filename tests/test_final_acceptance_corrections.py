@@ -143,6 +143,32 @@ def test_ready_to_apply_excludes_applications_but_keeps_seen_unapplied(tmp_path,
     assert counts["ready_to_apply"] == 2
 
 
+def test_applications_and_inbox_share_selected_applicant_applied_state(tmp_path, monkeypatch):
+    client = _isolated_client(tmp_path, monkeypatch)
+    swe = _profile(client, "SWE", "software")
+    ece = _profile(client, "ECE", "ece")
+    job_id = _stored_job(client, occupation="software developer")
+
+    applied = client.post(f"/api/jobs/{job_id}/applied", json={"candidate_profile_id": swe, "date_applied": "2026-11-19"})
+    assert applied.status_code == 200
+    assert applied.get_json()["applicant_status"] == "Applied"
+    # The shared job remains a source record; the other applicant has no
+    # Applied decision and therefore cannot inherit SWE's lifecycle state.
+    swe_jobs = client.get(f"/api/jobs?candidate_profile_id={swe}").get_json()
+    ece_jobs = client.get(f"/api/jobs?candidate_profile_id={ece}").get_json()
+    assert next(job for job in swe_jobs if job["id"] == job_id)["status"] == "Applied"
+    assert next(job for job in ece_jobs if job["id"] == job_id)["status"] != "Applied"
+    applied_history = client.get(f"/api/discovery/inbox?candidate_profile_id={swe}&category=applied&include_history=1")
+    assert applied_history.status_code == 200
+    assert [job["id"] for job in applied_history.get_json()] == [job_id]
+    assert client.get(f"/api/discovery/inbox?candidate_profile_id={ece}&category=applied&include_history=1").get_json() == []
+    # A reload reads the durable applicant state rather than a frontend cache.
+    with app_module.app.app_context():
+        app_module.get_db().close()
+        app_module.g.pop("db", None)
+    assert next(job for job in client.get(f"/api/jobs?candidate_profile_id={swe}").get_json() if job["id"] == job_id)["applicant_status"] == "Applied"
+
+
 def test_historical_application_import_is_preview_first_and_durable(tmp_path, monkeypatch):
     client = _isolated_client(tmp_path, monkeypatch)
     swe = _profile(client, "SWE", "software")
