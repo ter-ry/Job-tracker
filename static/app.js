@@ -1295,6 +1295,8 @@ function renderDiscoveryInbox(jobs) {
     if (button) button.disabled = Boolean(state.discoveryInboxBulkAction);
   });
   const labels = { all_relevant: "All Relevant", new_actionable: "New Opportunities", review_required: "Needs Review", presented: "Presented / Seen", excluded: "Excluded Jobs", requalified: "Requalified Since Update", saved: "Saved", applied: "Applied", skipped: "Skipped", all_discovered: "All Discovered" };
+  const primaryViews = { new_actionable: "New Jobs", review_required: "Needs Review", all_discovered: "History" };
+  const historyViews = ["all_relevant", "presented", "saved", "applied", "skipped", "excluded", "requalified", "all_discovered"];
   const counts = jobs.reduce((result, job) => {
     const category = job.discovery_inbox_category || discoveryInboxCategory(job);
     result[category] = (result[category] || 0) + 1;
@@ -1304,9 +1306,21 @@ function renderDiscoveryInbox(jobs) {
   counts.all_relevant = jobs.filter((job) => ["new_actionable", "review_required", "requalified", "saved", "applied"].includes(job.discovery_inbox_category || discoveryInboxCategory(job))).length;
   const filters = document.getElementById("discovery-inbox-filters");
   if (filters) {
-    filters.innerHTML = Object.entries(labels).map(([category, label]) => { const scoped = Boolean(state.discoveryInboxSearchId); const countValue = scoped ? (category === state.discoveryInboxCategory ? jobs.length : "—") : (state.discoveryInboxCounts[category] ?? counts[category] ?? 0); const partial = !scoped && state.discoveryInboxHasMore && ["requalified", "presented", "excluded", "all_discovered"].includes(category); const count = `${countValue}${partial ? "+" : ""}`; return `<button class="button ghost small ${state.discoveryInboxCategory === category ? "active" : ""}" type="button" data-inbox-category="${category}" ${state.discoveryInboxBulkAction ? "disabled" : ""}>${label} <span class="muted">${count}</span></button>`; }).join("");
+    const countLabel = (category) => { const scoped = Boolean(state.discoveryInboxSearchId); const countValue = scoped ? (category === state.discoveryInboxCategory ? jobs.length : "—") : (state.discoveryInboxCounts[category] ?? counts[category] ?? 0); const partial = !scoped && state.discoveryInboxHasMore && ["requalified", "presented", "excluded", "all_discovered"].includes(category); return `${countValue}${partial ? "+" : ""}`; };
+    filters.innerHTML = `<div class="inbox-primary-views" role="tablist" aria-label="Primary Jobs Inbox views">${Object.entries(primaryViews).map(([category, label]) => `<button class="button ${state.discoveryInboxCategory === category || (category === "all_discovered" && historyViews.includes(state.discoveryInboxCategory)) ? "" : "ghost"} small ${state.discoveryInboxCategory === category || (category === "all_discovered" && historyViews.includes(state.discoveryInboxCategory)) ? "active" : ""}" type="button" role="tab" aria-selected="${state.discoveryInboxCategory === category || (category === "all_discovered" && historyViews.includes(state.discoveryInboxCategory))}" data-inbox-primary="${category}" ${state.discoveryInboxBulkAction ? "disabled" : ""}>${label} <span class="muted">${countLabel(category)}</span></button>`).join("")}</div>`;
+    const showHistoryControls = Boolean(state.discoveryInboxSearchId) || historyViews.includes(state.discoveryInboxCategory);
+    if (showHistoryControls) {
+      filters.insertAdjacentHTML("beforeend", `<div class="inbox-history-views" role="tablist" aria-label="History filters">${historyViews.map((category) => `<button class="button ghost small ${state.discoveryInboxCategory === category ? "active" : ""}" type="button" data-inbox-category="${category}" ${state.discoveryInboxBulkAction ? "disabled" : ""}>${labels[category]} <span class="muted">${countLabel(category)}</span></button>`).join("")}</div>`);
+    }
     const runOptions = state.discoveryInboxRuns.map((run) => `<option value="${escapeAttribute(run.search_id)}" ${state.discoveryInboxSearchId === run.search_id ? "selected" : ""}>${escapeHtml(run.search_id.slice(0, 12))} · ${Number(run.review_count || 0)} review · ${Number(run.excluded_count || 0)} excluded</option>`).join("");
-    filters.innerHTML += runOptions ? `<label class="inbox-search-run">Search run <select data-inbox-search-run><option value="">All runs</option>${runOptions}</select></label>` : "";
+    if (runOptions && showHistoryControls) filters.insertAdjacentHTML("beforeend", `<label class="inbox-search-run">Search run <select data-inbox-search-run><option value="">All runs</option>${runOptions}</select></label>`);
+    filters.querySelectorAll("[data-inbox-primary]").forEach((button) => button.addEventListener("click", async () => {
+      state.discoveryInboxSearchId = "";
+      state.discoveryInboxCategory = button.dataset.inboxPrimary || "all_discovered";
+      state.discoveryInboxPage = 0;
+      state.discoveryInboxJobs = [];
+      await loadDiscoveryInbox(true);
+    }));
     filters.querySelector("[data-inbox-search-run]")?.addEventListener("change", async (event) => {
       state.discoveryInboxSearchId = event.target.value || "";
       state.discoveryInboxCategory = state.discoveryInboxSearchId ? "review_required" : "all_discovered";
@@ -1330,7 +1344,7 @@ function renderDiscoveryInbox(jobs) {
   });
   const visibleIds = new Set(visibleJobs.map((job) => Number(job.id)));
   if (filters) {
-    filters.innerHTML += `${state.discoveryInboxSearchId ? `<span class="muted" role="status">Showing search ${escapeHtml(state.discoveryInboxSearchId)} only</span><button class="button ghost small" type="button" data-inbox-clear-search>Return to full Inbox</button>` : ""}<button class="button ghost small" type="button" data-inbox-select-visible ${state.discoveryInboxBulkAction ? "disabled" : ""}>Select visible</button><button class="button ghost small" type="button" data-inbox-clear-selection ${state.discoveryInboxBulkAction ? "disabled" : ""}>Clear selection</button>${state.discoveryInboxBulkMessage ? `<span class="muted" role="status">${escapeHtml(state.discoveryInboxBulkMessage)}</span>` : ""}`;
+    filters.insertAdjacentHTML("beforeend", `${state.discoveryInboxSearchId ? `<span class="muted" role="status">Showing search ${escapeHtml(state.discoveryInboxSearchId)} only</span><button class="button ghost small" type="button" data-inbox-clear-search>Return to full Inbox</button>` : ""}<button class="button ghost small" type="button" data-inbox-select-visible ${state.discoveryInboxBulkAction ? "disabled" : ""}>Select visible</button><button class="button ghost small" type="button" data-inbox-clear-selection ${state.discoveryInboxBulkAction ? "disabled" : ""}>Clear selection</button>${state.discoveryInboxBulkMessage ? `<span class="muted" role="status">${escapeHtml(state.discoveryInboxBulkMessage)}</span>` : ""}`);
     filters.querySelector("[data-inbox-clear-search]")?.addEventListener("click", async () => {
       state.discoveryInboxSearchId = "";
       state.discoveryInboxCategory = "all_discovered";

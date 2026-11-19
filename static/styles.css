@@ -466,6 +466,27 @@ legend {
   justify-content: flex-end;
 }
 
+.inbox-primary-views,
+.inbox-history-views {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  width: 100%;
+}
+
+.inbox-primary-views {
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 8px;
+}
+
+.inbox-history-views {
+  padding: 8px 0 2px;
+}
+
+.inbox-primary-views .button.active {
+  box-shadow: inset 0 -2px 0 currentColor;
+}
+
 input,
 select,
 textarea {

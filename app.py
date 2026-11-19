@@ -2193,7 +2193,11 @@ def create_app() -> Flask:
                 query += " AND NOT EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = jobs.id AND s.applicant_profile_id = ?)"
                 query_args.append(applicant_id)
         elif requested_category in {"review", "review_required"}:
-            query += " AND discovery_result_category = 'review_required'"
+            query += " AND (discovery_result_category = 'review_required'"
+            if applicant_id:
+                query += " OR EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = jobs.id AND s.applicant_profile_id = ? AND s.state = 'reviewed')"
+                query_args.append(applicant_id)
+            query += ")"
         elif requested_category == "excluded":
             query += " AND discovery_result_category = 'excluded'"
         elif requested_category == "presented":
@@ -2285,11 +2289,21 @@ def create_app() -> Flask:
             else:
                 row_evidence = row["search_membership_evidence"] if "search_membership_evidence" in row.keys() else "{}"
                 row_criteria = row["search_membership_criteria"] if "search_membership_criteria" in row.keys() else "{}"
-            if membership_category:
+            # Scoped search-run views are immutable snapshots and therefore
+            # use membership as their category.  Cumulative views use the
+            # current canonical job classification; membership is evidence
+            # only, otherwise a later run could make a row contradict the
+            # category and counts of the current view.
+            if membership_category and membership_search:
                 item["discovery_result_category"] = membership_category
                 item["discovery_result_reason"] = membership_reason
                 item["search_membership_evidence"] = parse_json_object(row_evidence)
                 item["search_membership_criteria"] = parse_json_object(row_criteria)
+            elif membership_category:
+                item["search_membership_evidence"] = parse_json_object(row_evidence)
+                item["search_membership_criteria"] = parse_json_object(row_criteria)
+                item["latest_search_membership_category"] = membership_category
+                item["latest_search_membership_reason"] = membership_reason
             if applicant_id:
                 reassessment = query_db(
                     "SELECT status, note, created_at, updated_at FROM discovery_reassessment_flags WHERE job_id = ? AND applicant_profile_id = ?",
@@ -2316,6 +2330,10 @@ def create_app() -> Flask:
                 category = "saved"
             elif text(item.get("discovery_state")) == "reviewed":
                 category = "review_required"
+            elif presentation and text(item.get("discovery_result_category")) in {"actionable", "review_required"}:
+                # Seen is a lifecycle state, not a loss of eligibility.  It
+                # belongs in History while New remains genuinely unseen.
+                category = "presented"
             elif requalified:
                 category = "requalified"
                 item["requalified_reason"] = text(requalified["reason"])
@@ -2357,7 +2375,7 @@ def create_app() -> Flask:
             if category in {"actionable", "review_required"} or int(row["requalified"] or 0) or state in {"saved", "applied", "reviewed"}:
                 counts["all_relevant"] += 1
             if category == "actionable" and not presented and not state: counts["new_actionable"] += 1
-            elif category == "review_required" or state == "reviewed": counts["review_required"] += 1
+            if category == "review_required" or state == "reviewed": counts["review_required"] += 1
             elif category == "excluded": counts["excluded"] += 1
         return jsonify(counts)
 

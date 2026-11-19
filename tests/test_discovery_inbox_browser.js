@@ -12,6 +12,7 @@ async function main() {
     args: ["--no-sandbox"],
   });
   const page = await browser.newPage();
+  page.on("pageerror", (error) => console.error("browser pageerror:", error.stack || error));
   const requests = [];
   await page.route("**/api/discovery/inbox*", async (route) => {
     const url = new URL(route.request().url());
@@ -36,10 +37,18 @@ async function main() {
       discovery_result_category: scoped ? category === "excluded" ? "excluded" : "review_required" : index === 44 ? "actionable" : "review_required",
       discovery_inbox_category: scoped ? category === "excluded" ? "excluded" : "review_required" : index === 44 ? "new_actionable" : "review_required",
       discovery_result_reason: "Evidence incomplete",
+      search_membership_evidence: scoped ? { rule: category === "excluded" ? "location evidence missing" : "qualification evidence incomplete", source_excerpt: "Original posting evidence retained for this search run." } : {},
     }));
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(rows) });
   });
-  await page.goto(baseUrl, { waitUntil: "networkidle" });
+  // The application keeps status polling requests open while a discovery
+  // worker is available; DOM readiness is the meaningful startup boundary.
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  await page.locator("#discovery-inbox").waitFor({ state: "attached" });
+  // Let the normal application bootstrap finish before installing the
+  // deterministic fixture; otherwise its late profile refresh can replace
+  // the run selector while the interaction is being exercised.
+  await page.waitForTimeout(750);
   await page.evaluate(async () => {
     setDiscoverySection("saved");
     state.selectedCandidateProfileId = "7";
@@ -52,33 +61,36 @@ async function main() {
     renderDiscoveryInbox([]);
     renderDiscoveryResults({ total: 0, source_counts: {}, diagnostics: {}, search_progress: { review_required: 44 } });
   });
+  await page.locator("[data-inbox-search-run]").waitFor({ state: "visible" });
 
-  await page.locator("[data-inbox-search-run]").selectOption("e968ffcafb0f4524be269e517a6709a1");
-  // Keep the click/select assertion independent of any initial page-load
-  // race, then exercise the same loader with the selected run.
-  await page.evaluate(async () => {
-    state.discoveryInboxSearchId = document.querySelector("[data-inbox-search-run]").value;
-    state.discoveryInboxCategory = "review_required";
-    await loadDiscoveryInbox(true);
+  const reviewRequestPromise = page.waitForRequest((request) => {
+    const url = new URL(request.url());
+    return url.pathname.endsWith("/api/discovery/inbox") && url.searchParams.get("search_id") === "e968ffcafb0f4524be269e517a6709a1" && url.searchParams.get("category") === "review_required";
   });
+  await page.locator("[data-inbox-search-run]").selectOption("e968ffcafb0f4524be269e517a6709a1");
+  const reviewRequest = await reviewRequestPromise;
+  assert.strictEqual(new URL(reviewRequest.url()).searchParams.get("category"), "review_required");
   await page.locator('[data-inbox-clear-search]').waitFor({ state: "visible" });
   assert.strictEqual(await page.locator("#discovery-inbox article").count(), 44);
   const scoped = requests.find((url) => url.searchParams.has("search_id"));
   assert.ok(scoped, "scoped request was sent");
   assert.strictEqual(scoped.searchParams.get("category"), "review_required");
 
-  await page.getByRole("button", { name: /Excluded Jobs/ }).click();
+  const [excludedRequest] = await Promise.all([
+    page.waitForRequest((request) => {
+      const url = new URL(request.url());
+      return url.pathname.endsWith("/api/discovery/inbox") && url.searchParams.get("search_id") === "e968ffcafb0f4524be269e517a6709a1" && url.searchParams.get("category") === "excluded";
+    }),
+    page.getByRole("button", { name: /Excluded Jobs/ }).click(),
+  ]);
   assert.strictEqual(await page.evaluate(() => state.discoveryInboxSearchId), "e968ffcafb0f4524be269e517a6709a1");
-  await page.evaluate(async () => {
-    state.discoveryInboxCategory = "excluded";
-    await loadDiscoveryInbox(true);
-  });
+  assert.strictEqual(new URL(excludedRequest.url()).searchParams.get("category"), "excluded");
   await page.waitForFunction(() => document.querySelectorAll("#discovery-inbox article").length === 44);
   const excluded = requests.filter((url) => url.searchParams.get("category") === "excluded").at(-1);
   assert.ok(excluded, "scoped excluded request was sent");
   assert.strictEqual(excluded.searchParams.get("search_id"), "e968ffcafb0f4524be269e517a6709a1");
   await page.locator("#discovery-inbox article details").first().click();
-  assert.match(await page.locator("#discovery-inbox").innerText(), /Evidence incomplete/);
+  assert.match(await page.locator("#discovery-inbox").innerText(), /location evidence missing/);
 
   await page.getByRole("button", { name: "Return to full Inbox" }).click();
   await page.waitForFunction(() => document.querySelectorAll("#discovery-inbox article").length === 45);

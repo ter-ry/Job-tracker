@@ -3083,6 +3083,52 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(counts.get_json()["new_actionable"], 0)
         self.assertEqual(counts.get_json()["presented"], 1)
         self.assertEqual(counts.get_json()["all_relevant"], 1)
+        cumulative = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=all_discovered&include_history=1").get_json()
+        cumulative_row = next(item for item in cumulative if item["id"] == job["id"])
+        self.assertEqual(cumulative_row["discovery_inbox_category"], "presented")
+        self.assertEqual(cumulative_row["discovery_result_category"], "actionable")
+
+    def test_reviewed_actionable_count_and_view_share_one_predicate(self):
+        self.client.get("/api/health")
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Reviewed owner", "workflow": "software"}).get_json()
+        job = {
+            "company": "Reviewed Co", "title": "Software Developer", "location": "Toronto, ON",
+            "url": "https://example.test/reviewed-actionable", "source": "Indeed", "source_job_id": "reviewed-actionable-1",
+            "discovery_result_category": "actionable", "discovery_result_reason": "Verified match",
+            "candidate_profile_id": profile["id"], "discovery_occupation": "software developer",
+        }
+        with app_module.app.app_context():
+            app_module.persist_discovery_jobs([job], None, None)
+        job_id = job["id"]
+        self.assertEqual(self.client.post(f"/api/discovery/inbox/{job_id}/review", json={"candidate_profile_id": profile["id"], "workflow": "software"}).status_code, 200)
+        rows = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=review_required&include_history=1").get_json()
+        counts = self.client.get(f"/api/discovery/inbox/counts?candidate_profile_id={profile['id']}").get_json()
+        self.assertEqual([row["id"] for row in rows], [job_id])
+        self.assertEqual(counts["review_required"], len(rows))
+        self.assertEqual(rows[0]["discovery_result_category"], "actionable")
+
+    def test_cumulative_membership_is_evidence_not_latest_category_override(self):
+        self.client.get("/api/health")
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Two run owner", "workflow": "software"}).get_json()
+        job = {
+            "company": "Two Run Co", "title": "Software Developer", "location": "Toronto, ON",
+            "url": "https://example.test/two-run", "source": "Indeed", "source_job_id": "two-run-1",
+            "discovery_result_category": "actionable", "discovery_result_reason": "Current verified match",
+            "candidate_profile_id": profile["id"], "discovery_occupation": "software developer", "role_type": "marketing",
+        }
+        with app_module.app.app_context():
+            app_module.persist_discovery_jobs([job], None, None)
+            app_module.persist_discovery_search_memberships("e" * 32, [job], profile["id"])
+            app_module.persist_discovery_search_memberships("f" * 32, [{**job, "discovery_result_category": "review_required", "discovery_result_reason": "Second run uncertainty"}], profile["id"])
+            app_module.get_db().execute("UPDATE jobs SET discovery_result_category = 'review_required', discovery_result_reason = 'Current uncertainty' WHERE id = ?", [job["id"]])
+            app_module.get_db().commit()
+        history = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=all_discovered&include_history=1").get_json()
+        row = next(item for item in history if item["id"] == job["id"])
+        self.assertEqual(row["discovery_inbox_category"], "review_required")
+        self.assertEqual(row["discovery_result_category"], "review_required")
+        self.assertEqual(row["latest_search_membership_category"], "review_required")
+        scoped = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=all_relevant&search_id={'e' * 32}&include_history=1").get_json()
+        self.assertEqual(scoped[0]["discovery_result_category"], "actionable")
 
     def test_search_run_history_and_membership_evidence_are_immutable(self):
         self.client.get("/api/health")
