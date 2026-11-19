@@ -2920,7 +2920,7 @@ class JobAssistantTest(unittest.TestCase):
             "source_counts": {"linkedin": 1, "indeed": 1},
         }
         with patch.object(app_module, "fetch_jobspy_jobs", return_value=fake):
-            response = self.client.post("/api/discovery/jobspy", json={"keywords": "software developer"})
+            response = self.client.post("/api/discovery/jobspy", json={"keywords": "software developer", "enabled_sources": ["linkedin", "indeed"]})
 
         body = response.get_json()
         self.assertEqual(body["total"], 2)
