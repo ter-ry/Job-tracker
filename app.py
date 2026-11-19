@@ -630,12 +630,25 @@ def create_app() -> Flask:
     @app.get("/api/qa/status")
     def qa_status() -> Response:
         active = os.environ.get("JOB_TRACKER_QA_MODE") == "1"
-        return jsonify({"active": active, "data_dir": str(DATA_DIR) if active else "", "message": "Disposable QA mode active; production data is isolated." if active else "Production data mode active."})
+        port = int(os.environ.get("JOB_TRACKER_PORT") or (5001 if active else 5000))
+        mode = "fresh_qa" if os.environ.get("JOB_TRACKER_FRESH_QA_MODE") == "1" else "qa" if active else "production"
+        return jsonify({
+            "active": active,
+            "mode": mode,
+            "port": port,
+            "data_dir": str(DATA_DIR),
+            "database_path": str(DB_PATH),
+            "message": "Fresh disposable QA workspace active; production and regular QA data are isolated." if mode == "fresh_qa" else "Disposable QA mode active; production data is isolated." if active else "Production data mode active.",
+        })
 
     @app.post("/api/qa/reset")
     def qa_reset() -> Response:
         if os.environ.get("JOB_TRACKER_QA_MODE") != "1":
             return jsonify({"error": "QA reset is available only in an explicit disposable QA session."}), 403
+        appdata = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA")
+        production_root = (Path(appdata) / "Job Tracker").resolve() if appdata else None
+        if production_root and DATA_DIR.resolve() == production_root:
+            return jsonify({"error": "QA reset refused: the configured data directory is not an isolated disposable workspace."}), 409
         global _INITIALIZED_DATABASE_PATH, _LAST_MIGRATION_BACKUP
         active = get_db().execute("SELECT COUNT(*) FROM discovery_async_searches WHERE status IN ('queued', 'running')").fetchone()[0]
         if active:
@@ -2499,12 +2512,19 @@ def create_app() -> Flask:
         for row in rows:
             item = job_to_dict(row, include_legacy_details=False)
             category, reason = discovery_result_category(item, text(item.get("discovery_remote_preference")))
+            memberships = query_db(
+                "SELECT search_execution_id, category, reason, evidence_json, criteria_json, created_at FROM discovery_search_memberships WHERE job_id = ? AND applicant_profile_id IN (0, ?) ORDER BY created_at",
+                [int(row["id"]), applicant_id],
+            )
             records.append({
                 "id": int(row["id"]),
                 "title": text(item.get("title")),
                 "company": text(item.get("company")),
                 "source": text(item.get("source")),
+                "source_job_id": text(item.get("source_job_id")),
                 "url": text(item.get("url")),
+                "application_url": text(item.get("application_url")),
+                "source_links": item.get("source_links") or [],
                 "location": text(item.get("location")),
                 "category": category,
                 "reason": reason,
@@ -2515,6 +2535,12 @@ def create_app() -> Flask:
                 "geographic_eligibility": text(item.get("geographic_eligibility")),
                 "distance_radius_status": text(item.get("distance_radius_status")),
                 "distance_precision": text(item.get("distance_precision")),
+                "qualification_evidence_source": text(item.get("qualification_evidence_source")),
+                "qualification_evidence_confidence": text(item.get("qualification_evidence_confidence")),
+                "search_memberships": [
+                    {"search_id": text(m["search_execution_id"]), "category": text(m["category"]), "reason": text(m["reason"]), "evidence": parse_json_object(m["evidence_json"]), "criteria": parse_json_object(m["criteria_json"]), "created_at": text(m["created_at"])}
+                    for m in memberships
+                ],
                 "source_excerpt": safe_excerpt(item.get("job_description")),
             })
         payload = {"schema_version": 1, "mutated": False, "total": len(records), "records": records}

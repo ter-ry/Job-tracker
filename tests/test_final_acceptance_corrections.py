@@ -143,6 +143,31 @@ def test_ready_to_apply_excludes_applications_but_keeps_seen_unapplied(tmp_path,
     assert counts["ready_to_apply"] == 2
 
 
+def test_new_count_and_listing_reconcile_with_mixed_applicant_history(tmp_path, monkeypatch):
+    client = _isolated_client(tmp_path, monkeypatch)
+    swe = _profile(client, "SWE", "software")
+    with app_module.app.app_context():
+        jobs = []
+        for index in range(76):
+            job = app_module.normalize_job_payload({
+                "source": "fixture", "source_job_id": f"count-{index}",
+                "title": f"Junior Software Developer {index}", "company": "Count Co",
+                "location": "Toronto, ON", "url": f"https://count.example/{index}",
+                "job_description": "A software developer posting with current responsibilities.",
+            })
+            job.update({"discovery_first_seen_at": "2026-01-01T00:00:00", "discovery_result_category": "actionable", "discovery_occupation": "software developer"})
+            jobs.append(job)
+        ids = app_module.persist_discovery_jobs(jobs, None, None)["new_job_ids"]
+        for job_id in ids[47:]:
+            app_module.get_db().execute("INSERT INTO discovery_applicant_presentations(job_id, applicant_profile_id) VALUES (?, ?)", [job_id, swe])
+        app_module.get_db().commit()
+    counts = client.get(f"/api/discovery/inbox/counts?candidate_profile_id={swe}").get_json()
+    rows = client.get(f"/api/discovery/inbox?candidate_profile_id={swe}&category=new_actionable&include_history=1").get_json()
+    assert counts["new_actionable"] == 47
+    assert len(rows) == counts["new_actionable"]
+    assert {row["id"] for row in rows} == set(ids[:47])
+
+
 def test_applications_and_inbox_share_selected_applicant_applied_state(tmp_path, monkeypatch):
     client = _isolated_client(tmp_path, monkeypatch)
     swe = _profile(client, "SWE", "software")

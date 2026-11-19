@@ -39,6 +39,7 @@ const state = {
   discoveryInboxHasMore: false,
   discoveryInboxCounts: {},
   discoveryInboxRuns: [],
+  discoveryInboxLoadToken: 0,
   discoveryInboxSelected: new Set(),
   discoveryInboxBulkAction: "",
   discoveryInboxBulkMessage: "",
@@ -369,7 +370,7 @@ async function loadQAStatus() {
     const banner = document.getElementById("qa-session-banner");
     if (!banner) return;
     banner.hidden = !status.active;
-    if (status.active) setText("qa-session-message", status.message);
+    if (status.active) setText("qa-session-message", `${status.message} Port ${status.port}; database ${status.database_path}`);
   } catch (_) { /* compatibility with older installations */ }
 }
 
@@ -1553,6 +1554,7 @@ function discoveryInboxRequestUrl({ profileId = "", category = "all_relevant", s
 async function loadDiscoveryInbox(force = false, append = false) {
   const target = document.getElementById("discovery-inbox");
   if (!target) return;
+  const loadToken = ++state.discoveryInboxLoadToken;
   if (!force && state.discoveryInboxJobs.length) {
     renderDiscoveryInbox(state.discoveryInboxJobs);
     return;
@@ -1577,6 +1579,7 @@ async function loadDiscoveryInbox(force = false, append = false) {
       selectedProfile ? api.get(`/api/discovery/inbox/counts?candidate_profile_id=${encodeURIComponent(selectedProfile)}`) : Promise.resolve({}),
       selectedProfile ? api.get(`/api/discovery/inbox/search-runs?candidate_profile_id=${encodeURIComponent(selectedProfile)}`) : Promise.resolve([]),
     ]);
+    if (loadToken !== state.discoveryInboxLoadToken) return;
     state.discoveryInboxCounts = counts && typeof counts === "object" && !Array.isArray(counts) ? counts : {};
     state.discoveryInboxRuns = Array.isArray(runs) ? runs : [];
     // Shared discovery rows use candidate_profile_id=0; applicant-specific
@@ -1590,6 +1593,7 @@ async function loadDiscoveryInbox(force = false, append = false) {
     state.discoveryInboxJobs = append && pagedCategory ? [...state.discoveryInboxJobs, ...incoming] : incoming;
     renderDiscoveryInbox(state.discoveryInboxJobs);
   } catch (error) {
+    if (loadToken !== state.discoveryInboxLoadToken) return;
     target.innerHTML = `<div class="error-message"><p>${escapeHtml(error.message || "Inbox request failed")}</p><button class="button ghost small" type="button" data-inbox-retry>Retry</button></div>`;
     target.querySelector("[data-inbox-retry]")?.addEventListener("click", () => loadDiscoveryInbox(true));
   }

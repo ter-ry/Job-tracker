@@ -18,6 +18,7 @@ import webbrowser
 HOST = "127.0.0.1"
 PORT = 5000
 QA_PORT = 5001
+FRESH_QA_PORT = 5002
 APPDATA_FOLDER = "Job Tracker"
 INSTANCE_MUTEX = "JobTrackerInstance"
 
@@ -30,6 +31,21 @@ def default_data_dir() -> Path:
     if appdata:
         return Path(appdata) / APPDATA_FOLDER
     return Path.home() / APPDATA_FOLDER
+
+
+def canonical_data_dir() -> Path:
+    """Return the owner-facing production root, independent of stale overrides."""
+    appdata = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA")
+    return (Path(appdata) / APPDATA_FOLDER) if appdata else (Path.home() / APPDATA_FOLDER)
+
+
+def validated_runtime_data_dir(qa_mode: bool, fresh_qa: bool = False) -> Path | None:
+    """Reject inherited data-root overrides that cross production/QA modes."""
+    expected = canonical_data_dir() / ("Fresh QA Session" if fresh_qa else "QA Session") if qa_mode else canonical_data_dir()
+    configured = os.environ.get("JOB_TRACKER_DATA_DIR")
+    if configured and Path(configured).expanduser().resolve() != expected.resolve():
+        return None
+    return expected
 
 
 class SingleInstance:
@@ -167,34 +183,49 @@ def launch() -> int:
     # launcher. The provider runtime uses Windows spawn and never re-enters
     # launch() recursively.
     multiprocessing.freeze_support()
-    qa_mode = "--qa" in sys.argv or os.environ.get("JOB_TRACKER_QA_MODE") == "1"
-    runtime_port = QA_PORT if qa_mode else PORT
+    fresh_qa = "--fresh-qa" in sys.argv
+    qa_mode = "--qa" in sys.argv or fresh_qa
+    if ("--qa" in sys.argv or fresh_qa) and "--production" in sys.argv:
+        show_startup_recovery("Choose either Production (port 5000) or QA (port 5001), not both.")
+        return 2
+    if not qa_mode and os.environ.get("JOB_TRACKER_QA_MODE") == "1":
+        show_startup_recovery("Production launch refused: inherited QA mode was detected. Close this process and launch Production explicitly.")
+        return 2
+    runtime_port = FRESH_QA_PORT if fresh_qa else QA_PORT if qa_mode else PORT
+    data_dir = validated_runtime_data_dir(qa_mode, fresh_qa)
+    if data_dir is None:
+        show_startup_recovery("Job Tracker launch refused: JOB_TRACKER_DATA_DIR does not match this mode's safe data directory.")
+        return 2
     if qa_mode:
         os.environ["JOB_TRACKER_QA_MODE"] = "1"
-        data_dir = default_data_dir() / "QA Session"
+        if fresh_qa:
+            os.environ["JOB_TRACKER_FRESH_QA_MODE"] = "1"
+        else:
+            os.environ.pop("JOB_TRACKER_FRESH_QA_MODE", None)
     else:
-        data_dir = default_data_dir()
+        os.environ.pop("JOB_TRACKER_QA_MODE", None)
+        os.environ.pop("JOB_TRACKER_FRESH_QA_MODE", None)
     data_dir.mkdir(parents=True, exist_ok=True)
     os.environ["JOB_TRACKER_DATA_DIR"] = str(data_dir)
     os.environ.setdefault("JOB_TRACKER_BIND_HOST", HOST)
     os.environ["JOB_TRACKER_PORT"] = str(runtime_port)
     os.environ.setdefault("JOB_TRACKER_EXIT_TOKEN", os.urandom(32).hex())
 
-    mutex_name = f"{INSTANCE_MUTEX}-QA" if qa_mode else INSTANCE_MUTEX
+    mutex_name = f"{INSTANCE_MUTEX}-FRESH-QA" if fresh_qa else f"{INSTANCE_MUTEX}-QA" if qa_mode else INSTANCE_MUTEX
     lock = SingleInstance(data_dir / "instance.lock", mutex_name=mutex_name)
     if not lock.acquire():
         if server_is_healthy(port=runtime_port, qa_mode=qa_mode):
             open_browser_or_report(f"http://{HOST}:{runtime_port}/", data_dir)
             return 0
         if qa_mode:
-            show_startup_recovery(f"QA mode could not start because port {runtime_port} or the QA instance is already in use. Production was not opened.")
+            show_startup_recovery(f"Disposable mode could not start because port {runtime_port} or its instance is already in use. Production was not opened.")
         return 2
     atexit.register(lock.close)
 
     from waitress import create_server
     from app import app
 
-    server = create_server(app, host=HOST, port=runtime_port, threads=8, ident="JobTracker-QA" if qa_mode else "JobTracker")
+    server = create_server(app, host=HOST, port=runtime_port, threads=8, ident="JobTracker-Fresh-QA" if fresh_qa else "JobTracker-QA" if qa_mode else "JobTracker")
     server_thread = threading.Thread(
         target=server.run,
         daemon=True,
