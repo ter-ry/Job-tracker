@@ -198,7 +198,33 @@ async function confirmHistoricalApplications() {
     historicalApplicationImport = null;
     const confirm = document.getElementById("historical-application-confirm");
     if (confirm) confirm.hidden = true;
-    await Promise.all([loadAll(), loadDiscoveryInbox(true)]);
+    await Promise.all([loadAll(), loadDiscoveryInbox(true), loadHistoricalDuplicateMatches()]);
+  } catch (error) { toast(error.message); }
+}
+
+async function loadHistoricalDuplicateMatches() {
+  const target = document.getElementById("historical-duplicate-matches");
+  const profileId = state.selectedCandidateProfileId || value("discovery-profile") || "";
+  if (!target || !profileId) return;
+  try {
+    const matches = await api.get(`/api/applications/duplicate-matches?candidate_profile_id=${encodeURIComponent(profileId)}`);
+    if (!matches.length) { target.innerHTML = ""; return; }
+    target.innerHTML = `<hr><strong>Possible duplicate applications requiring a decision</strong>${matches.map((match) => `
+      <div class="duplicate-match" data-duplicate-match="${Number(match.id)}">
+        <p>${escapeHtml(match.imported.company)} — ${escapeHtml(match.imported.title)}<br>Imported application: ${escapeHtml(match.application_date)} · <a href="${escapeHtml(match.imported.url)}" target="_blank" rel="noopener">source</a><br>Possible existing vacancy: ${escapeHtml(match.existing.company)} — ${escapeHtml(match.existing.title)} · <a href="${escapeHtml(match.existing.url)}" target="_blank" rel="noopener">source</a></p>
+        <button class="button ghost" type="button" data-duplicate-resolution="same_vacancy" data-match-id="${Number(match.id)}">Same vacancy — mark original Applied</button>
+        <button class="button ghost" type="button" data-duplicate-resolution="different_vacancy" data-match-id="${Number(match.id)}">Different vacancy — release original</button>
+      </div>`).join("")}`;
+    target.querySelectorAll("[data-duplicate-resolution]").forEach((button) => button.addEventListener("click", () => resolveHistoricalDuplicateMatch(button.dataset.matchId, button.dataset.duplicateResolution)));
+  } catch (error) { target.textContent = error.message; }
+}
+
+async function resolveHistoricalDuplicateMatch(matchId, resolution) {
+  const profileId = state.selectedCandidateProfileId || value("discovery-profile") || "";
+  try {
+    await api.send(`/api/applications/duplicate-matches/${encodeURIComponent(matchId)}/resolve`, "POST", { candidate_profile_id: profileId, resolution });
+    toast(resolution === "same_vacancy" ? "Original vacancy marked Applied for this applicant." : "Original vacancy released as a separate vacancy.");
+    await Promise.all([loadHistoricalDuplicateMatches(), loadAll({ skipProfiles: true }), loadDiscoveryInbox(true)]);
   } catch (error) { toast(error.message); }
 }
 
@@ -440,6 +466,7 @@ async function loadAll({ skipProfiles = false } = {}) {
     renderDiscoveryInbox(state.discoveryInboxJobs);
     renderProfile(profile);
     renderCandidateProfiles();
+    void loadHistoricalDuplicateMatches();
     renderTemplateStatus(profile);
     renderOllamaHealth({ status: "loading", summary: "Checking local AI status…" });
     renderEvidenceLibrary(evidence);

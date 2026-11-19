@@ -2004,7 +2004,22 @@ def create_app() -> Flask:
                     })
                     inserted = persist_discovery_jobs([candidate], None, None)
                     if inserted["new_job_ids"]:
-                        outcome["job_id"] = int(inserted["new_job_ids"][0])
+                        imported_job_id = int(inserted["new_job_ids"][0])
+                        outcome["job_id"] = imported_job_id
+                        evidence = {"url": outcome["url"], "company": outcome["company"], "title": outcome["title"], "source": source, "source_job_id": source_id, "location": location}
+                        match = db.execute(
+                            """INSERT INTO discovery_applicant_duplicate_matches
+                               (imported_job_id, existing_job_id, applicant_profile_id, application_date, evidence_json)
+                               VALUES (?, ?, ?, ?, ?)
+                               ON CONFLICT(imported_job_id, applicant_profile_id) DO UPDATE SET
+                                 existing_job_id = excluded.existing_job_id,
+                                 application_date = excluded.application_date,
+                                 evidence_json = excluded.evidence_json,
+                                 status = CASE WHEN discovery_applicant_duplicate_matches.status = 'pending' THEN 'pending' ELSE discovery_applicant_duplicate_matches.status END,
+                                 updated_at = CURRENT_TIMESTAMP""",
+                            [imported_job_id, int(outcome["possible_job_id"]), profile_id, outcome["date_applied"], dumps_json(evidence, sort_keys=True)],
+                        )
+                        outcome["pending_match_id"] = int(match.lastrowid or db.execute("SELECT id FROM discovery_applicant_duplicate_matches WHERE imported_job_id = ? AND applicant_profile_id = ?", [imported_job_id, profile_id]).fetchone()[0])
                     else:
                         held = find_existing_job_match(candidate)
                         if held is not None:
@@ -2014,6 +2029,60 @@ def create_app() -> Flask:
             outcome.pop("candidate", None)
         counts = dict(Counter(item["outcome"] for item in outcomes))
         return jsonify({"preview": preview, "outcomes": outcomes, "counts": counts, "message": "Preview only; no application history changed." if preview else "Application history recorded without overwriting existing Applied decisions."})
+
+    @app.get("/api/applications/duplicate-matches")
+    def list_historical_duplicate_matches() -> Response:
+        profile_id = applicant_profile_id(request.args)
+        if not profile_id:
+            return jsonify({"error": "candidate_profile_id is required for duplicate-match review."}), 400
+        rows = query_db(
+            """SELECT m.*, imported.title AS imported_title, imported.company AS imported_company,
+                      imported.url AS imported_url, existing.title AS existing_title,
+                      existing.company AS existing_company, existing.url AS existing_url
+               FROM discovery_applicant_duplicate_matches m
+               JOIN jobs imported ON imported.id = m.imported_job_id
+               JOIN jobs existing ON existing.id = m.existing_job_id
+               WHERE m.applicant_profile_id = ? AND m.status = 'pending'
+               ORDER BY m.created_at, m.id""",
+            [profile_id],
+        )
+        return jsonify([
+            {
+                "id": int(row["id"]), "status": text(row["status"]),
+                "applicant_profile_id": int(row["applicant_profile_id"]), "application_date": text(row["application_date"]),
+                "evidence": parse_json_object(row["evidence_json"]),
+                "imported": {"job_id": int(row["imported_job_id"]), "title": text(row["imported_title"]), "company": text(row["imported_company"]), "url": text(row["imported_url"])},
+                "existing": {"job_id": int(row["existing_job_id"]), "title": text(row["existing_title"]), "company": text(row["existing_company"]), "url": text(row["existing_url"])},
+            }
+            for row in rows
+        ])
+
+    @app.post("/api/applications/duplicate-matches/<int:match_id>/resolve")
+    def resolve_historical_duplicate_match(match_id: int) -> Response:
+        payload = request.get_json(silent=True) or {}
+        profile_id = applicant_profile_id(payload)
+        if not profile_id:
+            return jsonify({"error": "candidate_profile_id is required to resolve a duplicate match."}), 400
+        resolution = normalize_space(text(payload.get("resolution"))).lower()
+        if resolution not in {"same_vacancy", "different_vacancy"}:
+            return jsonify({"error": "resolution must be same_vacancy or different_vacancy."}), 400
+        match = query_db("SELECT * FROM discovery_applicant_duplicate_matches WHERE id = ? AND applicant_profile_id = ? AND status = 'pending'", [match_id, profile_id], one=True)
+        if match is None:
+            return jsonify({"error": "Pending duplicate match not found for this applicant."}), 404
+        db = get_db()
+        if resolution == "same_vacancy":
+            applied_date = text(match["application_date"])
+            current = query_db("SELECT state, date_applied FROM discovery_applicant_states WHERE job_id = ? AND applicant_profile_id = ?", [int(match["existing_job_id"]), profile_id], one=True)
+            if not current or text(current["state"]) != "applied":
+                set_applicant_discovery_state(int(match["existing_job_id"]), profile_id, "applied", applied_date)
+            elif not text(current["date_applied"]) and applied_date:
+                db.execute("UPDATE discovery_applicant_states SET date_applied = ?, updated_at = CURRENT_TIMESTAMP WHERE job_id = ? AND applicant_profile_id = ?", [applied_date, int(match["existing_job_id"]), profile_id])
+            imported_current = query_db("SELECT state FROM discovery_applicant_states WHERE job_id = ? AND applicant_profile_id = ?", [int(match["imported_job_id"]), profile_id], one=True)
+            if not imported_current or text(imported_current["state"]) != "applied":
+                set_applicant_discovery_state(int(match["imported_job_id"]), profile_id, "applied", applied_date)
+        db.execute("UPDATE discovery_applicant_duplicate_matches SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND applicant_profile_id = ?", ["resolved_same" if resolution == "same_vacancy" else "resolved_different", match_id, profile_id])
+        db.commit()
+        return jsonify({"ok": True, "id": match_id, "resolution": resolution, "application_date": text(match["application_date"]), "original_job_id": int(match["existing_job_id"]), "imported_job_id": int(match["imported_job_id"])})
 
     @app.post("/api/discovery/search")
     def discovery_search() -> Response:
@@ -2446,12 +2515,16 @@ def create_app() -> Flask:
                 query_args.append(applicant_id)
                 query += " AND NOT EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = jobs.id AND s.applicant_profile_id = ?)"
                 query_args.append(applicant_id)
+                query += " AND NOT EXISTS (SELECT 1 FROM discovery_applicant_duplicate_matches d WHERE d.existing_job_id = jobs.id AND d.applicant_profile_id = ? AND d.status = 'pending')"
+                query_args.append(applicant_id)
         elif requested_category == "ready_to_apply":
             if not applicant_id:
                 return jsonify({"error": "candidate_profile_id is required for Ready to Apply."}), 400
             query += " AND discovery_result_category = 'actionable'"
             query += " AND status NOT IN ('Applied', 'shortlisted')"
             query += " AND NOT EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = jobs.id AND s.applicant_profile_id = ? AND s.state IN ('applied', 'skipped', 'ignored'))"
+            query_args.append(applicant_id)
+            query += " AND NOT EXISTS (SELECT 1 FROM discovery_applicant_duplicate_matches d WHERE d.existing_job_id = jobs.id AND d.applicant_profile_id = ? AND d.status = 'pending')"
             query_args.append(applicant_id)
         elif requested_category in {"review", "review_required"}:
             query += " AND (discovery_result_category = 'review_required'"
@@ -2491,6 +2564,9 @@ def create_app() -> Flask:
                 query += " AND m.category = 'review_required'"
             elif requested_category in {"new", "new_actionable"}:
                 query += " AND m.category = 'actionable'"
+                if applicant_id:
+                    query += " AND NOT EXISTS (SELECT 1 FROM discovery_applicant_duplicate_matches d WHERE d.existing_job_id = j.id AND d.applicant_profile_id = ? AND d.status = 'pending')"
+                    query_args.append(applicant_id)
             elif requested_category == "excluded":
                 query += " AND m.category = 'excluded'"
             elif requested_category == "all_relevant":
@@ -2641,8 +2717,8 @@ def create_app() -> Flask:
             return jsonify({"error": "candidate_profile_id is required for applicant-specific Inbox counts."}), 400
         base = "j.discovery_first_seen_at <> '' AND (j.candidate_profile_id IN ('', 0) OR j.candidate_profile_id = ? OR EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = j.id AND p.applicant_profile_id = ?) OR EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = j.id AND s.applicant_profile_id = ?))"
         args = [applicant_id, applicant_id, applicant_id]
-        rows = query_db(f"SELECT j.id, j.status, j.discovery_result_category, EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = j.id AND p.applicant_profile_id = ?) AS presented, COALESCE((SELECT state FROM discovery_applicant_states s WHERE s.job_id = j.id AND s.applicant_profile_id = ?), '') AS applicant_state, EXISTS (SELECT 1 FROM discovery_requalifications r WHERE r.job_id = j.id AND r.applicant_profile_id = ?) AS requalified FROM jobs j WHERE {base}", [applicant_id, applicant_id, applicant_id, *args])
-        counts = {"all_discovered": 0, "all_relevant": 0, "new_actionable": 0, "ready_to_apply": 0, "review_required": 0, "excluded": 0, "presented": 0, "saved": 0, "applied": 0, "skipped": 0}
+        rows = query_db(f"SELECT j.id, j.status, j.discovery_result_category, EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = j.id AND p.applicant_profile_id = ?) AS presented, COALESCE((SELECT state FROM discovery_applicant_states s WHERE s.job_id = j.id AND s.applicant_profile_id = ?), '') AS applicant_state, EXISTS (SELECT 1 FROM discovery_requalifications r WHERE r.job_id = j.id AND r.applicant_profile_id = ?) AS requalified, EXISTS (SELECT 1 FROM discovery_applicant_duplicate_matches d WHERE d.existing_job_id = j.id AND d.applicant_profile_id = ? AND d.status = 'pending') AS pending_duplicate FROM jobs j WHERE {base}", [applicant_id, applicant_id, applicant_id, applicant_id, *args])
+        counts = {"all_discovered": 0, "all_relevant": 0, "new_actionable": 0, "ready_to_apply": 0, "review_required": 0, "excluded": 0, "presented": 0, "saved": 0, "applied": 0, "skipped": 0, "pending_duplicate": 0}
         for row in rows:
             counts["all_discovered"] += 1
             if int(row["presented"] or 0): counts["presented"] += 1
@@ -2652,11 +2728,14 @@ def create_app() -> Flask:
             elif state in {"skipped", "ignored"}: counts["skipped"] += 1
             category = text(row["discovery_result_category"])
             presented = int(row["presented"] or 0)
+            pending_duplicate = int(row["pending_duplicate"] or 0)
+            if pending_duplicate:
+                counts["pending_duplicate"] += 1
             if category in {"actionable", "review_required"} or int(row["requalified"] or 0) or state in {"saved", "applied", "reviewed"}:
                 counts["all_relevant"] += 1
             globally_applied = text(row["status"]) in {"Applied", "shortlisted"}
-            if category == "actionable" and not globally_applied and not presented and not state: counts["new_actionable"] += 1
-            if category == "actionable" and not globally_applied and state not in {"applied", "skipped", "ignored"}: counts["ready_to_apply"] += 1
+            if category == "actionable" and not globally_applied and not presented and not state and not pending_duplicate: counts["new_actionable"] += 1
+            if category == "actionable" and not globally_applied and state not in {"applied", "skipped", "ignored"} and not pending_duplicate: counts["ready_to_apply"] += 1
             if category == "review_required" or state == "reviewed": counts["review_required"] += 1
             elif category == "excluded": counts["excluded"] += 1
         return jsonify(counts)
@@ -11605,6 +11684,26 @@ def init_db() -> None:
     )
     ensure_columns("discovery_applicant_states", {"date_applied": "TEXT NOT NULL DEFAULT ''"})
     db.execute("CREATE INDEX IF NOT EXISTS discovery_applicant_states_profile_idx ON discovery_applicant_states(applicant_profile_id, state)")
+    # Applicant-scoped uncertainty from historical application imports. This
+    # durable hold prevents a possible duplicate from reappearing in New or
+    # Ready to Apply after restart, provider changes, or upgrades.
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS discovery_applicant_duplicate_matches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            imported_job_id INTEGER NOT NULL,
+            existing_job_id INTEGER NOT NULL,
+            applicant_profile_id INTEGER NOT NULL,
+            application_date TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending',
+            evidence_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(imported_job_id, applicant_profile_id),
+            FOREIGN KEY(imported_job_id) REFERENCES jobs(id) ON DELETE CASCADE,
+            FOREIGN KEY(existing_job_id) REFERENCES jobs(id) ON DELETE CASCADE
+        )"""
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS discovery_applicant_duplicate_matches_profile_idx ON discovery_applicant_duplicate_matches(applicant_profile_id, status)")
     # Presented is deliberately separate from a user's Saved/Applied/Skipped
     # choice. It makes New Opportunities applicant-scoped without rewriting
     # legacy job history or hiding a shared posting from another applicant.

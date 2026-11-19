@@ -154,10 +154,13 @@ def test_historical_application_import_is_preview_first_and_durable(tmp_path, mo
         })
         existing.update({"discovery_first_seen_at": "2026-01-01T00:00:00", "discovery_result_category": "actionable", "discovery_occupation": "software developer"})
         existing_id = app_module.persist_discovery_jobs([existing], None, None)["new_job_ids"][0]
+        possible_existing = dict(existing)
+        possible_existing.update({"source": "workday", "source_job_id": "possible-original", "company": "Possible Co", "url": "https://example.test/possible-original", "application_url": "https://example.test/possible-original", "source_links_json": "[]"})
+        possible_existing_id = app_module.persist_discovery_jobs([possible_existing], None, None)["new_job_ids"][0]
     payload = {"candidate_profile_id": swe, "workflow": "software", "records": [
         {"url": "https://example.test/known-apply", "company": "Known Co", "title": "Software Engineer", "date_applied": "2026-01-10"},
         {"url": "https://example.test/new-apply", "company": "New Co", "title": "Junior Developer", "date_applied": "2026-01-11"},
-        {"url": "https://example.test/possible", "company": "Known Co", "title": "Software Engineer", "date_applied": "2026-01-12"},
+        {"url": "https://example.test/possible", "company": "Possible Co", "title": "Software Engineer", "date_applied": "2026-01-12"},
         {"url": "not-a-url", "company": "Bad", "title": "Missing", "date_applied": "2026-01-12"},
     ]}
     preview = client.post("/api/applications/import-history", json=payload)
@@ -175,7 +178,10 @@ def test_historical_application_import_is_preview_first_and_durable(tmp_path, mo
         imported = app_module.query_db("SELECT id FROM jobs WHERE url = ?", ["https://example.test/new-apply"], one=True)
         assert imported is not None
         held = app_module.query_db("SELECT possible_duplicate, possible_duplicate_job_id, discovery_result_category FROM jobs WHERE url = ?", ["https://example.test/possible"], one=True)
-        assert dict(held) == {"possible_duplicate": 1, "possible_duplicate_job_id": existing_id, "discovery_result_category": "review_required"}
+        assert dict(held) == {"possible_duplicate": 1, "possible_duplicate_job_id": possible_existing_id, "discovery_result_category": "review_required"}
+        pending = app_module.query_db("SELECT existing_job_id, applicant_profile_id, application_date, status FROM discovery_applicant_duplicate_matches WHERE imported_job_id = (SELECT id FROM jobs WHERE url = ?)", ["https://example.test/possible"], one=True)
+        assert dict(pending) == {"existing_job_id": possible_existing_id, "applicant_profile_id": swe, "application_date": "2026-01-12", "status": "pending"}
+        assert client.get(f"/api/discovery/inbox/counts?candidate_profile_id={swe}").get_json()["pending_duplicate"] == 1
     assert client.get(f"/api/discovery/inbox?candidate_profile_id={swe}&category=ready_to_apply&include_history=1").get_json() == []
 
 
@@ -204,6 +210,49 @@ def test_possible_duplicate_import_is_held_and_ats_identity_keeps_case(tmp_path,
         app_module.g.pop("db", None)
         reloaded = app_module.find_existing_job_match({"source": "employer_direct", "url": "https://careers.example/jobs/ReqABC", "title": "Software Engineer", "company": "Identity Co", "location": "Toronto, ON"})
         assert reloaded["id"] == first_id
+
+def test_possible_duplicate_resolution_is_applicant_scoped_and_releases_without_merge(tmp_path, monkeypatch):
+    client = _isolated_client(tmp_path, monkeypatch)
+    swe = _profile(client, "SWE", "software")
+    other = _profile(client, "Other", "software")
+    with app_module.app.app_context():
+        original = app_module.normalize_job_payload({
+            "source": "indeed", "source_job_id": "actionable-original", "title": "Backend Developer",
+            "company": "Resolution Co", "location": "Toronto, ON", "url": "https://example.test/original",
+            "description": "A complete backend development posting with requirements and responsibilities for applicants.",
+        })
+        original.update({"discovery_first_seen_at": "2026-01-01T00:00:00", "discovery_result_category": "actionable", "discovery_occupation": "software developer"})
+        original_id = app_module.persist_discovery_jobs([original], None, None)["new_job_ids"][0]
+    payload = {"candidate_profile_id": swe, "workflow": "software", "preview": False, "confirm_apply": True, "records": [{
+        "url": "https://example.test/imported", "company": "Resolution Co", "title": "Backend Developer", "date_applied": "2026-02-03"
+    }]}
+    assert client.post("/api/applications/import-history", json=payload).get_json()["counts"] == {"possible_duplicate": 1}
+    pending = client.get(f"/api/applications/duplicate-matches?candidate_profile_id={swe}").get_json()
+    assert len(pending) == 1
+    match_id = pending[0]["id"]
+    before = client.get(f"/api/discovery/inbox/counts?candidate_profile_id={swe}").get_json()
+    assert before["new_actionable"] == 0 and before["ready_to_apply"] == 0 and before["pending_duplicate"] == 1
+    assert client.get(f"/api/discovery/inbox/counts?candidate_profile_id={other}").get_json()["ready_to_apply"] == 1
+    released = client.post(f"/api/applications/duplicate-matches/{match_id}/resolve", json={"candidate_profile_id": swe, "resolution": "different_vacancy"})
+    assert released.status_code == 200
+    assert client.get(f"/api/discovery/inbox/counts?candidate_profile_id={swe}").get_json()["ready_to_apply"] == 1
+    with app_module.app.app_context():
+        imported = app_module.query_db("SELECT id, possible_duplicate_job_id FROM jobs WHERE url = ?", ["https://example.test/imported"], one=True)
+        assert imported["possible_duplicate_job_id"] == original_id
+        assert app_module.query_db("SELECT status FROM discovery_applicant_duplicate_matches WHERE id = ?", [match_id], one=True)["status"] == "resolved_different"
+        second = dict(original)
+        second.update({"source_job_id": "actionable-second", "company": "Same Co", "url": "https://example.test/second", "application_url": "https://example.test/second", "source_links_json": "[]"})
+        second_id = app_module.persist_discovery_jobs([second], None, None)["new_job_ids"][0]
+    same_payload = {"candidate_profile_id": swe, "workflow": "software", "preview": False, "confirm_apply": True, "records": [{
+        "url": "https://example.test/same-import", "company": "Same Co", "title": "Backend Developer", "date_applied": "2026-02-04"
+    }]}
+    client.post("/api/applications/import-history", json=same_payload)
+    same_match = client.get(f"/api/applications/duplicate-matches?candidate_profile_id={swe}").get_json()[0]
+    assert client.post(f"/api/applications/duplicate-matches/{same_match['id']}/resolve", json={"candidate_profile_id": swe, "resolution": "same_vacancy"}).status_code == 200
+    with app_module.app.app_context():
+        state = app_module.query_db("SELECT state, date_applied FROM discovery_applicant_states WHERE job_id = ? AND applicant_profile_id = ?", [second_id, swe], one=True)
+        assert dict(state) == {"state": "applied", "date_applied": "2026-02-04"}
+
 
 def test_history_audit_export_is_read_only_and_resume_free(tmp_path, monkeypatch):
     client = _isolated_client(tmp_path, monkeypatch)
