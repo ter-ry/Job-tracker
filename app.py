@@ -2210,11 +2210,11 @@ def create_app() -> Flask:
                 """INSERT INTO saved_search_profiles
                    (name, keywords, location, remote_preference, seniority, minimum_salary,
                     enabled_sources_json, date_window, search_depth, distance, per_source_cap, new_matching_target, total_cap, interval_minutes, enabled,
-                    search_mode, title_match_mode,
+                    search_mode, title_match_mode, include_internships,
                     auto_prepare_enabled, auto_prepare_min_priority, auto_prepare_require_canadian,
                     auto_prepare_candidate_profile_id, auto_prepare_resume_id, auto_prepare_cover_letter_template_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["search_depth"], search["distance"], search["per_source_cap"], search["new_matching_target"], search["total_cap"], search["interval_minutes"], search["enabled"], search["search_mode"], search["title_match_mode"], search["auto_prepare_enabled"], search["auto_prepare_min_priority"], search["auto_prepare_require_canadian"], search["auto_prepare_candidate_profile_id"], search["auto_prepare_resume_id"], search["auto_prepare_cover_letter_template_id"]],
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["search_depth"], search["distance"], search["per_source_cap"], search["new_matching_target"], search["total_cap"], search["interval_minutes"], search["enabled"], search["search_mode"], search["title_match_mode"], search["include_internships"], search["auto_prepare_enabled"], search["auto_prepare_min_priority"], search["auto_prepare_require_canadian"], search["auto_prepare_candidate_profile_id"], search["auto_prepare_resume_id"], search["auto_prepare_cover_letter_template_id"]],
             )
             get_db().commit()
         except sqlite3.IntegrityError:
@@ -2358,10 +2358,10 @@ def create_app() -> Flask:
                 """UPDATE saved_search_profiles SET name = ?, keywords = ?, location = ?, remote_preference = ?,
                    seniority = ?, minimum_salary = ?, enabled_sources_json = ?, date_window = ?, search_depth = ?, distance = ?,
                    per_source_cap = ?, new_matching_target = ?, total_cap = ?, interval_minutes = ?, enabled = ?, auto_prepare_enabled = ?, auto_prepare_min_priority = ?,
-                   search_mode = ?, title_match_mode = ?,
+                   search_mode = ?, title_match_mode = ?, include_internships = ?,
                    auto_prepare_require_canadian = ?, auto_prepare_candidate_profile_id = ?, auto_prepare_resume_id = ?,
                    auto_prepare_cover_letter_template_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
-                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["search_depth"], search["distance"], search["per_source_cap"], search["new_matching_target"], search["total_cap"], search["interval_minutes"], search["enabled"], search["auto_prepare_enabled"], search["auto_prepare_min_priority"], search["search_mode"], search["title_match_mode"], search["auto_prepare_require_canadian"], search["auto_prepare_candidate_profile_id"], search["auto_prepare_resume_id"], search["auto_prepare_cover_letter_template_id"], search_id],
+                [search["name"], search["keywords"], search["location"], search["remote_preference"], search["seniority"], search["minimum_salary"], dumps_json(search["enabled_sources"]), search["date_window"], search["search_depth"], search["distance"], search["per_source_cap"], search["new_matching_target"], search["total_cap"], search["interval_minutes"], search["enabled"], search["auto_prepare_enabled"], search["auto_prepare_min_priority"], search["search_mode"], search["title_match_mode"], search["include_internships"], search["auto_prepare_require_canadian"], search["auto_prepare_candidate_profile_id"], search["auto_prepare_resume_id"], search["auto_prepare_cover_letter_template_id"], search_id],
             )
             get_db().commit()
         except sqlite3.IntegrityError:
@@ -2674,6 +2674,16 @@ def create_app() -> Flask:
         if source_filter:
             query += f" AND {filter_alias}source LIKE ?"
             query_args.append(f"%{source_filter}%")
+        # Count the exact filtered relation before pagination.  The browser
+        # uses this authoritative total for every Inbox category, including
+        # search-run membership views, instead of inferring counts from a
+        # short page or appending an unbounded Load more stream.
+        total_row = query_db(
+            f"SELECT COUNT(*) AS total FROM ({query}) AS discovery_inbox_total",
+            query_args,
+            one=True,
+        )
+        total_count = int(total_row["total"] or 0) if total_row else 0
         if membership_search:
             query += " ORDER BY j.discovery_last_seen_at DESC, j.id DESC"
         page_size = clamp_int_default(request.args.get("page_size"), 500, 1, 500)
@@ -2797,7 +2807,11 @@ def create_app() -> Flask:
                 category = "archived_unclassified"
             item["discovery_inbox_category"] = category
             jobs.append(item)
-        return jsonify(jobs)
+        response = jsonify(jobs)
+        response.headers["X-Job-Tracker-Total"] = str(total_count)
+        response.headers["X-Job-Tracker-Page"] = str(page)
+        response.headers["X-Job-Tracker-Page-Size"] = str(page_size)
+        return response
 
     @app.get("/api/discovery/inbox/counts")
     def discovery_inbox_counts() -> Response:
@@ -4002,10 +4016,10 @@ def create_app() -> Flask:
 
 def normalize_discovery_sources(value: Any) -> list[str]:
     if not isinstance(value, list):
-        return ["linkedin", "indeed"]
+        return ["indeed", "glassdoor", "employer_direct"]
     selected = [text(source).lower() for source in value]
     clean = [source for source in selected if source in DISCOVERY_SOURCES]
-    return clean or ["linkedin", "indeed"]
+    return clean or ["indeed", "glassdoor", "employer_direct"]
 
 
 def applicant_profile_id(payload: Any = None) -> int:
@@ -4321,6 +4335,7 @@ def normalize_saved_search_payload(payload: dict[str, Any], existing: dict[str, 
     distance = clamp_int_default(payload.get("distance", existing.get("distance")), 50, 0, 1000)
     search_mode = normalize_choice(payload.get("search_mode", existing.get("search_mode")), {"title", "explore", "shortlist"}) or "title"
     title_match_mode = normalize_choice(payload.get("title_match_mode", existing.get("title_match_mode")), {"strict", "related"}) or "related"
+    include_internships = 1 if as_bool(payload.get("include_internships", existing.get("include_internships", False))) else 0
     existing_sources = existing.get("enabled_sources")
     if not isinstance(existing_sources, list):
         try:
@@ -4351,6 +4366,7 @@ def normalize_saved_search_payload(payload: dict[str, Any], existing: dict[str, 
         "total_cap": total_cap,
         "search_mode": search_mode,
         "title_match_mode": title_match_mode,
+        "include_internships": include_internships,
         # SWE defaults to breadth; ECE keeps its existing title-only policy.
         "match_policy": normalize_choice(payload.get("match_policy"), {"apply_broadly", "strict_matching"})
         or ("apply_broadly" if search_mode == "shortlist" and occupation_for_keywords(text(payload.get("keywords"))) == "software developer" else "strict_matching"),
@@ -4388,7 +4404,8 @@ def saved_search_to_discovery_payload(search: dict[str, Any]) -> dict[str, Any]:
         # qualification evidence.
         "candidate_profile_id": selected_profile if search.get("search_mode") == "shortlist" else "",
         "applicant_profile_id": selected_profile,
-        "enabled_sources": search.get("enabled_sources") or ["linkedin", "indeed"],
+        "enabled_sources": search.get("enabled_sources") or ["indeed", "glassdoor", "employer_direct"],
+        "include_internships": bool(search.get("include_internships")),
         "search_depth": search.get("search_depth") or "standard",
         "total_cap": int(search.get("total_cap") or 200),
         "new_matching_target": int(search.get("new_matching_target") or 50),
@@ -11901,7 +11918,8 @@ def init_db() -> None:
             remote_preference TEXT NOT NULL DEFAULT '',
             seniority TEXT NOT NULL DEFAULT '',
             minimum_salary INTEGER NOT NULL DEFAULT 0,
-            enabled_sources_json TEXT NOT NULL DEFAULT '["linkedin", "indeed"]',
+            enabled_sources_json TEXT NOT NULL DEFAULT '["indeed", "glassdoor", "employer_direct"]',
+            include_internships INTEGER NOT NULL DEFAULT 0,
             date_window TEXT NOT NULL DEFAULT '14d',
             search_depth TEXT NOT NULL DEFAULT 'standard',
             distance INTEGER NOT NULL DEFAULT 50,
@@ -11922,6 +11940,7 @@ def init_db() -> None:
         {
             "search_mode": "TEXT NOT NULL DEFAULT 'title'",
             "title_match_mode": "TEXT NOT NULL DEFAULT 'related'",
+            "include_internships": "INTEGER NOT NULL DEFAULT 0",
         },
     )
     db.execute(

@@ -16,6 +16,13 @@ assert.match(html, /id="saved-search-new-target"[^>]*value="50"/);
 assert.match(js, /new_matching_target: Number\(value\("discovery-new-matching-target"\) \|\| 50\)/);
 assert.doesNotMatch(html, /id="discovery-total-cap"[^>]*type="number"/);
 assert.doesNotMatch(html, /id="discovery-per-source-cap"[^>]*type="number"/);
+assert.doesNotMatch(html, /name="discovery-source" value="linkedin"/);
+assert.doesNotMatch(html, /name="discovery-source" value="zip_recruiter"/);
+assert.match(html, /name="discovery-source" value="indeed" checked/);
+assert.match(html, /name="discovery-source" value="glassdoor" checked/);
+assert.match(html, /name="discovery-source" value="employer_direct" checked/);
+assert.doesNotMatch(html, /name="saved-search-source" value="linkedin"/);
+assert.doesNotMatch(html, /name="saved-search-source" value="zip_recruiter"/);
 
 // Both workflows, applicant switching, and useful title/seniority controls stay wired.
 assert.match(html, /value="software"/);

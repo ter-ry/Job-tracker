@@ -15,7 +15,7 @@ const context = {
   },
   document: { getElementById: () => ({ textContent: "" }) },
   renderDiscoveryInbox: () => {},
-  api: { get: async (url) => { calls.push(url); return []; } },
+    api: { get: async (url) => { calls.push(url); return []; }, getWithMeta: async (url) => { calls.push(url); return { data: [], total: 0, page: 0, pageSize: 50 }; } },
 };
 vm.runInNewContext(`${source.slice(start, end)}; this.loadDiscoveryInbox = loadDiscoveryInbox; this.discoveryInboxRequestUrl = discoveryInboxRequestUrl;`, context);
 
@@ -28,6 +28,8 @@ vm.runInNewContext(`${source.slice(start, end)}; this.loadDiscoveryInbox = loadD
   assert.strictEqual(scoped.searchParams.get("category"), "review_required");
   assert.strictEqual(scoped.searchParams.get("search_id"), searchId);
   assert.strictEqual(scoped.searchParams.get("include_history"), "1");
+  assert.strictEqual(scoped.searchParams.get("page"), "0");
+  assert.strictEqual(scoped.searchParams.get("page_size"), "50");
 
   context.state.discoveryInboxCategory = "all_relevant";
   context.state.discoveryInboxSearchId = "";

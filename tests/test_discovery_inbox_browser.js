@@ -44,7 +44,7 @@ async function main() {
       search_membership_evidence: scoped ? { rule: category === "excluded" ? "location evidence missing" : "qualification evidence incomplete", source_excerpt: "Original posting evidence retained for this search run." } : {},
     }));
     const page = Number(url.searchParams.get("page") || 0);
-    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(rows.slice(page * 50, page * 50 + 50)) });
+    await route.fulfill({ status: 200, contentType: "application/json", headers: { "X-Job-Tracker-Total": String(count), "X-Job-Tracker-Page": String(page), "X-Job-Tracker-Page-Size": "50" }, body: JSON.stringify(rows.slice(page * 50, page * 50 + 50)) });
   });
   // The application keeps status polling requests open while a discovery
   // worker is available; DOM readiness is the meaningful startup boundary.
@@ -118,8 +118,9 @@ async function main() {
   await page.evaluate(() => { state.discoveryInboxQuery = ""; });
   await page.getByRole("button", { name: /Ready to Apply/ }).click();
   await page.waitForFunction(() => document.querySelectorAll("#discovery-inbox article").length === 50);
-  await page.getByRole("button", { name: "Load more" }).click();
-  await page.waitForFunction(() => document.querySelectorAll("#discovery-inbox article").length === 51);
+  await page.getByRole("button", { name: "Next" }).first().click();
+  await page.waitForFunction(() => document.querySelectorAll("#discovery-inbox article").length === 1);
+  assert.match(await page.locator("#discovery-inbox").innerText(), /Page 2 of 2 · 51 results/);
   await browser.close();
   console.log("discovery Inbox browser click regression passed");
 }

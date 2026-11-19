@@ -37,6 +37,8 @@ const state = {
   discoveryInboxReason: "",
   discoveryInboxSource: "",
   discoveryInboxHasMore: false,
+  discoveryInboxPageSize: 50,
+  discoveryInboxTotal: 0,
   discoveryInboxCounts: {},
   discoveryInboxRuns: [],
   discoveryInboxLoadToken: 0,
@@ -114,6 +116,19 @@ const api = {
       throw new Error(error.error || `Request failed (${response.status})`);
     }
     return response.json();
+  },
+  async getWithMeta(path) {
+    const response = await fetch(path);
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.error || `Request failed (${response.status})`);
+    }
+    return {
+      data: await response.json(),
+      total: Number(response.headers.get("X-Job-Tracker-Total") || 0),
+      page: Number(response.headers.get("X-Job-Tracker-Page") || 0),
+      pageSize: Number(response.headers.get("X-Job-Tracker-Page-Size") || 0),
+    };
   },
   async getOutcome(path) {
     const response = await fetch(path);
@@ -1331,6 +1346,7 @@ function editSavedSearch(search) {
   setValue("saved-search-per-source-cap", search.per_source_cap || 100);
   setValue("saved-search-interval", search.interval_minutes || 360);
   setChecked("saved-search-enabled", Boolean(search.enabled));
+  setChecked("saved-search-include-internships", Boolean(search.include_internships));
   setChecked("saved-search-auto-prepare", Boolean(search.auto_prepare_enabled));
   setValue("saved-search-auto-min-priority", search.auto_prepare_min_priority || 75);
   setValue("saved-search-auto-profile", search.auto_prepare_candidate_profile_id || "");
@@ -1345,7 +1361,7 @@ async function saveSavedSearch(event) {
     remote_preference: value("saved-search-remote"), distance: Number(value("saved-search-distance") || 50), seniority: value("saved-search-seniority"), minimum_salary: Number(value("saved-search-minimum-salary") || 0),
     date_window: value("saved-search-date-window"), search_depth: value("saved-search-depth") || "standard",
     new_matching_target: Number(value("saved-search-new-target") || 50), total_cap: Math.max(200, Number(value("saved-search-new-target") || 50) * 4), per_source_cap: Number(value("saved-search-per-source-cap") || 100),
-    interval_minutes: Number(value("saved-search-interval") || 360), enabled: checked("saved-search-enabled"),
+    interval_minutes: Number(value("saved-search-interval") || 360), enabled: checked("saved-search-enabled"), include_internships: checked("saved-search-include-internships"),
     auto_prepare_enabled: checked("saved-search-auto-prepare"), auto_prepare_min_priority: Number(value("saved-search-auto-min-priority") || 75),
     auto_prepare_candidate_profile_id: Number(value("saved-search-auto-profile") || 0),
     enabled_sources: [...document.querySelectorAll('input[name="saved-search-source"]:checked')].map((input) => input.value),
@@ -1375,6 +1391,7 @@ function saveCurrentDiscoverySearch() {
   setValue("saved-search-per-source-cap", criteria.per_source_cap);
   setValue("saved-search-interval", 360);
   setChecked("saved-search-enabled", false);
+  setChecked("saved-search-include-internships", Boolean(criteria.include_internships));
   setChecked("saved-search-auto-prepare", false);
   setValue("saved-search-auto-min-priority", 75);
   setValue("saved-search-auto-profile", criteria.candidate_profile_id || "");
@@ -1400,6 +1417,41 @@ function discoveryInboxCategory(job) {
   return "new_actionable";
 }
 
+function inboxPaginationMarkup(position) {
+  const size = Number(state.discoveryInboxPageSize || 50);
+  const total = Number(state.discoveryInboxTotal || 0);
+  const page = Number(state.discoveryInboxPage || 0);
+  const pages = Math.max(1, Math.ceil(total / size));
+  return `<nav class="inbox-pagination ${position}" aria-label="Inbox pagination" data-inbox-pagination>
+    <label>Results per page <select data-inbox-page-size aria-label="Results per page"><option value="25" ${size === 25 ? "selected" : ""}>25</option><option value="50" ${size === 50 ? "selected" : ""}>50</option><option value="100" ${size === 100 ? "selected" : ""}>100</option></select></label>
+    <button class="button ghost small" type="button" data-inbox-prev ${page <= 0 ? "disabled" : ""}>Previous</button>
+    <span class="muted" data-inbox-page-status>Page ${Math.min(page + 1, pages)} of ${pages} · ${total} results</span>
+    <button class="button ghost small" type="button" data-inbox-next ${page + 1 >= pages ? "disabled" : ""}>Next</button>
+  </nav>`;
+}
+
+function bindInboxPagination(root) {
+  root?.querySelectorAll("[data-inbox-page-size]").forEach((select) => select.addEventListener("change", async (event) => {
+    state.discoveryInboxPageSize = Number(event.target.value) || 50;
+    state.discoveryInboxPage = 0;
+    state.discoveryInboxJobs = [];
+    await loadDiscoveryInbox(true);
+  }));
+  root?.querySelectorAll("[data-inbox-prev]").forEach((button) => button.addEventListener("click", async () => {
+    if (state.discoveryInboxPage <= 0) return;
+    state.discoveryInboxPage -= 1;
+    state.discoveryInboxJobs = [];
+    await loadDiscoveryInbox(true);
+  }));
+  root?.querySelectorAll("[data-inbox-next]").forEach((button) => button.addEventListener("click", async () => {
+    const pages = Math.max(1, Math.ceil(Number(state.discoveryInboxTotal || 0) / Number(state.discoveryInboxPageSize || 50)));
+    if (state.discoveryInboxPage + 1 >= pages) return;
+    state.discoveryInboxPage += 1;
+    state.discoveryInboxJobs = [];
+    await loadDiscoveryInbox(true);
+  }));
+}
+
 function renderDiscoveryInbox(jobs) {
   const target = document.getElementById("discovery-inbox");
   if (!target) return;
@@ -1410,6 +1462,7 @@ function renderDiscoveryInbox(jobs) {
   const labels = { all_relevant: "All Relevant", new_actionable: "New Opportunities", ready_to_apply: "Ready to Apply", review_required: "Needs Review", presented: "Presented / Seen", excluded: "Excluded Jobs", requalified: "Requalified Since Update", saved: "Saved", applied: "Applied", skipped: "Skipped", all_discovered: "All Discovered" };
   const primaryViews = { new_actionable: "New Jobs", review_required: "Needs Review", all_discovered: "History" };
   const historyViews = ["all_relevant", "ready_to_apply", "presented", "saved", "applied", "skipped", "excluded", "requalified", "all_discovered"];
+  const pagedCategory = ["new", "new_actionable", "review", "review_required", "ready_to_apply", "requalified", "presented", "saved", "applied", "skipped", "excluded", "all_relevant", "all_discovered"].includes(state.discoveryInboxCategory);
   const counts = jobs.reduce((result, job) => {
     const category = job.discovery_inbox_category || discoveryInboxCategory(job);
     result[category] = (result[category] || 0) + 1;
@@ -1428,6 +1481,7 @@ function renderDiscoveryInbox(jobs) {
     const runOptions = state.discoveryInboxRuns.map((run) => `<option value="${escapeAttribute(run.search_id)}" ${state.discoveryInboxSearchId === run.search_id ? "selected" : ""}>${escapeHtml(run.search_id.slice(0, 12))} · ${Number(run.review_count || 0)} review · ${Number(run.excluded_count || 0)} excluded</option>`).join("");
     if (showHistoryControls) filters.insertAdjacentHTML("beforeend", `<div class="inbox-history-search"><label>Search title or company<input type="search" data-inbox-history-search value="${escapeAttribute(state.discoveryInboxQuery)}" placeholder="Search history"></label><label>Reason filter<input type="search" data-inbox-reason-filter value="${escapeAttribute(state.discoveryInboxReason)}" placeholder="Reason"></label><label>Source filter<input type="search" data-inbox-source-filter value="${escapeAttribute(state.discoveryInboxSource)}" placeholder="Provider"></label></div>`);
     if (runOptions && showHistoryControls) filters.insertAdjacentHTML("beforeend", `<label class="inbox-search-run">Search run <select data-inbox-search-run><option value="">All runs</option>${runOptions}</select></label>`);
+    if (pagedCategory) filters.insertAdjacentHTML("beforeend", inboxPaginationMarkup("top"));
     filters.querySelectorAll("[data-inbox-primary]").forEach((button) => button.addEventListener("click", async () => {
       state.discoveryInboxSearchId = "";
       state.discoveryInboxCategory = button.dataset.inboxPrimary || "all_discovered";
@@ -1473,13 +1527,7 @@ function renderDiscoveryInbox(jobs) {
     });
     filters.querySelector("[data-inbox-select-visible]")?.addEventListener("click", () => { visibleIds.forEach((id) => state.discoveryInboxSelected.add(id)); renderDiscoveryInbox(state.discoveryInboxJobs); });
     filters.querySelector("[data-inbox-clear-selection]")?.addEventListener("click", () => { state.discoveryInboxSelected.clear(); renderDiscoveryInbox(state.discoveryInboxJobs); });
-    if (["ready_to_apply", "requalified", "presented", "excluded", "all_relevant", "all_discovered"].includes(state.discoveryInboxCategory) && state.discoveryInboxHasMore) {
-      const next = document.createElement("button");
-      next.className = "button ghost small";
-      next.textContent = "Load more";
-      filters.appendChild(next);
-      next.addEventListener("click", async () => { state.discoveryInboxPage += 1; await loadDiscoveryInbox(true, true); });
-    }
+    bindInboxPagination(filters);
   }
   target.classList.toggle("empty", !visibleJobs.length);
   const renderInboxCard = (job) => {
@@ -1487,14 +1535,18 @@ function renderDiscoveryInbox(jobs) {
     const membership = job.search_membership_evidence || {};
     const flag = job.reassessment_flag;
     const label = labels[category] || "Archived";
-    const excerpt = membership.source_excerpt || job.qualification_evidence_excerpt || job.workplace_evidence || job.salary_evidence_text || job.job_description || "";
+    // Salary evidence is useful for pay display, but never proves occupation
+    // or seniority. Exclusion inspection must use title/description evidence
+    // and identify when that evidence is unavailable.
+    const excerpt = membership.source_excerpt || job.qualification_evidence_excerpt || job.job_description || "";
+    const evidenceLabel = excerpt ? (job.job_description ? "Title/description evidence" : "Qualification evidence") : "Occupation/seniority evidence unavailable";
     const sourceUrl = job.url || membership.url || "";
-    const evidenceText = excerpt ? `<p class="muted">${escapeHtml(excerpt.slice(0, 600))}</p>` : `<p class="muted">Source evidence: unverified/missing.</p>`;
+    const evidenceText = excerpt ? `<p class="muted"><strong>${evidenceLabel}:</strong> ${escapeHtml(excerpt.slice(0, 600))}</p>` : `<p class="muted"><strong>${evidenceLabel}:</strong> Source evidence unverified/missing.</p>`;
     const sourceLink = sourceUrl ? `<a href="${escapeAttribute(sourceUrl)}" target="_blank" rel="noreferrer">Open source evidence</a>` : "";
     const audit = category === "excluded" ? [
       `<p><strong>Why excluded:</strong> ${escapeHtml(job.discovery_result_reason || "Unverified/missing exclusion reason.")}</p>`,
       `<p class="muted"><strong>Supported rule:</strong> ${escapeHtml(membership.rule || job.discovery_exclusion_reason_bucket || "Unverified/missing")}</p>`,
-      `<p class="muted"><strong>Source excerpt:</strong> ${escapeHtml(excerpt ? excerpt.slice(0, 600) : "Unverified/missing")}</p>`,
+      `<p class="muted"><strong>${evidenceLabel}:</strong> ${escapeHtml(excerpt ? excerpt.slice(0, 600) : "Unverified/missing")}</p>`,
       `<p class="muted"><strong>Evidence confidence:</strong> ${escapeHtml(job.qualification_evidence_confidence || membership.qualification_evidence_confidence || "Unverified/missing")}</p>`,
       `<p class="muted">Reassessment: ${escapeHtml(flag?.status || "not flagged")}${flag?.note ? " — " + escapeHtml(flag.note) : ""}</p>`,
       `<button class="button ghost small" type="button" onclick="flagInboxReassessment(${job.id})">Flag for reassessment</button>`,
@@ -1505,7 +1557,8 @@ function renderDiscoveryInbox(jobs) {
       : category === "skipped" ? `<button class="button ghost small" type="button" onclick="restoreInboxJob(${job.id})">Restore</button>` : "";
     return `<article class="inbox-row"><label><input type="checkbox" data-inbox-select="${job.id}" ${state.discoveryInboxSelected.has(Number(job.id)) ? "checked" : ""}> Select</label><div><span class="inbox-badge">${escapeHtml(label)}</span><strong>${escapeHtml(job.title || "Untitled role")}</strong><span>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(resultWorkplaceLabel(job))}</span><span class="muted">${escapeHtml(job.work_arrangement || job.remote_type || "Unknown arrangement")} · ${escapeHtml(displaySalary(job))} · ${escapeHtml(resultDistanceLabel(job))}</span>${renderExperienceSummary(job)}<details><summary>${category === "excluded" ? "Exclusion evidence" : "Requirements and source evidence"}</summary><span class="muted">Decision: ${escapeHtml(job.discovery_result_category || category)} · Reason: ${escapeHtml(job.discovery_result_reason || "Unverified/missing")} · Source: ${escapeHtml(job.source || membership.source || "Unverified/missing")} · Evidence: ${escapeHtml(job.qualification_evidence_source || membership.qualification_evidence_source || "Unverified/missing")} · Confidence: ${escapeHtml(job.qualification_evidence_confidence || membership.qualification_evidence_confidence || "Unverified/missing")}</span>${evidenceText}${membership.required_experience ? `<p class="muted">Required experience evidence: ${escapeHtml(JSON.stringify(membership.required_experience))}</p>` : ""}${sourceLink}</details>${audit}</div><div class="row-actions">${actions}${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open Original</a>` : ""}</div></article>`;
   };
-  target.innerHTML = visibleJobs.length ? visibleJobs.map(renderInboxCard).join("") : `No ${(labels[state.discoveryInboxCategory] || "discovery").toLowerCase()} discovery records.`;
+  target.innerHTML = `${pagedCategory ? inboxPaginationMarkup("bottom") : ""}${visibleJobs.length ? visibleJobs.map(renderInboxCard).join("") : `No ${(labels[state.discoveryInboxCategory] || "discovery").toLowerCase()} discovery records.`}`;
+  bindInboxPagination(target);
   target.querySelectorAll("[data-inbox-select]").forEach((box) => box.addEventListener("change", () => { const id = Number(box.dataset.inboxSelect); if (box.checked) state.discoveryInboxSelected.add(id); else state.discoveryInboxSelected.delete(id); }));
 }
 
@@ -1541,12 +1594,12 @@ function discoveryInboxRequestUrl({ profileId = "", category = "all_relevant", s
     if (!["review_required", "excluded", "new_actionable", "all_relevant"].includes(category)) throw new Error("A search-scoped Inbox request must use a supported category.");
     params.set("category", category);
     params.set("search_id", String(searchId));
-  } else if (["requalified", "ready_to_apply", "presented", "saved", "applied", "skipped", "excluded", "all_relevant", "all_discovered"].includes(category)) {
+    params.set("page_size", String(pageSize));
+    params.set("page", String(page));
+  } else if (["new", "new_actionable", "review", "review_required", "requalified", "ready_to_apply", "presented", "saved", "applied", "skipped", "excluded", "all_relevant", "all_discovered"].includes(category)) {
     params.set("category", category === "all_discovered" ? "all_discovered" : category);
     params.set("page_size", String(pageSize));
     params.set("page", String(page));
-  } else if (["new", "new_actionable", "ready_to_apply", "review", "review_required", "excluded"].includes(category)) {
-    params.set("category", category);
   }
   return `/api/discovery/inbox?${params.toString()}`;
 }
@@ -1561,21 +1614,20 @@ async function loadDiscoveryInbox(force = false, append = false) {
   }
   try {
     if (force && !append) target.textContent = "Loading Inbox history…";
-    const isRequalified = state.discoveryInboxCategory === "requalified";
-    const pagedCategory = ["ready_to_apply", "requalified", "presented", "saved", "applied", "skipped", "excluded", "all_relevant", "all_discovered"].includes(state.discoveryInboxCategory);
+    const pagedCategory = ["new", "new_actionable", "review", "review_required", "ready_to_apply", "requalified", "presented", "saved", "applied", "skipped", "excluded", "all_relevant", "all_discovered"].includes(state.discoveryInboxCategory);
     const jobsUrl = discoveryInboxRequestUrl({
       profileId: state.selectedCandidateProfileId,
       category: state.discoveryInboxCategory,
       searchId: state.discoveryInboxSearchId,
       page: state.discoveryInboxPage,
-      pageSize: 50,
+      pageSize: state.discoveryInboxPageSize,
       query: state.discoveryInboxQuery,
       reason: state.discoveryInboxReason,
       source: state.discoveryInboxSource,
     });
     const selectedProfile = state.selectedCandidateProfileId ? String(state.selectedCandidateProfileId) : "";
-    const [jobs, counts, runs] = await Promise.all([
-      api.get(jobsUrl),
+    const [jobResponse, counts, runs] = await Promise.all([
+      api.getWithMeta(jobsUrl),
       selectedProfile ? api.get(`/api/discovery/inbox/counts?candidate_profile_id=${encodeURIComponent(selectedProfile)}`) : Promise.resolve({}),
       selectedProfile ? api.get(`/api/discovery/inbox/search-runs?candidate_profile_id=${encodeURIComponent(selectedProfile)}`) : Promise.resolve([]),
     ]);
@@ -1584,13 +1636,15 @@ async function loadDiscoveryInbox(force = false, append = false) {
     state.discoveryInboxRuns = Array.isArray(runs) ? runs : [];
     // Shared discovery rows use candidate_profile_id=0; applicant-specific
     // state returned by the API is the ownership signal for those rows.
-    const incoming = (Array.isArray(jobs) ? jobs : []).filter((job) => {
+    const incoming = (Array.isArray(jobResponse.data) ? jobResponse.data : []).filter((job) => {
       if (!selectedProfile) return true;
       const owner = String(job.candidate_profile_id || "");
       return owner === "" || owner === "0" || owner === selectedProfile;
     });
-    state.discoveryInboxHasMore = pagedCategory && incoming.length === 50;
-    state.discoveryInboxJobs = append && pagedCategory ? [...state.discoveryInboxJobs, ...incoming] : incoming;
+    state.discoveryInboxPageSize = jobResponse.pageSize || state.discoveryInboxPageSize;
+    state.discoveryInboxTotal = jobResponse.total || (state.discoveryInboxPage * state.discoveryInboxPageSize + incoming.length);
+    state.discoveryInboxHasMore = pagedCategory && (state.discoveryInboxPage + 1) * state.discoveryInboxPageSize < state.discoveryInboxTotal;
+    state.discoveryInboxJobs = incoming;
     renderDiscoveryInbox(state.discoveryInboxJobs);
   } catch (error) {
     if (loadToken !== state.discoveryInboxLoadToken) return;

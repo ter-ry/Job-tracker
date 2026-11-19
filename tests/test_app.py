@@ -7359,6 +7359,48 @@ class JobAssistantTest(unittest.TestCase):
                 "total_cap": 2,
             })
 
+    def test_inbox_page_metadata_and_saved_internship_preference_are_authoritative(self):
+        self.client.get("/api/health")
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Pagination owner", "workflow": "software"}).get_json()
+        jobs = [
+            {
+                "company": "Paging Co", "title": f"Junior Software Developer {index}", "location": "Toronto, ON",
+                "url": f"https://example.test/pagination-{index}", "source": "Indeed", "source_job_id": f"pagination-{index}",
+                "discovery_result_category": "actionable", "discovery_result_reason": "Verified match",
+                "candidate_profile_id": profile["id"], "discovery_occupation": "software developer",
+            }
+            for index in range(123)
+        ]
+        with app_module.app.app_context():
+            app_module.persist_discovery_jobs(jobs, None, None)
+        first = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=new_actionable&include_history=1&page_size=25&page=0")
+        second = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=new_actionable&include_history=1&page_size=25&page=1")
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.headers["X-Job-Tracker-Total"], "123")
+        self.assertEqual(first.headers["X-Job-Tracker-Page"], "0")
+        self.assertEqual(first.headers["X-Job-Tracker-Page-Size"], "25")
+        self.assertEqual(len(first.get_json()), 25)
+        self.assertEqual(len(second.get_json()), 25)
+        self.assertTrue({row["id"] for row in first.get_json()}.isdisjoint({row["id"] for row in second.get_json()}))
+
+        created = self.client.post("/api/discovery/searches", json={
+            "name": "Internship preference", "keywords": "software developer", "enabled_sources": ["indeed"], "include_internships": True,
+        })
+        self.assertEqual(created.status_code, 201, created.get_json())
+        saved = created.get_json()
+        self.assertTrue(saved["include_internships"])
+        updated = self.client.put(f"/api/discovery/searches/{saved['id']}", json={**saved, "include_internships": False})
+        self.assertEqual(updated.status_code, 200, updated.get_json())
+        self.assertFalse(updated.get_json()["include_internships"])
+        with app_module.app.app_context():
+            payload = app_module.saved_search_to_discovery_payload(updated.get_json())
+        self.assertFalse(payload["include_internships"])
+
+    def test_normal_source_defaults_exclude_disabled_providers_but_allow_explicit_reactivation(self):
+        self.assertEqual(app_module.normalize_discovery_sources(None), ["indeed", "glassdoor", "employer_direct"])
+        self.assertEqual(app_module.normalize_discovery_sources([]), ["indeed", "glassdoor", "employer_direct"])
+        self.assertEqual(app_module.normalize_discovery_sources(["linkedin", "zip_recruiter"]), ["linkedin", "zip_recruiter"])
+
     def test_discovery_search_config_separates_new_match_target_from_fetch_budget(self):
         config = app_module.discovery_search_config({
             "keywords": "software developer",
