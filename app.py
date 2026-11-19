@@ -1970,7 +1970,7 @@ def create_app() -> Flask:
             if existing is not None:
                 outcomes.append({"outcome": "matched_existing", "job_id": int(existing["id"]), "url": url, "company": company, "title": title, "date_applied": parsed_date})
             elif possible is not None:
-                outcomes.append({"outcome": "possible_duplicate", "possible_job_id": int(possible["id"]), "url": url, "company": company, "title": title, "date_applied": parsed_date, "candidate": candidate, "reason": "Same company and title, but no verified identity match."})
+                outcomes.append({"outcome": "possible_duplicate", "possible_job_id": int(possible["id"]), "url": url, "company": company, "title": title, "date_applied": parsed_date, "source": source, "source_job_id": source_id, "location": location, "candidate": candidate, "reason": "Same company and title, but no verified identity match."})
             else:
                 outcomes.append({"outcome": "new_imported", "url": url, "company": company, "title": title, "date_applied": parsed_date, "candidate": candidate})
 
@@ -2006,7 +2006,7 @@ def create_app() -> Flask:
                     if inserted["new_job_ids"]:
                         imported_job_id = int(inserted["new_job_ids"][0])
                         outcome["job_id"] = imported_job_id
-                        evidence = {"url": outcome["url"], "company": outcome["company"], "title": outcome["title"], "source": source, "source_job_id": source_id, "location": location}
+                        evidence = {"url": outcome["url"], "company": outcome["company"], "title": outcome["title"], "source": outcome.get("source", "historical_import"), "source_job_id": outcome.get("source_job_id", ""), "location": outcome.get("location", "")}
                         match = db.execute(
                             """INSERT INTO discovery_applicant_duplicate_matches
                                (imported_job_id, existing_job_id, applicant_profile_id, application_date, evidence_json)
@@ -2070,16 +2070,19 @@ def create_app() -> Flask:
         if match is None:
             return jsonify({"error": "Pending duplicate match not found for this applicant."}), 404
         db = get_db()
+        applied_date = text(match["application_date"])
+        # The imported historical row is itself an application record in both
+        # decisions.  Different-vacancy only releases the existing actionable
+        # requisition; it must not make the imported application disappear.
+        imported_current = query_db("SELECT state FROM discovery_applicant_states WHERE job_id = ? AND applicant_profile_id = ?", [int(match["imported_job_id"]), profile_id], one=True)
+        if not imported_current or text(imported_current["state"]) != "applied":
+            set_applicant_discovery_state(int(match["imported_job_id"]), profile_id, "applied", applied_date)
         if resolution == "same_vacancy":
-            applied_date = text(match["application_date"])
             current = query_db("SELECT state, date_applied FROM discovery_applicant_states WHERE job_id = ? AND applicant_profile_id = ?", [int(match["existing_job_id"]), profile_id], one=True)
             if not current or text(current["state"]) != "applied":
                 set_applicant_discovery_state(int(match["existing_job_id"]), profile_id, "applied", applied_date)
             elif not text(current["date_applied"]) and applied_date:
                 db.execute("UPDATE discovery_applicant_states SET date_applied = ?, updated_at = CURRENT_TIMESTAMP WHERE job_id = ? AND applicant_profile_id = ?", [applied_date, int(match["existing_job_id"]), profile_id])
-            imported_current = query_db("SELECT state FROM discovery_applicant_states WHERE job_id = ? AND applicant_profile_id = ?", [int(match["imported_job_id"]), profile_id], one=True)
-            if not imported_current or text(imported_current["state"]) != "applied":
-                set_applicant_discovery_state(int(match["imported_job_id"]), profile_id, "applied", applied_date)
         db.execute("UPDATE discovery_applicant_duplicate_matches SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND applicant_profile_id = ?", ["resolved_same" if resolution == "same_vacancy" else "resolved_different", match_id, profile_id])
         db.commit()
         return jsonify({"ok": True, "id": match_id, "resolution": resolution, "application_date": text(match["application_date"]), "original_job_id": int(match["existing_job_id"]), "imported_job_id": int(match["imported_job_id"])})

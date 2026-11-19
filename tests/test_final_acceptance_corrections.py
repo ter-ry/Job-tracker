@@ -233,12 +233,18 @@ def test_possible_duplicate_resolution_is_applicant_scoped_and_releases_without_
     before = client.get(f"/api/discovery/inbox/counts?candidate_profile_id={swe}").get_json()
     assert before["new_actionable"] == 0 and before["ready_to_apply"] == 0 and before["pending_duplicate"] == 1
     assert client.get(f"/api/discovery/inbox/counts?candidate_profile_id={other}").get_json()["ready_to_apply"] == 1
+    with app_module.app.app_context():
+        app_module.get_db().close()
+        app_module.g.pop("db", None)
+    assert len(client.get(f"/api/applications/duplicate-matches?candidate_profile_id={swe}").get_json()) == 1
     released = client.post(f"/api/applications/duplicate-matches/{match_id}/resolve", json={"candidate_profile_id": swe, "resolution": "different_vacancy"})
     assert released.status_code == 200
     assert client.get(f"/api/discovery/inbox/counts?candidate_profile_id={swe}").get_json()["ready_to_apply"] == 1
     with app_module.app.app_context():
         imported = app_module.query_db("SELECT id, possible_duplicate_job_id FROM jobs WHERE url = ?", ["https://example.test/imported"], one=True)
         assert imported["possible_duplicate_job_id"] == original_id
+        imported_state = app_module.query_db("SELECT state, date_applied FROM discovery_applicant_states WHERE job_id = ? AND applicant_profile_id = ?", [int(imported["id"]), swe], one=True)
+        assert dict(imported_state) == {"state": "applied", "date_applied": "2026-02-03"}
         assert app_module.query_db("SELECT status FROM discovery_applicant_duplicate_matches WHERE id = ?", [match_id], one=True)["status"] == "resolved_different"
         second = dict(original)
         second.update({"source_job_id": "actionable-second", "company": "Same Co", "url": "https://example.test/second", "application_url": "https://example.test/second", "source_links_json": "[]"})
@@ -252,6 +258,27 @@ def test_possible_duplicate_resolution_is_applicant_scoped_and_releases_without_
     with app_module.app.app_context():
         state = app_module.query_db("SELECT state, date_applied FROM discovery_applicant_states WHERE job_id = ? AND applicant_profile_id = ?", [second_id, swe], one=True)
         assert dict(state) == {"state": "applied", "date_applied": "2026-02-04"}
+
+
+def test_csv_duplicate_matches_keep_each_row_source_identity_and_location(tmp_path, monkeypatch):
+    client = _isolated_client(tmp_path, monkeypatch)
+    swe = _profile(client, "SWE", "software")
+    with app_module.app.app_context():
+        for index, company in enumerate(("CSV One", "CSV Two"), start=1):
+            original = app_module.normalize_job_payload({
+                "source": "indeed", "source_job_id": f"original-{index}", "title": "Software Developer",
+                "company": company, "location": "Toronto, ON", "url": f"https://example.test/original-{index}",
+                "description": "A complete software development posting with requirements and responsibilities for applicants.",
+            })
+            original.update({"discovery_first_seen_at": "2026-01-01T00:00:00", "discovery_result_category": "actionable", "discovery_occupation": "software developer"})
+            assert app_module.persist_discovery_jobs([original], None, None)["new_job_ids"]
+    csv_text = "url,company,title,date_applied,provider,requisition_id,location\nhttps://example.test/import-1,CSV One,Software Developer,2026-03-01,greenhouse,GH-1,Ottawa ON\nhttps://example.test/import-2,CSV Two,Software Developer,2026-03-02,workday,WD-2,Montreal QC\n"
+    response = client.post("/api/applications/import-history", json={"candidate_profile_id": swe, "workflow": "software", "csv": csv_text, "preview": False, "confirm_apply": True})
+    assert response.status_code == 200
+    matches = client.get(f"/api/applications/duplicate-matches?candidate_profile_id={swe}").get_json()
+    assert sorted((item["evidence"]["source"], item["evidence"]["source_job_id"], item["evidence"]["location"]) for item in matches) == [
+        ("greenhouse", "GH-1", "Ottawa ON"), ("workday", "WD-2", "Montreal QC")
+    ]
 
 
 def test_history_audit_export_is_read_only_and_resume_free(tmp_path, monkeypatch):
