@@ -124,7 +124,7 @@ async function main() {
   // Candidate selection is intentionally not persisted in browser state.
   // Re-select the owner before replaying applicant-scoped Inbox history.
   await page.locator("#discovery-profile").selectOption(String(profile.id));
-  await page.evaluate(async () => { setDiscoverySection("saved"); await loadDiscoveryInbox(true); });
+  await page.evaluate(async () => { setDiscoverySection("inbox"); await loadDiscoveryInbox(true); });
   console.log(`inbox filters after restart: ${await page.locator("#discovery-inbox-filters").innerText()}`);
   console.log(`inbox body after restart: ${(await page.locator("#discovery-inbox").innerText()).slice(0, 500)}`);
   const appliedCount = await page.locator('[data-inbox-category="applied"]').innerText();

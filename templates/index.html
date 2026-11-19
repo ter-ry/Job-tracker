@@ -27,8 +27,9 @@
 
     <main class="layout">
       <section id="discovery" class="tab-panel active">
-        <nav class="discovery-subnav beta-secondary" aria-label="Discovery views">
+        <nav class="discovery-subnav" aria-label="Discovery views">
           <button class="discovery-subnav-button active" type="button" data-discovery-view="find">Find jobs</button>
+          <button class="discovery-subnav-button" type="button" data-discovery-view="inbox">Jobs Inbox</button>
           <button class="discovery-subnav-button" type="button" data-discovery-view="pipeline">Pipeline</button>
           <button class="discovery-subnav-button" type="button" data-discovery-view="saved">Saved searches</button>
         </nav>
@@ -280,8 +281,9 @@
             <div id="fast-apply-current" class="generated-output empty">Run a search to build a new-opportunities queue.</div>
           </section>
 
-          <section class="panel discovery-inbox-panel discovery-view-saved">
-            <div class="panel-header"><div><h2>Jobs Inbox</h2><p class="muted helper">New, review, saved, applied, skipped and history stay applicant-specific.</p></div><div class="actions compact"><button class="button ghost small" type="button" id="inbox-bulk-save">Save selected</button><button class="button ghost small" type="button" id="inbox-bulk-skip">Skip selected</button><button class="button ghost small" type="button" id="inbox-bulk-applied">Confirm selected Applied</button><button class="button ghost small" type="button" id="refresh-discovery-inbox">Refresh</button></div></div>
+          <section class="panel discovery-inbox-panel discovery-view-inbox" hidden>
+            <div class="panel-header"><div><h2>Jobs Inbox</h2><p class="muted helper">New, review, saved, applied, skipped and history stay applicant-specific.</p></div><div class="actions compact"><button class="button ghost small" type="button" id="inbox-audit-history">Audit history</button><button class="button ghost small" type="button" id="inbox-reassess-history">Preview reassessment</button><button class="button ghost small" type="button" id="inbox-bulk-save">Save selected</button><button class="button ghost small" type="button" id="inbox-bulk-skip">Skip selected</button><button class="button ghost small" type="button" id="inbox-bulk-applied">Confirm selected Applied</button><button class="button ghost small" type="button" id="refresh-discovery-inbox">Refresh</button></div></div>
+            <div id="inbox-audit-summary" class="muted helper" role="status" hidden></div>
             <nav id="discovery-inbox-filters" class="actions compact" role="navigation" aria-label="Jobs Inbox views"><span class="muted">New Jobs · Needs Review · History</span></nav>
             <div id="discovery-inbox" class="generated-output empty">No discovered opportunities yet.</div>
           </section>

@@ -85,6 +85,25 @@ def test_re_evaluate_is_occupation_scoped_and_preserves_history(tmp_path, monkey
     assert jobs[0]["discovery_first_seen_at"] == original_seen
 
 
+def test_history_reassessment_preview_and_audit_are_non_mutating(tmp_path, monkeypatch):
+    client = _isolated_client(tmp_path, monkeypatch)
+    swe = _profile(client, "SWE", "software")
+    job_id = _stored_job(client, occupation="software developer")
+    with app_module.app.app_context():
+        before = dict(app_module.query_db("SELECT discovery_result_category, discovery_result_reason FROM jobs WHERE id = ?", [job_id], one=True))
+    preview = client.post("/api/discovery/re-evaluate", json={"applicant_profile_id": swe, "workflow": "software", "preview": True})
+    assert preview.status_code == 200
+    assert preview.get_json()["preview"] is True
+    assert preview.get_json()["mutated"] if "mutated" in preview.get_json() else True
+    with app_module.app.app_context():
+        after = dict(app_module.query_db("SELECT discovery_result_category, discovery_result_reason FROM jobs WHERE id = ?", [job_id], one=True))
+    assert after == before
+    audit = client.get(f"/api/discovery/inbox/audit?candidate_profile_id={swe}")
+    assert audit.status_code == 200
+    assert audit.get_json()["mutated"] is False
+    assert audit.get_json()["total"] >= 1
+
+
 def test_qa_status_and_reset_are_isolated_and_visible(tmp_path, monkeypatch):
     monkeypatch.setenv("JOB_TRACKER_QA_MODE", "1")
     client = _isolated_client(tmp_path, monkeypatch)

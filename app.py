@@ -2115,9 +2115,19 @@ def create_app() -> Flask:
 
     @app.post("/api/discovery/re-evaluate")
     def re_evaluate_discovery_history() -> Response:
-        """Recheck stored exclusions without changing the user's decisions."""
+        """Preview or apply evidence-backed history reclassification.
+
+        Preview is the default safety boundary.  Applying never edits search
+        memberships or applicant decisions; it only updates a current
+        canonical classification when the stored title/source evidence is
+        sufficient and records a requalification marker where appropriate.
+        """
         payload = request.get_json(silent=True) or {}
         workflow = discovery_workflow(payload)
+        # Preserve the legacy API's explicit apply behavior; the current UI
+        # always requests preview first and only sends preview=false after an
+        # owner confirmation.
+        preview = as_bool(payload.get("preview", False))
         try:
             applicant_id = validate_discovery_applicant(payload, workflow)
         except ValueError as exc:
@@ -2128,33 +2138,93 @@ def create_app() -> Flask:
                LEFT JOIN discovery_applicant_states s ON s.job_id = j.id AND s.applicant_profile_id = ?
                LEFT JOIN discovery_applicant_presentations p ON p.job_id = j.id AND p.applicant_profile_id = ?
                WHERE j.discovery_first_seen_at <> ''
-                 AND j.discovery_result_category IN ('excluded', 'review_required')
                  AND (j.candidate_profile_id = 0 OR j.candidate_profile_id = ? OR s.job_id IS NOT NULL OR p.job_id IS NOT NULL)
                  AND (j.discovery_occupation = ? OR j.discovery_occupation = '' OR j.discovery_occupation IS NULL)""",
             [applicant_id, applicant_id, applicant_id, requested_occupation],
         )
         changed = []
+        category_counts: dict[str, int] = {}
         db = get_db()
         for row in rows:
             item = job_to_dict(row, include_legacy_details=False)
-            category, reason = discovery_result_category(item, text(item.get("discovery_remote_preference")))
-            if category != "actionable":
-                continue
-            db.execute(
-                """INSERT OR REPLACE INTO discovery_requalifications(job_id, applicant_profile_id, reason)
-                   VALUES (?, ?, ?)""",
-                [int(row["id"]), applicant_id, f"Requalified by current matching rules: {reason or category}"],
+            membership = query_db(
+                """SELECT criteria_json FROM discovery_search_memberships
+                   WHERE job_id = ? AND applicant_profile_id IN (0, ?)
+                   ORDER BY created_at DESC, search_execution_id DESC LIMIT 1""",
+                [int(row["id"]), applicant_id], one=True,
             )
-            item["discovery_inbox_category"] = "requalified"
-            item["requalified_reason"] = reason or category
-            changed.append(item)
-        db.commit()
-        return jsonify({"count": len(changed), "jobs": changed, "message": "History re-evaluated; prior Seen, Saved, Applied and Skipped decisions were preserved."})
+            criteria = parse_json_object(membership["criteria_json"]) if membership else {}
+            if "include_internships" in criteria:
+                item["discovery_include_internships"] = bool(criteria.get("include_internships"))
+            category, reason = discovery_result_category(item, text(item.get("discovery_remote_preference")))
+            grounded = bool(text(item.get("title")) and (text(item.get("url")) or text(item.get("source"))))
+            if text(item.get("job_description")) and len(text(item.get("job_description"))) >= 80:
+                grounded = True
+            category_counts[category] = category_counts.get(category, 0) + 1
+            preview_item = {"id": int(row["id"]), "title": text(item.get("title")), "company": text(item.get("company")), "current_category": text(row["discovery_result_category"]), "proposed_category": category, "reason": reason, "evidence_sufficient": grounded, "source": text(item.get("source")), "url": text(item.get("url")), "search_criteria": criteria}
+            changed.append(preview_item)
+            if preview or not grounded:
+                continue
+            db.execute("UPDATE jobs SET discovery_result_category = ?, discovery_result_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [category, reason, int(row["id"])])
+            if category == "actionable":
+                db.execute(
+                    """INSERT OR REPLACE INTO discovery_requalifications(job_id, applicant_profile_id, reason)
+                       VALUES (?, ?, ?)""",
+                    [int(row["id"]), applicant_id, f"Requalified by current matching rules: {reason or category}"],
+                )
+        if not preview:
+            db.commit()
+        return jsonify({"preview": preview, "count": len(changed), "category_counts": category_counts, "jobs": changed, "message": "Preview only; no records or applicant decisions changed." if preview else "History re-evaluated; prior search evidence and applicant decisions were preserved."})
+
+    @app.get("/api/discovery/inbox/audit")
+    def discovery_inbox_audit() -> Response:
+        """Return a non-mutating audit of the complete applicant history."""
+        applicant_id = applicant_profile_id(request.args)
+        if not applicant_id:
+            return jsonify({"error": "candidate_profile_id is required for history audit."}), 400
+        rows = query_db(
+            """SELECT DISTINCT j.* FROM jobs j
+               LEFT JOIN discovery_applicant_states s ON s.job_id = j.id AND s.applicant_profile_id = ?
+               LEFT JOIN discovery_applicant_presentations p ON p.job_id = j.id AND p.applicant_profile_id = ?
+               WHERE j.discovery_first_seen_at <> ''
+                 AND (j.candidate_profile_id IN ('', 0) OR j.candidate_profile_id = ? OR s.job_id IS NOT NULL OR p.job_id IS NOT NULL)
+               ORDER BY j.id""",
+            [applicant_id, applicant_id, applicant_id],
+        )
+        category_counts: dict[str, int] = {}
+        evidence_gaps: dict[str, int] = {}
+        exclusion_reasons: dict[str, int] = {}
+        examples: dict[str, list[dict[str, Any]]] = {"non_software_title": [], "experience_anomaly": [], "geography": []}
+        for row in rows:
+            item = job_to_dict(row, include_legacy_details=False)
+            category, reason = discovery_result_category(item, text(item.get("discovery_remote_preference")))
+            category_counts[category] = category_counts.get(category, 0) + 1
+            evidence = text(item.get("job_description") or item.get("qualification_evidence_source") or item.get("workplace_evidence"))
+            if not evidence:
+                evidence_gaps["missing_source_evidence"] = evidence_gaps.get("missing_source_evidence", 0) + 1
+            if category == "excluded":
+                bucket = discovery_exclusion_reason_bucket({**item, "discovery_result_reason": reason})
+                exclusion_reasons[bucket] = exclusion_reasons.get(bucket, 0) + 1
+            title = normalize_space(text(item.get("title"))).lower()
+            if not plausible_software_role(item) and len(examples["non_software_title"]) < 20:
+                examples["non_software_title"].append({"id": int(row["id"]), "title": text(item.get("title")), "current_category": category, "reason": reason, "url": text(item.get("url"))})
+            if re.search(r"\b(?:3[0-9]|[4-9][0-9]|[1-9][0-9]{2,})\s*\+?\s*years?\b", text(item.get("job_description")) + " " + text(item.get("qualification_fit_seniority"))):
+                evidence_gaps["suspicious_experience_range"] = evidence_gaps.get("suspicious_experience_range", 0) + 1
+                if len(examples["experience_anomaly"]) < 20:
+                    examples["experience_anomaly"].append({"id": int(row["id"]), "title": text(item.get("title")), "reason": reason, "url": text(item.get("url"))})
+            if re.search(r"\b(?:Concord,?\s*CA|California|USA|United States)\b", text(item.get("location")), re.I):
+                evidence_gaps["possible_geographic_mismatch"] = evidence_gaps.get("possible_geographic_mismatch", 0) + 1
+                if len(examples["geography"]) < 20:
+                    examples["geography"].append({"id": int(row["id"]), "title": text(item.get("title")), "location": text(item.get("location")), "url": text(item.get("url"))})
+        return jsonify({"total": len(rows), "category_counts": category_counts, "exclusion_reason_counts": exclusion_reasons, "evidence_gaps": evidence_gaps, "examples": examples, "mutated": False})
 
     @app.get("/api/discovery/inbox")
     def discovery_inbox() -> Response:
         include_history = as_bool(request.args.get("include_history"))
         requested_category = text(request.args.get("category")).lower()
+        search_query = normalize_space(text(request.args.get("q")))
+        reason_filter = normalize_space(text(request.args.get("reason")))
+        source_filter = normalize_space(text(request.args.get("source")))
         applicant_id = applicant_profile_id(request.args)
         requested_search_id = text(request.args.get("search_id"))
         if requested_search_id:
@@ -2234,6 +2304,23 @@ def create_app() -> Flask:
                 query += " AND m.category = 'excluded'"
             elif requested_category == "all_relevant":
                 query += " AND m.category IN ('actionable', 'review_required')"
+        filter_alias = "j." if membership_search or requested_category == "requalified" else ""
+        if search_query:
+            pattern = f"%{search_query}%"
+            query += f" AND ({filter_alias}title LIKE ? OR {filter_alias}company LIKE ?)"
+            query_args.extend([pattern, pattern])
+        if reason_filter:
+            reason_pattern = f"%{reason_filter}%"
+            if membership_search:
+                query += " AND (j.discovery_result_reason LIKE ? OR m.reason LIKE ?)"
+                query_args.extend([reason_pattern, reason_pattern])
+            else:
+                query += f" AND {filter_alias}discovery_result_reason LIKE ?"
+                query_args.append(reason_pattern)
+        if source_filter:
+            query += f" AND {filter_alias}source LIKE ?"
+            query_args.append(f"%{source_filter}%")
+        if membership_search:
             query += " ORDER BY j.discovery_last_seen_at DESC, j.id DESC"
         page_size = clamp_int_default(request.args.get("page_size"), 500, 1, 500)
         page = clamp_int_default(request.args.get("page"), 0, 0, 100000)
@@ -4116,6 +4203,7 @@ def persist_discovery_search_memberships(
             "required_experience": job.get("experience_requirements") or job.get("qualification_fit_seniority") or {},
             "qualification_evidence_source": text(job.get("qualification_evidence_source")),
             "qualification_evidence_confidence": text(job.get("qualification_evidence_confidence")),
+            "source_excerpt": normalize_space(text(job.get("qualification_evidence_excerpt") or job.get("workplace_evidence") or job.get("salary_evidence_text") or job.get("job_description")))[:600],
         }
         criteria = {
             "occupation": text(job.get("discovery_occupation")),
@@ -4123,6 +4211,8 @@ def persist_discovery_search_memberships(
             "maximum_required_years": job.get("discovery_maximum_required_years"),
             "location_scope": text(job.get("discovery_location_scope")),
             "remote_preference": text(job.get("discovery_remote_preference")),
+            "include_internships": bool(job.get("discovery_include_internships")),
+            "search_mode": text(job.get("discovery_search_mode")),
         }
         db.execute(
             """INSERT INTO discovery_search_memberships
@@ -10590,6 +10680,9 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
         return "excluded", hard_reason
     if text(job.get("role_type")).lower() == "intern" and not bool(job.get("discovery_include_internships")):
         return "excluded", "Internships are excluded by the selected search preference."
+    occupation = normalize_space(text(job.get("discovery_occupation") or job.get("occupation"))).lower()
+    if occupation in {"software developer", "software development", "software engineer", "swe"} and clearly_non_software_role(job):
+        return "excluded", "The grounded title or posting evidence identifies a non-software occupation."
     if normalize_space(text(remote_preference)).lower() != "remote":
         if text(job.get("posting_availability")).lower() == "confirmed_closed":
             return "excluded", "Posting is confirmed closed."
@@ -10651,7 +10744,7 @@ def plausible_software_role(job: dict[str, Any]) -> bool:
     role_type = normalize_space(text(job.get("role_type"))).lower()
     if re.search(r"\b(manager|director|vice president|vp|head of|chief)\b", title):
         return False
-    if re.search(r"\b(academic assistant|teaching assistant|instructor|teacher|faculty|professor|tutor|research assistant|researcher|recruiter|recruitment|human resources|administrator|coordinator)\b", title):
+    if re.search(r"\b(academic assistant|teaching assistant|instructor|teacher|faculty|professor|tutor|research assistant|researcher|recruiter|recruitment|human resources|administrator|coordinator|cnc|machinist|metal fabrication|bridge engineer|civil engineer|structural engineer|registered nurse|nurse contractor|provider operations|packaging developer)\b", title):
         return False
     # A title that explicitly says it is not development work is not a SWE
     # match merely because the provider classified it as a 'developer' role.
@@ -10661,9 +10754,25 @@ def plausible_software_role(job: dict[str, Any]) -> bool:
     software_signal = r"\b(?:software|web|application|cloud|api|platform|computer|automation|systems|backend|frontend|full[ -]?stack)\b"
     if re.search(nonsoftware_industries, title) and not re.search(software_signal, title):
         return False
-    if role_type in ACTIONABLE_DISCOVERY_ROLE_FAMILIES:
+    software_title = bool(re.search(r"\b(software engineer|software developer|software dev|web developer|application developer|full[ -]?stack|front[ -]?end|back[ -]?end|qa automation|test automation|devops|cloud engineer|api engineer|integration engineer|automation engineer|platform engineer|sdet)\b", title))
+    return software_title or (role_type in ACTIONABLE_DISCOVERY_ROLE_FAMILIES and bool(re.search(r"\b(software|web|application|cloud|api|platform|computer|automation|systems|backend|frontend|full[ -]?stack)\b", title)))
+
+
+def clearly_non_software_role(job: dict[str, Any]) -> bool:
+    """Return true only for grounded, explicit non-SWE title evidence.
+
+    A vague title is retained for review.  This gate is deliberately narrower
+    than ``plausible_software_role`` so provider misclassification cannot turn
+    low-information records into hard exclusions.
+    """
+    title = normalize_space(text(job.get("title"))).lower()
+    if re.search(r"\b(academic assistant|teaching assistant|instructor|teacher|faculty|professor|tutor|research assistant|researcher|recruiter|recruitment|human resources|administrator|coordinator|cnc|machinist|metal fabrication|bridge engineer|civil engineer|structural engineer|registered nurse|nurse contractor|provider operations|packaging developer)\b", title):
         return True
-    return bool(re.search(r"\b(software engineer|software developer|developer|engineer|full[ -]?stack|front[ -]?end|back[ -]?end|qa automation|test automation|devops|cloud engineer|api engineer|integration engineer|automation engineer|platform engineer|sdet)\b", title))
+    if re.search(r"\bproduction\s+support\b", title) and re.search(r"\b(?:not\s+(?:a\s+)?developer|mainframe)\b", title):
+        return True
+    if re.search(r"\b(?:packaging|sustainability|food\s+product|industrial\s+design|manufacturing|fashion\s+product|cosmetic\s+product)\b", title) and not re.search(r"\b(?:software|web|application|cloud|api|platform|computer|automation|systems|backend|frontend|full[ -]?stack)\b", title):
+        return True
+    return False
 
 
 def apply_broadly_reason(job: dict[str, Any]) -> str:

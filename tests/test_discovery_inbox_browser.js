@@ -26,6 +26,10 @@ async function main() {
       return;
     }
     const scoped = url.searchParams.has("search_id");
+    if (url.searchParams.get("q") === "zero") {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify([]) });
+      return;
+    }
     const count = scoped ? 44 : 45;
     const category = url.searchParams.get("category") || "all_discovered";
     const rows = Array.from({ length: count }, (_, index) => ({
@@ -49,8 +53,12 @@ async function main() {
   // deterministic fixture; otherwise its late profile refresh can replace
   // the run selector while the interaction is being exercised.
   await page.waitForTimeout(750);
+  await page.getByRole("button", { name: "Jobs Inbox" }).click();
+  await page.locator(".discovery-view-inbox").waitFor({ state: "visible" });
+  await page.getByRole("button", { name: "Find jobs", exact: true }).click();
+  await page.getByRole("button", { name: "Jobs Inbox" }).click();
+  await page.locator(".discovery-view-inbox").waitFor({ state: "visible" });
   await page.evaluate(async () => {
-    setDiscoverySection("saved");
     state.selectedCandidateProfileId = "7";
     state.discoveryLastSearchId = "e968ffcafb0f4524be269e517a6709a1";
     state.discoveryResults = [];
@@ -100,6 +108,12 @@ async function main() {
   assert.strictEqual(await page.locator('[data-inbox-clear-search]').count(), 0);
   assert.match(await page.locator("#discovery-inbox").innerText(), /Bluestar durable history/);
   assert.match(await page.locator("#discovery-inbox").innerText(), /Sun Life durable history/);
+  await page.getByRole("button", { name: "History" }).click();
+  const zeroRequest = page.waitForRequest((request) => new URL(request.url()).searchParams.get("q") === "zero");
+  await page.locator("[data-inbox-history-search]").fill("zero");
+  await zeroRequest;
+  await page.waitForFunction(() => /No all discovered discovery records/.test(document.querySelector("#discovery-inbox").innerText));
+  assert.match(await page.locator("#discovery-inbox").innerText(), /No all discovered discovery records/);
   await browser.close();
   console.log("discovery Inbox browser click regression passed");
 }

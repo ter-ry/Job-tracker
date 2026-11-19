@@ -354,6 +354,7 @@ legend {
 
 .discovery-view-find[hidden],
 .discovery-view-saved[hidden],
+.discovery-view-inbox[hidden],
 .pipeline-dashboard[hidden] {
   display: none !important;
 }
@@ -483,8 +484,32 @@ legend {
   padding: 8px 0 2px;
 }
 
+.inbox-history-search {
+  display: grid;
+  grid-template-columns: 2fr 1fr 1fr;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 0 2px;
+}
+
+.inbox-history-search label {
+  display: grid;
+  gap: 3px;
+  font-size: .8rem;
+  color: var(--muted);
+}
+
 .inbox-primary-views .button.active {
   box-shadow: inset 0 -2px 0 currentColor;
+}
+
+.inbox-badge {
+  justify-self: start;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: .72rem;
+  padding: 2px 7px;
 }
 
 input,
@@ -1309,6 +1334,10 @@ th {
   .saved-search-row .actions,
   .inbox-row .row-actions {
     justify-content: flex-start;
+  }
+
+  .inbox-history-search {
+    grid-template-columns: 1fr;
   }
 }
 
