@@ -174,6 +174,36 @@ def test_historical_application_import_is_preview_first_and_durable(tmp_path, mo
         assert dict(state) == {"state": "applied", "date_applied": "2026-01-10"}
         imported = app_module.query_db("SELECT id FROM jobs WHERE url = ?", ["https://example.test/new-apply"], one=True)
         assert imported is not None
+        held = app_module.query_db("SELECT possible_duplicate, possible_duplicate_job_id, discovery_result_category FROM jobs WHERE url = ?", ["https://example.test/possible"], one=True)
+        assert dict(held) == {"possible_duplicate": 1, "possible_duplicate_job_id": existing_id, "discovery_result_category": "review_required"}
+    assert client.get(f"/api/discovery/inbox?candidate_profile_id={swe}&category=ready_to_apply&include_history=1").get_json() == []
+
+
+def test_possible_duplicate_import_is_held_and_ats_identity_keeps_case(tmp_path, monkeypatch):
+    client = _isolated_client(tmp_path, monkeypatch)
+    swe = _profile(client, "SWE", "software")
+    with app_module.app.app_context():
+        first = app_module.normalize_job_payload({
+            "source": "indeed", "source_job_id": "ReqABC", "title": "Software Engineer",
+            "company": "Identity Co", "location": "Toronto, ON", "url": "https://jobs.example/ReqABC",
+            "description": "A complete software engineering posting with requirements and responsibilities.",
+        })
+        first.update({"discovery_first_seen_at": "2026-01-01T00:00:00", "discovery_result_category": "actionable", "discovery_occupation": "software developer"})
+        first_id = app_module.persist_discovery_jobs([first], None, None)["new_job_ids"][0]
+        second = dict(first)
+        second.update({"source": "glassdoor", "source_job_id": "reqabc", "url": "https://jobs.example/reqabc", "application_url": "", "source_links_json": app_module.dumps_json(["https://jobs.example/reqabc"])})
+        assert app_module.find_existing_job_match(second) is None
+        employer = dict(first)
+        employer.update({"source": "employer_direct", "source_job_id": "", "url": "https://careers.example/jobs/ReqABC"})
+        employer["source_links_json"] = app_module.dumps_json(["https://jobs.example/ReqABC", "https://careers.example/jobs/ReqABC"])
+        assert app_module.find_existing_job_match(employer)["id"] == first_id
+        app_module.persist_discovery_jobs([employer], None, None)
+        app_module.get_db().commit()
+    with app_module.app.app_context():
+        app_module.get_db().close()
+        app_module.g.pop("db", None)
+        reloaded = app_module.find_existing_job_match({"source": "employer_direct", "url": "https://careers.example/jobs/ReqABC", "title": "Software Engineer", "company": "Identity Co", "location": "Toronto, ON"})
+        assert reloaded["id"] == first_id
 
 def test_history_audit_export_is_read_only_and_resume_free(tmp_path, monkeypatch):
     client = _isolated_client(tmp_path, monkeypatch)

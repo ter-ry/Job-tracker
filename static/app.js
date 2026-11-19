@@ -1421,10 +1421,10 @@ function renderDiscoveryInbox(jobs) {
     });
     filters.querySelector("[data-inbox-select-visible]")?.addEventListener("click", () => { visibleIds.forEach((id) => state.discoveryInboxSelected.add(id)); renderDiscoveryInbox(state.discoveryInboxJobs); });
     filters.querySelector("[data-inbox-clear-selection]")?.addEventListener("click", () => { state.discoveryInboxSelected.clear(); renderDiscoveryInbox(state.discoveryInboxJobs); });
-    if (["requalified", "presented", "excluded", "all_relevant", "all_discovered"].includes(state.discoveryInboxCategory) && state.discoveryInboxHasMore) {
+    if (["ready_to_apply", "requalified", "presented", "excluded", "all_relevant", "all_discovered"].includes(state.discoveryInboxCategory) && state.discoveryInboxHasMore) {
       const next = document.createElement("button");
       next.className = "button ghost small";
-      next.textContent = "Load more history";
+      next.textContent = "Load more";
       filters.appendChild(next);
       next.addEventListener("click", async () => { state.discoveryInboxPage += 1; await loadDiscoveryInbox(true, true); });
     }
@@ -1509,7 +1509,7 @@ async function loadDiscoveryInbox(force = false, append = false) {
   try {
     if (force && !append) target.textContent = "Loading Inbox history…";
     const isRequalified = state.discoveryInboxCategory === "requalified";
-    const pagedCategory = ["requalified", "presented", "excluded", "all_relevant", "all_discovered"].includes(state.discoveryInboxCategory);
+    const pagedCategory = ["ready_to_apply", "requalified", "presented", "excluded", "all_relevant", "all_discovered"].includes(state.discoveryInboxCategory);
     const jobsUrl = discoveryInboxRequestUrl({
       profileId: state.selectedCandidateProfileId,
       category: state.discoveryInboxCategory,

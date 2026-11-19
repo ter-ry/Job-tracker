@@ -520,6 +520,8 @@ JOB_COLUMNS = {
     "distance_type": "TEXT NOT NULL DEFAULT 'unknown'",
     "commute_status": "TEXT NOT NULL DEFAULT 'unavailable'",
     "commute_source": "TEXT NOT NULL DEFAULT ''",
+    "possible_duplicate": "INTEGER NOT NULL DEFAULT 0",
+    "possible_duplicate_job_id": "INTEGER NOT NULL DEFAULT 0",
 }
 
 PROFILE_COLUMNS = {
@@ -1968,7 +1970,7 @@ def create_app() -> Flask:
             if existing is not None:
                 outcomes.append({"outcome": "matched_existing", "job_id": int(existing["id"]), "url": url, "company": company, "title": title, "date_applied": parsed_date})
             elif possible is not None:
-                outcomes.append({"outcome": "possible_duplicate", "possible_job_id": int(possible["id"]), "url": url, "company": company, "title": title, "date_applied": parsed_date, "reason": "Same company and title, but no verified identity match."})
+                outcomes.append({"outcome": "possible_duplicate", "possible_job_id": int(possible["id"]), "url": url, "company": company, "title": title, "date_applied": parsed_date, "candidate": candidate, "reason": "Same company and title, but no verified identity match."})
             else:
                 outcomes.append({"outcome": "new_imported", "url": url, "company": company, "title": title, "date_applied": parsed_date, "candidate": candidate})
 
@@ -1991,6 +1993,22 @@ def create_app() -> Flask:
                         job_id = int(inserted["new_job_ids"][0])
                         outcome["job_id"] = job_id
                     set_applicant_discovery_state(job_id, profile_id, "applied", outcome["date_applied"])
+                elif outcome["outcome"] == "possible_duplicate":
+                    candidate = dict(outcome.pop("candidate"))
+                    candidate.update({
+                        "possible_duplicate": 1,
+                        "possible_duplicate_job_id": int(outcome["possible_job_id"]),
+                        "discovery_occupation": "early childhood educator" if workflow == "ece" else "software developer",
+                        "discovery_result_category": "review_required",
+                        "discovery_result_reason": "Possible duplicate requires owner review; no verified requisition or URL identity was available.",
+                    })
+                    inserted = persist_discovery_jobs([candidate], None, None)
+                    if inserted["new_job_ids"]:
+                        outcome["job_id"] = int(inserted["new_job_ids"][0])
+                    else:
+                        held = find_existing_job_match(candidate)
+                        if held is not None:
+                            outcome["job_id"] = int(held["id"])
             db.commit()
         for outcome in outcomes:
             outcome.pop("candidate", None)
@@ -8145,9 +8163,9 @@ def job_source_aliases(job: dict[str, Any]) -> list[tuple[str, str, str]]:
     for value in source_link_values(job):
         aliases.add(("canonical_url", value, value))
     source = normalize_dedupe_text(job.get("source"))
-    source_id = normalize_dedupe_text(job.get("source_job_id"))
+    source_id = normalize_space(text(job.get("source_job_id")))
     if source and source_id:
-        aliases.add(("source_identity", f"{source}:{source_id}", text(job.get("source_job_id"))))
+        aliases.add(("source_identity", f"{source}:{source_id}", source_id))
     return sorted(aliases)
 
 
@@ -8184,8 +8202,10 @@ def dedupe_match(first: dict[str, Any], second: dict[str, Any]) -> bool:
     second_urls = source_link_values(second)
     if (first_urls - {""}) & (second_urls - {""}):
         return True
-    first_id = normalize_dedupe_text(first.get("source_job_id"))
-    second_id = normalize_dedupe_text(second.get("source_job_id"))
+    # ATS requisition identifiers are opaque and case-sensitive. Normalize
+    # surrounding whitespace only; lowercasing can merge distinct IDs.
+    first_id = normalize_space(text(first.get("source_job_id")))
+    second_id = normalize_space(text(second.get("source_job_id")))
     first_source = normalize_dedupe_text(first.get("source"))
     second_source = normalize_dedupe_text(second.get("source"))
     if first_id and second_id and first_source and first_source == second_source:
@@ -8205,13 +8225,15 @@ def dedupe_match(first: dict[str, Any], second: dict[str, Any]) -> bool:
 def canonical_url(value: str) -> str:
     if not value:
         return ""
-    parts = urlsplit(value.strip().lower())
+    parts = urlsplit(value.strip())
     tracking = {"source", "ref", "referrer", "referral", "recruiter", "gh_src", "trk", "from", "campaign"}
     query = [(key, val) for key, val in parse_qsl(parts.query, keep_blank_values=True)
-             if not key.startswith("utm_") and key not in tracking]
+             if not key.lower().startswith("utm_") and key.lower() not in tracking]
     path = parts.path.rstrip("/") or "/"
-    host = parts.netloc[4:] if parts.netloc.startswith("www.") else parts.netloc
-    return urlunsplit((parts.scheme, host, path, urlencode(query), "")).rstrip("/")
+    host = parts.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return urlunsplit((parts.scheme.lower(), host, path, urlencode(query), "")).rstrip("/")
 
 
 def normalize_dedupe_text(value: Any) -> str:

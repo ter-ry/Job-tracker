@@ -62,6 +62,8 @@ def test_implausibly_large_experience_value_stays_reviewable():
 
 def test_canonical_url_drops_provider_tracking_and_www_aliases():
     assert app.canonical_url("https://www.example.test/jobs/42/?utm_source=feed&ref=abc") == "https://example.test/jobs/42"
+    assert app.canonical_url("https://ATS.example/jobs/ReqABC?utm_source=feed&req=ReqABC") == "https://ats.example/jobs/ReqABC?req=ReqABC"
+    assert app.canonical_url("https://ats.example/jobs/ReqABC") != app.canonical_url("https://ats.example/jobs/reqabc")
 
 
 def test_unknown_city_location_is_provisional_but_strict_radius_requires_evidence():

@@ -30,20 +30,21 @@ async function main() {
       await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify([]) });
       return;
     }
-    const count = scoped ? 44 : 45;
     const category = url.searchParams.get("category") || "all_discovered";
+    const count = category === "ready_to_apply" ? 51 : scoped ? 44 : 45;
     const rows = Array.from({ length: count }, (_, index) => ({
       id: index + 1,
       title: scoped ? category === "excluded" ? `Excluded ${index + 1}` : `Review ${index + 1}` : index === 0 ? "Bluestar durable history" : index === 1 ? "Sun Life durable history" : `History ${index + 1}`,
       company: "Browser Fixture",
       location: "Toronto, ON",
       url: `https://example.test/${index + 1}`,
-      discovery_result_category: scoped ? category === "excluded" ? "excluded" : "review_required" : index === 44 ? "actionable" : "review_required",
-      discovery_inbox_category: scoped ? category === "excluded" ? "excluded" : "review_required" : index === 44 ? "new_actionable" : "review_required",
+      discovery_result_category: category === "ready_to_apply" ? "actionable" : scoped ? category === "excluded" ? "excluded" : "review_required" : index === 44 ? "actionable" : "review_required",
+      discovery_inbox_category: category === "ready_to_apply" ? "ready_to_apply" : scoped ? category === "excluded" ? "excluded" : "review_required" : index === 44 ? "new_actionable" : "review_required",
       discovery_result_reason: "Evidence incomplete",
       search_membership_evidence: scoped ? { rule: category === "excluded" ? "location evidence missing" : "qualification evidence incomplete", source_excerpt: "Original posting evidence retained for this search run." } : {},
     }));
-    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(rows) });
+    const page = Number(url.searchParams.get("page") || 0);
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(rows.slice(page * 50, page * 50 + 50)) });
   });
   // The application keeps status polling requests open while a discovery
   // worker is available; DOM readiness is the meaningful startup boundary.
@@ -114,6 +115,11 @@ async function main() {
   await zeroRequest;
   await page.waitForFunction(() => /No all discovered discovery records/.test(document.querySelector("#discovery-inbox").innerText));
   assert.match(await page.locator("#discovery-inbox").innerText(), /No all discovered discovery records/);
+  await page.evaluate(() => { state.discoveryInboxQuery = ""; });
+  await page.getByRole("button", { name: /Ready to Apply/ }).click();
+  await page.waitForFunction(() => document.querySelectorAll("#discovery-inbox article").length === 50);
+  await page.getByRole("button", { name: "Load more" }).click();
+  await page.waitForFunction(() => document.querySelectorAll("#discovery-inbox article").length === 51);
   await browser.close();
   console.log("discovery Inbox browser click regression passed");
 }
