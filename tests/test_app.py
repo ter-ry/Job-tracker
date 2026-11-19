@@ -7361,6 +7361,13 @@ class JobAssistantTest(unittest.TestCase):
 
     def test_inbox_page_metadata_and_saved_internship_preference_are_authoritative(self):
         self.client.get("/api/health")
+        # Keep this deliberately large pagination fixture isolated even when
+        # the application module has been used by an earlier test in the
+        # same process.
+        with app_module.app.app_context():
+            app_module.get_db().execute("DELETE FROM discovery_applicant_states")
+            app_module.get_db().execute("DELETE FROM jobs")
+            app_module.get_db().commit()
         profile = self.client.post("/api/candidate-profiles", json={"name": "Pagination owner", "workflow": "software"}).get_json()
         jobs = [
             {
@@ -7395,6 +7402,11 @@ class JobAssistantTest(unittest.TestCase):
         with app_module.app.app_context():
             payload = app_module.saved_search_to_discovery_payload(updated.get_json())
         self.assertFalse(payload["include_internships"])
+        with app_module.app.app_context():
+            app_module.get_db().execute("DELETE FROM saved_search_profiles WHERE name = ?", ["Internship preference"])
+            app_module.get_db().execute("DELETE FROM discovery_applicant_states")
+            app_module.get_db().execute("DELETE FROM jobs")
+            app_module.get_db().commit()
 
     def test_normal_source_defaults_exclude_disabled_providers_but_allow_explicit_reactivation(self):
         self.assertEqual(app_module.normalize_discovery_sources(None), ["indeed", "glassdoor", "employer_direct"])
