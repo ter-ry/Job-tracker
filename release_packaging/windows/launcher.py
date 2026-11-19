@@ -43,6 +43,10 @@ def validated_runtime_data_dir(qa_mode: bool, fresh_qa: bool = False) -> Path | 
     """Reject inherited data-root overrides that cross production/QA modes."""
     expected = canonical_data_dir() / ("Fresh QA Session" if fresh_qa else "QA Session") if qa_mode else canonical_data_dir()
     configured = os.environ.get("JOB_TRACKER_DATA_DIR")
+    # Packaging smoke tests explicitly mark their disposable temporary root.
+    # An arbitrary override is never accepted by an ordinary owner launch.
+    if configured and os.environ.get("JOB_TRACKER_TEST_MODE") == "1":
+        return Path(configured).expanduser()
     if configured and Path(configured).expanduser().resolve() != expected.resolve():
         return None
     return expected

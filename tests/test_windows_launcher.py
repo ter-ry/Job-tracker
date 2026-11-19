@@ -43,3 +43,10 @@ def test_inherited_qa_data_root_is_rejected_for_production(monkeypatch, tmp_path
     monkeypatch.setenv("JOB_TRACKER_DATA_DIR", str(tmp_path / "Job Tracker" / "QA Session"))
     assert launcher.validated_runtime_data_dir(False) is None
     assert launcher.validated_runtime_data_dir(True) == tmp_path / "Job Tracker" / "QA Session"
+
+
+def test_explicit_packaging_test_root_is_allowed_only_with_test_marker(monkeypatch, tmp_path):
+    custom = tmp_path / "frozen-smoke"
+    monkeypatch.setenv("JOB_TRACKER_DATA_DIR", str(custom))
+    monkeypatch.setenv("JOB_TRACKER_TEST_MODE", "1")
+    assert launcher.validated_runtime_data_dir(False) == custom
