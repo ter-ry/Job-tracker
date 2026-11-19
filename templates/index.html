@@ -470,6 +470,22 @@
               </select>
             </div>
           </div>
+          <details class="settings-block" id="historical-application-panel">
+            <summary>Record an application made before Job Tracker</summary>
+            <p class="muted helper">Preview first. Exact source identity is matched automatically; similar company/title records are held as Possible Duplicate for review.</p>
+            <div class="grid four">
+              <label>Posting URL<input id="historical-application-url" type="url" placeholder="https://…"></label>
+              <label>Company<input id="historical-application-company"></label>
+              <label>Title<input id="historical-application-title"></label>
+              <label>Application date<input id="historical-application-date" type="date"></label>
+            </div>
+            <label>CSV history (optional)<input id="historical-application-csv" type="file" accept=".csv,text/csv"></label>
+            <div class="actions">
+              <button class="button ghost" type="button" id="historical-application-preview">Preview import</button>
+              <button class="button" type="button" id="historical-application-confirm" hidden>Confirm recorded applications</button>
+            </div>
+            <div id="historical-application-outcomes" class="muted helper" aria-live="polite"></div>
+          </details>
           <div class="table-wrap">
             <table>
               <thead>

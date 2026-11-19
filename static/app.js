@@ -150,6 +150,58 @@ const api = {
   },
 };
 
+let historicalApplicationImport = null;
+
+function renderHistoricalApplicationOutcomes(result) {
+  const target = document.getElementById("historical-application-outcomes");
+  if (!target) return;
+  const counts = Object.entries(result.counts || {}).map(([key, count]) => `${key.replaceAll("_", " ")}: ${count}`).join(" · ");
+  const details = (result.outcomes || []).map((item) => `${item.outcome}: ${item.title || item.url || "record"}${item.reason ? ` (${item.reason})` : ""}`);
+  target.innerHTML = `<strong>${result.preview ? "Preview only" : "Recorded"}</strong>${counts ? ` — ${escapeHtml(counts)}` : ""}<br>${details.map(escapeHtml).join("<br>")}`;
+}
+
+async function readHistoricalApplicationCsv() {
+  const file = document.getElementById("historical-application-csv")?.files?.[0];
+  if (!file) return "";
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(new Error("CSV could not be read."));
+    reader.readAsText(file);
+  });
+}
+
+async function previewHistoricalApplications() {
+  try {
+    const profileId = state.selectedCandidateProfileId || value("discovery-profile") || "";
+    if (!profileId) throw new Error("Select an applicant before importing application history.");
+    const record = {
+      url: value("historical-application-url"), company: value("historical-application-company"),
+      title: value("historical-application-title"), date_applied: value("historical-application-date"),
+    };
+    const csv = await readHistoricalApplicationCsv();
+    if (!csv && !record.url && !record.company && !record.title) throw new Error("Enter a record or choose a CSV file.");
+    const records = Object.values(record).some(Boolean) ? [record] : [];
+    historicalApplicationImport = { candidate_profile_id: profileId, workflow: state.discoveryWorkflow || "software", records, csv };
+    const result = await api.send("/api/applications/import-history", "POST", { ...historicalApplicationImport, preview: true });
+    renderHistoricalApplicationOutcomes(result);
+    const confirm = document.getElementById("historical-application-confirm");
+    if (confirm) confirm.hidden = !Object.keys(result.counts || {}).some((key) => ["matched_existing", "new_imported"].includes(key));
+  } catch (error) { toast(error.message); }
+}
+
+async function confirmHistoricalApplications() {
+  if (!historicalApplicationImport) return;
+  try {
+    const result = await api.send("/api/applications/import-history", "POST", { ...historicalApplicationImport, preview: false, confirm_apply: true });
+    renderHistoricalApplicationOutcomes(result);
+    historicalApplicationImport = null;
+    const confirm = document.getElementById("historical-application-confirm");
+    if (confirm) confirm.hidden = true;
+    await Promise.all([loadAll(), loadDiscoveryInbox(true)]);
+  } catch (error) { toast(error.message); }
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   document.querySelectorAll(".tab").forEach((tab) => tab.addEventListener("click", switchTab));
   document.querySelectorAll("[data-discovery-view]").forEach((button) => {
@@ -176,6 +228,8 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("toggle-discovery-scheduler").addEventListener("click", toggleDiscoveryScheduler);
   document.getElementById("refresh-discovery-task-status")?.addEventListener("click", loadDiscoveryTaskStatus);
   document.getElementById("csv-import-form").addEventListener("submit", importCsv);
+  document.getElementById("historical-application-preview")?.addEventListener("click", previewHistoricalApplications);
+  document.getElementById("historical-application-confirm")?.addEventListener("click", confirmHistoricalApplications);
   document.getElementById("discovery-test-sources").addEventListener("click", testJobSources);
   document.getElementById("discovery-recalculate-distances")?.addEventListener("click", recalculateDiscoveryDistances);
   document.getElementById("discovery-re-evaluate")?.addEventListener("click", reEvaluateDiscoveryHistory);
@@ -1301,9 +1355,9 @@ function renderDiscoveryInbox(jobs) {
     const button = document.getElementById(`inbox-bulk-${action}`);
     if (button) button.disabled = Boolean(state.discoveryInboxBulkAction);
   });
-  const labels = { all_relevant: "All Relevant", new_actionable: "New Opportunities", review_required: "Needs Review", presented: "Presented / Seen", excluded: "Excluded Jobs", requalified: "Requalified Since Update", saved: "Saved", applied: "Applied", skipped: "Skipped", all_discovered: "All Discovered" };
+  const labels = { all_relevant: "All Relevant", new_actionable: "New Opportunities", ready_to_apply: "Ready to Apply", review_required: "Needs Review", presented: "Presented / Seen", excluded: "Excluded Jobs", requalified: "Requalified Since Update", saved: "Saved", applied: "Applied", skipped: "Skipped", all_discovered: "All Discovered" };
   const primaryViews = { new_actionable: "New Jobs", review_required: "Needs Review", all_discovered: "History" };
-  const historyViews = ["all_relevant", "presented", "saved", "applied", "skipped", "excluded", "requalified", "all_discovered"];
+  const historyViews = ["all_relevant", "ready_to_apply", "presented", "saved", "applied", "skipped", "excluded", "requalified", "all_discovered"];
   const counts = jobs.reduce((result, job) => {
     const category = job.discovery_inbox_category || discoveryInboxCategory(job);
     result[category] = (result[category] || 0) + 1;
@@ -1394,7 +1448,7 @@ function renderDiscoveryInbox(jobs) {
       `<button class="button ghost small" type="button" onclick="flagInboxReassessment(${job.id})">Flag for reassessment</button>`,
       `<button class="button ghost small" type="button" onclick="reassessInboxJob(${job.id})">Reassess now</button>`,
     ].join("") : "";
-    const actions = category === "new_actionable" || category === "review_required" || category === "requalified" || category === "presented"
+    const actions = category === "new_actionable" || category === "ready_to_apply" || category === "review_required" || category === "requalified" || category === "presented"
       ? `<button class="button ghost small" type="button" onclick="saveInboxJob(${job.id})">Save</button><button class="button ghost small" type="button" onclick="applyInboxJob(${job.id})">Confirm Applied</button><button class="button ghost small" type="button" onclick="ignoreInboxJob(${job.id})">Skip</button>`
       : category === "skipped" ? `<button class="button ghost small" type="button" onclick="restoreInboxJob(${job.id})">Restore</button>` : "";
     return `<article class="inbox-row"><label><input type="checkbox" data-inbox-select="${job.id}" ${state.discoveryInboxSelected.has(Number(job.id)) ? "checked" : ""}> Select</label><div><span class="inbox-badge">${escapeHtml(label)}</span><strong>${escapeHtml(job.title || "Untitled role")}</strong><span>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(resultWorkplaceLabel(job))}</span><span class="muted">${escapeHtml(job.work_arrangement || job.remote_type || "Unknown arrangement")} · ${escapeHtml(displaySalary(job))} · ${escapeHtml(resultDistanceLabel(job))}</span>${renderExperienceSummary(job)}<details><summary>${category === "excluded" ? "Exclusion evidence" : "Requirements and source evidence"}</summary><span class="muted">Decision: ${escapeHtml(job.discovery_result_category || category)} · Reason: ${escapeHtml(job.discovery_result_reason || "Unverified/missing")} · Source: ${escapeHtml(job.source || membership.source || "Unverified/missing")} · Evidence: ${escapeHtml(job.qualification_evidence_source || membership.qualification_evidence_source || "Unverified/missing")} · Confidence: ${escapeHtml(job.qualification_evidence_confidence || membership.qualification_evidence_confidence || "Unverified/missing")}</span>${evidenceText}${membership.required_experience ? `<p class="muted">Required experience evidence: ${escapeHtml(JSON.stringify(membership.required_experience))}</p>` : ""}${sourceLink}</details>${audit}</div><div class="row-actions">${actions}${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open Original</a>` : ""}</div></article>`;
@@ -1435,11 +1489,11 @@ function discoveryInboxRequestUrl({ profileId = "", category = "all_relevant", s
     if (!["review_required", "excluded", "new_actionable", "all_relevant"].includes(category)) throw new Error("A search-scoped Inbox request must use a supported category.");
     params.set("category", category);
     params.set("search_id", String(searchId));
-  } else if (["requalified", "presented", "excluded", "all_relevant", "all_discovered"].includes(category)) {
+  } else if (["requalified", "ready_to_apply", "presented", "excluded", "all_relevant", "all_discovered"].includes(category)) {
     params.set("category", category === "all_discovered" ? "all_discovered" : category);
     params.set("page_size", String(pageSize));
     params.set("page", String(page));
-  } else if (["new", "new_actionable", "review", "review_required", "excluded"].includes(category)) {
+  } else if (["new", "new_actionable", "ready_to_apply", "review", "review_required", "excluded"].includes(category)) {
     params.set("category", category);
   }
   return `/api/discovery/inbox?${params.toString()}`;
@@ -1507,10 +1561,10 @@ async function reEvaluateDiscoveryHistory() {
     const preview = await api.send("/api/discovery/re-evaluate", "POST", { ...discoveryApplicantActionPayload(), preview: true });
     const changes = (preview.jobs || []).filter((job) => job.current_category !== job.proposed_category);
     const summary = document.getElementById("inbox-audit-summary");
-    if (summary) { summary.hidden = false; summary.textContent = `Preview only: ${changes.length} of ${Number(preview.count || 0)} historical records would change. No decisions or search evidence changed.`; }
+    if (summary) { summary.hidden = false; summary.textContent = `Preview only: ${Number(preview.targeted_count || 0)} evidence-sufficient historical records would change. No decisions or search evidence changed.`; }
     renderDiscoveryReassessmentPreview(changes);
-    if (!changes.length || !window.confirm(`Preview found ${changes.length} proposed classification changes. Apply only evidence-sufficient changes?`)) return;
-    const result = await api.send("/api/discovery/re-evaluate", "POST", { ...discoveryApplicantActionPayload(), preview: false });
+    if (!Number(preview.targeted_count || 0) || !window.confirm(`Preview found ${Number(preview.targeted_count || 0)} evidence-sufficient classification changes. Apply them?`)) return;
+    const result = await api.send("/api/discovery/re-evaluate", "POST", { ...discoveryApplicantActionPayload(), preview: false, confirm_apply: true, preview_token: preview.preview_token });
     toast(`${Number(result.count || 0)} historical classification(s) updated; prior decisions were preserved.`);
     state.discoveryInboxCategory = "requalified";
     state.discoveryInboxPage = 0;

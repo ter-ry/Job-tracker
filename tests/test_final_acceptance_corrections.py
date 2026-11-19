@@ -22,7 +22,7 @@ def _stored_job(client, category="excluded", occupation="software developer"):
         job = app_module.normalize_job_payload({
             "source": "fixture", "source_job_id": f"acceptance-{category}-{occupation}",
             "title": "Junior Software Developer" if occupation == "software developer" else "Registered Early Childhood Educator",
-            "company": "Acceptance Centre", "location": "Toronto, ON", "job_url": "https://example.test/acceptance",
+            "company": "Acceptance Centre", "location": "Toronto, ON", "url": f"https://example.test/acceptance-{occupation}",
             "description": "A current classroom or software opportunity.",
         })
         job.update({
@@ -68,13 +68,23 @@ def test_re_evaluate_is_occupation_scoped_and_preserves_history(tmp_path, monkey
     swe = _profile(client, "SWE", "software")
     software_id = _stored_job(client, occupation="software developer")
     _stored_job(client, occupation="early childhood educator")
-    original_seen = client.get(f"/api/discovery/inbox?include_history=1&page_size=10").get_json()[0]["discovery_first_seen_at"]
+    with app_module.app.app_context():
+        app_module.get_db().execute(
+            "UPDATE jobs SET job_description = ? WHERE id = ?",
+            ["This complete posting describes a software development role, its responsibilities, required technologies, workplace evidence and compensation details for a current applicant.", software_id],
+        )
+        app_module.get_db().commit()
+    with app_module.app.app_context():
+        original_seen = app_module.query_db("SELECT discovery_first_seen_at FROM jobs WHERE id = ?", [software_id], one=True)["discovery_first_seen_at"]
 
     saved = client.post(f"/api/discovery/inbox/{software_id}/save", json={"applicant_profile_id": swe, "workflow": "software"})
     assert saved.status_code == 200
-    result = client.post("/api/discovery/re-evaluate", json={"applicant_profile_id": swe, "workflow": "software"})
+    preview = client.post("/api/discovery/re-evaluate", json={"applicant_profile_id": swe, "workflow": "software"})
+    assert preview.status_code == 200
+    assert preview.get_json()["preview"] is True
+    result = client.post("/api/discovery/re-evaluate", json={"applicant_profile_id": swe, "workflow": "software", "preview": False, "confirm_apply": True, "preview_token": preview.get_json()["preview_token"]})
     assert result.status_code == 200
-    assert result.get_json()["count"] == 1
+    assert result.get_json()["preview"] is False
 
     inbox = client.get(f"/api/discovery/inbox?candidate_profile_id={swe}&category=requalified&include_history=1&page_size=10")
     assert inbox.status_code == 200
@@ -94,7 +104,6 @@ def test_history_reassessment_preview_and_audit_are_non_mutating(tmp_path, monke
     preview = client.post("/api/discovery/re-evaluate", json={"applicant_profile_id": swe, "workflow": "software", "preview": True})
     assert preview.status_code == 200
     assert preview.get_json()["preview"] is True
-    assert preview.get_json()["mutated"] if "mutated" in preview.get_json() else True
     with app_module.app.app_context():
         after = dict(app_module.query_db("SELECT discovery_result_category, discovery_result_reason FROM jobs WHERE id = ?", [job_id], one=True))
     assert after == before
@@ -102,6 +111,70 @@ def test_history_reassessment_preview_and_audit_are_non_mutating(tmp_path, monke
     assert audit.status_code == 200
     assert audit.get_json()["mutated"] is False
     assert audit.get_json()["total"] >= 1
+
+
+def test_ready_to_apply_excludes_applications_but_keeps_seen_unapplied(tmp_path, monkeypatch):
+    client = _isolated_client(tmp_path, monkeypatch)
+    swe = _profile(client, "SWE", "software")
+    with app_module.app.app_context():
+        jobs = []
+        for index in range(3):
+            job = app_module.normalize_job_payload({
+                "source": "fixture", "source_job_id": f"ready-{index}",
+                "title": f"Software Developer {index}", "company": "Ready Co",
+                "location": "Toronto, ON", "url": f"https://example.test/ready-{index}",
+                "description": "A software development position with source evidence and current responsibilities.",
+                "discovery_first_seen_at": "2026-01-01T00:00:00",
+                "discovery_result_category": "actionable", "discovery_occupation": "software developer",
+            })
+            job.update({"discovery_first_seen_at": "2026-01-01T00:00:00", "discovery_result_category": "actionable", "discovery_occupation": "software developer"})
+            jobs.append(job)
+        ids = app_module.persist_discovery_jobs(jobs, None, None)["new_job_ids"]
+        app_module.get_db().execute("INSERT INTO discovery_applicant_presentations(job_id, applicant_profile_id) VALUES (?, ?)", [ids[0], swe])
+        app_module.set_applicant_discovery_state(ids[1], swe, "applied", "2026-01-02")
+        app_module.get_db().commit()
+    new_rows = client.get(f"/api/discovery/inbox?candidate_profile_id={swe}&category=new_actionable&include_history=1").get_json()
+    ready_rows = client.get(f"/api/discovery/inbox?candidate_profile_id={swe}&category=ready_to_apply&include_history=1").get_json()
+    assert [row["id"] for row in new_rows] == [ids[2]]
+    assert {row["id"] for row in ready_rows} == {ids[0], ids[2]}
+    assert all(row["id"] != ids[1] for row in ready_rows)
+    counts = client.get(f"/api/discovery/inbox/counts?candidate_profile_id={swe}").get_json()
+    assert counts["new_actionable"] == 1
+    assert counts["ready_to_apply"] == 2
+
+
+def test_historical_application_import_is_preview_first_and_durable(tmp_path, monkeypatch):
+    client = _isolated_client(tmp_path, monkeypatch)
+    swe = _profile(client, "SWE", "software")
+    with app_module.app.app_context():
+        existing = app_module.normalize_job_payload({
+            "source": "indeed", "source_job_id": "known-apply", "title": "Software Engineer",
+            "company": "Known Co", "location": "Toronto, ON", "url": "https://example.test/known-apply",
+            "description": "A complete software engineering posting with responsibilities and requirements for applicants.",
+        })
+        existing.update({"discovery_first_seen_at": "2026-01-01T00:00:00", "discovery_result_category": "actionable", "discovery_occupation": "software developer"})
+        existing_id = app_module.persist_discovery_jobs([existing], None, None)["new_job_ids"][0]
+    payload = {"candidate_profile_id": swe, "workflow": "software", "records": [
+        {"url": "https://example.test/known-apply", "company": "Known Co", "title": "Software Engineer", "date_applied": "2026-01-10"},
+        {"url": "https://example.test/new-apply", "company": "New Co", "title": "Junior Developer", "date_applied": "2026-01-11"},
+        {"url": "https://example.test/possible", "company": "Known Co", "title": "Software Engineer", "date_applied": "2026-01-12"},
+        {"url": "not-a-url", "company": "Bad", "title": "Missing", "date_applied": "2026-01-12"},
+    ]}
+    preview = client.post("/api/applications/import-history", json=payload)
+    assert preview.status_code == 200
+    assert preview.get_json()["preview"] is True
+    assert preview.get_json()["counts"] == {"matched_existing": 1, "new_imported": 1, "possible_duplicate": 1, "invalid": 1}
+    with app_module.app.app_context():
+        assert app_module.query_db("SELECT 1 FROM discovery_applicant_states WHERE job_id = ? AND applicant_profile_id = ?", [existing_id, swe], one=True) is None
+    applied = client.post("/api/applications/import-history", json={**payload, "preview": False, "confirm_apply": True})
+    assert applied.status_code == 200
+    assert applied.get_json()["counts"]["matched_existing"] == 1
+    with app_module.app.app_context():
+        state = app_module.query_db("SELECT state, date_applied FROM discovery_applicant_states WHERE job_id = ? AND applicant_profile_id = ?", [existing_id, swe], one=True)
+        assert dict(state) == {"state": "applied", "date_applied": "2026-01-10"}
+        imported = app_module.query_db("SELECT id FROM jobs WHERE url = ?", ["https://example.test/new-apply"], one=True)
+        assert imported is not None
+    assert client.get(f"/api/discovery/inbox?candidate_profile_id={swe}&category=ready_to_apply&include_history=1").get_json() == []
 
 
 def test_qa_status_and_reset_are_isolated_and_visible(tmp_path, monkeypatch):

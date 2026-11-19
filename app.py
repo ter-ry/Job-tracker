@@ -1890,6 +1890,113 @@ def create_app() -> Flask:
         imported = import_csv_jobs(content)
         return jsonify({"imported": imported})
 
+    @app.post("/api/applications/import-history")
+    def import_historical_applications() -> Response:
+        """Preview or record applications made before Job Tracker.
+
+        This endpoint deliberately defaults to preview.  Exact URL/source
+        identity reconciles an existing vacancy; title/company similarity is
+        reported as a possible duplicate and never creates an automatic
+        merge.  Applicant state is additive and never overwrites an existing
+        Applied decision or date.
+        """
+        payload = request.get_json(silent=True) or {}
+        profile_id = applicant_profile_id(payload)
+        if not profile_id:
+            return jsonify({"error": "candidate_profile_id is required for application history import."}), 400
+        profile = query_db("SELECT id, workflow FROM candidate_profiles WHERE id = ?", [profile_id], one=True)
+        if profile is None:
+            return jsonify({"error": "The selected applicant profile was not found."}), 400
+        workflow = text(payload.get("workflow")).lower() or text(profile["workflow"]).lower() or "software"
+        try:
+            validate_discovery_applicant({"candidate_profile_id": profile_id, "workflow": workflow}, workflow)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        records = payload.get("records")
+        if not isinstance(records, list):
+            records = []
+        csv_text = text(payload.get("csv"))
+        if csv_text:
+            try:
+                parsed = list(csv.DictReader(io.StringIO(csv_text)))
+            except (csv.Error, UnicodeError) as exc:
+                return jsonify({"error": f"CSV could not be read: {exc}"}), 400
+            records.extend(parsed)
+        if not records:
+            return jsonify({"error": "Provide at least one application record or CSV."}), 400
+
+        def field(record: dict[str, Any], *names: str) -> str:
+            lowered = {str(key).strip().lower().replace(" ", "_"): value for key, value in record.items()}
+            for name in names:
+                value = text(lowered.get(name))
+                if value:
+                    return value
+            return ""
+
+        outcomes: list[dict[str, Any]] = []
+        for raw in records[:1000]:
+            if not isinstance(raw, dict):
+                outcomes.append({"outcome": "invalid", "reason": "Record is not an object."})
+                continue
+            url = field(raw, "url", "posting_url", "job_url", "link")
+            company = field(raw, "company", "employer")
+            title = field(raw, "title", "job_title", "position")
+            applied_date = field(raw, "date_applied", "application_date", "date", "applied")
+            source = field(raw, "source", "provider") or "historical_import"
+            source_id = field(raw, "source_job_id", "requisition_id", "req_id")
+            location = field(raw, "location")
+            try:
+                parsed_date = datetime.fromisoformat(applied_date.replace("Z", "+00:00")).date().isoformat()
+            except (TypeError, ValueError):
+                parsed_date = ""
+            if not (re.match(r"^https?://", url, re.I) and company and title and parsed_date):
+                outcomes.append({"outcome": "invalid", "url": url, "company": company, "title": title, "reason": "URL, company, title and a valid application date are required."})
+                continue
+            candidate = normalize_job_payload({
+                "source": source, "source_job_id": source_id, "title": title,
+                "company": company, "location": location, "job_url": url,
+                "url": url, "application_url": url,
+                "description": f"Historical application record for {title} at {company}.",
+                "candidate_profile_id": 0,
+            })
+            existing = find_existing_job_match(candidate)
+            possible = None if existing is not None else query_db(
+                """SELECT * FROM jobs WHERE lower(company) = lower(?) AND lower(title) = lower(?)
+                   ORDER BY id LIMIT 1""", [company, title], one=True,
+            )
+            if existing is not None:
+                outcomes.append({"outcome": "matched_existing", "job_id": int(existing["id"]), "url": url, "company": company, "title": title, "date_applied": parsed_date})
+            elif possible is not None:
+                outcomes.append({"outcome": "possible_duplicate", "possible_job_id": int(possible["id"]), "url": url, "company": company, "title": title, "date_applied": parsed_date, "reason": "Same company and title, but no verified identity match."})
+            else:
+                outcomes.append({"outcome": "new_imported", "url": url, "company": company, "title": title, "date_applied": parsed_date, "candidate": candidate})
+
+        preview = not (payload.get("confirm_apply") is True and payload.get("preview") is False)
+        if not preview:
+            db = get_db()
+            for outcome in outcomes:
+                if outcome["outcome"] == "matched_existing":
+                    job_id = int(outcome["job_id"])
+                    current = query_db("SELECT state, date_applied FROM discovery_applicant_states WHERE job_id = ? AND applicant_profile_id = ?", [job_id, profile_id], one=True)
+                    if not current or text(current["state"]) != "applied":
+                        set_applicant_discovery_state(job_id, profile_id, "applied", outcome["date_applied"])
+                elif outcome["outcome"] == "new_imported":
+                    candidate = dict(outcome.pop("candidate"))
+                    inserted = persist_discovery_jobs([candidate], None, None)
+                    if not inserted["new_job_ids"]:
+                        outcome["outcome"] = "matched_existing"
+                        outcome["job_id"] = int(candidate.get("id") or 0)
+                    else:
+                        job_id = int(inserted["new_job_ids"][0])
+                        outcome["job_id"] = job_id
+                    set_applicant_discovery_state(job_id, profile_id, "applied", outcome["date_applied"])
+            db.commit()
+        for outcome in outcomes:
+            outcome.pop("candidate", None)
+        counts = dict(Counter(item["outcome"] for item in outcomes))
+        return jsonify({"preview": preview, "outcomes": outcomes, "counts": counts, "message": "Preview only; no application history changed." if preview else "Application history recorded without overwriting existing Applied decisions."})
+
     @app.post("/api/discovery/search")
     def discovery_search() -> Response:
         payload = request.get_json(force=True)
@@ -2124,10 +2231,10 @@ def create_app() -> Flask:
         """
         payload = request.get_json(silent=True) or {}
         workflow = discovery_workflow(payload)
-        # Preserve the legacy API's explicit apply behavior; the current UI
-        # always requests preview first and only sends preview=false after an
-        # owner confirmation.
-        preview = as_bool(payload.get("preview", False))
+        # Preview is the safety default. Applying requires both an explicit
+        # confirmation and the token returned by the immediately preceding
+        # targeted preview.
+        preview = not (payload.get("confirm_apply") is True and payload.get("preview") is False)
         try:
             applicant_id = validate_discovery_applicant(payload, workflow)
         except ValueError as exc:
@@ -2144,7 +2251,6 @@ def create_app() -> Flask:
         )
         changed = []
         category_counts: dict[str, int] = {}
-        db = get_db()
         for row in rows:
             item = job_to_dict(row, include_legacy_details=False)
             membership = query_db(
@@ -2157,24 +2263,27 @@ def create_app() -> Flask:
             if "include_internships" in criteria:
                 item["discovery_include_internships"] = bool(criteria.get("include_internships"))
             category, reason = discovery_result_category(item, text(item.get("discovery_remote_preference")))
-            grounded = bool(text(item.get("title")) and (text(item.get("url")) or text(item.get("source"))))
-            if text(item.get("job_description")) and len(text(item.get("job_description"))) >= 80:
-                grounded = True
+            description = text(item.get("job_description"))
+            grounded = bool(len(description) >= 80 and text(item.get("url")))
             category_counts[category] = category_counts.get(category, 0) + 1
             preview_item = {"id": int(row["id"]), "title": text(item.get("title")), "company": text(item.get("company")), "current_category": text(row["discovery_result_category"]), "proposed_category": category, "reason": reason, "evidence_sufficient": grounded, "source": text(item.get("source")), "url": text(item.get("url")), "search_criteria": criteria}
             changed.append(preview_item)
-            if preview or not grounded:
-                continue
-            db.execute("UPDATE jobs SET discovery_result_category = ?, discovery_result_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [category, reason, int(row["id"])])
-            if category == "actionable":
-                db.execute(
-                    """INSERT OR REPLACE INTO discovery_requalifications(job_id, applicant_profile_id, reason)
-                       VALUES (?, ?, ?)""",
-                    [int(row["id"]), applicant_id, f"Requalified by current matching rules: {reason or category}"],
-                )
+        targeted = [item for item in changed if item["evidence_sufficient"] and item["current_category"] != item["proposed_category"]]
+        preview_token = hashlib.sha256(json.dumps(targeted, sort_keys=True, default=str).encode("utf-8")).hexdigest()
         if not preview:
+            if text(payload.get("preview_token")) != preview_token:
+                return jsonify({"error": "A matching reassessment preview token is required before applying changes."}), 409
+            db = get_db()
+            for item in targeted:
+                db.execute("UPDATE jobs SET discovery_result_category = ?, discovery_result_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [item["proposed_category"], item["reason"], item["id"]])
+                if item["proposed_category"] == "actionable":
+                    db.execute(
+                        """INSERT OR REPLACE INTO discovery_requalifications(job_id, applicant_profile_id, reason)
+                           VALUES (?, ?, ?)""",
+                        [item["id"], applicant_id, f"Requalified by current matching rules: {item['reason'] or item['proposed_category']}"],
+                    )
             db.commit()
-        return jsonify({"preview": preview, "count": len(changed), "category_counts": category_counts, "jobs": changed, "message": "Preview only; no records or applicant decisions changed." if preview else "History re-evaluated; prior search evidence and applicant decisions were preserved."})
+        return jsonify({"preview": preview, "count": len(changed), "targeted_count": len(targeted), "preview_token": preview_token, "category_counts": category_counts, "jobs": changed, "message": "Preview only; no records or applicant decisions changed." if preview else "Targeted history classifications updated; search evidence and applicant decisions were preserved."})
 
     @app.get("/api/discovery/inbox/audit")
     def discovery_inbox_audit() -> Response:
@@ -2234,7 +2343,7 @@ def create_app() -> Flask:
             # cumulative Inbox.
             if not re.fullmatch(r"[0-9a-fA-F]{16,64}", requested_search_id):
                 return jsonify({"error": "Invalid discovery search ID."}), 400
-            if requested_category not in {"review", "review_required", "new", "new_actionable", "excluded", "all_relevant"}:
+            if requested_category not in {"review", "review_required", "new", "new_actionable", "ready_to_apply", "excluded", "all_relevant"}:
                 return jsonify({"error": "A supported discovery Inbox category is required with search_id."}), 400
         if requested_category == "presented" and not applicant_id:
             return jsonify({"error": "candidate_profile_id is required for Presented / Seen history."}), 400
@@ -2257,11 +2366,19 @@ def create_app() -> Flask:
             query += ")"
         if requested_category in {"new", "new_actionable"}:
             query += " AND discovery_result_category = 'actionable'"
+            query += " AND status NOT IN ('Applied', 'shortlisted')"
             if applicant_id:
                 query += " AND NOT EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = jobs.id AND p.applicant_profile_id = ?)"
                 query_args.append(applicant_id)
                 query += " AND NOT EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = jobs.id AND s.applicant_profile_id = ?)"
                 query_args.append(applicant_id)
+        elif requested_category == "ready_to_apply":
+            if not applicant_id:
+                return jsonify({"error": "candidate_profile_id is required for Ready to Apply."}), 400
+            query += " AND discovery_result_category = 'actionable'"
+            query += " AND status NOT IN ('Applied', 'shortlisted')"
+            query += " AND NOT EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = jobs.id AND s.applicant_profile_id = ? AND s.state IN ('applied', 'skipped', 'ignored'))"
+            query_args.append(applicant_id)
         elif requested_category in {"review", "review_required"}:
             query += " AND (discovery_result_category = 'review_required'"
             if applicant_id:
@@ -2404,18 +2521,20 @@ def create_app() -> Flask:
             item["presented_to_applicant"] = bool(presentation)
             item["presented_at"] = text(presentation["presented_at"]) if presentation else ""
             item["applicant_lifecycle_state"] = text(applicant_discovery_state(int(row["id"]), applicant_id)) if applicant_id else text(item.get("discovery_state"))
-            if requested_category == "presented" and presentation:
+            if requested_category == "ready_to_apply":
+                category = "ready_to_apply"
+            elif requested_category == "presented" and presentation:
                 category = "presented"
             elif requested_category == "requalified" and requalified:
                 category = "requalified"
                 item["requalified_reason"] = text(requalified["reason"])
-            elif text(item.get("status")) == "Applied" or text(item.get("discovery_state")) == "applied":
+            elif state == "applied" or text(item.get("status")) == "Applied" or text(item.get("discovery_state")) == "applied":
                 category = "applied"
-            elif text(item.get("discovery_state")) in {"ignored", "skipped"}:
+            elif state in {"ignored", "skipped"} or text(item.get("discovery_state")) in {"ignored", "skipped"}:
                 category = "skipped"
-            elif text(item.get("discovery_state")) == "saved":
+            elif state == "saved" or text(item.get("discovery_state")) == "saved":
                 category = "saved"
-            elif text(item.get("discovery_state")) == "reviewed":
+            elif state == "reviewed" or text(item.get("discovery_state")) == "reviewed":
                 category = "review_required"
             elif presentation and text(item.get("discovery_result_category")) in {"actionable", "review_required"}:
                 # Seen is a lifecycle state, not a loss of eligibility.  It
@@ -2448,8 +2567,8 @@ def create_app() -> Flask:
             return jsonify({"error": "candidate_profile_id is required for applicant-specific Inbox counts."}), 400
         base = "j.discovery_first_seen_at <> '' AND (j.candidate_profile_id IN ('', 0) OR j.candidate_profile_id = ? OR EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = j.id AND p.applicant_profile_id = ?) OR EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = j.id AND s.applicant_profile_id = ?))"
         args = [applicant_id, applicant_id, applicant_id]
-        rows = query_db(f"SELECT j.id, j.discovery_result_category, EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = j.id AND p.applicant_profile_id = ?) AS presented, COALESCE((SELECT state FROM discovery_applicant_states s WHERE s.job_id = j.id AND s.applicant_profile_id = ?), '') AS applicant_state, EXISTS (SELECT 1 FROM discovery_requalifications r WHERE r.job_id = j.id AND r.applicant_profile_id = ?) AS requalified FROM jobs j WHERE {base}", [applicant_id, applicant_id, applicant_id, *args])
-        counts = {"all_discovered": 0, "all_relevant": 0, "new_actionable": 0, "review_required": 0, "excluded": 0, "presented": 0, "saved": 0, "applied": 0, "skipped": 0}
+        rows = query_db(f"SELECT j.id, j.status, j.discovery_result_category, EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = j.id AND p.applicant_profile_id = ?) AS presented, COALESCE((SELECT state FROM discovery_applicant_states s WHERE s.job_id = j.id AND s.applicant_profile_id = ?), '') AS applicant_state, EXISTS (SELECT 1 FROM discovery_requalifications r WHERE r.job_id = j.id AND r.applicant_profile_id = ?) AS requalified FROM jobs j WHERE {base}", [applicant_id, applicant_id, applicant_id, *args])
+        counts = {"all_discovered": 0, "all_relevant": 0, "new_actionable": 0, "ready_to_apply": 0, "review_required": 0, "excluded": 0, "presented": 0, "saved": 0, "applied": 0, "skipped": 0}
         for row in rows:
             counts["all_discovered"] += 1
             if int(row["presented"] or 0): counts["presented"] += 1
@@ -2461,7 +2580,9 @@ def create_app() -> Flask:
             presented = int(row["presented"] or 0)
             if category in {"actionable", "review_required"} or int(row["requalified"] or 0) or state in {"saved", "applied", "reviewed"}:
                 counts["all_relevant"] += 1
-            if category == "actionable" and not presented and not state: counts["new_actionable"] += 1
+            globally_applied = text(row["status"]) in {"Applied", "shortlisted"}
+            if category == "actionable" and not globally_applied and not presented and not state: counts["new_actionable"] += 1
+            if category == "actionable" and not globally_applied and state not in {"applied", "skipped", "ignored"}: counts["ready_to_apply"] += 1
             if category == "review_required" or state == "reviewed": counts["review_required"] += 1
             elif category == "excluded": counts["excluded"] += 1
         return jsonify(counts)
