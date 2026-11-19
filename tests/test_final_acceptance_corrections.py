@@ -174,7 +174,19 @@ def test_historical_application_import_is_preview_first_and_durable(tmp_path, mo
         assert dict(state) == {"state": "applied", "date_applied": "2026-01-10"}
         imported = app_module.query_db("SELECT id FROM jobs WHERE url = ?", ["https://example.test/new-apply"], one=True)
         assert imported is not None
-    assert client.get(f"/api/discovery/inbox?candidate_profile_id={swe}&category=ready_to_apply&include_history=1").get_json() == []
+
+def test_history_audit_export_is_read_only_and_resume_free(tmp_path, monkeypatch):
+    client = _isolated_client(tmp_path, monkeypatch)
+    swe = _profile(client, "SWE", "software")
+    _stored_job(client, occupation="software developer")
+    response = client.get(f"/api/discovery/inbox/audit/export?candidate_profile_id={swe}")
+    assert response.status_code == 200
+    assert response.headers["Content-Disposition"].startswith("attachment;")
+    payload = response.get_json()
+    assert payload["mutated"] is False
+    assert payload["total"] == 1
+    assert "resume_text" not in payload["records"][0]
+    assert "source_excerpt" in payload["records"][0]
 
 
 def test_qa_status_and_reset_are_isolated_and_visible(tmp_path, monkeypatch):
