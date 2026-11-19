@@ -72,7 +72,7 @@ def test_re_evaluate_is_occupation_scoped_and_preserves_history(tmp_path, monkey
 
     saved = client.post(f"/api/discovery/inbox/{software_id}/save", json={"applicant_profile_id": swe, "workflow": "software"})
     assert saved.status_code == 200
-    result = client.post("/api/discovery/re-evaluate", json={"applicant_profile_id": swe, "workflow": "software"})
+    result = client.post("/api/discovery/re-evaluate", json={"applicant_profile_id": swe, "workflow": "software", "preview": False})
     assert result.status_code == 200
     assert result.get_json()["count"] == 1
 
@@ -102,6 +102,20 @@ def test_history_reassessment_preview_and_audit_are_non_mutating(tmp_path, monke
     assert audit.status_code == 200
     assert audit.get_json()["mutated"] is False
     assert audit.get_json()["total"] >= 1
+
+
+def test_history_audit_export_is_read_only_and_resume_free(tmp_path, monkeypatch):
+    client = _isolated_client(tmp_path, monkeypatch)
+    swe = _profile(client, "SWE", "software")
+    _stored_job(client, occupation="software developer")
+    response = client.get(f"/api/discovery/inbox/audit/export?candidate_profile_id={swe}")
+    assert response.status_code == 200
+    assert response.headers["Content-Disposition"].startswith("attachment;")
+    payload = response.get_json()
+    assert payload["mutated"] is False
+    assert payload["total"] == 1
+    assert "resume_text" not in payload["records"][0]
+    assert "source_excerpt" in payload["records"][0]
 
 
 def test_qa_status_and_reset_are_isolated_and_visible(tmp_path, monkeypatch):

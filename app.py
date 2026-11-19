@@ -20,7 +20,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 import urllib.error
 import urllib.request
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import zipfile
 import uuid
 from datetime import date, datetime, timedelta
@@ -2127,7 +2127,10 @@ def create_app() -> Flask:
         # Preserve the legacy API's explicit apply behavior; the current UI
         # always requests preview first and only sends preview=false after an
         # owner confirmation.
-        preview = as_bool(payload.get("preview", False))
+        # Reclassification is a read-only operation unless the caller opts in
+        # explicitly.  This protects historical search decisions when an old
+        # or third-party client omits the preview flag.
+        preview = True if "preview" not in payload else as_bool(payload.get("preview"))
         try:
             applicant_id = validate_discovery_applicant(payload, workflow)
         except ValueError as exc:
@@ -2217,6 +2220,62 @@ def create_app() -> Flask:
                 if len(examples["geography"]) < 20:
                     examples["geography"].append({"id": int(row["id"]), "title": text(item.get("title")), "location": text(item.get("location")), "url": text(item.get("url"))})
         return jsonify({"total": len(rows), "category_counts": category_counts, "exclusion_reason_counts": exclusion_reasons, "evidence_gaps": evidence_gaps, "examples": examples, "mutated": False})
+
+    @app.get("/api/discovery/inbox/audit/export")
+    def discovery_inbox_audit_export() -> Response:
+        """Download a read-only, résumé-free audit of an applicant history.
+
+        This is intentionally a posting diagnostics export, not a database
+        backup.  It excludes résumé/profile fields and redacts contact-like
+        text in the small source excerpt retained for manual review.
+        """
+        applicant_id = applicant_profile_id(request.args)
+        if not applicant_id:
+            return jsonify({"error": "candidate_profile_id is required for history audit export."}), 400
+        rows = query_db(
+            """SELECT DISTINCT j.* FROM jobs j
+               LEFT JOIN discovery_applicant_states s ON s.job_id = j.id AND s.applicant_profile_id = ?
+               LEFT JOIN discovery_applicant_presentations p ON p.job_id = j.id AND p.applicant_profile_id = ?
+               WHERE j.discovery_first_seen_at <> ''
+                 AND (j.candidate_profile_id IN ('', 0) OR j.candidate_profile_id = ? OR s.job_id IS NOT NULL OR p.job_id IS NOT NULL)
+               ORDER BY j.id""",
+            [applicant_id, applicant_id, applicant_id],
+        )
+
+        def safe_excerpt(value: Any) -> str:
+            excerpt = normalize_space(text(value))[:500]
+            excerpt = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "[redacted-email]", excerpt)
+            excerpt = re.sub(r"(?:\+?\d[\d ().-]{7,}\d)", "[redacted-phone]", excerpt)
+            return excerpt
+
+        records = []
+        for row in rows:
+            item = job_to_dict(row, include_legacy_details=False)
+            category, reason = discovery_result_category(item, text(item.get("discovery_remote_preference")))
+            records.append({
+                "id": int(row["id"]),
+                "title": text(item.get("title")),
+                "company": text(item.get("company")),
+                "source": text(item.get("source")),
+                "url": text(item.get("url")),
+                "location": text(item.get("location")),
+                "category": category,
+                "reason": reason,
+                "stored_category": text(row["discovery_result_category"]),
+                "role_type": text(item.get("role_type")),
+                "seniority": item.get("qualification_fit_seniority") or {},
+                "experience_requirements": item.get("experience_requirements") or {},
+                "geographic_eligibility": text(item.get("geographic_eligibility")),
+                "distance_radius_status": text(item.get("distance_radius_status")),
+                "distance_precision": text(item.get("distance_precision")),
+                "source_excerpt": safe_excerpt(item.get("job_description")),
+            })
+        payload = {"schema_version": 1, "mutated": False, "total": len(records), "records": records}
+        return Response(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+            mimetype="application/json",
+            headers={"Content-Disposition": "attachment; filename=job-tracker-qa-diagnostics.json", "Cache-Control": "no-store"},
+        )
 
     @app.get("/api/discovery/inbox")
     def discovery_inbox() -> Response:
@@ -8028,11 +8087,13 @@ def dedupe_match(first: dict[str, Any], second: dict[str, Any]) -> bool:
 def canonical_url(value: str) -> str:
     if not value:
         return ""
-    lowered = value.strip().lower()
-    lowered = re.sub(r"#.*$", "", lowered)
-    lowered = re.sub(r"[?&](utm_[^=&]+|source|ref)=[^&]+", "", lowered)
-    lowered = lowered.rstrip("?&/")
-    return lowered
+    parts = urlsplit(value.strip().lower())
+    tracking = {"source", "ref", "referrer", "referral", "recruiter", "gh_src", "trk", "from", "campaign"}
+    query = [(key, val) for key, val in parse_qsl(parts.query, keep_blank_values=True)
+             if not key.startswith("utm_") and key not in tracking]
+    path = parts.path.rstrip("/") or "/"
+    host = parts.netloc[4:] if parts.netloc.startswith("www.") else parts.netloc
+    return urlunsplit((parts.scheme, host, path, urlencode(query), "")).rstrip("/")
 
 
 def normalize_dedupe_text(value: Any) -> str:
@@ -10678,10 +10739,16 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
     hard_reason = discovery_hard_exclusion_reason(job)
     if hard_reason:
         return "excluded", hard_reason
-    if text(job.get("role_type")).lower() == "intern" and not bool(job.get("discovery_include_internships")):
+    title = normalize_space(text(job.get("title"))).lower()
+    explicit_internship_title = bool(re.search(r"\b(?:intern|internship|co[- ]?op|cooperative education|placement|trainee)\b", title))
+    provider_internship = text(job.get("role_type")).lower() in {"intern", "internship"}
+    # A provider role label is useful evidence only when the title is absent
+    # or agrees with it.  Several feeds label ordinary software jobs as
+    # internships because the description mentions an intern programme.
+    if (explicit_internship_title or (provider_internship and not title)) and not as_bool(job.get("discovery_include_internships")):
         return "excluded", "Internships are excluded by the selected search preference."
     occupation = normalize_space(text(job.get("discovery_occupation") or job.get("occupation"))).lower()
-    if occupation in {"software developer", "software development", "software engineer", "swe"} and clearly_non_software_role(job):
+    if clearly_non_software_role(job) and (occupation in {"software developer", "software development", "software engineer", "swe"} or (broad and search_mode == "shortlist")):
         return "excluded", "The grounded title or posting evidence identifies a non-software occupation."
     if normalize_space(text(remote_preference)).lower() != "remote":
         if text(job.get("posting_availability")).lower() == "confirmed_closed":
@@ -10803,6 +10870,9 @@ def discovery_hard_exclusion_reason(job: dict[str, Any], search: dict[str, Any] 
     """
     search = search or {}
     occupation = normalize_space(text(job.get("discovery_occupation") or job.get("occupation"))).lower()
+    broad_scope = text(job.get("discovery_match_policy")).lower() == "apply_broadly" and text(job.get("discovery_search_mode")).lower() == "shortlist"
+    if clearly_non_software_role(job) and (occupation in {"software developer", "software development", "software engineer", "swe"} or broad_scope):
+        return "The grounded title or posting evidence identifies a non-software occupation."
     if occupation and occupation not in {"software developer", "software development", "swe", "software engineer"}:
         return ""
     analysis = job.get("qualification_fit_seniority") or {}
@@ -10826,6 +10896,11 @@ def discovery_hard_exclusion_reason(job: dict[str, Any], search: dict[str, Any] 
         maximum = float(configured_max) if configured_max not in (None, "") else None
     except (TypeError, ValueError):
         maximum = None
+    # A bare 30+/35+ value is commonly a malformed age/history extraction.
+    # Keep it reviewable until the posting supplies role-scoped evidence; it
+    # must never silently remove a potentially eligible junior role.
+    if minimum is not None and minimum >= 20:
+        return ""
     if minimum is not None and maximum is not None and minimum > maximum:
         return f"Confirmed required experience starts at {minimum:g} years, above the selected maximum of {maximum:g}."
 
@@ -10945,7 +11020,7 @@ def discovery_is_clear_senior_role(job: dict[str, Any], search: dict[str, Any]) 
     required = analysis.get("required_experience") or {}
     minimum = required.get("minimum") if isinstance(required, dict) else None
     try:
-        high_experience = minimum is not None and float(minimum) >= 5
+        high_experience = minimum is not None and 5 <= float(minimum) < 20
     except (TypeError, ValueError):
         high_experience = False
     return level in {"senior", "lead", "manager", "director"} or bool(analysis.get("management_role")) or bool(analysis.get("leadership_expectations")) or high_experience
@@ -10969,6 +11044,8 @@ def discovery_target_assessment(job: dict[str, Any], search: dict[str, Any]) -> 
         minimum = None
     maximum = float(search.get("maximum_required_years") if search.get("maximum_required_years") not in (None, "") else 3)
     if minimum is not None and minimum > maximum:
+        if minimum >= 20:
+            return "review_required", "The extracted experience value is implausibly high or insufficiently scoped; confirm the employer's actual requirement."
         return "ineligible", "Confirmed required professional experience exceeds the selected maximum."
 
     unknown_levels = {"", "unknown", "ambiguous", "unverified"}

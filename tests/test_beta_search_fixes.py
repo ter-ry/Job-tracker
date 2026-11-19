@@ -41,6 +41,29 @@ def test_explicit_senior_and_confirmed_excess_years_are_hard_blockers():
     assert app.discovery_target_assessment(years, _search())[0] == "ineligible"
 
 
+def test_provider_intern_label_does_not_exclude_non_intern_title():
+    job = _job(title="Software Developer", role_type="intern", discovery_include_internships=False,
+               discovery_occupation="software developer", job_description="Build production APIs.")
+    assert app.discovery_result_category(job)[0] != "excluded"
+
+
+def test_broad_swe_scope_excludes_grounded_unrelated_title_without_occupation_field():
+    job = _job(title="CNC Machinist", discovery_match_policy="apply_broadly", discovery_search_mode="shortlist")
+    assert app.discovery_result_category(job)[0] == "excluded"
+
+
+def test_implausibly_large_experience_value_stays_reviewable():
+    job = _job(title="Junior Software Developer", job_description="Requirements: 35+ years of experience.",
+               qualification_fit_seniority={"detected_level": "unknown", "required_experience": {"minimum": 35}})
+    status, reason = app.discovery_target_assessment(job, _search())
+    assert status == "review_required"
+    assert "implausibly high" in reason
+
+
+def test_canonical_url_drops_provider_tracking_and_www_aliases():
+    assert app.canonical_url("https://www.example.test/jobs/42/?utm_source=feed&ref=abc") == "https://example.test/jobs/42"
+
+
 def test_unknown_city_location_is_provisional_but_strict_radius_requires_evidence():
     base = {"remote_type": "On-site", "location": "Toronto, ON", "distance_km": 9999, "application_priority_score": 80}
     provisional = app.apply_discovery_search_constraints(dict(base), "", "Toronto, ON", 50, "provisional")
