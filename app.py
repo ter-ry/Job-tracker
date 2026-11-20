@@ -22,7 +22,7 @@ import socket
 from concurrent.futures import ThreadPoolExecutor
 import urllib.error
 import urllib.request
-from urllib.parse import parse_qsl, quote_plus, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 import zipfile
 import uuid
 from datetime import date, datetime, timedelta
@@ -73,7 +73,6 @@ from sources.jobspy_source import (
 )
 from sources.ats_source import fetch_employer_direct_jobs
 from sources.provider_runtime import ProviderCircuitBreaker
-from sources.ontario_facilities import google_places_text_search, load_cohort, load_facilities, match_cohort
 from tailoring import generate_tailored_resume_draft
 from tailoring_pipeline import (
     build_cover_letter_paragraphs,
@@ -1701,6 +1700,33 @@ def create_app() -> Flask:
             get_db().execute("UPDATE jobs SET discovery_state = 'ignored', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
         get_db().commit()
         return jsonify({"ok": True, "candidate_profile_id": stored_profile or requested_profile})
+
+    @app.post("/api/jobs/<int:job_id>/workplace")
+    def confirm_job_workplace(job_id: int) -> Response:
+        """Save an applicant-specific owner-confirmed workplace."""
+        existing = query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)
+        if existing is None:
+            return jsonify({"error": "Job not found"}), 404
+        payload = request.get_json(silent=True) or {}
+        profile_id = applicant_profile_id(payload)
+        if not profile_id:
+            return jsonify({"error": "Select an applicant before confirming a workplace."}), 400
+        stored_profile = clamp_int(existing["candidate_profile_id"], 0, 10**9)
+        if stored_profile and stored_profile != profile_id:
+            return jsonify({"error": "This workplace belongs to a different applicant profile."}), 409
+        address = normalize_space(text(payload.get("address")))
+        postal = normalize_canadian_postal_code(extract_canadian_postal_code(text(payload.get("postal_code") or address)))
+        if not address and not postal:
+            return jsonify({"error": "Enter a workplace address or Canadian postal code."}), 400
+        get_db().execute(
+            """INSERT INTO discovery_applicant_workplaces(job_id, applicant_profile_id, workplace_address, workplace_postal_code)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(job_id, applicant_profile_id) DO UPDATE SET workplace_address = excluded.workplace_address,
+                 workplace_postal_code = excluded.workplace_postal_code, confirmed_at = CURRENT_TIMESTAMP""",
+            [job_id, profile_id, address, postal],
+        )
+        get_db().commit()
+        return jsonify({"ok": True, "job_id": job_id, "candidate_profile_id": profile_id, "workplace_address": address, "workplace_postal_code": postal, "confidence": "confirmed_by_owner"})
 
     @app.post("/api/jobs")
     def create_job() -> Response:
@@ -3904,76 +3930,6 @@ def create_app() -> Flask:
         )
         return jsonify(result)
 
-    @app.post("/api/jobs/enrich-workplace-registry")
-    def preview_ontario_facility_matches() -> Response:
-        """Run a read-only Ontario registry comparison for an exact ECE cohort.
-
-        The workbook and cohort are uploaded for this request only. No registry
-        rows, job workplaces, classifications, or applicant history are saved.
-        """
-        cohort_file = request.files.get("cohort_file")
-        registry_file = request.files.get("registry_file")
-        if not cohort_file or not registry_file:
-            return jsonify({"error": "Upload the exact ECE cohort CSV and Ontario facility XLSX."}), 400
-        profile_id = clamp_int(request.form.get("candidate_profile_id"), 0, 10**9)
-        if not profile_id:
-            return jsonify({"error": "Select the ECE applicant before running the registry preview."}), 400
-        profile = query_db("SELECT workflow FROM candidate_profiles WHERE id = ?", [profile_id], one=True)
-        if not profile or text(profile["workflow"]).lower() != "ece":
-            return jsonify({"error": "The Ontario registry preview is restricted to an ECE applicant."}), 400
-        try:
-            cohort = load_cohort(cohort_file.read())
-            facilities = load_facilities(registry_file.read())
-        except (ValueError, OSError, ImportError) as exc:
-            return jsonify({"error": f"Ontario registry preview could not read the supplied files: {exc}"}), 400
-        search_id = text(request.form.get("search_id"))
-        if search_id:
-            membership_rows = query_db(
-                """SELECT job_id FROM discovery_search_memberships
-                   WHERE search_execution_id = ? AND applicant_profile_id IN (0, ?)
-                     AND category IN ('actionable', 'review_required')""",
-                [search_id, profile_id],
-            )
-            allowed_ids = {str(int(row["job_id"])) for row in membership_rows}
-            cohort = [job for job in cohort if text(job.get("job_id")) in allowed_ids]
-        if not cohort:
-            return jsonify({"error": "The selected search has no matching ECE cohort records in the supplied CSV."}), 400
-        results = match_cohort(cohort, facilities)
-        google_opt_in = text(request.form.get("google_places_opt_in")).lower() in {"1", "true", "yes", "on"}
-        google_key = text(os.environ.get("GOOGLE_PLACES_API_KEY"))
-        google_notice = "Google Places disabled; use the free Google Maps name-search links."
-        if google_opt_in and not google_key:
-            google_notice = "Google Places requested but disabled because GOOGLE_PLACES_API_KEY is not configured; no paid lookup was attempted."
-        if google_opt_in and google_key:
-            google_notice = "Google Places was explicitly enabled with a server-side key; results remain unverified candidates and may incur billing."
-            for item, job in zip(results, cohort):
-                if item["category"] in {"no_defensible_registry_match", "multiple_licensed_facilities", "similar_name_requires_verification"}:
-                    item["google_candidates"] = google_places_text_search(text(job.get("employer")), text(job.get("advertised_location")), google_key)
-        else:
-            for item, job in zip(results, cohort):
-                item["google_maps_name_search_url"] = "https://www.google.com/maps/search/" + quote_plus(f"{job.get('employer', '')}, {job.get('advertised_location', '')}")
-        counts = {
-            "total": len(results),
-            "existing_precise": sum(1 for item in results if item["category"] == "existing_precise_registry_supported"),
-            "new_unique_facility_matches": sum(1 for item in results if item["category"] == "strong_single_centre_match"),
-            "similar_name_requires_verification": sum(1 for item in results if item["category"] == "similar_name_requires_verification"),
-            "ambiguous_multi_location_matches": sum(1 for item in results if item["category"] == "multiple_licensed_facilities"),
-            "unmatched_employers": sum(1 for item in results if item["category"] == "no_defensible_registry_match"),
-            "potential_incorrect_matches": sum(1 for item in results if "music" in text(item.get("job_title")).lower() and item["candidates"]),
-        }
-        return jsonify({
-            "preview": True,
-            "applicant_profile_id": profile_id,
-            "search_execution_id": search_id,
-            "registry_snapshot_date": "2026-10-31",
-            "source": "Ontario licensed child care facilities registry",
-            "source_url": "https://data.ontario.ca/dataset/licensed-child-care-facilities-in-ontario/resource/876d6b6a-784f-4d79-85f1-f0433e7e5e58",
-            "counts": counts,
-            "jobs": results,
-            "message": "Preview only. Every facility is a possible licensed facility — verify job workplace; no job or applicant data was changed.",
-            "google_notice": google_notice,
-        })
-
     @app.post("/api/generate")
     def generate_materials() -> Response:
         payload = request.get_json(force=True)
@@ -4488,6 +4444,13 @@ def apply_applicant_lifecycle_to_job(item: dict[str, Any], profile_id: int) -> d
         [int(item.get("id") or 0), profile_id], one=True,
     )
     if not row:
+        workplace = query_db("SELECT workplace_address, workplace_postal_code, evidence_source, confidence FROM discovery_applicant_workplaces WHERE job_id = ? AND applicant_profile_id = ?", [int(item.get("id") or 0), profile_id], one=True)
+        if workplace:
+            item["workplace_address"] = text(workplace["workplace_address"])
+            item["workplace_postal_code"] = text(workplace["workplace_postal_code"])
+            item["workplace_evidence_source"] = text(workplace["evidence_source"])
+            item["workplace_precision"] = "owner-confirmed"
+            item["workplace_confidence"] = 100
         return item
     state = text(row["state"])
     labels = {"applied": "Applied", "saved": "Saved", "skipped": "Skipped", "ignored": "Skipped", "reviewed": "Needs Review"}
@@ -4498,6 +4461,13 @@ def apply_applicant_lifecycle_to_job(item: dict[str, Any], profile_id: int) -> d
     if state == "applied":
         item["status"] = "Applied"
         item["date_applied"] = text(row["date_applied"]) or text(item.get("date_applied"))
+    workplace = query_db("SELECT workplace_address, workplace_postal_code, evidence_source FROM discovery_applicant_workplaces WHERE job_id = ? AND applicant_profile_id = ?", [int(item.get("id") or 0), profile_id], one=True)
+    if workplace:
+        item["workplace_address"] = text(workplace["workplace_address"])
+        item["workplace_postal_code"] = text(workplace["workplace_postal_code"])
+        item["workplace_evidence_source"] = text(workplace["evidence_source"])
+        item["workplace_precision"] = "owner-confirmed"
+        item["workplace_confidence"] = 100
     return item
 
 
@@ -10225,33 +10195,51 @@ def _extract_workplace_from_page(job: dict[str, Any], page: str, original_url: s
 
 
 def enrich_existing_workplace_locations(*, apply: bool = False, limit: int = 25, offset: int = 0, candidate_profile_id: int = 0, search_execution_id: str = "", job_ids: list[int] | None = None) -> dict[str, Any]:
-    """Preview/apply bounded enrichment for one applicant/search cohort only."""
+    """Preview/apply bounded workplace enrichment for any job category."""
     empty = {"processed": 0, "gained_verified": 0, "gained_candidate": 0, "remained_city_only": 0, "failed": 0, "preview": not apply, "records": []}
     if not candidate_profile_id:
         return {**empty, "error": "Select an applicant profile before enriching workplace locations."}
     execution_id = text(search_execution_id)
-    if not execution_id or not re.fullmatch(r"[0-9a-fA-F]{16,64}", execution_id):
-        return {**empty, "error": "Select the ECE search run before enriching workplace locations."}
+    if execution_id and not re.fullmatch(r"[0-9a-fA-F]{16,64}", execution_id):
+        return {**empty, "error": "The saved search identifier is invalid."}
     requested_ids = sorted({clamp_int(item, 1, 10**9) for item in (job_ids or []) if clamp_int(item, 1, 10**9)})
-    memberships = query_db(
-        """SELECT m.job_id, m.category, m.criteria_json, j.discovery_occupation
-           FROM discovery_search_memberships m JOIN jobs j ON j.id = m.job_id
-           WHERE m.search_execution_id = ? AND m.applicant_profile_id IN (0, ?)
-             AND m.category IN ('actionable', 'review_required')""",
-        [execution_id, candidate_profile_id],
-    )
-    ece_ids: set[int] = set()
-    for membership in memberships:
-        criteria = parse_json_object(membership["criteria_json"])
-        occupation = normalize_space(text(criteria.get("occupation") or membership["discovery_occupation"])).lower()
-        if occupation and not any(term in occupation for term in ("ece", "rece", "early childhood", "early learning", "child care", "childcare")):
-            continue
-        ece_ids.add(int(membership["job_id"]))
-    if requested_ids and not set(requested_ids).issubset(ece_ids):
-        return {**empty, "error": "One or more selected jobs do not belong to the selected ECE search cohort."}
-    cohort_ids = requested_ids or sorted(ece_ids)
+    if execution_id:
+        memberships = query_db(
+            """SELECT m.job_id FROM discovery_search_memberships m
+               WHERE m.search_execution_id = ? AND m.applicant_profile_id IN (0, ?)
+                 AND m.category IN ('actionable', 'review_required')""",
+            [execution_id, candidate_profile_id],
+        )
+        available_ids = {int(row["job_id"]) for row in memberships}
+        if requested_ids and not set(requested_ids).issubset(available_ids):
+            return {**empty, "error": "One or more selected jobs do not belong to the selected applicant search."}
+        cohort_ids = requested_ids or sorted(available_ids)
+    elif requested_ids:
+        placeholders = ",".join("?" for _ in requested_ids)
+        owned = query_db(
+            f"""SELECT DISTINCT j.id FROM jobs j
+                WHERE j.id IN ({placeholders}) AND (j.candidate_profile_id IN ('', 0, ?)
+                   OR EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = j.id AND p.applicant_profile_id = ?)
+                   OR EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = j.id AND s.applicant_profile_id = ?))""",
+            [*requested_ids, candidate_profile_id, candidate_profile_id, candidate_profile_id],
+        )
+        cohort_ids = [int(row["id"]) for row in owned]
+        if len(cohort_ids) != len(requested_ids):
+            return {**empty, "error": "One or more selected jobs is not owned by the selected applicant."}
+    else:
+        rows = query_db(
+            """SELECT DISTINCT j.id FROM jobs j
+               WHERE j.discovery_first_seen_at <> ''
+                 AND j.discovery_result_category IN ('actionable', 'review_required')
+                 AND (j.candidate_profile_id IN ('', 0, ?)
+                   OR EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = j.id AND p.applicant_profile_id = ?)
+                   OR EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = j.id AND s.applicant_profile_id = ?))
+               ORDER BY j.id DESC LIMIT ?""",
+            [candidate_profile_id, candidate_profile_id, candidate_profile_id, clamp_int(limit, 1, 50)],
+        )
+        cohort_ids = [int(row["id"]) for row in rows]
     if not cohort_ids:
-        return {**empty, "search_execution_id": execution_id, "cohort_total": 0, "error": "The selected search has no actionable ECE workplace records."}
+        return {**empty, "search_execution_id": execution_id, "cohort_total": 0, "error": "No applicant-owned actionable or review jobs need workplace enrichment."}
     placeholders = ",".join("?" for _ in cohort_ids)
     cohort_rows = query_db(f"SELECT * FROM jobs WHERE id IN ({placeholders}) ORDER BY id", cohort_ids)
     def precision_counts(rows: list[Any]) -> dict[str, int]:
@@ -12323,6 +12311,20 @@ def init_db() -> None:
     )
     ensure_columns("discovery_applicant_states", {"date_applied": "TEXT NOT NULL DEFAULT ''"})
     db.execute("CREATE INDEX IF NOT EXISTS discovery_applicant_states_profile_idx ON discovery_applicant_states(applicant_profile_id, state)")
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS discovery_applicant_workplaces (
+            job_id INTEGER NOT NULL,
+            applicant_profile_id INTEGER NOT NULL,
+            workplace_address TEXT NOT NULL DEFAULT '',
+            workplace_postal_code TEXT NOT NULL DEFAULT '',
+            evidence_source TEXT NOT NULL DEFAULT 'owner_verified',
+            confidence TEXT NOT NULL DEFAULT 'confirmed_by_owner',
+            confirmed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (job_id, applicant_profile_id),
+            FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+        )"""
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS discovery_applicant_workplaces_profile_idx ON discovery_applicant_workplaces(applicant_profile_id)")
     # Applicant-scoped uncertainty from historical application imports. This
     # durable hold prevents a possible duplicate from reappearing in New or
     # Ready to Apply after restart, provider changes, or upgrades.

@@ -152,7 +152,7 @@ def test_enrichment_prefers_saved_ece_jobspy_evidence_and_never_uses_swe_rows():
                 "candidate_profile_id": ece["id"], "search_id": search_id, "job_ids": [ece_job["id"], swe_job["id"]],
             }).get_json()
         assert result.get("error") is not None
-        assert "ECE search cohort" in result["error"]
+        assert "selected applicant search" in result["error"]
         with patch.object(app_module.urllib.request, "build_opener", side_effect=AssertionError("stored evidence should avoid network")):
             result = client.post("/api/jobs/enrich-workplace-locations", json={
                 "candidate_profile_id": ece["id"], "search_id": search_id, "job_ids": [ece_job["id"]],
@@ -183,3 +183,34 @@ def test_cloudflare_markup_is_not_workplace_evidence_and_blocked_sources_are_rep
             result = client.post("/api/jobs/enrich-workplace-locations", json={"candidate_profile_id": profile["id"], "search_id": search_id, "job_ids": [created["id"]]}).get_json()
         assert result["records"][0]["status"] == "blocked"
         assert "HTTP 401" in result["records"][0]["reason"]
+
+
+def test_universal_workplace_finder_handles_swe_saved_description_and_owner_confirmation():
+    with tempfile.TemporaryDirectory() as directory:
+        app_module.DATA_DIR = Path(directory)
+        app_module.DB_PATH = app_module.DATA_DIR / "test.sqlite"
+        app_module._INITIALIZED_DATABASE_PATH = None
+        app_module.app.config.update(TESTING=True)
+        client = app_module.app.test_client()
+        profile = client.post("/api/candidate-profiles", json={"name": "SWE QA", "workflow": "software"}).get_json()
+        created = client.post("/api/jobs", json={
+            "title": "Software Developer", "company": "Example Software", "location": "Toronto, ON",
+            "url": "https://example.test/swe", "source": "indeed",
+            "job_description": "Our Toronto office is at 1200 Bayview Avenue, Toronto, ON M4G 1Z8.",
+            "discovery_first_seen_at": "2026-11-20", "discovery_result_category": "actionable",
+            "candidate_profile_id": profile["id"],
+        }).get_json()
+        result = client.post("/api/jobs/enrich-workplace-locations", json={
+            "candidate_profile_id": profile["id"], "job_ids": [created["id"]], "limit": 25,
+        }).get_json()
+        assert result["gained_candidate"] == 1
+        assert result["records"][0]["alternatives"][0]["postal_code"] == "M4G 1Z8"
+        confirmed = client.post(f"/api/jobs/{created['id']}/workplace", json={
+            "candidate_profile_id": profile["id"], "address": "1200 Bayview Avenue, Toronto, ON M4G 1Z8",
+        })
+        assert confirmed.status_code == 200
+        app_module._INITIALIZED_DATABASE_PATH = None
+        restarted = client.get(f"/api/jobs?candidate_profile_id={profile['id']}").get_json()
+        saved = next(item for item in restarted if item["id"] == created["id"])
+        assert saved["workplace_precision"] == "owner-confirmed"
+        assert saved["workplace_address"].startswith("1200 Bayview Avenue")

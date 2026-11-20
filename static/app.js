@@ -296,15 +296,11 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("discovery-test-sources").addEventListener("click", testJobSources);
   document.getElementById("discovery-recalculate-distances")?.addEventListener("click", recalculateDiscoveryDistances);
   document.getElementById("discovery-enrich-workplaces")?.addEventListener("click", previewWorkplaceEnrichment);
-  document.getElementById("workplace-enrichment-search")?.addEventListener("change", (event) => {
-    state.workplaceEnrichmentSearchId = event.target.value;
-    state.workplaceEnrichmentSearch = state.workplaceEnrichmentRuns.find((run) => run.search_id === state.workplaceEnrichmentSearchId) || null;
-    state.workplaceEnrichmentOffset = 0;
-    state.workplaceEnrichmentNextOffset = 0;
-    renderWorkplaceSearchRuns();
+  document.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-confirm-workplace]");
+    if (button) confirmWorkplace(button.dataset.confirmWorkplace);
   });
   document.getElementById("workplace-enrichment-next")?.addEventListener("click", (event) => previewWorkplaceEnrichment(event, true));
-  document.getElementById("ontario-registry-preview")?.addEventListener("click", previewOntarioRegistryMatches);
   document.getElementById("discovery-re-evaluate")?.addEventListener("click", reEvaluateDiscoveryHistory);
   document.getElementById("qa-reset")?.addEventListener("click", resetQASession);
   document.getElementById("save-current-discovery-search").addEventListener("click", saveCurrentDiscoverySearch);
@@ -564,7 +560,7 @@ function renderWorkplaceSearchRuns() {
     state.workplaceEnrichmentSearchId = run.search_id;
     state.workplaceEnrichmentSearch = run;
     select.value = run.search_id;
-    if (status) status.textContent = `${run.actionable_count} ${run.workflow === "ece" ? "ECE " : ""}jobs selected · ${run.precise_workplace_count || 0} precise workplaces · ${run.needs_workplace_enrichment || 0} need enrichment.`;
+    if (status) status.textContent = `${run.actionable_count + (run.review_count || 0)} jobs selected · ${run.precise_workplace_count || 0} precise workplaces · ${run.needs_workplace_enrichment || 0} need enrichment.`;
   } else if (status) status.textContent = "Run a search first, or restore a completed search run.";
 }
 
@@ -574,11 +570,8 @@ async function loadWorkplaceSearchRuns() {
   try {
     const runs = await api.get(`/api/discovery/inbox/search-runs?candidate_profile_id=${encodeURIComponent(profileId)}`);
     state.workplaceEnrichmentRuns = Array.isArray(runs) ? runs : [];
-    const selectedProfile = state.candidateProfiles.find((profile) => String(profile.id) === String(profileId));
-    const eceRuns = state.workplaceEnrichmentRuns.filter((run) => run.workflow === "ece" || /ece|rece|early childhood|early learning|child ?care/i.test(run.occupation || ""));
-    if (!state.workplaceEnrichmentSearchId || !state.workplaceEnrichmentRuns.some((run) => run.search_id === state.workplaceEnrichmentSearchId) || selectedProfile?.workflow === "ece") {
-      const preferred = selectedProfile?.workflow === "ece" ? eceRuns[0] : state.workplaceEnrichmentRuns[0];
-      state.workplaceEnrichmentSearchId = preferred?.search_id || "";
+    if (!state.workplaceEnrichmentSearchId || !state.workplaceEnrichmentRuns.some((run) => run.search_id === state.workplaceEnrichmentSearchId)) {
+      state.workplaceEnrichmentSearchId = state.workplaceEnrichmentRuns[0]?.search_id || "";
     }
     renderWorkplaceSearchRuns();
   } catch (error) {
@@ -2258,24 +2251,41 @@ function googleMapsUrl(job, mode = "driving", alternative = null) {
   return `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(destination)}${originParam}&travelmode=${encodeURIComponent(mode)}`;
 }
 
+function workplaceConfirmationButton(job) {
+  if (!job?.id || String(job.workplace_precision || "").toLowerCase() === "owner-confirmed") return "";
+  return `<button class="button ghost small" type="button" data-confirm-workplace="${escapeAttribute(job.id)}">Verify or enter workplace</button>`;
+}
+
 function renderMapLinks(job) {
   const alternatives = workplaceAlternatives(job);
   const candidate = alternatives.find((alternative) => String(alternative.assignment_status || "").toLowerCase() === "candidate_unverified");
   if (candidate) {
     const query = String(candidate.address || candidate.postal_code || job.location || "").trim();
     const verifyUrl = query ? `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(query)}` : "";
-    return verifyUrl ? `<span class="map-links" aria-label="Verify workplace"><a class="button ghost small" href="${escapeAttribute(verifyUrl)}" target="_blank" rel="noreferrer">Verify workplace</a></span>` : "";
+    return verifyUrl ? `<span class="map-links" aria-label="Verify workplace"><a class="button ghost small" href="${escapeAttribute(verifyUrl)}" target="_blank" rel="noreferrer">Check in Google Maps</a>${workplaceConfirmationButton(job)}</span>` : workplaceConfirmationButton(job);
   }
   if (alternatives.length > 1) {
     const links = alternatives.map((alternative, index) => {
       const driving = googleMapsUrl(job, "driving", alternative);
       return driving ? `<a class="button ghost small" href="${escapeAttribute(driving)}" target="_blank" rel="noreferrer">Map workplace ${index + 1}</a>` : "";
     }).join("");
-    return links || areaMapLink(job);
+    return `${links || areaMapLink(job)}${workplaceConfirmationButton(job)}`;
   }
   const driving = googleMapsUrl(job, "driving", alternatives[0] || null);
-  if (driving) return `<span class="map-links" aria-label="Map directions"><a class="button ghost small" href="${escapeAttribute(driving)}" target="_blank" rel="noreferrer">Driving directions</a></span>`;
-  return areaMapLink(job);
+  if (driving) return `<span class="map-links" aria-label="Map directions"><a class="button ghost small" href="${escapeAttribute(driving)}" target="_blank" rel="noreferrer">Driving directions</a>${workplaceConfirmationButton(job)}</span>`;
+  return `${workplaceConfirmationButton(job)}${areaMapLink(job)}`;
+}
+
+async function confirmWorkplace(jobId) {
+  const address = window.prompt("Enter the workplace address or postal code after checking the original posting / Google Maps:", "");
+  if (address === null) return;
+  const profileId = state.selectedCandidateProfileId || value("discovery-profile") || "";
+  if (!profileId) { toast("Select an applicant before confirming a workplace."); return; }
+  try {
+    await api.send(`/api/jobs/${encodeURIComponent(jobId)}/workplace`, "POST", { candidate_profile_id: profileId, address, postal_code: address });
+    toast("Workplace saved for this applicant.");
+    await loadAll({ skipProfiles: true });
+  } catch (error) { toast(error.message); }
 }
 
 function areaMapLink(job) {
@@ -3669,18 +3679,16 @@ async function previewWorkplaceEnrichment(event, nextBatch = false) {
   event.preventDefault();
   const button = document.getElementById("discovery-enrich-workplaces");
   const status = document.getElementById("discovery-status");
-  const selectedRun = state.workplaceEnrichmentRuns.find((run) => run.search_id === state.workplaceEnrichmentSearchId) || state.workplaceEnrichmentSearch;
-  if (!selectedRun?.search_id) {
-    if (status) status.textContent = "Select a completed ECE search run before enriching workplace addresses.";
-    toast("Select a completed search run first.");
-    return;
-  }
   if (button) button.disabled = true;
-  if (status) status.textContent = "Previewing missing workplace-address enrichment; no workplace changes will be made…";
+  if (status) status.textContent = "Finding workplace evidence; no workplace changes will be made…";
   try {
     const offset = nextBatch ? Number(state.workplaceEnrichmentNextOffset || state.workplaceEnrichmentOffset || 0) : Number(state.workplaceEnrichmentOffset || 0);
-    const searchId = selectedRun.search_id;
-    const selectedJobIds = selectedRun.actionable_job_ids || [];
+    const searchId = state.workplaceEnrichmentSearchId || state.discoveryLastSearchId || "";
+    const selectedRun = state.workplaceEnrichmentRuns.find((run) => run.search_id === searchId) || state.workplaceEnrichmentSearch;
+    const visibleJobIds = (state.discoveryResults || [])
+      .filter((job) => ["actionable", "review_required"].includes(job?.discovery_result_category) && Number(job?.id) > 0)
+      .map((job) => Number(job.id));
+    const selectedJobIds = visibleJobIds.length ? visibleJobIds : (selectedRun?.actionable_job_ids || []);
     const preview = await api.send("/api/jobs/enrich-workplace-locations", "POST", {
       apply: false,
       limit: 25,
@@ -3721,51 +3729,13 @@ async function previewWorkplaceEnrichment(event, nextBatch = false) {
       if (status) status.textContent = `Workplace enrichment applied: ${applied.gained_candidate || 0} records gained evidence; ${applied.remained_city_only || 0} remained city-only; ${applied.failed || 0} failed.`;
       await loadAll({ skipProfiles: true });
     } else if (status) {
-      status.textContent = `Preview complete: ${found} records gained candidate evidence; ${preview.remained_city_only || 0} remained city-only; ${preview.failed || 0} blocked or failed. No workplace changes were applied.${preview.has_more ? " Select Next batch to continue." : ""}`;
+      status.textContent = `Workplace preview complete: ${found} candidates found; ${preview.remained_city_only || 0} remain unresolved; ${preview.failed || 0} blocked or failed. No workplace changes were applied.${preview.has_more ? " Select Next batch to continue." : ""}`;
     }
   } catch (error) {
     if (status) status.textContent = `Workplace enrichment failed: ${error.message}`;
     toast(error.message);
   } finally {
     if (button) button.disabled = false;
-  }
-}
-
-async function previewOntarioRegistryMatches(event) {
-  event.preventDefault();
-  const output = document.getElementById("ontario-registry-preview-output");
-  const button = document.getElementById("ontario-registry-preview");
-  const cohort = document.getElementById("ontario-cohort-file")?.files?.[0];
-  const registry = document.getElementById("ontario-registry-file")?.files?.[0];
-  if (!cohort || !registry) {
-    if (output) output.innerHTML = '<p class="error-message">Choose both the exact cohort CSV and Ontario registry XLSX.</p>';
-    return;
-  }
-  button.disabled = true;
-  if (output) output.textContent = "Comparing the exact ECE cohort offline…";
-  try {
-    const form = new FormData();
-    form.append("cohort_file", cohort);
-    form.append("registry_file", registry);
-    form.append("candidate_profile_id", state.selectedCandidateProfileId || value("discovery-profile") || "");
-    form.append("search_id", state.workplaceEnrichmentSearchId || "");
-    form.append("google_places_opt_in", document.getElementById("ontario-google-places-opt-in")?.checked ? "true" : "false");
-    const result = await api.upload("/api/jobs/enrich-workplace-registry", form);
-    const counts = Object.entries(result.counts || {}).map(([key, count]) => `<span>${escapeHtml(key.replaceAll("_", " "))}: <strong>${Number(count)}</strong></span>`).join(" · ");
-    const jobs = (result.jobs || []).map((job) => {
-      const candidates = (job.candidates || []).map((candidate) => `<li><strong>${escapeHtml(candidate.registered_facility_name)}</strong> · ${escapeHtml(candidate.address)} · ${escapeHtml(candidate.licence_status)}<br><span class="muted">Evidence: ${escapeHtml((candidate.matching_evidence || []).join("; "))} · ${escapeHtml(candidate.status)}</span></li>`).join("");
-      const googleCandidates = (job.google_candidates || []).map((candidate) => `<li><strong>${escapeHtml(candidate.business_name)}</strong> · ${escapeHtml(candidate.address)}<br><span class="muted">${escapeHtml(candidate.status)} · ${escapeHtml((candidate.matching_evidence || []).join("; "))}</span></li>`).join("");
-      const manualMap = job.google_maps_name_search_url ? `<a href="${escapeAttribute(job.google_maps_name_search_url)}" target="_blank" rel="noreferrer">Search employer name in Google Maps</a>` : "";
-      return `<article class="result-details"><strong>${escapeHtml(job.employer)} · ${escapeHtml(job.job_title)}</strong><p>Job ${escapeHtml(job.job_id)} · ${escapeHtml(job.category)} · confidence ${escapeHtml(job.confidence)}</p>${candidates || googleCandidates ? `<ul>${candidates}${googleCandidates}</ul>` : "<p class=\"muted\">No defensible registry match.</p>"}${manualMap}</article>`;
-    }).join("");
-    if (output) {
-      output.classList.remove("empty");
-      output.innerHTML = `<p><strong>Ontario registry preview · ${escapeHtml(String(result.registry_snapshot_date || ""))}</strong></p><p>${counts}</p><p class="muted">${escapeHtml(result.message || "Preview only")}</p><p class="muted">${escapeHtml(result.google_notice || "Google Places is disabled; use manual Maps lookup.")}</p>${jobs}`;
-    }
-  } catch (error) {
-    if (output) output.innerHTML = `<p class="error-message">Registry preview failed: ${escapeHtml(error.message)}</p>`;
-  } finally {
-    button.disabled = false;
   }
 }
 
