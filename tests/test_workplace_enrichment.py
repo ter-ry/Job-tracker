@@ -83,8 +83,17 @@ def test_workplace_enrichment_advances_batches_and_requires_selected_applicant()
         with patch.object(app_module, "_safe_public_destination", return_value=True), patch.object(app_module.urllib.request, "build_opener", return_value=_Opener()):
             first = client.post("/api/jobs/enrich-workplace-locations", json={"apply": False, "limit": 25, "candidate_profile_id": profile["id"], "offset": 0}).get_json()
             second = client.post("/api/jobs/enrich-workplace-locations", json={"apply": False, "limit": 25, "candidate_profile_id": profile["id"], "offset": first["next_offset"]}).get_json()
+            confirmed = client.post("/api/jobs/enrich-workplace-locations", json={
+                "apply": True, "limit": 25, "candidate_profile_id": profile["id"],
+                "offset": first["next_offset"], "job_ids": [second["records"][0]["id"]],
+            }).get_json()
         assert len(first["records"]) == 25
         assert len(second["records"]) == 1
         assert first["records"][0]["id"] != second["records"][0]["id"]
         assert first["has_more"] is True
         assert second["has_more"] is False
+        assert confirmed["processed"] == 1
+        with app_module.app.app_context():
+            row = app_module.query_db("SELECT workplace_address, workplace_alternatives_json FROM jobs WHERE id = ?", [second["records"][0]["id"]], one=True)
+        assert row["workplace_address"] == ""
+        assert "M4G 1Z8" in row["workplace_alternatives_json"]

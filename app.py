@@ -10071,8 +10071,12 @@ def enrich_existing_workplace_locations(*, apply: bool = False, limit: int = 25,
             args.extend(valid_ids)
     total = query_db(f"SELECT COUNT(*) AS count FROM jobs WHERE {' AND '.join(conditions)}", args, one=True)
     before_counts = {"total": int(total["count"] or 0), "street": 0, "postal": 0, "city_only": int(total["count"] or 0)}
+    # A confirmation request names the exact previewed records.  Do not apply
+    # the page offset a second time, or confirming page two would select no
+    # rows (or the wrong rows) after the ID filter is added.
+    query_offset = 0 if job_ids else max(0, int(offset or 0))
     rows = query_db(
-        f"SELECT * FROM jobs WHERE {' AND '.join(conditions)} ORDER BY id LIMIT ? OFFSET ?", [*args, clamp_int(limit, 1, 50), max(0, int(offset or 0))], one=False
+        f"SELECT * FROM jobs WHERE {' AND '.join(conditions)} ORDER BY id LIMIT ? OFFSET ?", [*args, clamp_int(limit, 1, 50), query_offset], one=False
     )
     summary = {"processed": 0, "gained_verified": 0, "gained_candidate": 0, "remained_city_only": 0, "failed": 0, "preview": not apply, "records": [], "offset": max(0, int(offset or 0)), "next_offset": max(0, int(offset or 0)) + len(rows), "has_more": max(0, int(offset or 0)) + len(rows) < int(total["count"] or 0), "before_counts": before_counts, "after_counts": dict(before_counts)}
     for row in rows:
