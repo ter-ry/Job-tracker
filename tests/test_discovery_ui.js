@@ -21,6 +21,9 @@ assert.doesNotMatch(html, /name="discovery-source" value="zip_recruiter"/);
 assert.match(html, /name="discovery-source" value="indeed" checked/);
 assert.match(html, /name="discovery-source" value="glassdoor" checked/);
 assert.match(html, /name="discovery-source" value="employer_direct" checked/);
+assert.match(html, /<button class="button ghost"[^>]*id="discovery-enrich-workplaces"/);
+assert.match(html, /id="workplace-enrichment-preview"/);
+assert.match(js, /function previewWorkplaceEnrichment/);
 assert.doesNotMatch(html, /name="saved-search-source" value="linkedin"/);
 assert.doesNotMatch(html, /name="saved-search-source" value="zip_recruiter"/);
 

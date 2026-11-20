@@ -18,6 +18,17 @@ class _Response:
         return b"<html><body><h2>Our Centre</h2><p>1200 Bayview Avenue<br>Toronto, ON M4G 1Z8</p></body></html>"
 
 
+class _Opener:
+    def open(self, *_args, **_kwargs):
+        return _Response()
+
+
+def test_workplace_fetch_rejects_local_and_private_destinations():
+    assert app_module._safe_public_destination("http://localhost:5000/job") is False
+    assert app_module._safe_public_destination("http://127.0.0.1/job") is False
+    assert app_module._safe_public_destination("http://10.0.0.8/job") is False
+
+
 def test_workplace_enrichment_is_preview_first_and_persists_evidence():
     with tempfile.TemporaryDirectory() as directory:
         app_module.DATA_DIR = Path(directory)
@@ -25,22 +36,24 @@ def test_workplace_enrichment_is_preview_first_and_persists_evidence():
         app_module._INITIALIZED_DATABASE_PATH = None
         app_module.app.config.update(TESTING=True)
         client = app_module.app.test_client()
+        profile = client.post("/api/candidate-profiles", json={"name": "ECE QA", "workflow": "ece"}).get_json()
         created = client.post("/api/jobs", json={
             "title": "RECE", "company": "Example Child Care", "location": "Toronto, ON",
-            "url": "https://example.test/jobs/rece-1", "source": "indeed",
+            "url": "https://example.com/jobs/rece-1", "source": "indeed",
             "job_description": "Join our early learning team.", "discovery_first_seen_at": "2026-11-20T00:00:00",
+            "discovery_result_category": "actionable", "candidate_profile_id": profile["id"],
         })
         assert created.status_code == 201
-        with patch.object(app_module.urllib.request, "urlopen", return_value=_Response()):
-            preview = client.post("/api/jobs/enrich-workplace-locations", json={"apply": False, "limit": 25})
+        with patch.object(app_module, "_safe_public_destination", return_value=True), patch.object(app_module.urllib.request, "build_opener", return_value=_Opener()):
+            preview = client.post("/api/jobs/enrich-workplace-locations", json={"apply": False, "limit": 25, "candidate_profile_id": profile["id"]})
         assert preview.status_code == 200
         assert preview.get_json()["preview"] is True
         assert preview.get_json()["gained_candidate"] == 1
         with app_module.app.app_context():
             row = app_module.query_db("SELECT workplace_address FROM jobs WHERE id = 1", one=True)
         assert row["workplace_address"] == ""
-        with patch.object(app_module.urllib.request, "urlopen", return_value=_Response()):
-            applied = client.post("/api/jobs/enrich-workplace-locations", json={"apply": True, "limit": 25})
+        with patch.object(app_module, "_safe_public_destination", return_value=True), patch.object(app_module.urllib.request, "build_opener", return_value=_Opener()):
+            applied = client.post("/api/jobs/enrich-workplace-locations", json={"apply": True, "limit": 25, "candidate_profile_id": profile["id"], "job_ids": [1]})
         assert applied.status_code == 200
         assert applied.get_json()["preview"] is False
         with app_module.app.app_context():
@@ -48,3 +61,30 @@ def test_workplace_enrichment_is_preview_first_and_persists_evidence():
         assert row["workplace_address"] == ""
         assert "M4G 1Z8" in row["workplace_alternatives_json"]
         assert row["workplace_precision"] == "candidate street address"
+
+
+def test_workplace_enrichment_advances_batches_and_requires_selected_applicant():
+    with tempfile.TemporaryDirectory() as directory:
+        app_module.DATA_DIR = Path(directory)
+        app_module.DB_PATH = app_module.DATA_DIR / "test.sqlite"
+        app_module._INITIALIZED_DATABASE_PATH = None
+        app_module.app.config.update(TESTING=True)
+        client = app_module.app.test_client()
+        assert client.post("/api/jobs/enrich-workplace-locations", json={"apply": False}).get_json()["error"]
+        profile = client.post("/api/candidate-profiles", json={"name": "ECE QA", "workflow": "ece"}).get_json()
+        for index in range(26):
+            response = client.post("/api/jobs", json={
+                "title": "RECE", "company": f"Centre {index}", "location": "Toronto, ON",
+                "url": f"https://example.com/jobs/rece-{index}", "source": "indeed",
+                "job_description": "Join our early learning team.", "discovery_first_seen_at": f"2026-11-20T00:{index:02d}:00",
+                "discovery_result_category": "actionable", "candidate_profile_id": profile["id"],
+            })
+            assert response.status_code == 201
+        with patch.object(app_module, "_safe_public_destination", return_value=True), patch.object(app_module.urllib.request, "build_opener", return_value=_Opener()):
+            first = client.post("/api/jobs/enrich-workplace-locations", json={"apply": False, "limit": 25, "candidate_profile_id": profile["id"], "offset": 0}).get_json()
+            second = client.post("/api/jobs/enrich-workplace-locations", json={"apply": False, "limit": 25, "candidate_profile_id": profile["id"], "offset": first["next_offset"]}).get_json()
+        assert len(first["records"]) == 25
+        assert len(second["records"]) == 1
+        assert first["records"][0]["id"] != second["records"][0]["id"]
+        assert first["has_more"] is True
+        assert second["has_more"] is False

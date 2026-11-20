@@ -1242,6 +1242,11 @@ th {
   display: none !important;
 }
 
+/* This is an owner-facing Find Jobs action, not a legacy/advanced control. */
+#discovery-enrich-workplaces {
+  display: inline-flex !important;
+}
+
 .beta-search-panel {
   max-width: 980px;
   margin-inline: auto;

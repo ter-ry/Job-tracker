@@ -45,6 +45,7 @@ const state = {
   discoveryInboxSelected: new Set(),
   discoveryInboxBulkAction: "",
   discoveryInboxBulkMessage: "",
+  workplaceEnrichmentOffset: 0,
   advancedFeatures: (() => { try { return localStorage.getItem("jobTracker.advancedFeatures") === "true"; } catch (_) { return false; } })(),
   pendingAppliedJobs: new Set(),
   tailoring: { draftId: null, jobId: null, profileId: null, resumeId: null, data: null, selectedParagraph: null, selectedKeyword: null, aiImproveJobId: null },
@@ -3609,24 +3610,38 @@ async function previewWorkplaceEnrichment(event) {
   if (button) button.disabled = true;
   if (status) status.textContent = "Previewing missing workplace-address enrichment; no records will be changed…";
   try {
+    const offset = Number(state.workplaceEnrichmentOffset || 0);
     const preview = await api.send("/api/jobs/enrich-workplace-locations", "POST", {
       apply: false,
       limit: 25,
+      offset,
       candidate_profile_id: state.selectedCandidateProfileId || value("discovery-profile") || "",
     });
     const records = preview.records || [];
     const found = records.filter((item) => ["candidate_address", "postal_code"].includes(item.status)).length;
+    const previewTarget = document.getElementById("workplace-enrichment-preview");
+    if (previewTarget) {
+      previewTarget.classList.toggle("empty", !records.length);
+      previewTarget.innerHTML = records.length ? `<h3>Workplace preview · ${escapeHtml(String(preview.before_counts?.total || records.length))} selected</h3>${records.map((item) => {
+        const proposed = item.alternatives?.map((alternative) => alternative.address || alternative.postal_code).filter(Boolean).join("; ") || "No reliable workplace found";
+        const excerpt = item.alternatives?.map((alternative) => alternative.evidence).filter(Boolean).join(" · ") || item.reason || "No supporting excerpt";
+        return `<article class="result-details"><strong>${escapeHtml(item.company || "Unknown employer")} · ${escapeHtml(item.title || "Untitled role")}</strong><p>Before: ${escapeHtml(item.before_precision || "city-only")} · After: ${escapeHtml(item.after_precision || "unchanged")}</p><p>Proposed workplace: ${escapeHtml(proposed)}</p><p class="muted">Status: ${escapeHtml(item.status || "unknown")} · Verification: candidate only; owner review required.</p><p class="muted">Evidence: ${escapeHtml(excerpt.slice(0, 500))}</p>${item.url ? `<a href="${escapeAttribute(item.url)}" target="_blank" rel="noreferrer">Open original</a>` : ""}</article>`;
+      }).join("")}<p class="muted">This is a preview. Candidate locations are never confirmed automatically.</p>` : "No records were returned for this selected applicant batch.";
+    }
     const proceed = found > 0 && window.confirm(`${found} records gained workplace evidence in preview. Apply these bounded changes?`);
     if (proceed) {
       const applied = await api.send("/api/jobs/enrich-workplace-locations", "POST", {
         apply: true,
         limit: 25,
+        offset,
+        job_ids: records.map((item) => item.id).filter(Boolean),
         candidate_profile_id: state.selectedCandidateProfileId || value("discovery-profile") || "",
       });
+      state.workplaceEnrichmentOffset = Number(applied.next_offset || offset + records.length);
       if (status) status.textContent = `Workplace enrichment applied: ${applied.gained_candidate || 0} records gained evidence; ${applied.remained_city_only || 0} remained city-only; ${applied.failed || 0} failed.`;
       await loadAll({ skipProfiles: true });
     } else if (status) {
-      status.textContent = `Preview complete: ${found} records gained candidate evidence; no database changes were applied.`;
+      status.textContent = `Preview complete: ${found} records gained candidate evidence; no database changes were applied. Review the details below.`;
     }
   } catch (error) {
     if (status) status.textContent = `Workplace enrichment failed: ${error.message}`;

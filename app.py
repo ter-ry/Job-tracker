@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import copy
+import ipaddress
 from collections import Counter
 import difflib
 import hashlib
@@ -17,10 +18,11 @@ import subprocess
 import sys
 import threading
 import time
+import socket
 from concurrent.futures import ThreadPoolExecutor
 import urllib.error
 import urllib.request
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 import zipfile
 import uuid
 from datetime import date, datetime, timedelta
@@ -3871,7 +3873,9 @@ def create_app() -> Flask:
         result = enrich_existing_workplace_locations(
             apply=as_bool(payload.get("apply")),
             limit=clamp_int(payload.get("limit"), 1, 50) or 25,
+            offset=clamp_int(payload.get("offset"), 0, 10**9),
             candidate_profile_id=clamp_int(payload.get("candidate_profile_id"), 0, 10**9),
+            job_ids=payload.get("job_ids") if isinstance(payload.get("job_ids"), list) else None,
         )
         return jsonify(result)
 
@@ -9973,10 +9977,37 @@ def workplace_precision_is_useful(job: dict[str, Any]) -> bool:
     return any(text(item.get("precision")).lower() in {"street address", "postal code"} for item in alternatives)
 
 
+def _safe_public_destination(url: str) -> bool:
+    """Allow public HTTP(S) destinations while rejecting local/private hosts."""
+    try:
+        parsed = urlsplit(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+            return False
+        host = parsed.hostname.rstrip(".").lower()
+        if host in {"localhost", "localhost.localdomain", "0.0.0.0", "::1"} or host.endswith(".local"):
+            return False
+        addresses = []
+        try:
+            addresses = [ipaddress.ip_address(host)]
+        except ValueError:
+            addresses = [ipaddress.ip_address(item[4][0]) for item in socket.getaddrinfo(host, None)]
+        return bool(addresses) and all(not address.is_private and not address.is_loopback and not address.is_link_local and not address.is_reserved for address in addresses)
+    except (OSError, ValueError):
+        return False
+
+
+class _SafePublicRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urljoin(req.full_url, newurl)
+        if not _safe_public_destination(target):
+            raise urllib.error.URLError("Redirect target is not a permitted public destination")
+        return super().redirect_request(req, fp, code, msg, headers, target)
+
+
 def _enrichment_fetch(url: str, *, max_age_hours: int = 168) -> dict[str, Any]:
     """Fetch one original page with persistent cache and a hard byte/time bound."""
     url = normalize_space(url)
-    if not url.startswith(("http://", "https://")):
+    if not _safe_public_destination(url):
         return {"ok": False, "status": "invalid_url", "error": "Original URL is unavailable."}
     cached = query_db("SELECT * FROM workplace_enrichment_cache WHERE url = ?", [url], one=True)
     if cached:
@@ -9988,7 +10019,8 @@ def _enrichment_fetch(url: str, *, max_age_hours: int = 168) -> dict[str, Any]:
             return {"ok": text(cached["status"]) == "ok", "status": text(cached["status"]), "body": text(cached["body"]), "content_type": text(cached["content_type"]), "error": text(cached["error"]), "cached": True}
     request_obj = urllib.request.Request(url, headers={"Accept": "text/html,application/xhtml+xml", "User-Agent": "Job Tracker workplace enrichment/1.0"})
     try:
-        with urllib.request.urlopen(request_obj, timeout=float(os.environ.get("JOB_TRACKER_WORKPLACE_FETCH_TIMEOUT_SECONDS", "8"))) as response:
+        opener = urllib.request.build_opener(_SafePublicRedirect)
+        with opener.open(request_obj, timeout=float(os.environ.get("JOB_TRACKER_WORKPLACE_FETCH_TIMEOUT_SECONDS", "8"))) as response:
             body = response.read(1_500_000).decode("utf-8", errors="replace")
             content_type = text(response.headers.get("Content-Type"))
         result = {"ok": True, "status": "ok", "body": body, "content_type": content_type, "error": "", "cached": False}
@@ -10024,39 +10056,48 @@ def _extract_workplace_from_page(job: dict[str, Any], page: str, original_url: s
     return alternatives
 
 
-def enrich_existing_workplace_locations(*, apply: bool = False, limit: int = 25, candidate_profile_id: int = 0) -> dict[str, Any]:
+def enrich_existing_workplace_locations(*, apply: bool = False, limit: int = 25, offset: int = 0, candidate_profile_id: int = 0, job_ids: list[int] | None = None) -> dict[str, Any]:
     """Preview/apply bounded page enrichment for existing city-only jobs."""
-    conditions = ["discovery_first_seen_at != ''", "(workplace_address = '' AND workplace_postal_code = '')"]
+    conditions = ["discovery_first_seen_at != ''", "(workplace_address = '' AND workplace_postal_code = '')", "discovery_result_category IN ('actionable', 'review_required')"]
     args: list[Any] = []
-    if candidate_profile_id:
-        conditions.append("candidate_profile_id = ?")
-        args.append(candidate_profile_id)
+    if not candidate_profile_id:
+        return {"processed": 0, "gained_verified": 0, "gained_candidate": 0, "remained_city_only": 0, "failed": 0, "preview": not apply, "records": [], "error": "Select an applicant profile before enriching workplace locations."}
+    conditions.append("candidate_profile_id = ?")
+    args.append(candidate_profile_id)
+    if job_ids:
+        valid_ids = [clamp_int(item, 1, 10**9) for item in job_ids if clamp_int(item, 1, 10**9)]
+        if valid_ids:
+            conditions.append("id IN (" + ",".join("?" for _ in valid_ids) + ")")
+            args.extend(valid_ids)
+    total = query_db(f"SELECT COUNT(*) AS count FROM jobs WHERE {' AND '.join(conditions)}", args, one=True)
+    before_counts = {"total": int(total["count"] or 0), "street": 0, "postal": 0, "city_only": int(total["count"] or 0)}
     rows = query_db(
-        f"SELECT * FROM jobs WHERE {' AND '.join(conditions)} ORDER BY id LIMIT ?", [*args, clamp_int(limit, 1, 50)], one=False
+        f"SELECT * FROM jobs WHERE {' AND '.join(conditions)} ORDER BY id LIMIT ? OFFSET ?", [*args, clamp_int(limit, 1, 50), max(0, int(offset or 0))], one=False
     )
-    summary = {"processed": 0, "gained_verified": 0, "gained_candidate": 0, "remained_city_only": 0, "failed": 0, "preview": not apply, "records": []}
+    summary = {"processed": 0, "gained_verified": 0, "gained_candidate": 0, "remained_city_only": 0, "failed": 0, "preview": not apply, "records": [], "offset": max(0, int(offset or 0)), "next_offset": max(0, int(offset or 0)) + len(rows), "has_more": max(0, int(offset or 0)) + len(rows) < int(total["count"] or 0), "before_counts": before_counts, "after_counts": dict(before_counts)}
     for row in rows:
         job = dict(row)
+        before_precision = text(job.get("workplace_precision")) or "city-only"
         original_url = text(job.get("url")) or text(job.get("application_url"))
         if not original_url:
             summary["remained_city_only"] += 1
-            summary["records"].append({"id": int(job["id"]), "status": "city_only", "reason": "No original posting URL."})
+            summary["records"].append({"id": int(job["id"]), "title": text(job.get("title")), "company": text(job.get("company")), "status": "city_only", "before_precision": before_precision, "after_precision": before_precision, "reason": "No original posting URL."})
             continue
         fetched = _enrichment_fetch(original_url)
         summary["processed"] += 1
         if not fetched.get("ok"):
             summary["failed"] += 1
-            summary["records"].append({"id": int(job["id"]), "status": "failed", "reason": fetched.get("error", "Page unavailable."), "url": original_url})
+            summary["records"].append({"id": int(job["id"]), "title": text(job.get("title")), "company": text(job.get("company")), "status": "failed", "before_precision": before_precision, "after_precision": before_precision, "reason": fetched.get("error", "Page unavailable."), "url": original_url})
             continue
         alternatives = _extract_workplace_from_page(job, text(fetched.get("body")), original_url)
         if not alternatives:
             summary["remained_city_only"] += 1
-            summary["records"].append({"id": int(job["id"]), "status": "city_only", "url": original_url})
+            summary["records"].append({"id": int(job["id"]), "title": text(job.get("title")), "company": text(job.get("company")), "status": "city_only", "before_precision": before_precision, "after_precision": before_precision, "url": original_url})
             continue
         has_street = any(text(item.get("precision")).lower() == "street address" for item in alternatives)
         status = "candidate_address" if has_street else "postal_code"
         summary["gained_candidate"] += 1
-        summary["records"].append({"id": int(job["id"]), "status": status, "alternatives": alternatives, "url": original_url})
+        summary["records"].append({"id": int(job["id"]), "title": text(job.get("title")), "company": text(job.get("company")), "status": status, "before_precision": before_precision, "after_precision": "candidate street address" if has_street else "postal code", "alternatives": alternatives, "url": original_url})
         if apply:
             # This query excluded precise records; retain a final guard so a
             # concurrent/manual confirmation is never silently overwritten.
@@ -10077,6 +10118,11 @@ def enrich_existing_workplace_locations(*, apply: bool = False, limit: int = 25,
                 )
     if apply:
         get_db().commit()
+    summary["after_counts"] = {
+        "total": before_counts["total"], "street": before_counts["street"],
+        "postal": before_counts["postal"], "city_only": before_counts["city_only"],
+        "candidate": summary["gained_candidate"], "failed": summary["failed"],
+    }
     return summary
 
 
