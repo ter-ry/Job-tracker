@@ -22,7 +22,7 @@ import socket
 from concurrent.futures import ThreadPoolExecutor
 import urllib.error
 import urllib.request
-from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote_plus, urlencode, urljoin, urlsplit, urlunsplit
 import zipfile
 import uuid
 from datetime import date, datetime, timedelta
@@ -73,6 +73,7 @@ from sources.jobspy_source import (
 )
 from sources.ats_source import fetch_employer_direct_jobs
 from sources.provider_runtime import ProviderCircuitBreaker
+from sources.ontario_facilities import google_places_text_search, load_cohort, load_facilities, match_cohort
 from tailoring import generate_tailored_resume_draft
 from tailoring_pipeline import (
     build_cover_letter_paragraphs,
@@ -3902,6 +3903,76 @@ def create_app() -> Flask:
             job_ids=payload.get("job_ids") if isinstance(payload.get("job_ids"), list) else None,
         )
         return jsonify(result)
+
+    @app.post("/api/jobs/enrich-workplace-registry")
+    def preview_ontario_facility_matches() -> Response:
+        """Run a read-only Ontario registry comparison for an exact ECE cohort.
+
+        The workbook and cohort are uploaded for this request only. No registry
+        rows, job workplaces, classifications, or applicant history are saved.
+        """
+        cohort_file = request.files.get("cohort_file")
+        registry_file = request.files.get("registry_file")
+        if not cohort_file or not registry_file:
+            return jsonify({"error": "Upload the exact ECE cohort CSV and Ontario facility XLSX."}), 400
+        profile_id = clamp_int(request.form.get("candidate_profile_id"), 0, 10**9)
+        if not profile_id:
+            return jsonify({"error": "Select the ECE applicant before running the registry preview."}), 400
+        profile = query_db("SELECT workflow FROM candidate_profiles WHERE id = ?", [profile_id], one=True)
+        if not profile or text(profile["workflow"]).lower() != "ece":
+            return jsonify({"error": "The Ontario registry preview is restricted to an ECE applicant."}), 400
+        try:
+            cohort = load_cohort(cohort_file.read())
+            facilities = load_facilities(registry_file.read())
+        except (ValueError, OSError, ImportError) as exc:
+            return jsonify({"error": f"Ontario registry preview could not read the supplied files: {exc}"}), 400
+        search_id = text(request.form.get("search_id"))
+        if search_id:
+            membership_rows = query_db(
+                """SELECT job_id FROM discovery_search_memberships
+                   WHERE search_execution_id = ? AND applicant_profile_id IN (0, ?)
+                     AND category IN ('actionable', 'review_required')""",
+                [search_id, profile_id],
+            )
+            allowed_ids = {str(int(row["job_id"])) for row in membership_rows}
+            cohort = [job for job in cohort if text(job.get("job_id")) in allowed_ids]
+        if not cohort:
+            return jsonify({"error": "The selected search has no matching ECE cohort records in the supplied CSV."}), 400
+        results = match_cohort(cohort, facilities)
+        google_opt_in = text(request.form.get("google_places_opt_in")).lower() in {"1", "true", "yes", "on"}
+        google_key = text(os.environ.get("GOOGLE_PLACES_API_KEY"))
+        google_notice = "Google Places disabled; use the free Google Maps name-search links."
+        if google_opt_in and not google_key:
+            google_notice = "Google Places requested but disabled because GOOGLE_PLACES_API_KEY is not configured; no paid lookup was attempted."
+        if google_opt_in and google_key:
+            google_notice = "Google Places was explicitly enabled with a server-side key; results remain unverified candidates and may incur billing."
+            for item, job in zip(results, cohort):
+                if item["category"] in {"no_defensible_registry_match", "multiple_licensed_facilities", "similar_name_requires_verification"}:
+                    item["google_candidates"] = google_places_text_search(text(job.get("employer")), text(job.get("advertised_location")), google_key)
+        else:
+            for item, job in zip(results, cohort):
+                item["google_maps_name_search_url"] = "https://www.google.com/maps/search/" + quote_plus(f"{job.get('employer', '')}, {job.get('advertised_location', '')}")
+        counts = {
+            "total": len(results),
+            "existing_precise": sum(1 for item in results if item["category"] == "existing_precise_registry_supported"),
+            "new_unique_facility_matches": sum(1 for item in results if item["category"] == "strong_single_centre_match"),
+            "similar_name_requires_verification": sum(1 for item in results if item["category"] == "similar_name_requires_verification"),
+            "ambiguous_multi_location_matches": sum(1 for item in results if item["category"] == "multiple_licensed_facilities"),
+            "unmatched_employers": sum(1 for item in results if item["category"] == "no_defensible_registry_match"),
+            "potential_incorrect_matches": sum(1 for item in results if "music" in text(item.get("job_title")).lower() and item["candidates"]),
+        }
+        return jsonify({
+            "preview": True,
+            "applicant_profile_id": profile_id,
+            "search_execution_id": search_id,
+            "registry_snapshot_date": "2026-10-31",
+            "source": "Ontario licensed child care facilities registry",
+            "source_url": "https://data.ontario.ca/dataset/licensed-child-care-facilities-in-ontario/resource/876d6b6a-784f-4d79-85f1-f0433e7e5e58",
+            "counts": counts,
+            "jobs": results,
+            "message": "Preview only. Every facility is a possible licensed facility — verify job workplace; no job or applicant data was changed.",
+            "google_notice": google_notice,
+        })
 
     @app.post("/api/generate")
     def generate_materials() -> Response:

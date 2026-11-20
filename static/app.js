@@ -304,6 +304,7 @@ document.addEventListener("DOMContentLoaded", () => {
     renderWorkplaceSearchRuns();
   });
   document.getElementById("workplace-enrichment-next")?.addEventListener("click", (event) => previewWorkplaceEnrichment(event, true));
+  document.getElementById("ontario-registry-preview")?.addEventListener("click", previewOntarioRegistryMatches);
   document.getElementById("discovery-re-evaluate")?.addEventListener("click", reEvaluateDiscoveryHistory);
   document.getElementById("qa-reset")?.addEventListener("click", resetQASession);
   document.getElementById("save-current-discovery-search").addEventListener("click", saveCurrentDiscoverySearch);
@@ -3727,6 +3728,44 @@ async function previewWorkplaceEnrichment(event, nextBatch = false) {
     toast(error.message);
   } finally {
     if (button) button.disabled = false;
+  }
+}
+
+async function previewOntarioRegistryMatches(event) {
+  event.preventDefault();
+  const output = document.getElementById("ontario-registry-preview-output");
+  const button = document.getElementById("ontario-registry-preview");
+  const cohort = document.getElementById("ontario-cohort-file")?.files?.[0];
+  const registry = document.getElementById("ontario-registry-file")?.files?.[0];
+  if (!cohort || !registry) {
+    if (output) output.innerHTML = '<p class="error-message">Choose both the exact cohort CSV and Ontario registry XLSX.</p>';
+    return;
+  }
+  button.disabled = true;
+  if (output) output.textContent = "Comparing the exact ECE cohort offline…";
+  try {
+    const form = new FormData();
+    form.append("cohort_file", cohort);
+    form.append("registry_file", registry);
+    form.append("candidate_profile_id", state.selectedCandidateProfileId || value("discovery-profile") || "");
+    form.append("search_id", state.workplaceEnrichmentSearchId || "");
+    form.append("google_places_opt_in", document.getElementById("ontario-google-places-opt-in")?.checked ? "true" : "false");
+    const result = await api.upload("/api/jobs/enrich-workplace-registry", form);
+    const counts = Object.entries(result.counts || {}).map(([key, count]) => `<span>${escapeHtml(key.replaceAll("_", " "))}: <strong>${Number(count)}</strong></span>`).join(" · ");
+    const jobs = (result.jobs || []).map((job) => {
+      const candidates = (job.candidates || []).map((candidate) => `<li><strong>${escapeHtml(candidate.registered_facility_name)}</strong> · ${escapeHtml(candidate.address)} · ${escapeHtml(candidate.licence_status)}<br><span class="muted">Evidence: ${escapeHtml((candidate.matching_evidence || []).join("; "))} · ${escapeHtml(candidate.status)}</span></li>`).join("");
+      const googleCandidates = (job.google_candidates || []).map((candidate) => `<li><strong>${escapeHtml(candidate.business_name)}</strong> · ${escapeHtml(candidate.address)}<br><span class="muted">${escapeHtml(candidate.status)} · ${escapeHtml((candidate.matching_evidence || []).join("; "))}</span></li>`).join("");
+      const manualMap = job.google_maps_name_search_url ? `<a href="${escapeAttribute(job.google_maps_name_search_url)}" target="_blank" rel="noreferrer">Search employer name in Google Maps</a>` : "";
+      return `<article class="result-details"><strong>${escapeHtml(job.employer)} · ${escapeHtml(job.job_title)}</strong><p>Job ${escapeHtml(job.job_id)} · ${escapeHtml(job.category)} · confidence ${escapeHtml(job.confidence)}</p>${candidates || googleCandidates ? `<ul>${candidates}${googleCandidates}</ul>` : "<p class=\"muted\">No defensible registry match.</p>"}${manualMap}</article>`;
+    }).join("");
+    if (output) {
+      output.classList.remove("empty");
+      output.innerHTML = `<p><strong>Ontario registry preview · ${escapeHtml(String(result.registry_snapshot_date || ""))}</strong></p><p>${counts}</p><p class="muted">${escapeHtml(result.message || "Preview only")}</p><p class="muted">${escapeHtml(result.google_notice || "Google Places is disabled; use manual Maps lookup.")}</p>${jobs}`;
+    }
+  } catch (error) {
+    if (output) output.innerHTML = `<p class="error-message">Registry preview failed: ${escapeHtml(error.message)}</p>`;
+  } finally {
+    button.disabled = false;
   }
 }
 

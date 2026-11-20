@@ -10,7 +10,7 @@ const baseUrl = process.env.JOB_TRACKER_URL || "http://127.0.0.1:5002";
 (async () => {
   const browser = await chromium.launch({ headless: true, executablePath: process.env.CHROMIUM_PATH || "/usr/bin/chromium", args: ["--no-sandbox"] });
   const page = await browser.newPage();
-  await page.route("**/api/discovery/inbox/search-runs?candidate_profile_id=17", async (route) => {
+  await page.route("**/api/discovery/inbox/search-runs*", async (route) => {
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify([{
       search_id: "b".repeat(32), created_at: "2026-11-20 10:00:00", applicant_name: "ECE QA",
       workflow: "ece", keywords: "RECE; Early Childhood Educator", occupation: "ece",
