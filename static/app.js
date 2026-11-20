@@ -289,6 +289,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("historical-application-confirm")?.addEventListener("click", confirmHistoricalApplications);
   document.getElementById("discovery-test-sources").addEventListener("click", testJobSources);
   document.getElementById("discovery-recalculate-distances")?.addEventListener("click", recalculateDiscoveryDistances);
+  document.getElementById("discovery-enrich-workplaces")?.addEventListener("click", previewWorkplaceEnrichment);
   document.getElementById("discovery-re-evaluate")?.addEventListener("click", reEvaluateDiscoveryHistory);
   document.getElementById("qa-reset")?.addEventListener("click", resetQASession);
   document.getElementById("save-current-discovery-search").addEventListener("click", saveCurrentDiscoverySearch);
@@ -2198,6 +2199,12 @@ function googleMapsUrl(job, mode = "driving", alternative = null) {
 
 function renderMapLinks(job) {
   const alternatives = workplaceAlternatives(job);
+  const candidate = alternatives.find((alternative) => String(alternative.assignment_status || "").toLowerCase() === "candidate_unverified");
+  if (candidate) {
+    const query = String(candidate.address || candidate.postal_code || job.location || "").trim();
+    const verifyUrl = query ? `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(query)}` : "";
+    return verifyUrl ? `<span class="map-links" aria-label="Verify workplace"><a class="button ghost small" href="${escapeAttribute(verifyUrl)}" target="_blank" rel="noreferrer">Verify workplace</a></span>` : "";
+  }
   if (alternatives.length > 1) {
     const links = alternatives.map((alternative, index) => {
       const driving = googleMapsUrl(job, "driving", alternative);
@@ -3592,6 +3599,40 @@ async function recalculateDiscoveryDistances(event) {
     toast(error.message);
   } finally {
     button.disabled = false;
+  }
+}
+
+async function previewWorkplaceEnrichment(event) {
+  event.preventDefault();
+  const button = document.getElementById("discovery-enrich-workplaces");
+  const status = document.getElementById("discovery-status");
+  if (button) button.disabled = true;
+  if (status) status.textContent = "Previewing missing workplace-address enrichment; no records will be changed…";
+  try {
+    const preview = await api.send("/api/jobs/enrich-workplace-locations", "POST", {
+      apply: false,
+      limit: 25,
+      candidate_profile_id: state.selectedCandidateProfileId || value("discovery-profile") || "",
+    });
+    const records = preview.records || [];
+    const found = records.filter((item) => ["candidate_address", "postal_code"].includes(item.status)).length;
+    const proceed = found > 0 && window.confirm(`${found} records gained workplace evidence in preview. Apply these bounded changes?`);
+    if (proceed) {
+      const applied = await api.send("/api/jobs/enrich-workplace-locations", "POST", {
+        apply: true,
+        limit: 25,
+        candidate_profile_id: state.selectedCandidateProfileId || value("discovery-profile") || "",
+      });
+      if (status) status.textContent = `Workplace enrichment applied: ${applied.gained_candidate || 0} records gained evidence; ${applied.remained_city_only || 0} remained city-only; ${applied.failed || 0} failed.`;
+      await loadAll({ skipProfiles: true });
+    } else if (status) {
+      status.textContent = `Preview complete: ${found} records gained candidate evidence; no database changes were applied.`;
+    }
+  } catch (error) {
+    if (status) status.textContent = `Workplace enrichment failed: ${error.message}`;
+    toast(error.message);
+  } finally {
+    if (button) button.disabled = false;
   }
 }
 

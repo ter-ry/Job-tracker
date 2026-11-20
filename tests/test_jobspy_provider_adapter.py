@@ -127,3 +127,48 @@ def test_structured_jobposting_locations_and_ambiguous_age_ranges_are_conservati
     assert [item["postal_code"] for item in normalized["workplace_alternatives"]] == ["M6B 2P9", "M6L 3E7"]
     assert normalized["workplace_precision"] == "multiple alternatives"
     assert normalized["experience_requirement"] == ""
+
+
+def test_second_location_layer_handles_multiline_daycare_labels_and_html():
+    from sources.jobspy_source import extract_workplace_alternatives
+
+    description = """Our Centre:
+    1200 Bayview Avenue
+    Suite 400
+    Toronto, ON M4G 1Z8
+    Reporting Location: <strong>85 Eglinton Avenue East, Toronto, ON M4P 1A6</strong>"""
+    alternatives = extract_workplace_alternatives({}, description)
+    assert {item["postal_code"] for item in alternatives} == {"M4G 1Z8", "M4P 1A6"}
+    assert all(item["evidence"] for item in alternatives)
+    assert all(item["extraction_method"] == "labelled_text" for item in alternatives)
+
+
+def test_second_location_layer_reads_jobposting_jsonld_and_preserves_branches():
+    from sources.jobspy_source import normalize_jobspy_row
+
+    normalized = normalize_jobspy_row({
+        "title": "RECE",
+        "location": "Toronto, ON",
+        "raw": {"jsonld": '{"@type":"JobPosting","jobLocation":[{"address":{"streetAddress":"10 Main Street","addressLocality":"Toronto","addressRegion":"ON","postalCode":"M5V 2T6"}},{"address":{"streetAddress":"20 King Street","addressLocality":"Toronto","addressRegion":"ON","postalCode":"M5H 1A1"}}]}'},
+        "description": "Join our early learning team.",
+    }, "indeed")
+    assert [item["postal_code"] for item in normalized["workplace_alternatives"]] == ["M5V 2T6", "M5H 1A1"]
+    assert all(item["extraction_method"] == "json_ld" for item in normalized["workplace_alternatives"])
+
+
+def test_second_location_layer_rejects_corporate_address_and_remote_location():
+    from sources.jobspy_source import normalize_jobspy_row
+
+    normalized = normalize_jobspy_row({
+        "title": "RECE",
+        "location": "Toronto, ON",
+        "description": "Corporate headquarters: 500 King Street, Toronto, ON M5V 1L9. Work Location: Toronto, ON.",
+    }, "indeed")
+    assert normalized["workplace_alternatives"] == []
+    remote = normalize_jobspy_row({
+        "title": "Remote RECE",
+        "location": "Toronto, ON",
+        "remote_type": "Remote",
+        "description": "Work from home across Canada. Mailing address: 100 Main Street, Toronto, ON M5V 1L9.",
+    }, "indeed")
+    assert remote["workplace_alternatives"] == []

@@ -65,6 +65,7 @@ from sources.jobspy_source import (
     extract_explicit_credentials,
     extract_keyword_requirements,
     extract_workplace_alternatives,
+    extract_workplace_location,
     fetch_jobspy_jobs,
     requirement_phrase_evidence,
 )
@@ -3861,6 +3862,18 @@ def create_app() -> Flask:
         refreshed_search_key = discovery_search_signature(search)
         save_discovery_search_run(refreshed_search_key, search, diagnostics, refreshed_jobs)
         return jsonify({"ok": True, "search_key": refreshed_search_key, "search": search, "jobs": refreshed_jobs, "updated_persisted_jobs": updated, "diagnostics": diagnostics, "scraped": False})
+
+    @app.post("/api/jobs/enrich-workplace-locations")
+    def enrich_workplace_locations_route() -> Response:
+        payload = request.get_json(silent=True) or {}
+        # Preview is the safe default. Applying extracted evidence requires an
+        # explicit apply=true and remains limited to missing-precision jobs.
+        result = enrich_existing_workplace_locations(
+            apply=as_bool(payload.get("apply")),
+            limit=clamp_int(payload.get("limit"), 1, 50) or 25,
+            candidate_profile_id=clamp_int(payload.get("candidate_profile_id"), 0, 10**9),
+        )
+        return jsonify(result)
 
     @app.post("/api/generate")
     def generate_materials() -> Response:
@@ -9950,6 +9963,121 @@ def workplace_alternatives_for_job(job: dict[str, Any]) -> list[dict[str, Any]]:
             "assignment_status": "confirmed",
         }]
     return alternatives
+
+
+def workplace_precision_is_useful(job: dict[str, Any]) -> bool:
+    """Whether a record already has a source-backed precise workplace."""
+    alternatives = workplace_alternatives_for_job(job)
+    if text(job.get("workplace_address")) or text(job.get("workplace_postal_code")):
+        return True
+    return any(text(item.get("precision")).lower() in {"street address", "postal code"} for item in alternatives)
+
+
+def _enrichment_fetch(url: str, *, max_age_hours: int = 168) -> dict[str, Any]:
+    """Fetch one original page with persistent cache and a hard byte/time bound."""
+    url = normalize_space(url)
+    if not url.startswith(("http://", "https://")):
+        return {"ok": False, "status": "invalid_url", "error": "Original URL is unavailable."}
+    cached = query_db("SELECT * FROM workplace_enrichment_cache WHERE url = ?", [url], one=True)
+    if cached:
+        try:
+            age = datetime.now() - datetime.fromisoformat(text(cached["fetched_at"]).replace("Z", "+00:00").replace("+00:00", ""))
+        except ValueError:
+            age = timedelta.max
+        if age <= timedelta(hours=max_age_hours):
+            return {"ok": text(cached["status"]) == "ok", "status": text(cached["status"]), "body": text(cached["body"]), "content_type": text(cached["content_type"]), "error": text(cached["error"]), "cached": True}
+    request_obj = urllib.request.Request(url, headers={"Accept": "text/html,application/xhtml+xml", "User-Agent": "Job Tracker workplace enrichment/1.0"})
+    try:
+        with urllib.request.urlopen(request_obj, timeout=float(os.environ.get("JOB_TRACKER_WORKPLACE_FETCH_TIMEOUT_SECONDS", "8"))) as response:
+            body = response.read(1_500_000).decode("utf-8", errors="replace")
+            content_type = text(response.headers.get("Content-Type"))
+        result = {"ok": True, "status": "ok", "body": body, "content_type": content_type, "error": "", "cached": False}
+    except Exception as exc:
+        result = {"ok": False, "status": "failed", "body": "", "content_type": "", "error": f"{type(exc).__name__}: {exc}", "cached": False}
+    get_db().execute(
+        """INSERT INTO workplace_enrichment_cache(url, fetched_at, status, content_type, body, error)
+           VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?, ?)
+           ON CONFLICT(url) DO UPDATE SET fetched_at = CURRENT_TIMESTAMP, status = excluded.status,
+             content_type = excluded.content_type, body = excluded.body, error = excluded.error""",
+        [url, result["status"], result["content_type"], result["body"], result["error"]],
+    )
+    get_db().commit()
+    return result
+
+
+def _extract_workplace_from_page(job: dict[str, Any], page: str, original_url: str) -> list[dict[str, Any]]:
+    """Extract page description plus JSON-LD without trusting page chrome."""
+    structured: list[Any] = []
+    for raw in re.findall(r"<script[^>]+type=[\"']application/ld\+json[\"'][^>]*>(.*?)</script>", page, re.I | re.S):
+        try:
+            structured.append(json.loads(html.unescape(raw)))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+    row = {"structured_data": structured, "location": text(job.get("location")), "title": text(job.get("title")), "source": text(job.get("source"))}
+    extracted = extract_workplace_location(row, page, text(job.get("location")))
+    alternatives = extracted.get("alternatives") or []
+    for item in alternatives:
+        item["source_url"] = original_url
+        item["extraction_method"] = text(item.get("extraction_method")) or ("json_ld" if "JSON-LD" in text(item.get("evidence_source")) else "labelled_text")
+        item["assignment_status"] = "candidate_unverified"
+        item["verification_note"] = "Extracted from the original posting; verify the workplace before relying on commute distance."
+    return alternatives
+
+
+def enrich_existing_workplace_locations(*, apply: bool = False, limit: int = 25, candidate_profile_id: int = 0) -> dict[str, Any]:
+    """Preview/apply bounded page enrichment for existing city-only jobs."""
+    conditions = ["discovery_first_seen_at != ''", "(workplace_address = '' AND workplace_postal_code = '')"]
+    args: list[Any] = []
+    if candidate_profile_id:
+        conditions.append("candidate_profile_id = ?")
+        args.append(candidate_profile_id)
+    rows = query_db(
+        f"SELECT * FROM jobs WHERE {' AND '.join(conditions)} ORDER BY id LIMIT ?", [*args, clamp_int(limit, 1, 50)], one=False
+    )
+    summary = {"processed": 0, "gained_verified": 0, "gained_candidate": 0, "remained_city_only": 0, "failed": 0, "preview": not apply, "records": []}
+    for row in rows:
+        job = dict(row)
+        original_url = text(job.get("url")) or text(job.get("application_url"))
+        if not original_url:
+            summary["remained_city_only"] += 1
+            summary["records"].append({"id": int(job["id"]), "status": "city_only", "reason": "No original posting URL."})
+            continue
+        fetched = _enrichment_fetch(original_url)
+        summary["processed"] += 1
+        if not fetched.get("ok"):
+            summary["failed"] += 1
+            summary["records"].append({"id": int(job["id"]), "status": "failed", "reason": fetched.get("error", "Page unavailable."), "url": original_url})
+            continue
+        alternatives = _extract_workplace_from_page(job, text(fetched.get("body")), original_url)
+        if not alternatives:
+            summary["remained_city_only"] += 1
+            summary["records"].append({"id": int(job["id"]), "status": "city_only", "url": original_url})
+            continue
+        has_street = any(text(item.get("precision")).lower() == "street address" for item in alternatives)
+        status = "candidate_address" if has_street else "postal_code"
+        summary["gained_candidate"] += 1
+        summary["records"].append({"id": int(job["id"]), "status": status, "alternatives": alternatives, "url": original_url})
+        if apply:
+            # This query excluded precise records; retain a final guard so a
+            # concurrent/manual confirmation is never silently overwritten.
+            current = query_db("SELECT * FROM jobs WHERE id = ?", [int(job["id"])], one=True)
+            if current and not workplace_precision_is_useful(dict(current)):
+                update = alternatives[0] if len(alternatives) == 1 else None
+                get_db().execute(
+                    """UPDATE jobs SET workplace_alternatives_json = ?, workplace_address = ?, workplace_postal_code = ?,
+                       workplace_evidence = ?, workplace_evidence_source = ?, workplace_precision = ?, workplace_confidence = ?,
+                       updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+                    # Page extraction is candidate evidence only. Keep the
+                    # legacy confirmed fields empty until the owner verifies
+                    # the workplace, while retaining the full alternative and
+                    # its source excerpt below.
+                    [dumps_json(alternatives), "", "",
+                     text(update.get("evidence")) if update else "", text(update.get("evidence_source")) if update else "",
+                     "candidate street address" if has_street else "postal code", clamp_int(update.get("confidence"), 0, 100) if update else 0, int(job["id"])],
+                )
+    if apply:
+        get_db().commit()
+    return summary
 
 
 def geocode_workplace_alternative(

@@ -213,6 +213,16 @@ def ensure_candidate_workflow_column(db: sqlite3.Connection) -> None:
             FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
         )"""
     )
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS workplace_enrichment_cache (
+            url TEXT PRIMARY KEY,
+            fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            status TEXT NOT NULL DEFAULT '',
+            content_type TEXT NOT NULL DEFAULT '',
+            body TEXT NOT NULL DEFAULT '',
+            error TEXT NOT NULL DEFAULT ''
+        )"""
+    )
 
 
 def _migration_010_tailoring_revision_history(db: sqlite3.Connection) -> None:
