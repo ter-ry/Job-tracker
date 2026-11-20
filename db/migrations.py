@@ -181,13 +181,28 @@ def _migration_009_skill_confirmation_metadata(db: sqlite3.Connection) -> None:
 
 
 def ensure_candidate_workflow_column(db: sqlite3.Connection) -> None:
-    """Add workflow metadata without advancing the established schema 14."""
+    """Add candidate metadata without advancing the established schema 14."""
     if not db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'candidate_profiles'").fetchone():
         return
     existing = {row[1] for row in db.execute("PRAGMA table_info(candidate_profiles)")}
     if "workflow" not in existing:
         db.execute("ALTER TABLE candidate_profiles ADD COLUMN workflow TEXT NOT NULL DEFAULT 'software'")
     db.execute("UPDATE candidate_profiles SET workflow = 'software' WHERE workflow IS NULL OR workflow = ''")
+    commute_columns = {
+        "commute_origin_input": "TEXT NOT NULL DEFAULT ''",
+        "commute_origin_normalized": "TEXT NOT NULL DEFAULT ''",
+        "commute_origin_latitude": "TEXT NOT NULL DEFAULT ''",
+        "commute_origin_longitude": "TEXT NOT NULL DEFAULT ''",
+        "commute_origin_provider": "TEXT NOT NULL DEFAULT ''",
+        "commute_origin_confidence": "INTEGER NOT NULL DEFAULT 0",
+        "commute_origin_precision": "TEXT NOT NULL DEFAULT ''",
+        "commute_origin_geocoded_at": "TEXT NOT NULL DEFAULT ''",
+        "commute_origin_status": "TEXT NOT NULL DEFAULT 'missing'",
+        "commute_origin_error": "TEXT NOT NULL DEFAULT ''",
+    }
+    for name, definition in commute_columns.items():
+        if name not in existing:
+            db.execute(f"ALTER TABLE candidate_profiles ADD COLUMN {name} {definition}")
     db.execute(
         """CREATE TABLE IF NOT EXISTS discovery_requalifications (
             job_id INTEGER NOT NULL,

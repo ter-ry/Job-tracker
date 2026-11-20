@@ -117,6 +117,7 @@
               </label>
               <label>Job titles<input id="discovery-keywords" required placeholder="software developer; junior software engineer"><small class="muted">Use semicolons for multiple titles.</small></label>
               <label>Search area<input id="discovery-location" placeholder="Toronto, Ontario"></label>
+              <label>Commute From<input id="discovery-distance-origin" placeholder="CF Fairview Mall, 1800 Sheppard Avenue East, Toronto, ON, Canada" value="CF Fairview Mall, 1800 Sheppard Avenue East, Toronto, ON, Canada"><small class="muted">Used only for commute context. A failed lookup stays unresolved; it never falls back to the search area.</small></label>
               <label>Number of new matching jobs<input id="discovery-new-matching-target" type="number" min="1" max="500" step="1" value="50"><small class="muted">Target for qualifying new jobs, not the raw provider-fetch limit.</small></label>
               <label>Distance radius<input id="discovery-distance" type="number" min="0" step="1" placeholder="50 km"></label>
               <label>Remote preference
@@ -204,7 +205,7 @@
             </div>
             <div class="compatibility-fields" aria-hidden="true">
               <select id="discovery-search-mode"><option value="shortlist">shortlist</option></select>
-              <input id="discovery-distance-origin"><input id="discovery-shortlist-size" value="50"><input id="discovery-total-cap" type="hidden" value="200"><input id="discovery-per-source-cap" type="hidden" value="100"><input id="discovery-strict-technical" type="checkbox">
+              <input id="discovery-shortlist-size" value="50"><input id="discovery-total-cap" type="hidden" value="200"><input id="discovery-per-source-cap" type="hidden" value="100"><input id="discovery-strict-technical" type="checkbox">
             </div>
           </form>
 

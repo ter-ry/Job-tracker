@@ -543,6 +543,10 @@ async function loadCandidateProfiles({ reloadPanelsOnSelectionChange = false } =
     }
     state.candidateProfilesStatus = "ready";
     renderCandidateProfiles();
+    const selectedProfile = state.candidateProfiles.find((profile) => String(profile.id) === String(state.selectedCandidateProfileId));
+    if (selectedProfile && !String(value("discovery-distance-origin") || "").trim()) {
+      setValue("discovery-distance-origin", selectedProfile.commute_origin_input || "CF Fairview Mall, 1800 Sheppard Avenue East, Toronto, ON, Canada");
+    }
     if (state.selectedCandidateProfileId) await renderCandidateProfileDocuments();
     if (reloadPanelsOnSelectionChange && selectedAtStart !== state.selectedCandidateProfileId) {
       void loadAll({ skipProfiles: true });
@@ -1857,6 +1861,8 @@ function renderCandidateProfiles() {
     discoveryProfile.value = state.selectedCandidateProfileId;
     discoveryProfile.onchange = async () => {
       state.selectedCandidateProfileId = discoveryProfile.value;
+      const selected = state.candidateProfiles.find((profile) => String(profile.id) === String(state.selectedCandidateProfileId));
+      setValue("discovery-distance-origin", selected?.commute_origin_input || "CF Fairview Mall, 1800 Sheppard Avenue East, Toronto, ON, Canada");
       try { localStorage.setItem("jobTracker.selectedCandidateProfileId", state.selectedCandidateProfileId); } catch (_) { /* storage may be disabled */ }
       clearVisibleDiscoveryResults();
       state.discoveryInboxJobs = [];
@@ -1877,6 +1883,8 @@ function renderCandidateProfiles() {
 
 async function selectCandidateProfile(profileId) {
   state.selectedCandidateProfileId = String(profileId);
+  const selected = state.candidateProfiles.find((profile) => String(profile.id) === String(profileId));
+  setValue("discovery-distance-origin", selected?.commute_origin_input || "CF Fairview Mall, 1800 Sheppard Avenue East, Toronto, ON, Canada");
   try { localStorage.setItem("jobTracker.selectedCandidateProfileId", state.selectedCandidateProfileId); } catch (_) { /* storage may be disabled */ }
   state.discoveryInboxJobs = [];
   state.discoveryInboxPage = 0;
@@ -2183,7 +2191,9 @@ function googleMapsUrl(job, mode = "driving", alternative = null) {
   const destination = mapDestination(job, alternative);
   const arrangement = String(job?.work_arrangement || job?.remote_type || "").toLowerCase();
   if (!destination || arrangement.includes("remote")) return "";
-  return `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(destination)}&travelmode=${encodeURIComponent(mode)}`;
+  const origin = String(job?.distance_origin_label || value("discovery-distance-origin") || "").trim();
+  const originParam = origin ? `&origin=${encodeURIComponent(origin)}` : "";
+  return `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(destination)}${originParam}&travelmode=${encodeURIComponent(mode)}`;
 }
 
 function renderMapLinks(job) {
@@ -2203,8 +2213,28 @@ function renderMapLinks(job) {
 function areaMapLink(job) {
   const area = String(job?.location || job?.normalized_location || job?.workplace_postal_code || "").trim();
   if (!area || isRemoteJob(job)) return "";
-  const areaUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(area)}`;
-  return `<span class="map-links" aria-label="Area map"><a class="button ghost small" href="${escapeAttribute(areaUrl)}" target="_blank" rel="noreferrer">View area on map</a></span>`;
+  const origin = String(job?.distance_origin_label || value("discovery-distance-origin") || "").trim();
+  const areaUrl = origin
+    ? `https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(origin)}&destination=${encodeURIComponent(area)}&travelmode=driving`
+    : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(area)}`;
+  const label = origin ? "Approximate driving directions" : "View area on map";
+  return `<span class="map-links" aria-label="Area map"><a class="button ghost small" href="${escapeAttribute(areaUrl)}" target="_blank" rel="noreferrer">${label}</a></span>`;
+}
+
+function commuteDisplayLabel(job) {
+  const arrangement = String(job?.work_arrangement || job?.remote_type || "").toLowerCase();
+  if (arrangement.includes("remote")) return "Commute: N/A (remote)";
+  if (String(job?.commute_status || "") === "routed" && Number(job?.commute_distance_km) > 0) {
+    const duration = Number(job?.commute_duration_minutes) > 0 ? ` · ${Math.round(Number(job.commute_duration_minutes))} min` : "";
+    return `Driving: ${Number(job.commute_distance_km).toFixed(1)} km${duration} (routing provider)`;
+  }
+  if (String(job?.distance_type || "") === "straight_line" && Number(job?.distance_km) < 9999) {
+    return `Straight-line only: ${Number(job.distance_km).toFixed(1)} km; driving unavailable`;
+  }
+  if (String(job?.distance_precision || job?.location_precision || "").toLowerCase().includes("city") || !job?.workplace_address) {
+    return "Commute: Exact workplace unknown";
+  }
+  return "Commute: driving distance unavailable";
 }
 
 function renderWorkplaceAlternatives(job) {
@@ -3011,6 +3041,7 @@ function applyDiscoverySearchDefaults() {
   setValue("discovery-date-window", "14d");
   setValue("discovery-sort-mode", "best_match");
   setValue("discovery-distance", "");
+  setValue("discovery-distance-origin", "CF Fairview Mall, 1800 Sheppard Avenue East, Toronto, ON, Canada");
   setValue("discovery-per-source-cap", 100);
   setValue("discovery-new-matching-target", 50);
   setValue("discovery-seniority", "entry_level,junior,intermediate");
@@ -3039,6 +3070,7 @@ function discoverySearchCriteriaFromControls(continuation = false) {
     keywords: value("discovery-keywords"),
     location: value("discovery-location"),
     distance_origin: value("discovery-distance-origin"),
+    distance_origin_input: value("discovery-distance-origin"),
     enabled_sources: selectedDiscoverySources(),
     remote_preference: value("discovery-remote-preference"),
     distance: value("discovery-distance"),
@@ -3072,7 +3104,7 @@ function applyDiscoverySearchCriteriaToControls(criteria = {}) {
   setValue("discovery-title-match-mode", criteria.title_match_mode || "related");
   setValue("discovery-keywords", criteria.keywords || "");
   setValue("discovery-location", criteria.location || criteria.discovery_location || "");
-  setValue("discovery-distance-origin", criteria.distance_origin_input || criteria.distance_origin || "");
+  setValue("discovery-distance-origin", criteria.distance_origin_input || criteria.distance_origin || "CF Fairview Mall, 1800 Sheppard Avenue East, Toronto, ON, Canada");
   setValue("discovery-distance", criteria.distance ?? 50);
   setValue("discovery-remote-preference", criteria.remote_preference || "");
   setValue("discovery-search-depth", criteria.search_depth || "standard");
@@ -3735,7 +3767,7 @@ function renderFastApply() {
   if (!job) { target.textContent = "No new opportunities remain in this queue."; return; }
   const key = escapeAttribute(discoveryJobKey(job));
   const url = job.application_url || job.url || "";
-  target.innerHTML = `<article class="discovery-card"><h3>${escapeHtml(job.title || "Untitled role")}</h3><p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(resultWorkplaceLabel(job))}</p><p class="muted">${escapeHtml(displaySalary(job))} · ${escapeHtml(job.discovery_fit_label || "Match not fully assessed")}</p><details><summary>Essential requirements</summary>${escapeHtml((job.qualification_requirements || job.required_skills || "Not fully assessed from the posting.").toString())}</details><div class="row-actions">${url ? `<a class="button small" href="${escapeAttribute(url)}" target="_blank" rel="noreferrer">Open Original / Apply</a>` : ""}<button class="button small ghost" data-fast-action="applied" data-job-key="${key}">Confirm Applied</button><button class="button small ghost" data-fast-action="save" data-job-key="${key}">Save for later</button><button class="button small ghost" data-fast-action="skip" data-job-key="${key}">Skip</button></div><p class="muted helper">Opening a posting never marks it applied. Confirm only after submitting externally.</p></article>`;
+  target.innerHTML = `<article class="discovery-card"><h3>${escapeHtml(job.title || "Untitled role")}</h3><p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(resultWorkplaceLabel(job))}</p><p class="muted">${escapeHtml(displaySalary(job))} · ${escapeHtml(job.discovery_fit_label || "Match not fully assessed")} · ${escapeHtml(commuteDisplayLabel(job))}</p><details><summary>Essential requirements</summary>${escapeHtml((job.qualification_requirements || job.required_skills || "Not fully assessed from the posting.").toString())}</details><div class="row-actions">${url ? `<a class="button small" href="${escapeAttribute(url)}" target="_blank" rel="noreferrer">Open Original / Apply</a>` : ""}<button class="button small ghost" data-fast-action="applied" data-job-key="${key}">Confirm Applied</button><button class="button small ghost" data-fast-action="save" data-job-key="${key}">Save for later</button><button class="button small ghost" data-fast-action="skip" data-job-key="${key}">Skip</button></div><p class="muted helper">Opening a posting never marks it applied. Confirm only after submitting externally.</p></article>`;
   target.querySelectorAll("[data-fast-action]").forEach((button) => button.addEventListener("click", async () => {
     const action = button.dataset.fastAction;
     if (action === "applied") await applyDiscoveryJob(button.dataset.jobKey);
@@ -3997,6 +4029,10 @@ function resultWorkplaceLabel(job) {
 
 function resultDistanceLabel(job) {
   if (isRemoteJob(job)) return "N/A";
+  if (String(job.commute_status || "") === "routed" && Number(job.commute_distance_km) > 0) {
+    const duration = Number(job.commute_duration_minutes) > 0 ? ` · ${Math.round(Number(job.commute_duration_minutes))} min` : "";
+    return `Driving ${Number(job.commute_distance_km).toFixed(1)} km${duration}`;
+  }
   const precision = String(job.workplace_precision || job.location_precision || "").toLowerCase();
   const verifiedPrecision = precision.includes("street") || precision.includes("postal") || precision.includes("house");
   if (job.city_estimate_km !== undefined && job.city_estimate_km !== null) {

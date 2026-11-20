@@ -75,6 +75,28 @@ class FoundationArchitectureTest(unittest.TestCase):
         updated = store.update_profile(profile_id, applicant_phone="555-0100")
         self.assertEqual(updated["applicant_phone"], "555-0100")
 
+    def test_commute_origin_columns_are_additive_and_persist_across_reopen(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database_path = Path(tmpdir) / "commute.db"
+            db = sqlite3.connect(database_path)
+            db.row_factory = sqlite3.Row
+            self.assertEqual(run_migrations(db), 14)
+            profile_id = CandidateProfileStore(db).create_profile("SWE")
+            db.execute(
+                """UPDATE candidate_profiles SET commute_origin_input = ?, commute_origin_normalized = ?,
+                   commute_origin_latitude = ?, commute_origin_longitude = ?, commute_origin_status = ? WHERE id = ?""",
+                ("M2J 0B6", "M2J 0B6, Canada", "43.787", "-79.353", "saved", profile_id),
+            )
+            db.commit()
+            db.close()
+            reopened = sqlite3.connect(database_path)
+            reopened.row_factory = sqlite3.Row
+            profile = CandidateProfileStore(reopened).list_profiles()[0]
+            self.assertEqual(profile["commute_origin_input"], "M2J 0B6")
+            self.assertEqual(profile["commute_origin_status"], "saved")
+            self.assertEqual(reopened.execute("PRAGMA user_version").fetchone()[0], 14)
+            reopened.close()
+
     def test_multiple_profiles_and_documents_persist_across_reopen(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             database_path = Path(tmpdir) / "profiles.db"

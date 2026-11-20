@@ -520,6 +520,10 @@ JOB_COLUMNS = {
     "distance_type": "TEXT NOT NULL DEFAULT 'unknown'",
     "commute_status": "TEXT NOT NULL DEFAULT 'unavailable'",
     "commute_source": "TEXT NOT NULL DEFAULT ''",
+    "commute_distance_km": "REAL NOT NULL DEFAULT 0",
+    "commute_duration_minutes": "REAL NOT NULL DEFAULT 0",
+    "commute_calculated_at": "TEXT NOT NULL DEFAULT ''",
+    "commute_assumption": "TEXT NOT NULL DEFAULT ''",
     "possible_duplicate": "INTEGER NOT NULL DEFAULT 0",
     "possible_duplicate_job_id": "INTEGER NOT NULL DEFAULT 0",
 }
@@ -750,6 +754,45 @@ def create_app() -> Flask:
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         return jsonify(profile)
+
+    @app.post("/api/candidate-profiles/<int:profile_id>/commute-origin")
+    def update_candidate_commute_origin(profile_id: int) -> Response:
+        """Resolve and persist this applicant's commute origin.
+
+        Failed lookups are stored as unresolved evidence; they never fall
+        back to the search region or a different applicant's home location.
+        """
+        payload = request.get_json(silent=True) or {}
+        origin_input = normalize_space(text(payload.get("origin") or payload.get("commute_origin_input")))
+        if not origin_input:
+            return jsonify({"error": "Commute From is required."}), 400
+        row = get_db().execute("SELECT id FROM candidate_profiles WHERE id = ?", (profile_id,)).fetchone()
+        if row is None:
+            return jsonify({"error": "Candidate profile was not found."}), 404
+        lookup = geocode_location_value(
+            origin_input, lookup_type="commute_origin", profile=load_profile(),
+            provider=get_geocoding_provider(), use_cache=not as_bool(payload.get("bypass_cache")),
+        )
+        resolved = bool(lookup.get("ok"))
+        status = text(lookup.get("status")) or ("saved" if resolved else "unresolved")
+        get_db().execute(
+            """UPDATE candidate_profiles SET commute_origin_input = ?, commute_origin_normalized = ?,
+               commute_origin_latitude = ?, commute_origin_longitude = ?, commute_origin_provider = ?,
+               commute_origin_confidence = ?, commute_origin_precision = ?, commute_origin_geocoded_at = ?,
+               commute_origin_status = ?, commute_origin_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+            [origin_input, text(lookup.get("normalized_query")) or origin_input,
+             text(lookup.get("latitude")) if resolved else "", text(lookup.get("longitude")) if resolved else "",
+             text(lookup.get("provider")), clamp_int(lookup.get("confidence"), 0, 100),
+             text(lookup.get("precision")) if resolved else "unknown", text(lookup.get("geocoded_at")),
+             status, text(lookup.get("error")) if not resolved else "", profile_id],
+        )
+        get_db().commit()
+        result = dict(get_db().execute("SELECT * FROM candidate_profiles WHERE id = ?", (profile_id,)).fetchone())
+        result["commute_origin_resolved"] = resolved
+        result["commute_origin_failure_reasons"] = lookup.get("failure_reasons", [])
+        if not resolved:
+            return jsonify(result), 422
+        return jsonify(result)
 
     @app.get("/api/candidate-profiles/<int:profile_id>/documents")
     def candidate_profile_documents(profile_id: int) -> Response:
@@ -3310,9 +3353,28 @@ def create_app() -> Flask:
         profile = load_profile()
         evidence_profile = resolve_discovery_evidence_profile(payload)
         provider = get_geocoding_provider()
-        origin = profile_home_location(profile)
+        applicant_id = clamp_int(payload.get("applicant_profile_id"), 0, 10**9)
+        candidate_row = get_db().execute("SELECT * FROM candidate_profiles WHERE id = ?", (applicant_id,)).fetchone() if applicant_id else None
+        candidate = dict(candidate_row) if candidate_row else {}
+        default_origin = text(candidate.get("commute_origin_input")) or "CF Fairview Mall, 1800 Sheppard Avenue East, Toronto, ON, Canada"
+        # Legacy/profileless callers retain the historical postal-origin
+        # behavior. Applicant-scoped searches use the explicit commute field.
+        requested_origin = normalize_space(search.get("distance_origin_input")) or (default_origin if applicant_id else "")
+        origin = {
+            "input": default_origin,
+            "normalized": text(candidate.get("commute_origin_normalized")) or default_origin,
+            "latitude": candidate.get("commute_origin_latitude"),
+            "longitude": candidate.get("commute_origin_longitude"),
+            "provider": text(candidate.get("commute_origin_provider")),
+            "confidence": clamp_int(candidate.get("commute_origin_confidence"), 0, 100),
+            "precision": text(candidate.get("commute_origin_precision")),
+            "status": text(candidate.get("commute_origin_status")) or "missing",
+            "error": text(candidate.get("commute_origin_error")),
+        }
+        if not applicant_id and not requested_origin:
+            origin = profile_home_location(profile)
         try:
-            location_context = resolve_discovery_location_context(search["location"], profile, provider, use_cache=not bypass_cache, distance_origin_input=search.get("distance_origin_input", ""))
+            location_context = resolve_discovery_location_context(search["location"], profile, provider, use_cache=not bypass_cache, distance_origin_input=requested_origin)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         search["original_location"] = location_context["original_input"]
@@ -3322,6 +3384,20 @@ def create_app() -> Flask:
         search["location_resolution_method"] = location_context["resolution_method"]
         search["location_geocode"] = location_context["lookup"]
         origin = resolve_search_distance_origin(location_context, origin)
+        if applicant_id and candidate_row is not None:
+            origin_lookup = location_context.get("distance_origin_lookup") or {}
+            get_db().execute(
+                """UPDATE candidate_profiles SET commute_origin_input = ?, commute_origin_normalized = ?,
+                   commute_origin_latitude = ?, commute_origin_longitude = ?, commute_origin_provider = ?,
+                   commute_origin_confidence = ?, commute_origin_precision = ?, commute_origin_geocoded_at = ?,
+                   commute_origin_status = ?, commute_origin_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+                [requested_origin, text(origin.get("normalized")) or requested_origin,
+                 text(origin.get("latitude")), text(origin.get("longitude")), text(origin.get("provider")),
+                 clamp_int(origin.get("confidence"), 0, 100), text(origin.get("precision")), text(origin.get("geocoded_at")),
+                 text(origin.get("status")) or ("saved" if origin_lookup.get("ok") else "unresolved"),
+                 text(origin.get("error")), applicant_id],
+            )
+            get_db().commit()
 
         search["keywords"] = keywords
         prior_metadata = prior_run.get("metadata") if isinstance(prior_run.get("metadata"), dict) else {}
@@ -3715,9 +3791,12 @@ def create_app() -> Flask:
             return jsonify({"error": "No cached discovery results are available to re-enrich."}), 404
         search = dict(cached_run.get("search") or {})
         profile = load_profile()
+        applicant_id = clamp_int(payload.get("applicant_profile_id"), 0, 10**9)
+        candidate_row = get_db().execute("SELECT * FROM candidate_profiles WHERE id = ?", (applicant_id,)).fetchone() if applicant_id else None
+        candidate_data = dict(candidate_row) if candidate_row else {}
         origin_input = normalize_space(text(payload.get("distance_origin_input") or payload.get("distance_origin")))
         if not origin_input:
-            origin_input = text(search.get("distance_origin_input")) or text(profile.get("home_location_original") or profile.get("location"))
+            origin_input = text(search.get("distance_origin_input")) or text(candidate_data.get("commute_origin_input")) or "CF Fairview Mall, 1800 Sheppard Avenue East, Toronto, ON, Canada"
         provider = get_geocoding_provider()
         try:
             location_context = resolve_discovery_location_context(
@@ -3750,11 +3829,15 @@ def create_app() -> Flask:
                 get_db().execute(
                     """UPDATE jobs SET distance_km = ?, distance_confidence = ?, distance_origin_label = ?,
                        distance_origin_precision = ?, distance_origin_status = ?, distance_type = ?,
-                       commute_status = ?, commute_source = ?, workplace_alternatives_json = ?,
+                       commute_status = ?, commute_source = ?, commute_distance_km = ?,
+                       commute_duration_minutes = ?, commute_calculated_at = ?, commute_assumption = ?,
+                       workplace_alternatives_json = ?,
                        updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
                     [job.get("distance_km", 9999), job.get("distance_confidence", 0), job.get("distance_origin_label", ""),
                      job.get("distance_origin_precision", ""), job.get("distance_origin_status", ""), job.get("distance_type", "unknown"),
                      job.get("commute_status", "unavailable"), job.get("commute_source", ""),
+                     job.get("commute_distance_km", 0), job.get("commute_duration_minutes", 0),
+                     job.get("commute_calculated_at", ""), job.get("commute_assumption", ""),
                      dumps_json(job.get("workplace_alternatives") or []), job_id],
                 )
                 updated += 1
@@ -9921,6 +10004,47 @@ def geocode_workplace_alternative(
     return enriched, geocode
 
 
+def calculate_driving_route(origin: dict[str, Any], destination: dict[str, Any]) -> dict[str, Any]:
+    """Return a routed commute only when the installation opted into Routes.
+
+    Straight-line geocoding remains useful context, but is never reported as
+    driving.  The API call is bounded and deliberately has no traffic claim.
+    """
+    api_key = text(os.environ.get("JOB_TRACKER_GOOGLE_ROUTES_API_KEY"))
+    try:
+        origin_lat, origin_lon = float(origin.get("latitude")), float(origin.get("longitude"))
+        dest_lat, dest_lon = float(destination.get("latitude")), float(destination.get("longitude"))
+    except (TypeError, ValueError):
+        return {"ok": False, "status": "unavailable", "error": "Both commute endpoints need verified coordinates."}
+    if not api_key:
+        return {"ok": False, "status": "not_configured", "error": "Google Routes API is not configured; Maps links remain available."}
+    body = json.dumps({
+        "origin": {"location": {"latLng": {"latitude": origin_lat, "longitude": origin_lon}}},
+        "destination": {"location": {"latLng": {"latitude": dest_lat, "longitude": dest_lon}}},
+        "travelMode": "DRIVE",
+        "routingPreference": "TRAFFIC_UNAWARE",
+        "computeAlternativeRoutes": False,
+    }).encode("utf-8")
+    request_obj = urllib.request.Request(
+        "https://routes.googleapis.com/directions/v2:computeRoutes", data=body, method="POST",
+        headers={"Content-Type": "application/json", "X-Goog-Api-Key": api_key,
+                 "X-Goog-FieldMask": "routes.distanceMeters,routes.duration"},
+    )
+    try:
+        with urllib.request.urlopen(request_obj, timeout=float(os.environ.get("JOB_TRACKER_ROUTING_TIMEOUT_SECONDS", "8"))) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        route = (payload.get("routes") or [{}])[0]
+        distance_m = float(route.get("distanceMeters") or 0)
+        duration_seconds = float(str(route.get("duration") or "0").rstrip("s"))
+        if distance_m <= 0:
+            raise ValueError("Routes API returned no usable route")
+        return {"ok": True, "status": "routed", "distance_km": distance_m / 1000,
+                "duration_minutes": duration_seconds / 60, "source": "google_routes",
+                "assumption": "Driving, traffic-unaware provider estimate."}
+    except Exception as exc:  # bounded optional enrichment must not block discovery
+        return {"ok": False, "status": "unavailable", "source": "google_routes", "error": str(exc)}
+
+
 def geocode_discovery_job(
     job: dict[str, Any],
     profile: dict[str, str],
@@ -10037,6 +10161,24 @@ def geocode_discovery_job(
     job["distance_origin_precision"] = text(origin.get("precision"))
     job["distance_origin_status"] = text(origin.get("status"))
     job["distance_cached"] = bool(geocode.get("cached"))
+    job["commute_distance_km"] = 0
+    job["commute_duration_minutes"] = 0
+    job["commute_calculated_at"] = ""
+    job["commute_assumption"] = ""
+    if distance["distance_label"] == "remote":
+        job["commute_assumption"] = "Remote role; commute does not apply."
+    elif geocode.get("ok") and origin.get("latitude") not in (None, "") and origin.get("longitude") not in (None, ""):
+        route = calculate_driving_route(origin, geocode)
+        if route.get("ok"):
+            job["commute_status"] = "routed"
+            job["commute_source"] = text(route.get("source"))
+            job["commute_distance_km"] = route.get("distance_km", 0)
+            job["commute_duration_minutes"] = route.get("duration_minutes", 0)
+            job["commute_calculated_at"] = datetime.now().isoformat(timespec="seconds")
+            job["commute_assumption"] = text(route.get("assumption"))
+        else:
+            job["commute_source"] = text(route.get("source"))
+            job["commute_assumption"] = text(route.get("error"))
     if len(alternatives) == 1:
         enriched, _ = geocode_workplace_alternative(alternatives[0], profile, origin, provider, use_cache=use_cache)
         job["workplace_alternatives"] = [enriched]
