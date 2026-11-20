@@ -3646,6 +3646,8 @@ def create_app() -> Flask:
         # Persist only after the final hard and target gates have run. This
         # prevents stale actionable rows from surviving a stricter recheck.
         persisted = persist_discovery_jobs(ordered, None, manual_run_id)
+        search_execution_id = uuid.uuid4().hex
+        persist_discovery_search_memberships(search_execution_id, ordered, selected_applicant_id)
         new_matching_jobs = matching_jobs[:requested_target]
         # The response is unified: actionable new matches first, followed by a
         # separately labelled review queue. Excluded jobs never enter it.
@@ -3724,6 +3726,7 @@ def create_app() -> Flask:
                 "excluded_count": excluded_count,
                 "capped_count": capped_count,
                 "search_key": search_key,
+                "search_id": search_execution_id,
                 "search": search,
                 "continuation": {"endpoint": "/api/discovery/jobspy", "method": "POST", "body": {**payload, "continue_search": True}} if diagnostics["continuation_available"] else None,
                 "raw_jobs_returned": len(raw_jobs),
@@ -3875,6 +3878,7 @@ def create_app() -> Flask:
             limit=clamp_int(payload.get("limit"), 1, 50) or 25,
             offset=clamp_int(payload.get("offset"), 0, 10**9),
             candidate_profile_id=clamp_int(payload.get("candidate_profile_id"), 0, 10**9),
+            search_execution_id=text(payload.get("search_id") or payload.get("search_execution_id")),
             job_ids=payload.get("job_ids") if isinstance(payload.get("job_ids"), list) else None,
         )
         return jsonify(result)
@@ -10024,6 +10028,8 @@ def _enrichment_fetch(url: str, *, max_age_hours: int = 168) -> dict[str, Any]:
             body = response.read(1_500_000).decode("utf-8", errors="replace")
             content_type = text(response.headers.get("Content-Type"))
         result = {"ok": True, "status": "ok", "body": body, "content_type": content_type, "error": "", "cached": False}
+    except urllib.error.HTTPError as exc:
+        result = {"ok": False, "status": f"http_{int(exc.code)}", "body": "", "content_type": "", "error": f"HTTP {int(exc.code)}: access denied or unavailable.", "cached": False}
     except Exception as exc:
         result = {"ok": False, "status": "failed", "body": "", "content_type": "", "error": f"{type(exc).__name__}: {exc}", "cached": False}
     get_db().execute(
@@ -10037,96 +10043,180 @@ def _enrichment_fetch(url: str, *, max_age_hours: int = 168) -> dict[str, Any]:
     return result
 
 
+def _visible_job_page_text(page: str) -> str:
+    """Return visible page prose without scripts, styles or security chrome."""
+    value = html.unescape(page or "")
+    value = re.sub(r"<!--.*?-->", " ", value, flags=re.I | re.S)
+    value = re.sub(r"<\s*(?:script|style|noscript|template|svg|canvas)\b[^>]*>.*?<\s*/\s*(?:script|style|noscript|template|svg|canvas)\s*>", " ", value, flags=re.I | re.S)
+    value = re.sub(r"<\s*br\s*/?>", "\n", value, flags=re.I)
+    value = re.sub(r"</\s*(?:p|div|li|h[1-6]|tr|td|section)\s*>", "\n", value, flags=re.I)
+    value = re.sub(r"<[^>]+>", " ", value)
+    return re.sub(r"[ \t]+", " ", value).strip()
+
+
+def _workplace_location_is_plausible(item: dict[str, Any], advertised_location: str) -> bool:
+    """Reject postal/province evidence that cannot belong to the advertised area."""
+    advertised = normalize_space(advertised_location).upper()
+    postal = normalize_canadian_postal_code(extract_canadian_postal_code(text(item.get("postal_code") or item.get("address"))))
+    if postal:
+        province = province_code_from_text(advertised)
+        postal_prefixes = {"ON": "KLMNP", "BC": "V", "AB": "T", "SK": "S", "MB": "R", "QC": "GHJ", "NB": "E", "NS": "B", "PE": "C", "NL": "A"}
+        if province and postal[:1] not in postal_prefixes.get(province, ""):
+            return False
+        if "TORONTO" in advertised and not postal.startswith("M"):
+            return False
+        if "MISSISSAUGA" in advertised and not postal.startswith("L"):
+            return False
+    address = normalize_space(text(item.get("address"))).upper()
+    known_cities = ("TORONTO", "MISSISSAUGA", "MARKHAM", "VAUGHAN", "RICHMOND HILL", "NORTH YORK", "SCARBOROUGH", "BRAMPTON", "OAKVILLE")
+    advertised_cities = [city for city in known_cities if city in advertised]
+    address_cities = [city for city in known_cities if city in address]
+    return not (advertised_cities and address_cities and not set(advertised_cities) & set(address_cities))
+
+
+def _stored_workplace_alternatives(job: dict[str, Any]) -> list[dict[str, Any]]:
+    """Recover workplace evidence already retained by JobSpy before fetching."""
+    row = dict(job)
+    raw = parse_json_object(job.get("provider_raw_json"))
+    if raw:
+        row["provider_raw_json"] = raw
+        row["raw"] = raw
+    row["location_header"] = text(job.get("provider_location")) or text(job.get("location"))
+    row["title_header"] = "\n".join(filter(None, [text(job.get("provider_title")), text(job.get("title")), row["location_header"]]))
+    result = extract_workplace_location(row, text(job.get("job_description")), row["location_header"])
+    alternatives = result.get("alternatives") or ([] if not result.get("address") and not result.get("postal_code") else [result])
+    recovered: list[dict[str, Any]] = []
+    for item in alternatives:
+        candidate = dict(item)
+        if text(candidate.get("precision")).lower() not in {"street address", "postal code"}:
+            continue
+        if not _workplace_location_is_plausible(candidate, text(job.get("location")) or row["location_header"]):
+            continue
+        candidate["source_url"] = text(job.get("url")) or text(job.get("application_url"))
+        candidate["extraction_method"] = text(candidate.get("extraction_method")) or "stored_jobspy_evidence"
+        candidate["evidence_source"] = text(candidate.get("evidence_source")) or "saved JobSpy evidence"
+        candidate["assignment_status"] = "candidate_unverified"
+        candidate["verification_note"] = "Recovered from saved provider evidence; verify the workplace before relying on commute distance."
+        recovered.append(candidate)
+    return recovered
+
+
 def _extract_workplace_from_page(job: dict[str, Any], page: str, original_url: str) -> list[dict[str, Any]]:
-    """Extract page description plus JSON-LD without trusting page chrome."""
+    """Extract matching JSON-LD and visible role text, never page scripts/chrome."""
+    lowered = page.lower()
+    if any(marker in lowered for marker in ("cf-chl-", "__cf$cv$params", "challenge-platform", "just a moment...")):
+        return []
     structured: list[Any] = []
     for raw in re.findall(r"<script[^>]+type=[\"']application/ld\+json[\"'][^>]*>(.*?)</script>", page, re.I | re.S):
         try:
             structured.append(json.loads(html.unescape(raw)))
         except (TypeError, ValueError, json.JSONDecodeError):
             continue
-    row = {"structured_data": structured, "location": text(job.get("location")), "title": text(job.get("title")), "source": text(job.get("source"))}
-    extracted = extract_workplace_location(row, page, text(job.get("location")))
+    row = {"structured_data": structured, "location": text(job.get("location")), "location_header": text(job.get("provider_location")) or text(job.get("location")), "title": text(job.get("title")), "source": text(job.get("source"))}
+    extracted = extract_workplace_location(row, _visible_job_page_text(page), text(job.get("location")))
     alternatives = extracted.get("alternatives") or []
+    accepted: list[dict[str, Any]] = []
     for item in alternatives:
+        if text(item.get("precision")).lower() not in {"street address", "postal code"}:
+            continue
         item["source_url"] = original_url
         item["extraction_method"] = text(item.get("extraction_method")) or ("json_ld" if "JSON-LD" in text(item.get("evidence_source")) else "labelled_text")
         item["assignment_status"] = "candidate_unverified"
         item["verification_note"] = "Extracted from the original posting; verify the workplace before relying on commute distance."
-    return alternatives
+        if not _workplace_location_is_plausible(item, text(job.get("location"))):
+            continue
+        accepted.append(item)
+    return accepted
 
 
-def enrich_existing_workplace_locations(*, apply: bool = False, limit: int = 25, offset: int = 0, candidate_profile_id: int = 0, job_ids: list[int] | None = None) -> dict[str, Any]:
-    """Preview/apply bounded page enrichment for existing city-only jobs."""
-    conditions = ["discovery_first_seen_at != ''", "(workplace_address = '' AND workplace_postal_code = '')", "discovery_result_category IN ('actionable', 'review_required')"]
-    args: list[Any] = []
+def enrich_existing_workplace_locations(*, apply: bool = False, limit: int = 25, offset: int = 0, candidate_profile_id: int = 0, search_execution_id: str = "", job_ids: list[int] | None = None) -> dict[str, Any]:
+    """Preview/apply bounded enrichment for one applicant/search cohort only."""
+    empty = {"processed": 0, "gained_verified": 0, "gained_candidate": 0, "remained_city_only": 0, "failed": 0, "preview": not apply, "records": []}
     if not candidate_profile_id:
-        return {"processed": 0, "gained_verified": 0, "gained_candidate": 0, "remained_city_only": 0, "failed": 0, "preview": not apply, "records": [], "error": "Select an applicant profile before enriching workplace locations."}
-    conditions.append("candidate_profile_id = ?")
-    args.append(candidate_profile_id)
-    if job_ids:
-        valid_ids = [clamp_int(item, 1, 10**9) for item in job_ids if clamp_int(item, 1, 10**9)]
-        if valid_ids:
-            conditions.append("id IN (" + ",".join("?" for _ in valid_ids) + ")")
-            args.extend(valid_ids)
-    total = query_db(f"SELECT COUNT(*) AS count FROM jobs WHERE {' AND '.join(conditions)}", args, one=True)
-    before_counts = {"total": int(total["count"] or 0), "street": 0, "postal": 0, "city_only": int(total["count"] or 0)}
-    # A confirmation request names the exact previewed records.  Do not apply
-    # the page offset a second time, or confirming page two would select no
-    # rows (or the wrong rows) after the ID filter is added.
-    query_offset = 0 if job_ids else max(0, int(offset or 0))
-    rows = query_db(
-        f"SELECT * FROM jobs WHERE {' AND '.join(conditions)} ORDER BY id LIMIT ? OFFSET ?", [*args, clamp_int(limit, 1, 50), query_offset], one=False
+        return {**empty, "error": "Select an applicant profile before enriching workplace locations."}
+    execution_id = text(search_execution_id)
+    if not execution_id or not re.fullmatch(r"[0-9a-fA-F]{16,64}", execution_id):
+        return {**empty, "error": "Select the ECE search run before enriching workplace locations."}
+    requested_ids = sorted({clamp_int(item, 1, 10**9) for item in (job_ids or []) if clamp_int(item, 1, 10**9)})
+    memberships = query_db(
+        """SELECT m.job_id, m.category, m.criteria_json, j.discovery_occupation
+           FROM discovery_search_memberships m JOIN jobs j ON j.id = m.job_id
+           WHERE m.search_execution_id = ? AND m.applicant_profile_id IN (0, ?)
+             AND m.category IN ('actionable', 'review_required')""",
+        [execution_id, candidate_profile_id],
     )
-    summary = {"processed": 0, "gained_verified": 0, "gained_candidate": 0, "remained_city_only": 0, "failed": 0, "preview": not apply, "records": [], "offset": max(0, int(offset or 0)), "next_offset": max(0, int(offset or 0)) + len(rows), "has_more": max(0, int(offset or 0)) + len(rows) < int(total["count"] or 0), "before_counts": before_counts, "after_counts": dict(before_counts)}
+    ece_ids: set[int] = set()
+    for membership in memberships:
+        criteria = parse_json_object(membership["criteria_json"])
+        occupation = normalize_space(text(criteria.get("occupation") or membership["discovery_occupation"])).lower()
+        if occupation and not any(term in occupation for term in ("ece", "rece", "early childhood", "early learning", "child care", "childcare")):
+            continue
+        ece_ids.add(int(membership["job_id"]))
+    if requested_ids and not set(requested_ids).issubset(ece_ids):
+        return {**empty, "error": "One or more selected jobs do not belong to the selected ECE search cohort."}
+    cohort_ids = requested_ids or sorted(ece_ids)
+    if not cohort_ids:
+        return {**empty, "search_execution_id": execution_id, "cohort_total": 0, "error": "The selected search has no actionable ECE workplace records."}
+    placeholders = ",".join("?" for _ in cohort_ids)
+    cohort_rows = query_db(f"SELECT * FROM jobs WHERE id IN ({placeholders}) ORDER BY id", cohort_ids)
+    def precision_counts(rows: list[Any]) -> dict[str, int]:
+        counts = {"total": len(rows), "street": 0, "postal": 0, "candidate": 0, "city_only": 0}
+        for row in rows:
+            item = dict(row)
+            precision = text(item.get("workplace_precision")).lower()
+            if "candidate" in precision:
+                counts["candidate"] += 1
+            elif text(item.get("workplace_address")):
+                counts["street"] += 1
+            elif text(item.get("workplace_postal_code")) or precision == "postal code":
+                counts["postal"] += 1
+            else:
+                counts["city_only"] += 1
+        return counts
+    before_counts = precision_counts(cohort_rows)
+    conditions = ["discovery_first_seen_at != ''", "(workplace_address = '' AND workplace_postal_code = '')", f"id IN ({placeholders})"]
+    args: list[Any] = list(cohort_ids)
+    total = query_db(f"SELECT COUNT(*) AS count FROM jobs WHERE {' AND '.join(conditions)}", args, one=True)
+    page_offset = 0 if requested_ids else max(0, int(offset or 0))
+    rows = query_db(f"SELECT * FROM jobs WHERE {' AND '.join(conditions)} ORDER BY id LIMIT ? OFFSET ?", [*args, clamp_int(limit, 1, 50), page_offset])
+    summary = {**empty, "offset": max(0, int(offset or 0)), "next_offset": max(0, int(offset or 0)) + len(rows), "has_more": max(0, int(offset or 0)) + len(rows) < int(total["count"] or 0), "before_counts": before_counts, "after_counts": dict(before_counts), "cohort_total": len(cohort_ids), "search_execution_id": execution_id}
     for row in rows:
         job = dict(row)
+        job_id = int(job["id"])
         before_precision = text(job.get("workplace_precision")) or "city-only"
         original_url = text(job.get("url")) or text(job.get("application_url"))
-        if not original_url:
-            summary["remained_city_only"] += 1
-            summary["records"].append({"id": int(job["id"]), "title": text(job.get("title")), "company": text(job.get("company")), "status": "city_only", "before_precision": before_precision, "after_precision": before_precision, "reason": "No original posting URL."})
-            continue
-        fetched = _enrichment_fetch(original_url)
-        summary["processed"] += 1
-        if not fetched.get("ok"):
-            summary["failed"] += 1
-            summary["records"].append({"id": int(job["id"]), "title": text(job.get("title")), "company": text(job.get("company")), "status": "failed", "before_precision": before_precision, "after_precision": before_precision, "reason": fetched.get("error", "Page unavailable."), "url": original_url})
-            continue
-        alternatives = _extract_workplace_from_page(job, text(fetched.get("body")), original_url)
+        alternatives = _stored_workplace_alternatives(job)
+        evidence_source = "saved JobSpy evidence" if alternatives else ""
+        fetched = None
+        if not alternatives and original_url:
+            fetched = _enrichment_fetch(original_url)
+            summary["processed"] += 1
+            if fetched.get("ok"):
+                alternatives = _extract_workplace_from_page(job, text(fetched.get("body")), original_url)
+                evidence_source = "original posting"
         if not alternatives:
             summary["remained_city_only"] += 1
-            summary["records"].append({"id": int(job["id"]), "title": text(job.get("title")), "company": text(job.get("company")), "status": "city_only", "before_precision": before_precision, "after_precision": before_precision, "url": original_url})
+            status = "blocked" if fetched and text(fetched.get("status")).startswith("http_") else "city_only"
+            if fetched and not fetched.get("ok"):
+                summary["failed"] += 1
+            summary["records"].append({"id": job_id, "title": text(job.get("title")), "company": text(job.get("company")), "status": status, "before_precision": before_precision, "after_precision": before_precision, "reason": (fetched or {}).get("error", "No reliable stored workplace evidence."), "url": original_url})
             continue
         has_street = any(text(item.get("precision")).lower() == "street address" for item in alternatives)
         status = "candidate_address" if has_street else "postal_code"
         summary["gained_candidate"] += 1
-        summary["records"].append({"id": int(job["id"]), "title": text(job.get("title")), "company": text(job.get("company")), "status": status, "before_precision": before_precision, "after_precision": "candidate street address" if has_street else "postal code", "alternatives": alternatives, "url": original_url})
+        summary["records"].append({"id": job_id, "title": text(job.get("title")), "company": text(job.get("company")), "status": status, "before_precision": before_precision, "after_precision": "candidate street address" if has_street else "postal code", "alternatives": alternatives, "url": original_url, "evidence_source": evidence_source})
         if apply:
-            # This query excluded precise records; retain a final guard so a
-            # concurrent/manual confirmation is never silently overwritten.
-            current = query_db("SELECT * FROM jobs WHERE id = ?", [int(job["id"])], one=True)
+            current = query_db("SELECT * FROM jobs WHERE id = ?", [job_id], one=True)
             if current and not workplace_precision_is_useful(dict(current)):
                 update = alternatives[0] if len(alternatives) == 1 else None
                 get_db().execute(
-                    """UPDATE jobs SET workplace_alternatives_json = ?, workplace_address = ?, workplace_postal_code = ?,
-                       workplace_evidence = ?, workplace_evidence_source = ?, workplace_precision = ?, workplace_confidence = ?,
-                       updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
-                    # Page extraction is candidate evidence only. Keep the
-                    # legacy confirmed fields empty until the owner verifies
-                    # the workplace, while retaining the full alternative and
-                    # its source excerpt below.
-                    [dumps_json(alternatives), "", "",
-                     text(update.get("evidence")) if update else "", text(update.get("evidence_source")) if update else "",
-                     "candidate street address" if has_street else "postal code", clamp_int(update.get("confidence"), 0, 100) if update else 0, int(job["id"])],
+                    """UPDATE jobs SET workplace_alternatives_json = ?, workplace_address = '', workplace_postal_code = '', workplace_evidence = ?, workplace_evidence_source = ?, workplace_precision = ?, workplace_confidence = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+                    [dumps_json(alternatives), text(update.get("evidence")) if update else "", text(update.get("evidence_source")) if update else evidence_source, "candidate street address" if has_street else "postal code", clamp_int(update.get("confidence"), 0, 100) if update else 0, job_id],
                 )
     if apply:
         get_db().commit()
-    summary["after_counts"] = {
-        "total": before_counts["total"], "street": before_counts["street"],
-        "postal": before_counts["postal"], "city_only": before_counts["city_only"],
-        "candidate": summary["gained_candidate"], "failed": summary["failed"],
-    }
+        refreshed = query_db(f"SELECT * FROM jobs WHERE id IN ({placeholders}) ORDER BY id", cohort_ids)
+        summary["after_counts"] = precision_counts(refreshed)
     return summary
 
 

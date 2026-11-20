@@ -761,6 +761,12 @@ WORKPLACE_LABEL_CUE = re.compile(
 def _plain_location_text(value: str) -> str:
     """Convert HTML/Markdown location prose to deterministic plain text."""
     value = unescape(clean(value))
+    # Never treat executable page chrome as job-description evidence.  This is
+    # especially important for Cloudflare challenge payloads, which commonly
+    # contain strings that happen to match Canadian postal-code syntax.
+    value = re.sub(r"<!--.*?-->", " ", value, flags=re.I | re.S)
+    value = re.sub(r"<\s*(?:script|style|noscript|template|svg|canvas)\b[^>]*>.*?<\s*/\s*(?:script|style|noscript|template|svg|canvas)\s*>", " ", value, flags=re.I | re.S)
+    value = re.sub(r"\b(?:__cf\$cv\$params|cf-chl-|challenge-platform|turnstile|cloudflare)\b[^\n]*", " ", value, flags=re.I)
     value = re.sub(r"<\s*br\s*/?>", "\n", value, flags=re.I)
     value = re.sub(r"</\s*(?:p|div|li|h[1-6]|tr|td|section)\s*>", "\n", value, flags=re.I)
     value = re.sub(r"<[^>]+>", " ", value)
@@ -935,7 +941,7 @@ def extract_workplace_alternatives(row: dict[str, Any], description: str, provid
     for item in structured:
         if not any(clean(existing.get("address")).lower() == clean(item.get("address")).lower() for existing in candidates):
             candidates.append(item)
-    raw_fields = [(key, clean(row.get(key))) for key in ("workplace_address", "address", "street_address", "office_address", "office_location", "location")]
+    raw_fields = [(key, clean(row.get(key))) for key in ("workplace_address", "address", "street_address", "office_address", "office_location", "location", "location_header", "title_header")]
     field_key, field_value = next(
         ((key, value) for key, value in raw_fields if value and (key != "location" or STREET_PATTERN.search(value) or re.search(POSTAL_PATTERN, value, re.I))),
         ("", ""),

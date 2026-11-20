@@ -3403,6 +3403,7 @@ async function stopProgressiveDiscoverySearch() {
 
 async function searchDiscovery(event, continuation = false) {
   event.preventDefault();
+  if (!continuation) state.workplaceEnrichmentOffset = 0;
   const button = document.getElementById("discovery-submit");
   const status = document.getElementById("discovery-status");
   const criteria = discoverySearchCriteriaFromControls(continuation);
@@ -3434,6 +3435,7 @@ async function searchDiscovery(event, continuation = false) {
     state.discoveryAllResults = responseJobs.filter((job) => job.discovery_result_category === "actionable");
     state.discoveryResults = state.discoveryAllResults.slice();
     state.discoverySearchKey = result.search_key || "";
+    state.discoveryLastSearchId = result.search_id || state.discoveryLastSearchId;
     state.discoveryContinuationIndex = Number(result.search_progress?.continuation_index ?? result.diagnostics?.continuation_index ?? 0);
     state.discoveryPreferences = result.preferences || discoveryPreferencesFromControls();
     state.discoverySearchCriteria = result.search || criteria;
@@ -3608,14 +3610,20 @@ async function previewWorkplaceEnrichment(event) {
   const button = document.getElementById("discovery-enrich-workplaces");
   const status = document.getElementById("discovery-status");
   if (button) button.disabled = true;
-  if (status) status.textContent = "Previewing missing workplace-address enrichment; no records will be changed…";
+  if (status) status.textContent = "Previewing missing workplace-address enrichment; no workplace changes will be made…";
   try {
     const offset = Number(state.workplaceEnrichmentOffset || 0);
+    const searchId = state.discoveryLastSearchId || state.discoveryActiveSearchId || "";
+    const selectedJobIds = (state.discoveryResults || [])
+      .filter((job) => job?.discovery_result_category === "actionable" && Number(job?.id) > 0)
+      .map((job) => Number(job.id));
     const preview = await api.send("/api/jobs/enrich-workplace-locations", "POST", {
       apply: false,
       limit: 25,
       offset,
       candidate_profile_id: state.selectedCandidateProfileId || value("discovery-profile") || "",
+      search_id: searchId,
+      job_ids: selectedJobIds,
     });
     const records = preview.records || [];
     const found = records.filter((item) => ["candidate_address", "postal_code"].includes(item.status)).length;
@@ -3636,12 +3644,13 @@ async function previewWorkplaceEnrichment(event) {
         offset,
         job_ids: records.map((item) => item.id).filter(Boolean),
         candidate_profile_id: state.selectedCandidateProfileId || value("discovery-profile") || "",
+        search_id: searchId,
       });
       state.workplaceEnrichmentOffset = Number(applied.next_offset || offset + records.length);
       if (status) status.textContent = `Workplace enrichment applied: ${applied.gained_candidate || 0} records gained evidence; ${applied.remained_city_only || 0} remained city-only; ${applied.failed || 0} failed.`;
       await loadAll({ skipProfiles: true });
     } else if (status) {
-      status.textContent = `Preview complete: ${found} records gained candidate evidence; no database changes were applied. Review the details below.`;
+      status.textContent = `Preview complete: ${found} records gained candidate evidence; no workplace changes were applied. Review the details below.`;
     }
   } catch (error) {
     if (status) status.textContent = `Workplace enrichment failed: ${error.message}`;

@@ -11,12 +11,20 @@ const baseUrl = process.env.JOB_TRACKER_URL || "http://127.0.0.1:5002";
   const browser = await chromium.launch({ headless: true, executablePath: process.env.CHROMIUM_PATH || "/usr/bin/chromium", args: ["--no-sandbox"] });
   const page = await browser.newPage();
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
-  await page.evaluate(() => { window.confirm = () => false; state.selectedCandidateProfileId = "17"; });
+  await page.evaluate(() => {
+    window.confirm = () => false;
+    state.selectedCandidateProfileId = "17";
+    state.discoveryLastSearchId = "a".repeat(32);
+    state.discoveryResults = [{ id: 1, discovery_result_category: "actionable" }];
+  });
   const button = page.locator("#discovery-enrich-workplaces");
   assert.strictEqual(await button.isVisible(), true, "Find missing workplace addresses must be visible in Find Jobs");
   let requested = false;
   await page.route("**/api/jobs/enrich-workplace-locations", async (route) => {
     requested = true;
+    const requestBody = JSON.parse(route.request().postData() || "{}");
+    assert.strictEqual(requestBody.search_id, "a".repeat(32));
+    assert.deepStrictEqual(requestBody.job_ids, [1]);
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ preview: true, gained_candidate: 1, records: [{ id: 1, company: "Centre", title: "RECE", status: "candidate_address", url: "https://example.com/job/1", alternatives: [{ address: "1200 Bayview Avenue, Toronto, ON M4G 1Z8", evidence: "Our Centre: 1200 Bayview Avenue" }] }], before_counts: { total: 1 } }) });
   });
   await button.click();
