@@ -204,6 +204,12 @@
               <button class="button ghost" type="button" id="discovery-enrich-workplaces">Find missing workplace addresses</button>
               <button class="button ghost beta-secondary" type="button" id="discovery-re-evaluate">Re-evaluate stored history</button>
             </div>
+            <div class="workplace-enrichment-selector" id="workplace-enrichment-selector" hidden>
+              <label>Saved search run for workplace enrichment
+                <select id="workplace-enrichment-search" aria-label="Saved ECE search run"></select>
+              </label>
+              <p id="workplace-enrichment-selection-status" class="muted helper" aria-live="polite"></p>
+            </div>
             <div class="compatibility-fields" aria-hidden="true">
               <select id="discovery-search-mode"><option value="shortlist">shortlist</option></select>
               <input id="discovery-shortlist-size" value="50"><input id="discovery-total-cap" type="hidden" value="200"><input id="discovery-per-source-cap" type="hidden" value="100"><input id="discovery-strict-technical" type="checkbox">
@@ -217,6 +223,7 @@
                 <p id="discovery-active-state" class="muted helper">Search results will appear here.</p>
                 <p id="discovery-distance-origin-summary" class="muted helper">Distance calculated from: not configured.</p>
               <div id="workplace-enrichment-preview" class="generated-output empty" aria-live="polite">Workplace enrichment preview details will appear here.</div>
+              <button class="button ghost small" type="button" id="workplace-enrichment-next" hidden>Next batch</button>
               </div>
               <div class="actions compact discovery-toolbar-actions">
                 <label class="toolbar-select">

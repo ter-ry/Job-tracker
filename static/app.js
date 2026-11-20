@@ -46,6 +46,11 @@ const state = {
   discoveryInboxBulkAction: "",
   discoveryInboxBulkMessage: "",
   workplaceEnrichmentOffset: 0,
+  workplaceEnrichmentSearchId: "",
+  workplaceEnrichmentSearch: null,
+  workplaceEnrichmentRuns: [],
+  workplaceEnrichmentNextOffset: 0,
+  workplaceEnrichmentHasMore: false,
   advancedFeatures: (() => { try { return localStorage.getItem("jobTracker.advancedFeatures") === "true"; } catch (_) { return false; } })(),
   pendingAppliedJobs: new Set(),
   tailoring: { draftId: null, jobId: null, profileId: null, resumeId: null, data: null, selectedParagraph: null, selectedKeyword: null, aiImproveJobId: null },
@@ -291,6 +296,14 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("discovery-test-sources").addEventListener("click", testJobSources);
   document.getElementById("discovery-recalculate-distances")?.addEventListener("click", recalculateDiscoveryDistances);
   document.getElementById("discovery-enrich-workplaces")?.addEventListener("click", previewWorkplaceEnrichment);
+  document.getElementById("workplace-enrichment-search")?.addEventListener("change", (event) => {
+    state.workplaceEnrichmentSearchId = event.target.value;
+    state.workplaceEnrichmentSearch = state.workplaceEnrichmentRuns.find((run) => run.search_id === state.workplaceEnrichmentSearchId) || null;
+    state.workplaceEnrichmentOffset = 0;
+    state.workplaceEnrichmentNextOffset = 0;
+    renderWorkplaceSearchRuns();
+  });
+  document.getElementById("workplace-enrichment-next")?.addEventListener("click", (event) => previewWorkplaceEnrichment(event, true));
   document.getElementById("discovery-re-evaluate")?.addEventListener("click", reEvaluateDiscoveryHistory);
   document.getElementById("qa-reset")?.addEventListener("click", resetQASession);
   document.getElementById("save-current-discovery-search").addEventListener("click", saveCurrentDiscoverySearch);
@@ -487,6 +500,7 @@ async function loadAll({ skipProfiles = false } = {}) {
     ]);
     const shortlist = await api.get("/api/shortlist");
     await profilesPromise;
+    await loadWorkplaceSearchRuns();
     if (loadToken !== state.loadToken) return;
     state.jobs = jobs;
     state.discoveryInboxJobs = jobs.filter((job) => job.discovery_first_seen_at);
@@ -525,6 +539,51 @@ async function loadAll({ skipProfiles = false } = {}) {
     performance.measure("job-tracker-loadAll", { start: "job-tracker-loadAll-start", end: "job-tracker-loadAll-end" });
   } catch (error) {
     toast(error.message);
+  }
+}
+
+function workplaceSearchLabel(run) {
+  const date = run.created_at ? new Date(run.created_at.replace(" ", "T") + (run.created_at.endsWith("Z") ? "" : "Z")).toLocaleString() : "Saved search";
+  const keywords = run.keywords || "saved keywords unavailable";
+  const occupation = run.occupation || run.workflow || "occupation unavailable";
+  return `${date} · ${run.applicant_name || "Applicant"} · ${keywords} · ${occupation} · ${Number(run.actionable_count || 0)} actionable`;
+}
+
+function renderWorkplaceSearchRuns() {
+  const wrapper = document.getElementById("workplace-enrichment-selector");
+  const select = document.getElementById("workplace-enrichment-search");
+  const status = document.getElementById("workplace-enrichment-selection-status");
+  if (!wrapper || !select) return;
+  const runs = state.workplaceEnrichmentRuns || [];
+  wrapper.hidden = !runs.length;
+  select.innerHTML = runs.length ? runs.map((run) => `<option value="${escapeAttribute(run.search_id)}">${escapeHtml(workplaceSearchLabel(run))}</option>`).join("") : `<option value="">No completed search runs found</option>`;
+  if (state.workplaceEnrichmentSearchId && runs.some((run) => run.search_id === state.workplaceEnrichmentSearchId)) select.value = state.workplaceEnrichmentSearchId;
+  const run = runs.find((item) => item.search_id === select.value) || runs[0];
+  if (run) {
+    state.workplaceEnrichmentSearchId = run.search_id;
+    state.workplaceEnrichmentSearch = run;
+    select.value = run.search_id;
+    if (status) status.textContent = `${run.actionable_count} ${run.workflow === "ece" ? "ECE " : ""}jobs selected · ${run.precise_workplace_count || 0} precise workplaces · ${run.needs_workplace_enrichment || 0} need enrichment.`;
+  } else if (status) status.textContent = "Run a search first, or restore a completed search run.";
+}
+
+async function loadWorkplaceSearchRuns() {
+  const profileId = state.selectedCandidateProfileId || value("discovery-profile") || "";
+  if (!profileId) return;
+  try {
+    const runs = await api.get(`/api/discovery/inbox/search-runs?candidate_profile_id=${encodeURIComponent(profileId)}`);
+    state.workplaceEnrichmentRuns = Array.isArray(runs) ? runs : [];
+    const selectedProfile = state.candidateProfiles.find((profile) => String(profile.id) === String(profileId));
+    const eceRuns = state.workplaceEnrichmentRuns.filter((run) => run.workflow === "ece" || /ece|rece|early childhood|early learning|child ?care/i.test(run.occupation || ""));
+    if (!state.workplaceEnrichmentSearchId || !state.workplaceEnrichmentRuns.some((run) => run.search_id === state.workplaceEnrichmentSearchId) || selectedProfile?.workflow === "ece") {
+      const preferred = selectedProfile?.workflow === "ece" ? eceRuns[0] : state.workplaceEnrichmentRuns[0];
+      state.workplaceEnrichmentSearchId = preferred?.search_id || "";
+    }
+    renderWorkplaceSearchRuns();
+  } catch (error) {
+    state.workplaceEnrichmentRuns = [];
+    const status = document.getElementById("workplace-enrichment-selection-status");
+    if (status) status.textContent = `Saved search runs unavailable: ${error.message}`;
   }
 }
 
@@ -3605,18 +3664,22 @@ async function recalculateDiscoveryDistances(event) {
   }
 }
 
-async function previewWorkplaceEnrichment(event) {
+async function previewWorkplaceEnrichment(event, nextBatch = false) {
   event.preventDefault();
   const button = document.getElementById("discovery-enrich-workplaces");
   const status = document.getElementById("discovery-status");
+  const selectedRun = state.workplaceEnrichmentRuns.find((run) => run.search_id === state.workplaceEnrichmentSearchId) || state.workplaceEnrichmentSearch;
+  if (!selectedRun?.search_id) {
+    if (status) status.textContent = "Select a completed ECE search run before enriching workplace addresses.";
+    toast("Select a completed search run first.");
+    return;
+  }
   if (button) button.disabled = true;
   if (status) status.textContent = "Previewing missing workplace-address enrichment; no workplace changes will be made…";
   try {
-    const offset = Number(state.workplaceEnrichmentOffset || 0);
-    const searchId = state.discoveryLastSearchId || state.discoveryActiveSearchId || "";
-    const selectedJobIds = (state.discoveryResults || [])
-      .filter((job) => job?.discovery_result_category === "actionable" && Number(job?.id) > 0)
-      .map((job) => Number(job.id));
+    const offset = nextBatch ? Number(state.workplaceEnrichmentNextOffset || state.workplaceEnrichmentOffset || 0) : Number(state.workplaceEnrichmentOffset || 0);
+    const searchId = selectedRun.search_id;
+    const selectedJobIds = selectedRun.actionable_job_ids || [];
     const preview = await api.send("/api/jobs/enrich-workplace-locations", "POST", {
       apply: false,
       limit: 25,
@@ -3636,21 +3699,28 @@ async function previewWorkplaceEnrichment(event) {
         return `<article class="result-details"><strong>${escapeHtml(item.company || "Unknown employer")} · ${escapeHtml(item.title || "Untitled role")}</strong><p>Before: ${escapeHtml(item.before_precision || "city-only")} · After: ${escapeHtml(item.after_precision || "unchanged")}</p><p>Proposed workplace: ${escapeHtml(proposed)}</p><p class="muted">Status: ${escapeHtml(item.status || "unknown")} · Verification: candidate only; owner review required.</p><p class="muted">Evidence: ${escapeHtml(excerpt.slice(0, 500))}</p>${item.url ? `<a href="${escapeAttribute(item.url)}" target="_blank" rel="noreferrer">Open original</a>` : ""}</article>`;
       }).join("")}<p class="muted">This is a preview. Candidate locations are never confirmed automatically.</p>` : "No records were returned for this selected applicant batch.";
     }
+    state.workplaceEnrichmentHasMore = Boolean(preview.has_more);
+    state.workplaceEnrichmentNextOffset = Number(preview.next_offset || offset + records.length);
+    const nextButton = document.getElementById("workplace-enrichment-next");
+    if (nextButton) nextButton.hidden = !state.workplaceEnrichmentHasMore;
     const proceed = found > 0 && window.confirm(`${found} records gained workplace evidence in preview. Apply these bounded changes?`);
     if (proceed) {
       const applied = await api.send("/api/jobs/enrich-workplace-locations", "POST", {
         apply: true,
         limit: 25,
-        offset,
+        offset: 0,
         job_ids: records.map((item) => item.id).filter(Boolean),
         candidate_profile_id: state.selectedCandidateProfileId || value("discovery-profile") || "",
         search_id: searchId,
       });
       state.workplaceEnrichmentOffset = Number(applied.next_offset || offset + records.length);
+      state.workplaceEnrichmentNextOffset = state.workplaceEnrichmentOffset;
+      state.workplaceEnrichmentHasMore = Boolean(applied.has_more);
+      if (nextButton) nextButton.hidden = !state.workplaceEnrichmentHasMore;
       if (status) status.textContent = `Workplace enrichment applied: ${applied.gained_candidate || 0} records gained evidence; ${applied.remained_city_only || 0} remained city-only; ${applied.failed || 0} failed.`;
       await loadAll({ skipProfiles: true });
     } else if (status) {
-      status.textContent = `Preview complete: ${found} records gained candidate evidence; no workplace changes were applied. Review the details below.`;
+      status.textContent = `Preview complete: ${found} records gained candidate evidence; ${preview.remained_city_only || 0} remained city-only; ${preview.failed || 0} blocked or failed. No workplace changes were applied.${preview.has_more ? " Select Next batch to continue." : ""}`;
     }
   } catch (error) {
     if (status) status.textContent = `Workplace enrichment failed: ${error.message}`;

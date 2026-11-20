@@ -2900,7 +2900,11 @@ def create_app() -> Flask:
                       SUM(CASE WHEN m.category = 'actionable' THEN 1 ELSE 0 END) AS actionable_count,
                       SUM(CASE WHEN m.category = 'review_required' THEN 1 ELSE 0 END) AS review_count,
                       SUM(CASE WHEN m.category = 'excluded' THEN 1 ELSE 0 END) AS excluded_count,
-                      COUNT(*) AS membership_count
+                      COUNT(*) AS membership_count,
+                      MAX(m.criteria_json) AS criteria_json,
+                      MAX(CASE WHEN m.applicant_profile_id = ? THEN m.applicant_profile_id ELSE 0 END) AS selected_applicant_id,
+                      SUM(CASE WHEN m.category = 'actionable' AND COALESCE(j.workplace_address, '') = '' AND COALESCE(j.workplace_postal_code, '') = '' THEN 1 ELSE 0 END) AS needs_workplace_enrichment,
+                      SUM(CASE WHEN m.category = 'actionable' AND (COALESCE(j.workplace_address, '') <> '' OR COALESCE(j.workplace_postal_code, '') <> '') THEN 1 ELSE 0 END) AS precise_workplace_count
                FROM discovery_search_memberships m
                JOIN jobs j ON j.id = m.job_id
                WHERE m.applicant_profile_id IN (0, ?)
@@ -2911,19 +2915,35 @@ def create_app() -> Flask:
                                  WHERE s.job_id = j.id AND s.applicant_profile_id = ?))
                GROUP BY m.search_execution_id
                ORDER BY created_at DESC, m.search_execution_id DESC""",
-            [applicant_id, applicant_id, applicant_id, applicant_id],
+            [applicant_id, applicant_id, applicant_id, applicant_id, applicant_id],
         )
-        return jsonify([
-            {
+        result = []
+        for row in rows:
+            criteria = parse_json_object(row["criteria_json"])
+            selected_applicant_id = int(row["selected_applicant_id"] or 0)
+            profile = query_db("SELECT name, applicant_name, workflow FROM candidate_profiles WHERE id = ?", [selected_applicant_id], one=True) if selected_applicant_id else None
+            actionable_job_ids = [int(item["job_id"]) for item in query_db(
+                "SELECT job_id FROM discovery_search_memberships WHERE search_execution_id = ? AND applicant_profile_id IN (0, ?) AND category = 'actionable' ORDER BY job_id",
+                [text(row["search_execution_id"]), applicant_id],
+            )]
+            result.append({
                 "search_id": text(row["search_execution_id"]),
                 "created_at": text(row["created_at"]),
                 "actionable_count": int(row["actionable_count"] or 0),
                 "review_count": int(row["review_count"] or 0),
                 "excluded_count": int(row["excluded_count"] or 0),
                 "membership_count": int(row["membership_count"] or 0),
-            }
-            for row in rows
-        ])
+                "needs_workplace_enrichment": int(row["needs_workplace_enrichment"] or 0),
+                "precise_workplace_count": int(row["precise_workplace_count"] or 0),
+                "keywords": text(criteria.get("keywords") or criteria.get("search_keywords")),
+                "location": text(criteria.get("location") or criteria.get("location_scope")),
+                "occupation": text(criteria.get("occupation")),
+                "applicant_profile_id": selected_applicant_id or applicant_id,
+                "applicant_name": text((profile["applicant_name"] if profile else "") or (profile["name"] if profile else "")) or f"Applicant {selected_applicant_id or applicant_id}",
+                "workflow": text(profile["workflow"] if profile else "") or ("ece" if "ece" in text(criteria.get("occupation")).lower() else "software"),
+                "actionable_job_ids": actionable_job_ids,
+            })
+        return jsonify(result)
 
     @app.post("/api/discovery/inbox/<int:job_id>/flag-reassessment")
     def flag_discovery_reassessment(job_id: int) -> Response:
@@ -4715,6 +4735,8 @@ def persist_discovery_search_memberships(
             "source_excerpt": normalize_space(text(job.get("qualification_evidence_excerpt") or job.get("workplace_evidence") or job.get("salary_evidence_text") or job.get("job_description")))[:600],
         }
         criteria = {
+            "keywords": text(job.get("discovery_search_keywords")),
+            "location": text(job.get("discovery_search_location")),
             "occupation": text(job.get("discovery_occupation")),
             "seniority": text(job.get("discovery_seniority")),
             "maximum_required_years": job.get("discovery_maximum_required_years"),
@@ -4895,6 +4917,8 @@ def run_discovery_pipeline(
         clean["candidate_profile_id"] = clamp_int(payload.get("applicant_profile_id") or payload.get("candidate_profile_id"), 0, 10**9)
         clean["benefits"] = parse_json_array(clean.get("benefits_json"))
         clean["discovery_occupation"] = search["occupation"]
+        clean["discovery_search_keywords"] = keywords
+        clean["discovery_search_location"] = search.get("location") or search.get("discovery_location")
         clean["discovery_profile_independent"] = int(search["profile_independent"])
         clean["discovery_search_mode"] = search["search_mode"]
         clean["discovery_match_policy"] = search["match_policy"]
@@ -10177,7 +10201,10 @@ def enrich_existing_workplace_locations(*, apply: bool = False, limit: int = 25,
     conditions = ["discovery_first_seen_at != ''", "(workplace_address = '' AND workplace_postal_code = '')", f"id IN ({placeholders})"]
     args: list[Any] = list(cohort_ids)
     total = query_db(f"SELECT COUNT(*) AS count FROM jobs WHERE {' AND '.join(conditions)}", args, one=True)
-    page_offset = 0 if requested_ids else max(0, int(offset or 0))
+    # The browser may send the durable actionable IDs to prove applicant and
+    # search membership.  Keep pagination independent of whether that explicit
+    # cohort list was supplied.
+    page_offset = max(0, int(offset or 0)) if (not requested_ids or len(requested_ids) > clamp_int(limit, 1, 50)) else 0
     rows = query_db(f"SELECT * FROM jobs WHERE {' AND '.join(conditions)} ORDER BY id LIMIT ? OFFSET ?", [*args, clamp_int(limit, 1, 50), page_offset])
     summary = {**empty, "offset": max(0, int(offset or 0)), "next_offset": max(0, int(offset or 0)) + len(rows), "has_more": max(0, int(offset or 0)) + len(rows) < int(total["count"] or 0), "before_counts": before_counts, "after_counts": dict(before_counts), "cohort_total": len(cohort_ids), "search_execution_id": execution_id}
     for row in rows:
