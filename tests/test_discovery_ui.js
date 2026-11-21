@@ -25,6 +25,8 @@ assert.match(html, /<button class="button ghost"[^>]*id="discovery-enrich-workpl
 assert.match(html, /id="workplace-enrichment-preview"/);
 assert.match(html, /id="workplace-enrichment-search"/);
 assert.match(html, /Choose previous search/);
+assert.match(js, /data-find-workplace-job/);
+assert.match(js, /Search employer in Google Maps/);
 assert.doesNotMatch(html, /ontario-registry-preview|ontario-cohort-file|ontario-google-places-opt-in/);
 assert.doesNotMatch(js, /google_places_opt_in|enrich-workplace-registry|Google Places Text Search/);
 assert.match(js, /function previewWorkplaceEnrichment/);

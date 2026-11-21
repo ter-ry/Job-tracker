@@ -298,6 +298,10 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("discovery-enrich-workplaces")?.addEventListener("click", previewWorkplaceEnrichment);
   document.getElementById("workplace-enrichment-search")?.addEventListener("change", (event) => selectWorkplaceSearchRun(event.target.value));
   document.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-find-workplace-job]");
+    if (button) findWorkplaceForJob(button.dataset.findWorkplaceJob);
+  });
+  document.addEventListener("click", (event) => {
     const button = event.target.closest("[data-confirm-workplace]");
     if (button) confirmWorkplace(button.dataset.confirmWorkplace);
   });
@@ -1628,14 +1632,35 @@ function renderDiscoveryInbox(jobs) {
       `<button class="button ghost small" type="button" onclick="flagInboxReassessment(${job.id})">Flag for reassessment</button>`,
       `<button class="button ghost small" type="button" onclick="reassessInboxJob(${job.id})">Reassess now</button>`,
     ].join("") : "";
-    const actions = category === "new_actionable" || category === "ready_to_apply" || category === "review_required" || category === "requalified" || category === "presented"
-      ? `<button class="button ghost small" type="button" onclick="saveInboxJob(${job.id})">Save</button><button class="button ghost small" type="button" onclick="applyInboxJob(${job.id})">Confirm Applied</button><button class="button ghost small" type="button" onclick="ignoreInboxJob(${job.id})">Skip</button>`
-      : category === "skipped" ? `<button class="button ghost small" type="button" onclick="restoreInboxJob(${job.id})">Restore</button>` : "";
+    const workplaceActions = `${!job.workplace_address && !job.workplace_postal_code ? `<button class="button ghost small" type="button" data-find-workplace-job="${escapeAttribute(job.id)}">Find workplace</button>` : ""}${renderMapLinks(job)}`;
+    const actions = category === "new_actionable" || category === "ready_to_apply" || category === "review_required" || category === "requalified" || category === "presented" || category === "saved" || category === "applied"
+      ? `<button class="button ghost small" type="button" onclick="saveInboxJob(${job.id})">Save</button><button class="button ghost small" type="button" onclick="applyInboxJob(${job.id})">Confirm Applied</button><button class="button ghost small" type="button" onclick="ignoreInboxJob(${job.id})">Skip</button>${workplaceActions}`
+      : category === "skipped" ? `<button class="button ghost small" type="button" onclick="restoreInboxJob(${job.id})">Restore</button>${workplaceActions}` : category !== "excluded" ? workplaceActions : "";
     return `<article class="inbox-row"><label><input type="checkbox" data-inbox-select="${job.id}" ${state.discoveryInboxSelected.has(Number(job.id)) ? "checked" : ""}> Select</label><div><span class="inbox-badge">${escapeHtml(label)}</span><strong>${escapeHtml(job.title || "Untitled role")}</strong><span>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(resultWorkplaceLabel(job))}</span><span class="muted">${escapeHtml(job.work_arrangement || job.remote_type || "Unknown arrangement")} · ${escapeHtml(displaySalary(job))} · ${escapeHtml(resultDistanceLabel(job))}</span>${renderExperienceSummary(job)}<details><summary>${category === "excluded" ? "Exclusion evidence" : "Requirements and source evidence"}</summary><span class="muted">Decision: ${escapeHtml(job.discovery_result_category || category)} · Reason: ${escapeHtml(job.discovery_result_reason || "Unverified/missing")} · Source: ${escapeHtml(job.source || membership.source || "Unverified/missing")} · Evidence: ${escapeHtml(job.qualification_evidence_source || membership.qualification_evidence_source || "Unverified/missing")} · Confidence: ${escapeHtml(job.qualification_evidence_confidence || membership.qualification_evidence_confidence || "Unverified/missing")}</span>${evidenceText}${membership.required_experience ? `<p class="muted">Required experience evidence: ${escapeHtml(JSON.stringify(membership.required_experience))}</p>` : ""}${sourceLink}</details>${audit}</div><div class="row-actions">${actions}${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open Original</a>` : ""}</div></article>`;
   };
   target.innerHTML = `${pagedCategory ? inboxPaginationMarkup("bottom") : ""}${visibleJobs.length ? visibleJobs.map(renderInboxCard).join("") : `No ${(labels[state.discoveryInboxCategory] || "discovery").toLowerCase()} discovery records.`}`;
   bindInboxPagination(target);
   target.querySelectorAll("[data-inbox-select]").forEach((box) => box.addEventListener("change", () => { const id = Number(box.dataset.inboxSelect); if (box.checked) state.discoveryInboxSelected.add(id); else state.discoveryInboxSelected.delete(id); }));
+}
+
+async function findWorkplaceForJob(jobId) {
+  const profileId = state.selectedCandidateProfileId || value("discovery-profile") || "";
+  const status = document.getElementById("discovery-status");
+  if (!profileId) { toast("Select an applicant before finding a workplace."); return; }
+  if (status) status.textContent = "Finding workplace evidence for this job; no changes will be applied…";
+  try {
+    const result = await api.send("/api/jobs/enrich-workplace-locations", "POST", {
+      apply: false, limit: 1, offset: 0, candidate_profile_id: profileId, job_ids: [Number(jobId)],
+    });
+    const record = result.records?.[0];
+    if (status) status.textContent = record
+      ? `${record.company || "Job"}: ${record.status === "city_only" || record.status === "blocked" ? (record.reason || "No reliable workplace found.") : "Workplace evidence found; review the preview above."}`
+      : (result.error || "No workplace evidence was returned.");
+    toast(result.error || (record?.status === "city_only" ? "No reliable workplace found." : "Workplace preview complete."));
+  } catch (error) {
+    if (status) status.textContent = `Workplace lookup failed: ${error.message}`;
+    toast(error.message);
+  }
 }
 
 async function bulkInboxAction(action) {
@@ -2279,18 +2304,26 @@ function renderMapLinks(job) {
   if (candidate) {
     const query = String(candidate.address || candidate.postal_code || job.location || "").trim();
     const verifyUrl = query ? `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(query)}` : "";
-    return verifyUrl ? `<span class="map-links" aria-label="Verify workplace"><a class="button ghost small" href="${escapeAttribute(verifyUrl)}" target="_blank" rel="noreferrer">Check in Google Maps</a>${workplaceConfirmationButton(job)}</span>` : workplaceConfirmationButton(job);
+    return verifyUrl ? `<span class="map-links" aria-label="Verify workplace"><a class="button ghost small" href="${escapeAttribute(verifyUrl)}" target="_blank" rel="noreferrer">Check in Google Maps</a>${employerMapSearchLink(job)}${workplaceConfirmationButton(job)}</span>` : `${employerMapSearchLink(job)}${workplaceConfirmationButton(job)}`;
   }
   if (alternatives.length > 1) {
     const links = alternatives.map((alternative, index) => {
       const driving = googleMapsUrl(job, "driving", alternative);
       return driving ? `<a class="button ghost small" href="${escapeAttribute(driving)}" target="_blank" rel="noreferrer">Map workplace ${index + 1}</a>` : "";
     }).join("");
-    return `${links || areaMapLink(job)}${workplaceConfirmationButton(job)}`;
+    return `${links || areaMapLink(job)}${employerMapSearchLink(job)}${workplaceConfirmationButton(job)}`;
   }
   const driving = googleMapsUrl(job, "driving", alternatives[0] || null);
-  if (driving) return `<span class="map-links" aria-label="Map directions"><a class="button ghost small" href="${escapeAttribute(driving)}" target="_blank" rel="noreferrer">Driving directions</a>${workplaceConfirmationButton(job)}</span>`;
-  return `${workplaceConfirmationButton(job)}${areaMapLink(job)}`;
+  if (driving) return `<span class="map-links" aria-label="Map directions"><a class="button ghost small" href="${escapeAttribute(driving)}" target="_blank" rel="noreferrer">Driving directions</a>${employerMapSearchLink(job)}${workplaceConfirmationButton(job)}</span>`;
+  return `${workplaceConfirmationButton(job)}${employerMapSearchLink(job)}${areaMapLink(job)}`;
+}
+
+function employerMapSearchLink(job) {
+  const employer = String(job?.company || job?.employer || "").trim();
+  const location = String(job?.location || "").trim();
+  if (!employer) return "";
+  const query = [employer, location].filter(Boolean).join(", ");
+  return `<a class="button ghost small" href="https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(query)}" target="_blank" rel="noreferrer">Search employer in Google Maps</a>`;
 }
 
 async function confirmWorkplace(jobId) {
