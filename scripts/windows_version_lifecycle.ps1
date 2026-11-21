@@ -157,7 +157,14 @@ finally:
 '@ | Set-Content -LiteralPath $schemaScriptPath -Encoding utf8
     # Passing a script path avoids PowerShell/Start-Process quoting changes to
     # inline Python code containing SQL quotes and semicolons.
-    $process = Start-Process -FilePath 'python' -ArgumentList @($schemaScriptPath, $dbPath) -RedirectStandardOutput $outputPath -RedirectStandardError $errorPath -PassThru
+    # Start-Process joins ArgumentList into one command line. Quote both
+    # paths explicitly because the disposable database lives under the
+    # application's `Job Tracker` directory. Without this, Python receives
+    # only the prefix before the space and silently opens a different SQLite
+    # file, making a real migration look like schema 0 -> 0.
+    $pythonArgs = @('"' + $schemaScriptPath + '"', '"' + $dbPath + '"')
+    Write-Host "[lifecycle] schema-inspect-db=$dbPath script=$schemaScriptPath"
+    $process = Start-Process -FilePath 'python' -ArgumentList $pythonArgs -RedirectStandardOutput $outputPath -RedirectStandardError $errorPath -PassThru
     Write-Host "[lifecycle] schema-inspect-start pid=$($process.Id) timeout=${script:SchemaTimeoutSeconds}s db=$dbPath"
     try {
         if (!$process.WaitForExit($script:SchemaTimeoutSeconds * 1000)) {

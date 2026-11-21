@@ -85,6 +85,8 @@ class WindowsReleaseTests(unittest.TestCase):
         self.assertIn("SchemaTimeoutSeconds = 30", source)
         self.assertIn("CleanupTimeoutSeconds = 30", source)
         self.assertIn("schema-inspect-start", source)
+        self.assertIn("$pythonArgs = @('\"' + $schemaScriptPath + '\"', '\"' + $dbPath + '\"')", source)
+        self.assertIn("schema-inspect-db=", source)
         self.assertIn("cleanup-start", source)
         self.assertIn("SQLite schema inspection timeout", source)
         self.assertIn("disposable root cleanup timeout", source)
