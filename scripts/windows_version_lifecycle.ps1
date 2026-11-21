@@ -144,8 +144,20 @@ function Get-SchemaVersion {
     Set-Phase 'inspect SQLite schema'
     $outputPath = Join-Path $root ("schema-" + [guid]::NewGuid().ToString() + '.out')
     $errorPath = Join-Path $root ("schema-" + [guid]::NewGuid().ToString() + '.err')
-    $code = 'import sqlite3,sys; db=sqlite3.connect(sys.argv[1], timeout=5); print(db.execute("PRAGMA user_version").fetchone()[0]); db.close()'
-    $process = Start-Process -FilePath 'python' -ArgumentList @('-c', $code, $dbPath) -RedirectStandardOutput $outputPath -RedirectStandardError $errorPath -PassThru
+    $schemaScriptPath = Join-Path $root ("schema-" + [guid]::NewGuid().ToString() + '.py')
+    @'
+import sqlite3
+import sys
+
+db = sqlite3.connect(sys.argv[1], timeout=5)
+try:
+    print(db.execute("PRAGMA user_version").fetchone()[0])
+finally:
+    db.close()
+'@ | Set-Content -LiteralPath $schemaScriptPath -Encoding utf8
+    # Passing a script path avoids PowerShell/Start-Process quoting changes to
+    # inline Python code containing SQL quotes and semicolons.
+    $process = Start-Process -FilePath 'python' -ArgumentList @($schemaScriptPath, $dbPath) -RedirectStandardOutput $outputPath -RedirectStandardError $errorPath -PassThru
     Write-Host "[lifecycle] schema-inspect-start pid=$($process.Id) timeout=${script:SchemaTimeoutSeconds}s db=$dbPath"
     try {
         if (!$process.WaitForExit($script:SchemaTimeoutSeconds * 1000)) {
@@ -159,7 +171,7 @@ function Get-SchemaVersion {
         Complete-Phase "schema=$value pid=$($process.Id)"
         return [int]$value
     } finally {
-        Remove-Item $outputPath, $errorPath -Force -ErrorAction SilentlyContinue
+        Remove-Item $outputPath, $errorPath, $schemaScriptPath -Force -ErrorAction SilentlyContinue
     }
 }
 
