@@ -164,9 +164,9 @@ finally:
             Stop-ProcessTree $process 'SQLite schema inspection timeout'
             throw "SQLite schema inspection timed out after $($script:SchemaTimeoutSeconds) seconds"
         }
-        $stderr = if (Test-Path $errorPath) { (Get-Content $errorPath -Raw).Trim() } else { '' }
+        $stderr = if (Test-Path $errorPath) { ([string](Get-Content $errorPath -Raw)).Trim() } else { '' }
         if ($process.ExitCode -ne 0) { throw "Could not inspect SQLite schema version (exit $($process.ExitCode)): $stderr" }
-        $value = (Get-Content $outputPath -Raw).Trim()
+        $value = ([string](Get-Content $outputPath -Raw)).Trim()
         if ($value -notmatch '^\d+$') { throw "SQLite schema inspection returned invalid output: $value" }
         Complete-Phase "schema=$value pid=$($process.Id)"
         return [int]$value
