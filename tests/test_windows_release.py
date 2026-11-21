@@ -79,6 +79,18 @@ class WindowsReleaseTests(unittest.TestCase):
         with patch("urllib.request.urlopen", return_value=response):
             self.assertEqual(post_exit("http://127.0.0.1:5000/api/app/exit", "token"), (200, b""))
 
+    def test_historical_lifecycle_has_bounded_schema_and_cleanup_phases(self):
+        script = Path(__file__).parents[1] / "scripts" / "windows_version_lifecycle.ps1"
+        source = script.read_text(encoding="utf-8")
+        self.assertIn("SchemaTimeoutSeconds = 30", source)
+        self.assertIn("CleanupTimeoutSeconds = 30", source)
+        self.assertIn("schema-inspect-start", source)
+        self.assertIn("$pythonArgs = @('\"' + $schemaScriptPath + '\"', '\"' + $dbPath + '\"')", source)
+        self.assertIn("schema-inspect-db=", source)
+        self.assertIn("cleanup-start", source)
+        self.assertIn("SQLite schema inspection timeout", source)
+        self.assertIn("disposable root cleanup timeout", source)
+
     def test_semver_normalization_and_ordering(self):
         self.assertEqual(normalize_semver("v1.0.0"), "1.0.0")
         self.assertEqual(semver_key("1.0.0"), semver_key("v1.0.0"))

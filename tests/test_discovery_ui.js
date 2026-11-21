@@ -16,6 +16,22 @@ assert.match(html, /id="saved-search-new-target"[^>]*value="50"/);
 assert.match(js, /new_matching_target: Number\(value\("discovery-new-matching-target"\) \|\| 50\)/);
 assert.doesNotMatch(html, /id="discovery-total-cap"[^>]*type="number"/);
 assert.doesNotMatch(html, /id="discovery-per-source-cap"[^>]*type="number"/);
+assert.doesNotMatch(html, /name="discovery-source" value="linkedin"/);
+assert.doesNotMatch(html, /name="discovery-source" value="zip_recruiter"/);
+assert.match(html, /name="discovery-source" value="indeed" checked/);
+assert.match(html, /name="discovery-source" value="glassdoor" checked/);
+assert.match(html, /name="discovery-source" value="employer_direct" checked/);
+assert.match(html, /<button class="button ghost"[^>]*id="discovery-enrich-workplaces">Find workplace<\/button>/);
+assert.match(html, /id="workplace-enrichment-preview"/);
+assert.match(html, /id="workplace-enrichment-search"/);
+assert.match(html, /Choose previous search/);
+assert.match(js, /data-find-workplace-job/);
+assert.match(js, /Search employer in Google Maps/);
+assert.doesNotMatch(html, /ontario-registry-preview|ontario-cohort-file|ontario-google-places-opt-in/);
+assert.doesNotMatch(js, /google_places_opt_in|enrich-workplace-registry|Google Places Text Search/);
+assert.match(js, /function previewWorkplaceEnrichment/);
+assert.doesNotMatch(html, /name="saved-search-source" value="linkedin"/);
+assert.doesNotMatch(html, /name="saved-search-source" value="zip_recruiter"/);
 
 // Both workflows, applicant switching, and useful title/seniority controls stay wired.
 assert.match(html, /value="software"/);
@@ -32,7 +48,7 @@ assert.doesNotMatch(js, /renderGroup\("Verified matches"/);
 assert.doesNotMatch(js, /renderGroup\("Provisional matches"/);
 assert.doesNotMatch(js, /renderGroup\("Review required"/);
 assert.match(js, /state\.discoveryExcludedResults = responseJobs\.filter/);
-assert.match(js, /job\.discovery_result_category !== "excluded"/);
+assert.match(js, /state\.discoveryResults = merged\.filter\(\(job\) => job\.discovery_result_category === "actionable"\)/);
 
 // Actions are applicant-scoped and update local state immediately.
 for (const endpoint of ["/save", "/applied", "/ignore"]) {
@@ -68,8 +84,18 @@ assert.match(js, /"paused", "completed", "completed_with_errors"/);
 assert.match(js, /outcome\.status === 202 && result\.search_id/);
 assert.match(js, /retaining earlier results while new provider batches arrive/);
 assert.match(js, /function loadCandidateProfiles/);
+assert.match(js, /function loadHistoricalDuplicateMatches/);
+assert.match(js, /same_vacancy/);
+assert.match(js, /different_vacancy/);
 assert.match(js, /candidateProfilesStatus = "error"/);
 assert.match(js, /Retry/);
+assert.match(js, /discoveryInboxSearchId/);
+assert.match(js, /function discoveryInboxRequestUrl/);
+assert.match(js, /params\.set\("category", category\)/);
+assert.match(js, /params\.set\("search_id", String\(searchId\)\)/);
+assert.match(js, /Showing search/);
+assert.match(js, /Return to full Inbox/);
+assert.match(js, /supported category/);
 
 // Experience, salary, and workplace wording remain evidence-safe.
 for (const label of ["Detected seniority", "Required experience", "Preferred experience", "Applicant demonstrated experience", "Experience fit", "Technical compatibility"]) {

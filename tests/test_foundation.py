@@ -13,6 +13,23 @@ class FoundationArchitectureTest(unittest.TestCase):
         analysis = analyze_job_seniority({"title": "Software Engineer", "job_description": "Requirements: 3+ years building and shipping production software."})
         self.assertEqual(analysis["required_experience"]["minimum"], 3)
 
+    def test_experience_parser_does_not_treat_age_as_professional_experience(self):
+        analysis = analyze_job_seniority({
+            "title": "Software Engineering Co-op",
+            "job_description": "Applicants must be 18+ years of age. Preferred: 3—5 years of software development experience.",
+        })
+        self.assertIsNone(analysis["required_experience"])
+        self.assertEqual(analysis["preferred_experience"]["minimum"], 3)
+        self.assertEqual(analysis["preferred_experience"]["maximum"], 5)
+
+    def test_experience_parser_keeps_ambiguous_range_context(self):
+        analysis = analyze_job_seniority({
+            "title": "Co-op Developer",
+            "job_description": "The company has 35+ years of history. Experience may be 3–5 years depending on placement.",
+        })
+        self.assertIsNone(analysis["required_experience"])
+        self.assertTrue(analysis["ambiguous_experience"])
+
     def test_migrations_are_versioned_and_repeatable(self):
         db = sqlite3.connect(":memory:")
         first = run_migrations(db)
@@ -57,6 +74,28 @@ class FoundationArchitectureTest(unittest.TestCase):
         self.assertEqual(profile["identity_mode"], "distinct")
         updated = store.update_profile(profile_id, applicant_phone="555-0100")
         self.assertEqual(updated["applicant_phone"], "555-0100")
+
+    def test_commute_origin_columns_are_additive_and_persist_across_reopen(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database_path = Path(tmpdir) / "commute.db"
+            db = sqlite3.connect(database_path)
+            db.row_factory = sqlite3.Row
+            self.assertEqual(run_migrations(db), 14)
+            profile_id = CandidateProfileStore(db).create_profile("SWE")
+            db.execute(
+                """UPDATE candidate_profiles SET commute_origin_input = ?, commute_origin_normalized = ?,
+                   commute_origin_latitude = ?, commute_origin_longitude = ?, commute_origin_status = ? WHERE id = ?""",
+                ("M2J 0B6", "M2J 0B6, Canada", "43.787", "-79.353", "saved", profile_id),
+            )
+            db.commit()
+            db.close()
+            reopened = sqlite3.connect(database_path)
+            reopened.row_factory = sqlite3.Row
+            profile = CandidateProfileStore(reopened).list_profiles()[0]
+            self.assertEqual(profile["commute_origin_input"], "M2J 0B6")
+            self.assertEqual(profile["commute_origin_status"], "saved")
+            self.assertEqual(reopened.execute("PRAGMA user_version").fetchone()[0], 14)
+            reopened.close()
 
     def test_multiple_profiles_and_documents_persist_across_reopen(self):
         with tempfile.TemporaryDirectory() as tmpdir:

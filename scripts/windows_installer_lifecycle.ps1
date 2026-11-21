@@ -33,7 +33,20 @@ function Start-InstalledApp {
 
 function Stop-InstalledApp {
     $headers = @{ 'X-Job-Tracker-Exit-Token' = $env:JOB_TRACKER_EXIT_TOKEN }
-    Invoke-RestMethod "$base/api/app/exit" -Method Post -Headers $headers -TimeoutSec 10 | Out-Null
+    # The endpoint deliberately shuts down the local server immediately.  On
+    # Windows the TCP response can therefore end before Invoke-RestMethod has
+    # read the JSON body (ResponseEnded), even though the shutdown request was
+    # accepted.  The process exit remains the authoritative lifecycle check.
+    try {
+        $response = Invoke-RestMethod "$base/api/app/exit" -Method Post -Headers $headers -TimeoutSec 10
+        Write-Host "Shutdown endpoint response: $($response | ConvertTo-Json -Compress)"
+    } catch {
+        $message = [string]$_.Exception.Message
+        if ($message -notmatch 'ResponseEnded|prematurely|connection.*closed|unable to read data') {
+            throw "Shutdown endpoint failed before process exit: $message"
+        }
+        Write-Host "Shutdown endpoint closed its connection during intentional server exit; validating process termination."
+    }
     if (!$script:appProcess.WaitForExit(15000)) { throw 'Installed app did not exit cleanly' }
     if ($script:appProcess.ExitCode -ne 0) { throw "Installed app exited with $($script:appProcess.ExitCode)" }
     $script:appProcess = $null

@@ -88,6 +88,10 @@ class JobAssistantTest(unittest.TestCase):
         self.tmpdir = tempfile.TemporaryDirectory()
         app_module.DATA_DIR = Path(self.tmpdir.name)
         app_module.DB_PATH = app_module.DATA_DIR / "test.sqlite"
+        # The application caches its initialized path process-wide. Reset it
+        # between disposable test databases so a Windows temp-path reuse can
+        # never make one fixture's rows visible to another test.
+        app_module._INITIALIZED_DATABASE_PATH = None
         app_module.app.config.update(TESTING=True)
         self.client = app_module.app.test_client()
 
@@ -2567,6 +2571,86 @@ class JobAssistantTest(unittest.TestCase):
         second = {"source": "indeed", "source_job_id": "70075bfc7b7c2f68", "company": "ExaSystems", "title": "Full Stack Developer", "location": "Mississauga, ON"}
         self.assertFalse(app_module.dedupe_match(first, second))
 
+    def test_distinct_verified_cross_provider_ids_do_not_merge_without_shared_url(self):
+        first = {"source": "indeed", "source_job_id": "indeed-1", "company": "Example", "title": "Software Engineer", "location": "Toronto, ON", "url": "https://ca.indeed.com/viewjob?jk=indeed-1"}
+        second = {"source": "employer_direct", "source_job_id": "greenhouse:example:2", "company": "Example", "title": "Software Engineer", "location": "Toronto, ON", "url": "https://boards.greenhouse.io/example/jobs/2"}
+        assert not app_module.dedupe_match(first, second)
+
+    def test_shared_canonical_application_url_merges_provider_records(self):
+        first = {"source": "indeed", "source_job_id": "indeed-1", "company": "Example", "title": "Software Engineer", "location": "Toronto, ON", "url": "https://example.test/jobs/1?utm_source=indeed"}
+        second = {"source": "employer_direct", "source_job_id": "greenhouse:example:2", "company": "Example", "title": "Software Engineer", "location": "Toronto, ON", "url": "https://example.test/jobs/1"}
+        assert app_module.dedupe_match(first, second)
+
+    def test_source_links_are_retained_when_a_vacancy_is_seen_again(self):
+        first = {"url": "https://ca.indeed.com/viewjob?jk=one", "application_url": "https://ca.indeed.com/viewjob?jk=one"}
+        second = {"url": "https://jobs.example.test/roles/one", "application_url": "https://jobs.example.test/roles/one"}
+        links = app_module.merge_source_links(existing={"url": first["url"], "application_url": first["application_url"], "source_links_json": "[]"}, incoming=second)
+        self.assertEqual(links, [first["url"], second["url"]])
+
+    def test_persisted_cross_source_alias_survives_duplicate_discovery(self):
+        with app_module.app.app_context():
+            app_module.init_db()
+            first = app_module.normalize_job_payload({
+                "source": "indeed", "source_job_id": "indeed-1", "company": "Alias Co", "title": "Software Engineer",
+                "location": "Toronto, ON", "url": "https://jobs.alias.test/roles/one?utm_source=indeed",
+                "description": "Build software.", "discovery_first_seen_at": "2026-11-17T00:00:00",
+            })
+            second = app_module.normalize_job_payload({
+                "source": "employer_direct", "source_job_id": "greenhouse:alias:one", "company": "Alias Co", "title": "Software Engineer",
+                "location": "Toronto, ON", "url": "https://jobs.alias.test/roles/one",
+                "description": "Build software.", "discovery_first_seen_at": "2026-11-17T00:00:00",
+            })
+            self.assertEqual(app_module.persist_discovery_jobs([first], None, None)["new"], 1)
+            self.assertEqual(app_module.persist_discovery_jobs([second], None, None)["duplicate"], 1)
+        row = self.client.get("/api/jobs").get_json()[0]
+        self.assertEqual(set(row["source_links"]), {first["url"], second["url"]})
+
+    def test_three_provider_discovery_resolves_persisted_secondary_alias(self):
+        with app_module.app.app_context():
+            app_module.init_db()
+            indeed = app_module.normalize_job_payload({
+                "source": "indeed", "source_job_id": "indeed-three", "company": "Three Source Co",
+                "title": "Software Engineer", "location": "Toronto, ON",
+                "url": "https://ca.indeed.com/viewjob?jk=three",
+                "source_links": ["https://careers.three.test/jobs/three"],
+            })
+            direct = app_module.normalize_job_payload({
+                "source": "employer_direct", "source_job_id": "greenhouse:three:three",
+                "company": "Three Source Co", "title": "Software Engineer", "location": "Toronto, ON",
+                "url": "https://careers.three.test/jobs/three",
+            })
+            glassdoor = app_module.normalize_job_payload({
+                "source": "glassdoor", "source_job_id": "glassdoor-three",
+                "company": "Three Source Co", "title": "Software Engineer", "location": "Toronto, ON",
+                "url": "https://www.glassdoor.ca/job-listing/three",
+                "application_url": "https://careers.three.test/jobs/three",
+            })
+            assert app_module.persist_discovery_jobs([indeed], None, None)["new"] == 1
+            assert app_module.persist_discovery_jobs([direct], None, None)["duplicate"] == 1
+            assert app_module.persist_discovery_jobs([glassdoor], None, None)["duplicate"] == 1
+            row = app_module.query_db("SELECT * FROM jobs WHERE source_job_id = ?", ["indeed-three"], one=True)
+            self.assertIsNotNone(row)
+            self.assertEqual(app_module.query_db("SELECT COUNT(*) AS count FROM jobs", one=True)["count"], 1)
+            self.assertEqual(len(app_module.query_db("SELECT * FROM job_source_aliases WHERE job_id = ?", [row["id"]])), 6)
+
+    def test_possible_duplicate_scans_more_than_one_hundred_same_title_records(self):
+        with app_module.app.app_context():
+            app_module.init_db()
+            for index in range(150):
+                job = app_module.normalize_job_payload({
+                    "source": "indeed", "source_job_id": f"history-{index}",
+                    "company": "Other Company", "title": "Software Engineer", "location": "Toronto, ON",
+                    "url": f"https://indeed.test/jobs/{index}",
+                })
+                app_module.persist_discovery_jobs([job], None, None)
+            target = app_module.normalize_job_payload({
+                "source": "employer_direct", "source_job_id": "direct-target",
+                "company": "Other Company", "title": "Software Engineer", "location": "Toronto, ON",
+                "url": "https://careers.other.test/jobs/target",
+            })
+            possible = app_module.find_possible_duplicate_match(target)
+            self.assertIsNotNone(possible)
+
     def test_hybrid_prose_overrides_boolean_remote_without_provider_work_model(self):
         row = {"is_remote": True, "location": "Mississauga, ON", "description": "Hybrid remote in Mississauga, ON L5L 5Y1."}
         self.assertEqual(jobspy_source.infer_remote_type(row), "Hybrid")
@@ -2836,14 +2920,17 @@ class JobAssistantTest(unittest.TestCase):
             "source_counts": {"linkedin": 1, "indeed": 1},
         }
         with patch.object(app_module, "fetch_jobspy_jobs", return_value=fake):
-            response = self.client.post("/api/discovery/jobspy", json={"keywords": "software developer"})
+            response = self.client.post("/api/discovery/jobspy", json={"keywords": "software developer", "enabled_sources": ["linkedin", "indeed"]})
 
         body = response.get_json()
         self.assertEqual(body["total"], 2)
-        self.assertEqual(body["visible_total"], 1)
-        self.assertEqual(body["duplicates"], 1)
+        # Distinct verified provider IDs remain distinct when URLs do not
+        # prove that the postings are the same vacancy.
+        self.assertEqual(body["visible_total"], 2)
+        self.assertEqual(body["duplicates"], 0)
         self.assertEqual(body["diagnostics"]["already_saved_matches"], 1)
-        self.assertTrue(body["jobs"][0]["already_saved"])
+        self.assertTrue(any(job["already_saved"] for job in body["jobs"]))
+        self.assertTrue(any(job.get("possible_duplicate") for job in body["jobs"]))
 
     def test_discovered_result_can_save_to_tracker_and_prevent_future_duplicate_button(self):
         fake = {
@@ -2896,6 +2983,208 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(categories["Junior Python Developer"], "applied")
         self.assertEqual(categories["Backend Developer"], "skipped")
         self.assertEqual(self.client.get("/api/discovery/inbox").get_json(), [])
+
+    def test_actionable_discovery_records_are_explicit_new_opportunities(self):
+        self.client.get("/api/health")
+        job = {
+            "company": "Actionable Co", "title": "Junior Software Developer",
+            "location": "Toronto, ON", "url": "https://example.test/actionable",
+            "source": "Indeed", "source_job_id": "actionable-1",
+            "job_description": "Build Python services.",
+            "discovery_result_category": "actionable",
+            "discovery_result_reason": "Verified match",
+        }
+        with app_module.app.app_context():
+            app_module.persist_discovery_jobs([job], None, None)
+        response = self.client.get("/api/discovery/inbox?include_history=1")
+        assert response.status_code == 200
+        row = next(item for item in response.get_json() if item["title"] == job["title"])
+        self.assertEqual(row["discovery_inbox_category"], "new_actionable")
+
+    def test_opaque_search_membership_limits_needs_review_to_that_search(self):
+        self.client.get("/api/health")
+        jobs = [
+            {
+                "company": "Review Co", "title": f"Software Developer {index}",
+                "location": "Toronto, ON", "url": f"https://example.test/review-{index}",
+                "source": "Indeed", "source_job_id": f"review-{index}",
+                "discovery_result_category": "review_required",
+                "discovery_result_reason": f"reason-{index}",
+            }
+            for index in range(3)
+        ]
+        with app_module.app.app_context():
+            app_module.persist_discovery_jobs(jobs, None, None)
+            app_module.persist_discovery_search_memberships("a" * 32, jobs[:2], 0)
+            app_module.persist_discovery_search_memberships("b" * 32, jobs[1:], 0)
+        first = self.client.get(f"/api/discovery/inbox?include_history=1&category=review_required&search_id={'a' * 32}")
+        second = self.client.get(f"/api/discovery/inbox?include_history=1&category=review_required&search_id={'b' * 32}")
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual({item["source_job_id"] for item in first.get_json()}, {"review-0", "review-1"})
+        self.assertEqual({item["source_job_id"] for item in second.get_json()}, {"review-1", "review-2"})
+        self.assertEqual({item["discovery_result_reason"] for item in first.get_json()}, {"reason-0", "reason-1"})
+        self.assertEqual(self.client.get("/api/discovery/inbox?include_history=1&category=review_required").status_code, 200)
+
+    def test_incomplete_search_scoped_inbox_request_does_not_fall_back_to_history(self):
+        self.client.get("/api/health")
+        self.assertEqual(self.client.get(f"/api/discovery/inbox?include_history=1&search_id={'c' * 32}").status_code, 400)
+        self.assertEqual(self.client.get("/api/discovery/inbox?include_history=1&category=review_required&search_id=not-hex").status_code, 400)
+
+    def test_presented_and_excluded_history_are_paginated_and_auditable(self):
+        self.client.get("/api/health")
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Audit applicant", "workflow": "software"}).get_json()
+        jobs = [
+            {
+                "company": "Audit Co", "title": f"Role {index}", "location": "Toronto, ON",
+                "url": f"https://example.test/audit-{index}", "source": "Indeed",
+                "source_job_id": f"audit-{index}", "discovery_result_category": "actionable" if index == 0 else "excluded",
+                "discovery_result_reason": "Confirmed unrelated occupation" if index else "Verified match",
+                "discovery_occupation": "software developer",
+                "qualification_evidence_source": "Original posting description",
+            }
+            for index in range(3)
+        ]
+        with app_module.app.app_context():
+            app_module.persist_discovery_jobs(jobs, None, None)
+            app_module.mark_discovery_jobs_presented([jobs[0]["id"]], profile["id"])
+        presented = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=presented&include_history=1&page_size=1")
+        excluded = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=excluded&include_history=1&page_size=2")
+        counts = self.client.get(f"/api/discovery/inbox/counts?candidate_profile_id={profile['id']}")
+        self.assertEqual(presented.status_code, 200)
+        self.assertEqual(presented.get_json()[0]["discovery_inbox_category"], "presented")
+        self.assertEqual(excluded.status_code, 200)
+        self.assertEqual(len(excluded.get_json()), 2)
+        self.assertEqual(counts.status_code, 200)
+        self.assertEqual(counts.get_json()["excluded"], 2)
+        flagged = self.client.post(f"/api/discovery/inbox/{jobs[1]['id']}/flag-reassessment", json={"applicant_profile_id": profile["id"], "workflow": "software", "note": "Check source evidence"})
+        self.assertEqual(flagged.status_code, 200)
+        reassessed = self.client.post(f"/api/discovery/inbox/{jobs[1]['id']}/reassess", json={"applicant_profile_id": profile["id"], "workflow": "software"})
+        self.assertEqual(reassessed.status_code, 200)
+        self.assertEqual(reassessed.get_json()["status"], "reviewed")
+        self.assertFalse(reassessed.get_json()["evidence_grounded"])
+        refreshed = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=excluded&include_history=1").get_json()
+        refreshed_job = next(item for item in refreshed if item["id"] == jobs[1]["id"])
+        self.assertEqual(refreshed_job["reassessment_flag"]["status"], "reviewed")
+
+    def test_presented_actionable_jobs_are_not_new_and_counts_match(self):
+        self.client.get("/api/health")
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Inbox owner", "workflow": "software"}).get_json()
+        job = {
+            "company": "Repeat Co", "title": "Junior Software Developer", "location": "Toronto, ON",
+            "url": "https://example.test/repeat", "source": "Indeed", "source_job_id": "repeat-1",
+            "discovery_result_category": "actionable", "discovery_result_reason": "Verified match",
+        }
+        with app_module.app.app_context():
+            app_module.persist_discovery_jobs([job], None, None)
+            app_module.mark_discovery_jobs_presented([job["id"]], profile["id"])
+        new_view = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=new_actionable&include_history=1")
+        presented = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=presented&include_history=1")
+        counts = self.client.get(f"/api/discovery/inbox/counts?candidate_profile_id={profile['id']}")
+        self.assertEqual(new_view.status_code, 200)
+        self.assertEqual(new_view.get_json(), [])
+        self.assertEqual(presented.get_json()[0]["discovery_inbox_category"], "presented")
+        self.assertEqual(counts.get_json()["new_actionable"], 0)
+        self.assertEqual(counts.get_json()["presented"], 1)
+        self.assertEqual(counts.get_json()["all_relevant"], 1)
+        cumulative = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=all_discovered&include_history=1").get_json()
+        cumulative_row = next(item for item in cumulative if item["id"] == job["id"])
+        self.assertEqual(cumulative_row["discovery_inbox_category"], "presented")
+        self.assertEqual(cumulative_row["discovery_result_category"], "actionable")
+
+    def test_reviewed_actionable_count_and_view_share_one_predicate(self):
+        self.client.get("/api/health")
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Reviewed owner", "workflow": "software"}).get_json()
+        job = {
+            "company": "Reviewed Co", "title": "Software Developer", "location": "Toronto, ON",
+            "url": "https://example.test/reviewed-actionable", "source": "Indeed", "source_job_id": "reviewed-actionable-1",
+            "discovery_result_category": "actionable", "discovery_result_reason": "Verified match",
+            "candidate_profile_id": profile["id"], "discovery_occupation": "software developer",
+        }
+        with app_module.app.app_context():
+            app_module.persist_discovery_jobs([job], None, None)
+        job_id = job["id"]
+        self.assertEqual(self.client.post(f"/api/discovery/inbox/{job_id}/review", json={"candidate_profile_id": profile["id"], "workflow": "software"}).status_code, 200)
+        rows = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=review_required&include_history=1").get_json()
+        counts = self.client.get(f"/api/discovery/inbox/counts?candidate_profile_id={profile['id']}").get_json()
+        self.assertEqual([row["id"] for row in rows], [job_id])
+        self.assertEqual(counts["review_required"], len(rows))
+        self.assertEqual(rows[0]["discovery_result_category"], "actionable")
+
+    def test_cumulative_membership_is_evidence_not_latest_category_override(self):
+        self.client.get("/api/health")
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Two run owner", "workflow": "software"}).get_json()
+        job = {
+            "company": "Two Run Co", "title": "Software Developer", "location": "Toronto, ON",
+            "url": "https://example.test/two-run", "source": "Indeed", "source_job_id": "two-run-1",
+            "discovery_result_category": "actionable", "discovery_result_reason": "Current verified match",
+            "candidate_profile_id": profile["id"], "discovery_occupation": "software developer", "role_type": "marketing",
+        }
+        with app_module.app.app_context():
+            app_module.persist_discovery_jobs([job], None, None)
+            app_module.persist_discovery_search_memberships("e" * 32, [job], profile["id"])
+            app_module.persist_discovery_search_memberships("f" * 32, [{**job, "discovery_result_category": "review_required", "discovery_result_reason": "Second run uncertainty"}], profile["id"])
+            app_module.get_db().execute("UPDATE jobs SET discovery_result_category = 'review_required', discovery_result_reason = 'Current uncertainty' WHERE id = ?", [job["id"]])
+            app_module.get_db().commit()
+        history = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=all_discovered&include_history=1").get_json()
+        row = next(item for item in history if item["id"] == job["id"])
+        self.assertEqual(row["discovery_inbox_category"], "review_required")
+        self.assertEqual(row["discovery_result_category"], "review_required")
+        self.assertEqual(row["latest_search_membership_category"], "review_required")
+        scoped = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=all_relevant&search_id={'e' * 32}&include_history=1").get_json()
+        self.assertEqual(scoped[0]["discovery_result_category"], "actionable")
+
+    def test_search_run_history_and_membership_evidence_are_immutable(self):
+        self.client.get("/api/health")
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Run audit", "workflow": "software"}).get_json()
+        job = {
+            "company": "Evidence Co", "title": "Software Developer", "location": "Toronto, ON",
+            "url": "https://example.test/evidence", "source": "Indeed", "source_job_id": "evidence-1",
+            "discovery_result_category": "excluded", "discovery_result_reason": "Original exclusion",
+            "discovery_occupation": "software developer", "qualification_evidence_source": "Original JD",
+        }
+        with app_module.app.app_context():
+            app_module.persist_discovery_jobs([job], None, None)
+            app_module.persist_discovery_search_memberships("d" * 32, [job], profile["id"])
+            job["discovery_result_reason"] = "Replay must not overwrite"
+            app_module.persist_discovery_search_memberships("d" * 32, [job], profile["id"])
+        runs = self.client.get(f"/api/discovery/inbox/search-runs?candidate_profile_id={profile['id']}")
+        scoped = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=excluded&search_id={'d' * 32}&include_history=1")
+        self.assertEqual(runs.status_code, 200)
+        self.assertEqual(runs.get_json()[0]["search_id"], "d" * 32)
+        self.assertEqual(runs.get_json()[0]["excluded_count"], 1)
+        self.assertEqual(scoped.get_json()[0]["search_membership_evidence"]["reason"], "Original exclusion")
+
+    def test_all_relevant_is_server_filtered_and_paginated_with_reviewed_state(self):
+        self.client.get("/api/health")
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Paging owner", "workflow": "software"}).get_json()
+        jobs = [
+            {
+                "company": "Paging Co", "title": f"Software Developer {index}", "location": "Toronto, ON",
+                "url": f"https://example.test/paging-{index}", "source": "Indeed", "source_job_id": f"paging-{index}",
+                "discovery_result_category": "actionable", "discovery_result_reason": "Verified match",
+                "candidate_profile_id": profile["id"], "discovery_occupation": "software developer",
+            }
+            for index in range(501)
+        ]
+        with app_module.app.app_context():
+            app_module.persist_discovery_jobs(jobs, None, None)
+        first = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=all_relevant&include_history=1&page_size=500&page=0")
+        second = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=all_relevant&include_history=1&page_size=500&page=1")
+        counts = self.client.get(f"/api/discovery/inbox/counts?candidate_profile_id={profile['id']}").get_json()
+        self.assertEqual(len(first.get_json()), 500)
+        self.assertEqual(len(second.get_json()), 1)
+        self.assertEqual(counts["all_relevant"], 501)
+        self.assertEqual(counts["new_actionable"], 501)
+        reviewed_id = jobs[0]["id"]
+        reviewed = self.client.post(f"/api/discovery/inbox/{reviewed_id}/review", json={"candidate_profile_id": profile["id"], "workflow": "software"})
+        self.assertEqual(reviewed.status_code, 200)
+        new_rows = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=new_actionable&include_history=1").get_json()
+        self.assertNotIn(reviewed_id, {item["id"] for item in new_rows})
+        reviewed_rows = []
+        for page in (0, 1):
+            reviewed_rows.extend(self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=all_relevant&include_history=1&page_size=500&page={page}").get_json())
+        self.assertEqual(next(item for item in reviewed_rows if item["id"] == reviewed_id)["discovery_inbox_category"], "review_required")
 
     def test_live_discovery_persists_save_skip_and_applied_without_generation(self):
         fake = {
@@ -7073,6 +7362,60 @@ class JobAssistantTest(unittest.TestCase):
                 "enabled_sources": ["linkedin", "indeed", "zip_recruiter"],
                 "total_cap": 2,
             })
+
+    def test_inbox_page_metadata_and_saved_internship_preference_are_authoritative(self):
+        self.client.get("/api/health")
+        # Keep this deliberately large pagination fixture isolated even when
+        # the application module has been used by an earlier test in the
+        # same process.
+        with app_module.app.app_context():
+            app_module.get_db().execute("DELETE FROM discovery_applicant_states")
+            app_module.get_db().execute("DELETE FROM jobs")
+            app_module.get_db().commit()
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Pagination owner", "workflow": "software"}).get_json()
+        jobs = [
+            {
+                "company": "Paging Co", "title": f"Junior Software Developer {index}", "location": "Toronto, ON",
+                "url": f"https://example.test/pagination-{index}", "source": "Indeed", "source_job_id": f"pagination-{index}",
+                "discovery_result_category": "actionable", "discovery_result_reason": "Verified match",
+                "candidate_profile_id": profile["id"], "discovery_occupation": "software developer",
+            }
+            for index in range(123)
+        ]
+        with app_module.app.app_context():
+            app_module.persist_discovery_jobs(jobs, None, None)
+        first = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=new_actionable&include_history=1&page_size=25&page=0")
+        second = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=new_actionable&include_history=1&page_size=25&page=1")
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.headers["X-Job-Tracker-Total"], "123")
+        self.assertEqual(first.headers["X-Job-Tracker-Page"], "0")
+        self.assertEqual(first.headers["X-Job-Tracker-Page-Size"], "25")
+        self.assertEqual(len(first.get_json()), 25)
+        self.assertEqual(len(second.get_json()), 25)
+        self.assertTrue({row["id"] for row in first.get_json()}.isdisjoint({row["id"] for row in second.get_json()}))
+
+        created = self.client.post("/api/discovery/searches", json={
+            "name": "Internship preference", "keywords": "software developer", "enabled_sources": ["indeed"], "include_internships": True,
+        })
+        self.assertEqual(created.status_code, 201, created.get_json())
+        saved = created.get_json()
+        self.assertTrue(saved["include_internships"])
+        updated = self.client.put(f"/api/discovery/searches/{saved['id']}", json={**saved, "include_internships": False})
+        self.assertEqual(updated.status_code, 200, updated.get_json())
+        self.assertFalse(updated.get_json()["include_internships"])
+        with app_module.app.app_context():
+            payload = app_module.saved_search_to_discovery_payload(updated.get_json())
+        self.assertFalse(payload["include_internships"])
+        with app_module.app.app_context():
+            app_module.get_db().execute("DELETE FROM saved_search_profiles WHERE name = ?", ["Internship preference"])
+            app_module.get_db().execute("DELETE FROM discovery_applicant_states")
+            app_module.get_db().execute("DELETE FROM jobs")
+            app_module.get_db().commit()
+
+    def test_normal_source_defaults_exclude_disabled_providers_but_allow_explicit_reactivation(self):
+        self.assertEqual(app_module.normalize_discovery_sources(None), ["indeed", "glassdoor", "employer_direct"])
+        self.assertEqual(app_module.normalize_discovery_sources([]), ["indeed", "glassdoor", "employer_direct"])
+        self.assertEqual(app_module.normalize_discovery_sources(["linkedin", "zip_recruiter"]), ["linkedin", "zip_recruiter"])
 
     def test_discovery_search_config_separates_new_match_target_from_fetch_budget(self):
         config = app_module.discovery_search_config({

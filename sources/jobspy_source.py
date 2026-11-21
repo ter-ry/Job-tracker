@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import warnings
 import re
+import json
+from html import unescape
 from importlib import metadata
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
@@ -749,6 +751,122 @@ WORKPLACE_CUE = re.compile(
     re.I,
 )
 NON_WORKPLACE_CUE = re.compile(r"\b(?:headquarters|corporate|mailing|registered)\s+(?:address|office)?\b", re.I)
+WORKPLACE_LABEL_CUE = re.compile(
+    r"\b(?:location|work\s+location|our\s+centre|our\s+center|located\s+at|worksite|campus|"
+    r"centre\s+address|center\s+address|reporting\s+location|based\s+at)\b\s*[:\-]?",
+    re.I,
+)
+
+
+def _plain_location_text(value: str) -> str:
+    """Convert HTML/Markdown location prose to deterministic plain text."""
+    value = unescape(clean(value))
+    # Never treat executable page chrome as job-description evidence.  This is
+    # especially important for Cloudflare challenge payloads, which commonly
+    # contain strings that happen to match Canadian postal-code syntax.
+    value = re.sub(r"<!--.*?-->", " ", value, flags=re.I | re.S)
+    value = re.sub(r"<\s*(?:script|style|noscript|template|svg|canvas)\b[^>]*>.*?<\s*/\s*(?:script|style|noscript|template|svg|canvas)\s*>", " ", value, flags=re.I | re.S)
+    value = re.sub(r"\b(?:__cf\$cv\$params|cf-chl-|challenge-platform|turnstile|cloudflare)\b[^\n]*", " ", value, flags=re.I)
+    value = re.sub(r"<\s*br\s*/?>", "\n", value, flags=re.I)
+    value = re.sub(r"</\s*(?:p|div|li|h[1-6]|tr|td|section)\s*>", "\n", value, flags=re.I)
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = re.sub(r"!?\[([^\]]+)\]\([^)]*\)", r"\1", value)
+    return re.sub(r"[ \t]+", " ", value).strip()
+
+
+def _json_location_values(value: Any) -> list[dict[str, Any]]:
+    """Find JobPosting location objects in raw provider/JSON-LD metadata."""
+    found: list[dict[str, Any]] = []
+    if isinstance(value, str):
+        raw = value.strip()
+        if raw.startswith("{") or raw.startswith("["):
+            try:
+                return _json_location_values(json.loads(raw))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return []
+        return found
+    if isinstance(value, list):
+        for item in value:
+            found.extend(_json_location_values(item))
+        return found
+    if not isinstance(value, dict):
+        return found
+    type_value = value.get("@type") or value.get("type")
+    types = " ".join(type_value) if isinstance(type_value, list) else clean(type_value)
+    if "jobposting" in types.lower():
+        location_value = value.get("jobLocation") or value.get("job_location") or value.get("location")
+        found.extend(_json_location_values({"job_location": location_value}))
+    for key, item in value.items():
+        if key.lower() in {"joblocation", "job_location", "location", "workplacelocation", "structured_location"}:
+            if isinstance(item, (dict, list)):
+                found.extend(_structured_location_item(item, "JobPosting JSON-LD"))
+        elif isinstance(item, (dict, list, str)) and key.lower() in {"raw", "provider_raw_json", "metadata", "jsonld", "structured_data"}:
+            found.extend(_json_location_values(item))
+    return found
+
+
+def _structured_location_item(value: Any, evidence_source: str) -> list[dict[str, Any]]:
+    values: list[dict[str, Any]] = []
+    items = value if isinstance(value, list) else [value]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        address = item.get("address") if isinstance(item.get("address"), dict) else item
+        street = clean(address.get("streetAddress") or address.get("street_address") or address.get("street"))
+        locality = clean(address.get("addressLocality") or address.get("city") or address.get("locality"))
+        region = clean(address.get("addressRegion") or address.get("province") or address.get("state"))
+        postal = clean(address.get("postalCode") or address.get("postal_code") or address.get("postcode"))
+        parts = [part for part in (street, locality, region, postal) if part]
+        if not parts:
+            continue
+        values.append({
+            "address": ", ".join(parts), "postal_code": postal.upper().replace("-", " "),
+            "precision": "street address" if street else "postal code" if postal else "city",
+            "confidence": 98 if street else 90 if postal else 70,
+            "evidence": ", ".join(parts), "evidence_source": evidence_source,
+            "extraction_method": "json_ld", "assignment_status": "confirmed",
+        })
+    return values
+
+
+def _text_workplace_values(text: str, evidence_source: str = "description advertised workplace") -> list[dict[str, Any]]:
+    """Extract labelled street/postal worksite evidence from plain text."""
+    text = _plain_location_text(text)
+    candidates: list[dict[str, Any]] = []
+    street_matches = list(STREET_PATTERN.finditer(text))
+    for index, match in enumerate(street_matches):
+        nearby = text[max(0, match.start() - 260):min(len(text), match.end() + 160)]
+        if NON_WORKPLACE_CUE.search(nearby):
+            continue
+        label_match = WORKPLACE_LABEL_CUE.search(text[max(0, match.start() - 220):match.start()])
+        if not label_match and not WORKPLACE_CUE.search(text[max(0, match.start() - 220):match.start()]):
+            continue
+        address, evidence = _address_evidence(text, match, street_matches[index + 1].start() if index + 1 < len(street_matches) else None)
+        postal = re.search(POSTAL_PATTERN, text[match.end():min(len(text), match.end() + 100)], re.I)
+        if postal and postal.group(0).upper().replace("-", " ") not in address.upper():
+            address = f"{address}, {postal.group(0).upper().replace('-', ' ')}"
+            evidence = clean(text[max(0, match.start() - 120):postal.end()])
+        if any(clean(item.get("address")).lower() == address.lower() for item in candidates):
+            continue
+        candidates.append({
+            "address": address, "postal_code": postal.group(0).upper().replace("-", " ") if postal else "",
+            "precision": "street address", "confidence": 95 if label_match else 88,
+            "evidence": evidence, "evidence_source": evidence_source,
+            "extraction_method": "labelled_text", "assignment_status": "confirmed",
+        })
+    for match in re.finditer(POSTAL_PATTERN, text, re.I):
+        context = text[max(0, match.start() - 180):min(len(text), match.end() + 100)]
+        if not WORKPLACE_LABEL_CUE.search(context) or NON_WORKPLACE_CUE.search(context):
+            continue
+        postal = match.group(0).upper().replace("-", " ")
+        if any(clean(item.get("postal_code")).upper() == postal for item in candidates):
+            continue
+        candidates.append({
+            "address": postal, "postal_code": postal, "precision": "postal code", "confidence": 88,
+            "evidence": clean(context), "evidence_source": evidence_source,
+            "extraction_method": "labelled_text", "assignment_status": "confirmed",
+        })
+    return candidates
 
 
 def _structured_workplace_values(row: dict[str, Any]) -> list[dict[str, Any]]:
@@ -785,6 +903,13 @@ def _structured_workplace_values(row: dict[str, Any]) -> list[dict[str, Any]]:
 
     for field in fields:
         visit(row.get(field))
+    # JobSpy/provider adapters sometimes retain JSON-LD or nested raw
+    # metadata under provider_raw_json/raw. Inspect only those structured
+    # containers; employer/company metadata is intentionally ignored.
+    for field in ("raw", "provider_raw_json", "metadata", "structured_data", "jsonld"):
+        for item in _json_location_values(row.get(field)):
+            if item not in values:
+                values.append(item)
     return values
 
 
@@ -804,23 +929,26 @@ def _address_evidence(description: str, match: re.Match[str], next_start: int | 
     return address, evidence or address
 
 
-def extract_workplace_alternatives(row: dict[str, Any], description: str) -> list[dict[str, Any]]:
+def extract_workplace_alternatives(row: dict[str, Any], description: str, provider_location: str = "") -> list[dict[str, Any]]:
     """Return every explicit advertised workplace without choosing an assigned site."""
+    provider_location = clean(provider_location or row.get("location") or row.get("provider_location"))
     supplied = row.get("workplace_alternatives")
     if isinstance(supplied, list):
-        return [dict(item) for item in supplied if isinstance(item, dict) and clean(item.get("address") or item.get("postal_code"))]
+        candidates = [dict(item) for item in supplied if isinstance(item, dict) and clean(item.get("address") or item.get("postal_code"))]
+    else:
+        candidates = []
     structured = _structured_workplace_values(row)
-    if structured:
-        return structured
-    raw_fields = [(key, clean(row.get(key))) for key in ("workplace_address", "address", "street_address", "office_address", "office_location", "location")]
+    for item in structured:
+        if not any(clean(existing.get("address")).lower() == clean(item.get("address")).lower() for existing in candidates):
+            candidates.append(item)
+    raw_fields = [(key, clean(row.get(key))) for key in ("workplace_address", "address", "street_address", "office_address", "office_location", "location", "location_header", "title_header")]
     field_key, field_value = next(
         ((key, value) for key, value in raw_fields if value and (key != "location" or STREET_PATTERN.search(value) or re.search(POSTAL_PATTERN, value, re.I))),
         ("", ""),
     )
-    candidates: list[dict[str, Any]] = []
     if field_value:
         postal_match = re.search(POSTAL_PATTERN, field_value, re.I)
-        candidates.append({
+        provider_candidate = {
             "address": field_value,
             "postal_code": postal_match.group(0).upper() if postal_match else clean(row.get("postal_code") or row.get("zip_code")),
             "precision": "street address" if STREET_PATTERN.search(field_value) else "postal code" if postal_match else "city",
@@ -828,25 +956,36 @@ def extract_workplace_alternatives(row: dict[str, Any], description: str) -> lis
             "evidence": field_value,
             "evidence_source": "provider location" if field_key == "location" else "provider field",
             "assignment_status": "confirmed",
-        })
-    matches = list(STREET_PATTERN.finditer(description or ""))
+        }
+        if not any(clean(item.get("address")).lower() == field_value.lower() for item in candidates):
+            candidates.append(provider_candidate)
+    plain_description = _plain_location_text(description or "")
+    text_candidates = _text_workplace_values(plain_description)
+    for item in text_candidates:
+        if not any(
+            clean(existing.get("address")).lower() == clean(item.get("address")).lower()
+            or (clean(existing.get("postal_code")).upper() and clean(existing.get("postal_code")).upper() == clean(item.get("postal_code")).upper())
+            for existing in candidates
+        ):
+            candidates.append(item)
+    matches = list(STREET_PATTERN.finditer(plain_description))
     for index, match in enumerate(matches):
-        context = (description or "")[max(0, match.start() - 180):match.start()]
+        context = plain_description[max(0, match.start() - 180):match.start()]
         # Provider/PDF descriptions often flatten a workplace list onto one
         # line.  Evaluate each address against its nearby evidence instead of
         # allowing an unrelated cue elsewhere in the posting to authorize all
         # street-shaped numbers.
-        nearby_context = (description or "")[max(0, match.start() - 240):min(len(description or ""), match.end() + 80)]
+        nearby_context = plain_description[max(0, match.start() - 240):min(len(plain_description), match.end() + 80)]
         if NON_WORKPLACE_CUE.search(nearby_context[-150:]):
             continue
         if not WORKPLACE_CUE.search(context):
             continue
-        address, evidence = _address_evidence(description, match, matches[index + 1].start() if index + 1 < len(matches) else None)
+        address, evidence = _address_evidence(plain_description, match, matches[index + 1].start() if index + 1 < len(matches) else None)
         postal_match = re.search(POSTAL_PATTERN, address, re.I)
         canonical = clean(STREET_PATTERN.search(address).group(0) if STREET_PATTERN.search(address) else address).lower()
         if any(clean(item.get("address")).lower().startswith(canonical) or canonical.startswith(clean(item.get("address")).lower()) for item in candidates):
             continue
-        candidates.append({
+        candidate = {
             "address": address,
             "postal_code": postal_match.group(0).upper() if postal_match else "",
             "precision": "street address",
@@ -854,16 +993,24 @@ def extract_workplace_alternatives(row: dict[str, Any], description: str) -> lis
             "evidence": evidence,
             "evidence_source": "description advertised workplace",
             "assignment_status": "advertised_alternative" if len(matches) > 1 else "confirmed",
-        })
+        }
+        if not any(clean(item.get("address")).lower().startswith(canonical) or canonical.startswith(clean(item.get("address")).lower()) for item in candidates):
+            candidates.append(candidate)
     if len(candidates) > 1:
         for item in candidates:
             item["assignment_status"] = "advertised_alternative"
+    # Preserve the legacy display contract for a description-only postal code:
+    # keep the provider's city/region alongside the postal evidence, without
+    # fabricating a street address.
+    for item in candidates:
+        if clean(item.get("precision")).lower() == "postal code" and clean(item.get("address")) == clean(item.get("postal_code")) and provider_location:
+            item["address"] = provider_location if clean(item.get("postal_code")).lower() in provider_location.lower() else f"{provider_location}, {item.get('postal_code')}"
     return candidates
 
 
 def extract_workplace_location(row: dict[str, Any], description: str, provider_location: str) -> dict[str, Any]:
     """Preserve alternatives and populate legacy fields only for one confirmed site."""
-    alternatives = extract_workplace_alternatives(row, description)
+    alternatives = extract_workplace_alternatives(row, description, provider_location)
     if len(alternatives) > 1:
         return {
             "display_location": provider_location or f"{len(alternatives)} advertised workplace alternatives",

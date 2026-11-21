@@ -157,6 +157,47 @@ def test_async_worker_does_not_mark_results_presented_before_delivery(monkeypatc
             assert not app_module.applicant_presented_discovery_job(job_id, 11)
 
 
+def test_async_search_records_opaque_needs_review_membership_for_inbox(monkeypatch, tmp_path):
+    app_module.DATA_DIR = Path(tmp_path)
+    app_module.DB_PATH = app_module.DATA_DIR / "search-membership.sqlite"
+    app_module.app.config.update(TESTING=True)
+
+    def fake_pipeline(payload, *, on_provider_update=None, search_execution_id=None):
+        assert search_execution_id
+        with app_module.app.app_context():
+            jobs = []
+            for index in range(2):
+                job = app_module.normalize_job_payload({
+                    "source": "Indeed", "source_job_id": f"membership-{index}",
+                    "title": f"Developer {index}", "company": "Review Co",
+                    "location": "Toronto, ON", "job_url": f"https://example.test/membership-{index}",
+                    "discovery_result_category": "review_required",
+                    "discovery_result_reason": f"review reason {index}",
+                })
+                jobs.append(job)
+            app_module.persist_discovery_jobs(jobs, None, None)
+            app_module.persist_discovery_search_memberships(search_execution_id, jobs, 0)
+        return {
+            "jobs": jobs, "matching_jobs": [], "review_required_jobs": jobs,
+            "total": 2, "errors": {},
+            "search_progress": {"requested_target": 2, "new_matching_jobs": 0,
+                                 "review_required": 2, "raw_jobs_inspected": 2},
+        }
+
+    monkeypatch.setattr(app_module, "run_discovery_pipeline", fake_pipeline)
+    client = app_module.app.test_client()
+    search_id = client.post("/api/discovery/searches", json={"keywords": "developer"}).get_json()["search_id"]
+    for _ in range(100):
+        status = client.get(f"/api/discovery/searches/{search_id}").get_json()
+        if status["status"] in {"completed", "completed_with_errors", "failed"}:
+            break
+        time.sleep(0.01)
+    assert status["status"] == "completed"
+    review = client.get(f"/api/discovery/inbox?include_history=1&category=review_required&search_id={search_id}")
+    assert review.status_code == 200
+    assert {row["source_job_id"] for row in review.get_json()} == {"membership-0", "membership-1"}
+
+
 def test_async_exclusion_tombstone_removes_visible_result_but_keeps_history():
     with tempfile.TemporaryDirectory() as directory:
         app_module.DATA_DIR = Path(directory)
@@ -233,6 +274,48 @@ def test_async_raw_provider_td_requirement_is_excluded_and_persisted(monkeypatch
         row = app_module.query_db("SELECT discovery_result_category, job_description FROM jobs WHERE source_job_id = ?", ["td-async-raw"], one=True)
         assert row["discovery_result_category"] == "excluded"
         assert "5+ years" in row["job_description"]
+
+
+def test_async_pipeline_marks_unproven_cross_source_duplicate_for_review(monkeypatch, tmp_path):
+    """The worker path must use the same duplicate policy as synchronous discovery."""
+    app_module.DATA_DIR = Path(tmp_path)
+    app_module.DB_PATH = app_module.DATA_DIR / "async-duplicates.sqlite"
+    app_module.app.config.update(TESTING=True)
+    current = {
+        "source": "Indeed", "source_job_id": "indeed-duplicate-1",
+        "title": "Junior Software Developer", "company": "Same Vacancy Co",
+        "location": "Toronto, ON", "job_url": "https://indeed.test/jobs/duplicate-1",
+        "description": "Build software applications with Python.", "job_type": "full-time",
+    }
+
+    def fetch(*_args, **_kwargs):
+        return {"jobs": [dict(current)], "errors": {}, "source_counts": {current["source"].lower(): 1},
+                "source_diagnostics": {}, "source_snapshots": {}, "attempted_query_batches": [],
+                "completed_query_batches": [], "pending_query_batches": []}
+
+    monkeypatch.setattr(app_module, "fetch_discovery_jobs_for_search", fetch)
+    monkeypatch.setattr(
+        app_module, "geocode_discovery_job",
+        lambda job, *_args, **_kwargs: ({**job, "distance_km": 2, "distance_confidence": 90,
+                                          "distance_radius_status": "within_radius",
+                                          "location_search_eligible": True}, {"ok": True}),
+    )
+    payload = {"keywords": "software developer", "location": "Toronto, ON", "enabled_sources": ["indeed"],
+               "search_mode": "shortlist", "occupation": "software developer", "match_policy": "apply_broadly",
+               "seniority": "entry_level,junior", "maximum_required_years": 3, "new_matching_target": 1}
+    with app_module.app.app_context():
+        app_module.init_db()
+        first = app_module.run_discovery_pipeline(payload)
+        assert first["persisted"]["new"] == 1
+        current.update({"source": "Employer Direct", "source_job_id": "greenhouse:same:1",
+                        "job_url": "https://careers.same.test/jobs/1"})
+        second = app_module.run_discovery_pipeline(payload)
+        assert second["persisted"]["new"] == 1
+        assert second["review_required_jobs"][0]["discovery_result_category"] == "review_required"
+        row = app_module.query_db("SELECT discovery_result_category, discovery_result_reason FROM jobs WHERE source_job_id = ?",
+                                  ["greenhouse:same:1"], one=True)
+        assert row["discovery_result_category"] == "review_required"
+        assert "Possible duplicate" in row["discovery_result_reason"]
 
 
 def test_named_search_keeps_legacy_saved_search_contract():

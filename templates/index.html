@@ -27,8 +27,9 @@
 
     <main class="layout">
       <section id="discovery" class="tab-panel active">
-        <nav class="discovery-subnav beta-secondary" aria-label="Discovery views">
+        <nav class="discovery-subnav" aria-label="Discovery views">
           <button class="discovery-subnav-button active" type="button" data-discovery-view="find">Find jobs</button>
+          <button class="discovery-subnav-button" type="button" data-discovery-view="inbox">Jobs Inbox</button>
           <button class="discovery-subnav-button" type="button" data-discovery-view="pipeline">Pipeline</button>
           <button class="discovery-subnav-button" type="button" data-discovery-view="saved">Saved searches</button>
         </nav>
@@ -85,11 +86,12 @@
               <input id="saved-search-per-source-cap" type="hidden" value="100">
               <label>Interval (minutes)<input id="saved-search-interval" type="number" min="15" step="15" value="360"></label>
               <label class="checkline"><input id="saved-search-enabled" type="checkbox"> Enable scheduled search</label>
+              <label class="checkline"><input id="saved-search-include-internships" type="checkbox"> Include internships</label>
               <label class="checkline"><input id="saved-search-auto-prepare" type="checkbox"> Automatically prepare qualifying packages</label>
               <p class="muted helper">Automatic preparation applies only to new discovery results. Unknown Canadian eligibility always requires manual confirmation; it is never bypassed by a saved-search setting.</p>
               <label>Minimum Job Priority<input id="saved-search-auto-min-priority" type="number" min="0" max="100" step="1" value="75"></label>
               <label>Résumé profile for scoring and preparation<select id="saved-search-auto-profile"><option value="">Use active Profile</option></select></label>
-              <fieldset class="source-picker"><legend>Sources</legend><label><input type="checkbox" name="saved-search-source" value="linkedin" checked> LinkedIn</label><label><input type="checkbox" name="saved-search-source" value="indeed" checked> Indeed</label><label><input type="checkbox" name="saved-search-source" value="zip_recruiter"> ZipRecruiter</label><label><input type="checkbox" name="saved-search-source" value="glassdoor"> Glassdoor <small class="muted">experimental</small></label><label><input type="checkbox" name="saved-search-source" value="employer_direct"> Employer Direct <small class="muted">pilot</small></label></fieldset>
+              <fieldset class="source-picker"><legend>Sources</legend><label><input type="checkbox" name="saved-search-source" value="indeed" checked> Indeed</label><label><input type="checkbox" name="saved-search-source" value="glassdoor" checked> Glassdoor <small class="muted">experimental</small></label><label><input type="checkbox" name="saved-search-source" value="employer_direct" checked> Employer Direct <small class="muted">pilot</small></label></fieldset>
               <div class="actions"><button class="button" type="submit">Save search</button><button class="button ghost" type="button" id="cancel-saved-search">Cancel</button></div>
             </form>
             <div class="actions compact"><button class="button ghost small" type="button" id="toggle-discovery-scheduler">Enable database scheduler</button><span id="discovery-scheduler-status" class="muted helper"></span></div>
@@ -115,6 +117,7 @@
               </label>
               <label>Job titles<input id="discovery-keywords" required placeholder="software developer; junior software engineer"><small class="muted">Use semicolons for multiple titles.</small></label>
               <label>Search area<input id="discovery-location" placeholder="Toronto, Ontario"></label>
+              <label>Commute From<input id="discovery-distance-origin" placeholder="CF Fairview Mall, 1800 Sheppard Avenue East, Toronto, ON, Canada" value="CF Fairview Mall, 1800 Sheppard Avenue East, Toronto, ON, Canada"><small class="muted">Used only for commute context. A failed lookup stays unresolved; it never falls back to the search area.</small></label>
               <label>Number of new matching jobs<input id="discovery-new-matching-target" type="number" min="1" max="500" step="1" value="50"><small class="muted">Target for qualifying new jobs, not the raw provider-fetch limit.</small></label>
               <label>Distance radius<input id="discovery-distance" type="number" min="0" step="1" placeholder="50 km"></label>
               <label>Remote preference
@@ -156,10 +159,8 @@
             </div>
             <fieldset class="source-picker">
               <legend>Sources</legend>
-              <label><input type="checkbox" name="discovery-source" value="linkedin" checked> LinkedIn</label>
               <label><input type="checkbox" name="discovery-source" value="indeed" checked> Indeed</label>
-              <label><input type="checkbox" name="discovery-source" value="zip_recruiter"> ZipRecruiter</label>
-              <label><input type="checkbox" name="discovery-source" value="glassdoor"> Glassdoor <small class="muted">experimental</small></label><label><input type="checkbox" name="discovery-source" value="employer_direct"> Employer Direct <small class="muted">pilot</small></label>
+              <label><input type="checkbox" name="discovery-source" value="glassdoor" checked> Glassdoor <small class="muted">experimental</small></label><label><input type="checkbox" name="discovery-source" value="employer_direct" checked> Employer Direct <small class="muted">pilot</small></label>
             </fieldset>
             <details class="settings-block">
               <summary>Search options</summary>
@@ -200,11 +201,18 @@
               <button class="button ghost beta-secondary" type="button" id="save-current-discovery-search">Save current search</button>
               <button class="button ghost beta-secondary" type="button" id="discovery-test-sources">Test job sources</button>
               <button class="button ghost beta-secondary" type="button" id="discovery-recalculate-distances">Recalculate distances</button>
+              <button class="button ghost" type="button" id="discovery-enrich-workplaces">Find workplace</button>
               <button class="button ghost beta-secondary" type="button" id="discovery-re-evaluate">Re-evaluate stored history</button>
+            </div>
+            <div class="workplace-enrichment-selector" id="workplace-enrichment-selector">
+              <label>Choose previous search
+                <select id="workplace-enrichment-search" aria-label="Choose previous search"></select>
+              </label>
+              <p id="workplace-enrichment-selection-status" class="muted helper" aria-live="polite">Loading completed searches…</p>
             </div>
             <div class="compatibility-fields" aria-hidden="true">
               <select id="discovery-search-mode"><option value="shortlist">shortlist</option></select>
-              <input id="discovery-distance-origin"><input id="discovery-shortlist-size" value="50"><input id="discovery-total-cap" type="hidden" value="200"><input id="discovery-per-source-cap" type="hidden" value="100"><input id="discovery-strict-technical" type="checkbox">
+              <input id="discovery-shortlist-size" value="50"><input id="discovery-total-cap" type="hidden" value="200"><input id="discovery-per-source-cap" type="hidden" value="100"><input id="discovery-strict-technical" type="checkbox">
             </div>
           </form>
 
@@ -214,6 +222,8 @@
                 <h2>Discovery results</h2>
                 <p id="discovery-active-state" class="muted helper">Search results will appear here.</p>
                 <p id="discovery-distance-origin-summary" class="muted helper">Distance calculated from: not configured.</p>
+              <div id="workplace-enrichment-preview" class="generated-output empty" aria-live="polite">Workplace enrichment preview details will appear here.</div>
+              <button class="button ghost small" type="button" id="workplace-enrichment-next" hidden>Next batch</button>
               </div>
               <div class="actions compact discovery-toolbar-actions">
                 <label class="toolbar-select">
@@ -280,9 +290,10 @@
             <div id="fast-apply-current" class="generated-output empty">Run a search to build a new-opportunities queue.</div>
           </section>
 
-          <section class="panel discovery-inbox-panel discovery-view-saved">
-            <div class="panel-header"><div><h2>Jobs Inbox</h2><p class="muted helper">New, review, saved, applied, skipped and history stay applicant-specific.</p></div><div class="actions compact"><button class="button ghost small" type="button" id="inbox-bulk-save">Save selected</button><button class="button ghost small" type="button" id="inbox-bulk-skip">Skip selected</button><button class="button ghost small" type="button" id="inbox-bulk-applied">Confirm selected Applied</button><button class="button ghost small" type="button" id="refresh-discovery-inbox">Refresh</button></div></div>
-            <nav id="discovery-inbox-filters" class="actions compact" role="tablist" aria-label="Jobs Inbox views"><span class="muted">All Relevant · New Opportunities · Needs Review · Saved · Applied · Skipped · All Discovered</span></nav>
+          <section class="panel discovery-inbox-panel discovery-view-inbox" hidden>
+            <div class="panel-header"><div><h2>Jobs Inbox</h2><p class="muted helper">New, review, saved, applied, skipped and history stay applicant-specific.</p></div><div class="actions compact"><button class="button ghost small" type="button" id="inbox-audit-history">Audit history</button><button class="button ghost small" type="button" id="inbox-reassess-history">Preview reassessment</button><button class="button ghost small" type="button" id="inbox-bulk-save">Save selected</button><button class="button ghost small" type="button" id="inbox-bulk-skip">Skip selected</button><button class="button ghost small" type="button" id="inbox-bulk-applied">Confirm selected Applied</button><button class="button ghost small" type="button" id="refresh-discovery-inbox">Refresh</button></div></div>
+            <div id="inbox-audit-summary" class="muted helper" role="status" hidden></div>
+            <nav id="discovery-inbox-filters" class="actions compact" role="navigation" aria-label="Jobs Inbox views"><span class="muted">New Jobs · Needs Review · History</span></nav>
             <div id="discovery-inbox" class="generated-output empty">No discovered opportunities yet.</div>
           </section>
 
@@ -449,6 +460,9 @@
           <div class="panel-header">
             <h2>Applications</h2>
             <button class="button ghost small" type="button" id="open-all-discovered">All Discovered history</button>
+            <button class="button ghost small" type="button" id="open-applied-applications">Applied <span id="applications-applied-count">0</span></button>
+            <button class="button ghost small" type="button" id="open-ready-applications">Ready to Apply <span id="applications-ready-count">0</span></button>
+            <span class="muted" id="applications-selected-applicant" aria-live="polite"></span>
             <div class="filter-row">
               <input id="search" placeholder="Search company, title, notes">
               <select id="status-filter"><option value="">All statuses</option>{% for status in statuses %}<option>{{ status }}</option>{% endfor %}</select>
@@ -468,6 +482,23 @@
               </select>
             </div>
           </div>
+          <details class="settings-block" id="historical-application-panel">
+            <summary>Record an application made before Job Tracker</summary>
+            <p class="muted helper">Preview first. Exact source identity is matched automatically; similar company/title records are held as Possible Duplicate for review.</p>
+            <div class="grid four">
+              <label>Posting URL<input id="historical-application-url" type="url" placeholder="https://…"></label>
+              <label>Company<input id="historical-application-company"></label>
+              <label>Title<input id="historical-application-title"></label>
+              <label>Application date<input id="historical-application-date" type="date"></label>
+            </div>
+            <label>CSV history (optional)<input id="historical-application-csv" type="file" accept=".csv,text/csv"></label>
+            <div class="actions">
+              <button class="button ghost" type="button" id="historical-application-preview">Preview import</button>
+              <button class="button" type="button" id="historical-application-confirm" hidden>Confirm recorded applications</button>
+            </div>
+            <div id="historical-application-outcomes" class="muted helper" aria-live="polite"></div>
+            <div id="historical-duplicate-matches" class="muted helper" aria-live="polite"></div>
+          </details>
           <div class="table-wrap">
             <table>
               <thead>

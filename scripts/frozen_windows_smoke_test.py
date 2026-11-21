@@ -40,6 +40,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="job-tracker-frozen-smoke-") as data_root:
         env = os.environ.copy()
         env["JOB_TRACKER_DATA_DIR"] = data_root
+        env["JOB_TRACKER_TEST_MODE"] = "1"
         env["JOB_TRACKER_VERSION"] = "0.0.0-frozen-smoke"
         env["JOB_TRACKER_EXIT_TOKEN"] = "frozen-smoke-exit-token"
         process = subprocess.Popen([str(executable)], env=env, cwd=str(executable.parent))

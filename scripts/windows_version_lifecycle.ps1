@@ -9,34 +9,46 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $script:Phase = 'initialization'
+$script:PhaseStarted = Get-Date
 $script:InstallerTimeoutSeconds = 120
+$script:SchemaTimeoutSeconds = 30
+$script:CleanupTimeoutSeconds = 30
 
 function Set-Phase([string]$name) {
     $script:Phase = $name
-    Write-Host "[lifecycle] $name"
+    $script:PhaseStarted = Get-Date
+    Write-Host "[lifecycle] START $name at $($script:PhaseStarted.ToString('o'))"
+}
+
+function Complete-Phase([string]$detail = '') {
+    $elapsed = ((Get-Date) - $script:PhaseStarted).TotalSeconds
+    Write-Host "[lifecycle] END $($script:Phase) elapsed=$([math]::Round($elapsed, 2))s $detail"
 }
 
 function Stop-ProcessTree([System.Diagnostics.Process]$process, [string]$reason) {
     if ($null -eq $process -or $process.HasExited) { return }
-    Write-Warning "Stopping process $($process.Id) after $reason"
+    Write-Warning "Stopping process $($process.Id) after $reason; phase=$script:Phase"
     $killer = Start-Process -FilePath 'taskkill.exe' -ArgumentList @('/PID', $process.Id, '/T', '/F') -PassThru
     if (!$killer.WaitForExit(10000)) {
         Write-Warning "taskkill did not finish within 10 seconds for PID $($process.Id)"
         Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
     }
     if (!$process.HasExited) { $process.WaitForExit(10000) | Out-Null }
+    Write-Host "[lifecycle] process-stop pid=$($process.Id) exited=$($process.HasExited)"
 }
 
 function Invoke-Installer([string]$installer, [string]$label) {
     Set-Phase "install $label"
     Write-Host "[lifecycle] installer=$installer target=$installDir timeout=${script:InstallerTimeoutSeconds}s"
     $process = Start-Process -FilePath $installer -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=$installDir") -PassThru
+    Write-Host "[lifecycle] installer-start pid=$($process.Id)"
     if (!$process.WaitForExit($script:InstallerTimeoutSeconds * 1000)) {
         Stop-ProcessTree $process 'installer timeout'
         throw "Installer timed out after $($script:InstallerTimeoutSeconds) seconds: $installer"
     }
     Write-Host "[lifecycle] installer exit=$($process.ExitCode)"
     if ($process.ExitCode -ne 0) { throw "Installer failed with exit $($process.ExitCode): $installer" }
+    Complete-Phase "installer exit=$($process.ExitCode)"
 }
 $previousPath = (Resolve-Path $PreviousInstaller).Path
 $currentPath = (Resolve-Path $CurrentInstaller).Path
@@ -69,6 +81,7 @@ function Start-Version([string]$expectedVersion) {
     $exe = Join-Path $installDir 'JobTracker.exe'
     if (!(Test-Path $exe)) { throw 'Installed JobTracker.exe is missing' }
     $script:appProcess = Start-Process -FilePath $exe -PassThru
+    Write-Host "[lifecycle] app-start version=$expectedVersion pid=$($script:appProcess.Id) health-timeout=60s"
     $deadline = (Get-Date).AddSeconds(60)
     $health = $null
     $attempts = 0
@@ -85,11 +98,13 @@ function Start-Version([string]$expectedVersion) {
     if ($version.version -ne $expectedVersion) { throw "Expected $expectedVersion, got $($version.version)" }
     if (!(Test-Path $dbPath)) { throw 'Installed app did not create SQLite database' }
     Write-Host "[lifecycle] healthy version=$($version.version) database=$actual probes=$attempts pid=$($script:appProcess.Id)"
+    Complete-Phase "healthy pid=$($script:appProcess.Id)"
 }
 
 function Stop-Version([bool]$supportsCleanExit) {
     Set-Phase "stop process $($script:appProcess.Id) clean=$supportsCleanExit"
     if ($supportsCleanExit) {
+        Write-Host "[lifecycle] shutdown-request pid=$($script:appProcess.Id) timeout=10s"
         $headers = @{ 'X-Job-Tracker-Exit-Token' = $env:JOB_TRACKER_EXIT_TOKEN }
         $result = $null
         try {
@@ -112,6 +127,7 @@ function Stop-Version([bool]$supportsCleanExit) {
         Stop-ProcessTree $script:appProcess 'historical binary has no clean-exit endpoint'
         Write-Host 'Historical version required forced stop; clean shutdown is untested for that version.'
     }
+    Complete-Phase "stopped clean=$supportsCleanExit"
     $script:appProcess = $null
 }
 
@@ -126,9 +142,61 @@ function Assert-Job([int]$jobId, [string]$appliedDate) {
 
 function Get-SchemaVersion {
     Set-Phase 'inspect SQLite schema'
-    $value = & python -c 'import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); print(db.execute("PRAGMA user_version").fetchone()[0]); db.close()' $dbPath
-    if ($LASTEXITCODE -ne 0) { throw 'Could not inspect SQLite schema version' }
-    return [int]$value
+    $outputPath = Join-Path $root ("schema-" + [guid]::NewGuid().ToString() + '.out')
+    $errorPath = Join-Path $root ("schema-" + [guid]::NewGuid().ToString() + '.err')
+    $schemaScriptPath = Join-Path $root ("schema-" + [guid]::NewGuid().ToString() + '.py')
+    @'
+import sqlite3
+import sys
+
+db = sqlite3.connect(sys.argv[1], timeout=5)
+try:
+    print(db.execute("PRAGMA user_version").fetchone()[0])
+finally:
+    db.close()
+'@ | Set-Content -LiteralPath $schemaScriptPath -Encoding utf8
+    # Passing a script path avoids PowerShell/Start-Process quoting changes to
+    # inline Python code containing SQL quotes and semicolons.
+    # Start-Process joins ArgumentList into one command line. Quote both
+    # paths explicitly because the disposable database lives under the
+    # application's `Job Tracker` directory. Without this, Python receives
+    # only the prefix before the space and silently opens a different SQLite
+    # file, making a real migration look like schema 0 -> 0.
+    $pythonArgs = @('"' + $schemaScriptPath + '"', '"' + $dbPath + '"')
+    Write-Host "[lifecycle] schema-inspect-db=$dbPath script=$schemaScriptPath"
+    $process = Start-Process -FilePath 'python' -ArgumentList $pythonArgs -RedirectStandardOutput $outputPath -RedirectStandardError $errorPath -PassThru
+    Write-Host "[lifecycle] schema-inspect-start pid=$($process.Id) timeout=${script:SchemaTimeoutSeconds}s db=$dbPath"
+    try {
+        if (!$process.WaitForExit($script:SchemaTimeoutSeconds * 1000)) {
+            Stop-ProcessTree $process 'SQLite schema inspection timeout'
+            throw "SQLite schema inspection timed out after $($script:SchemaTimeoutSeconds) seconds"
+        }
+        $stderr = if (Test-Path $errorPath) { (@(Get-Content $errorPath -Raw -ErrorAction SilentlyContinue) -join '') } else { '' }
+        $stderr = $stderr -replace '^\s+|\s+$', ''
+        if ($process.ExitCode -ne 0) { throw "Could not inspect SQLite schema version (exit $($process.ExitCode)): $stderr" }
+        $value = if (Test-Path $outputPath) { (@(Get-Content $outputPath -Raw -ErrorAction SilentlyContinue) -join '') } else { '' }
+        $value = $value -replace '^\s+|\s+$', ''
+        if ($value -notmatch '^\d+$') { throw "SQLite schema inspection returned invalid output: $value" }
+        Complete-Phase "schema=$value pid=$($process.Id)"
+        return [int]$value
+    } finally {
+        Remove-Item $outputPath, $errorPath, $schemaScriptPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Remove-RootBounded([string]$path) {
+    Set-Phase 'cleanup disposable lifecycle root'
+    if (!(Test-Path $path)) { Complete-Phase 'root already absent'; return }
+    $command = "Remove-Item -LiteralPath '$($path.Replace("'", "''"))' -Recurse -Force -ErrorAction Stop"
+    $cleanup = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', $command) -PassThru
+    Write-Host "[lifecycle] cleanup-start pid=$($cleanup.Id) timeout=${script:CleanupTimeoutSeconds}s root=$path"
+    if (!$cleanup.WaitForExit($script:CleanupTimeoutSeconds * 1000)) {
+        Stop-ProcessTree $cleanup 'disposable root cleanup timeout'
+        Write-Warning "Cleanup timed out; leaving runner-owned root for diagnostics: $path"
+        return
+    }
+    if ($cleanup.ExitCode -ne 0) { Write-Warning "Cleanup exited $($cleanup.ExitCode); leaving root for diagnostics: $path"; return }
+    Complete-Phase "cleanup exit=$($cleanup.ExitCode)"
 }
 
 try {
@@ -183,11 +251,6 @@ try {
     if ($null -eq $originalDataDir) { Remove-Item Env:JOB_TRACKER_DATA_DIR -ErrorAction SilentlyContinue } else { $env:JOB_TRACKER_DATA_DIR = $originalDataDir }
     if ($null -eq $originalExitToken) { Remove-Item Env:JOB_TRACKER_EXIT_TOKEN -ErrorAction SilentlyContinue } else { $env:JOB_TRACKER_EXIT_TOKEN = $originalExitToken }
     if ($root -and $root.StartsWith($env:RUNNER_TEMP) -and (Test-Path $root)) {
-        try {
-            Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction Stop
-            Write-Host "[lifecycle] cleanup removed $root"
-        } catch {
-            Write-Warning "Cleanup could not remove ${root}: $($_.Exception.Message)"
-        }
+        try { Remove-RootBounded $root } catch { Write-Warning "Cleanup failed safely: $($_.Exception.Message)" }
     }
 }

@@ -349,3 +349,18 @@ def test_internship_preference_is_an_authoritative_backend_gate():
     assert discovery_result_category(job)[0] == "excluded"
     job["discovery_include_internships"] = True
     assert discovery_result_category(job)[0] != "excluded"
+
+
+def test_grounded_unrelated_titles_are_excluded_but_vague_titles_stay_reviewable():
+    base = {"discovery_occupation": "software developer", "discovery_search_mode": "shortlist", "role_type": "software_developer"}
+    for title in ("CNC Machinist", "Bridge Engineer", "Registered Nurse Contractor", "Coding Instructor - Part-Time", "Production support - Mainframe (NOT developer)"):
+        category, reason = discovery_result_category({**base, "title": title})
+        assert category == "excluded"
+        assert "non-software occupation" in reason
+    category, _ = discovery_result_category({**base, "title": "Role A"})
+    assert category == "review_required"
+
+
+def test_related_software_title_gate_does_not_exclude_normal_coops_when_enabled():
+    job = {"title": "AI Software Engineer - 12 Month Co-op", "role_type": "intern", "discovery_occupation": "software developer", "discovery_include_internships": True}
+    assert discovery_result_category(job)[0] != "excluded"
