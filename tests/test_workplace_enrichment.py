@@ -214,3 +214,38 @@ def test_universal_workplace_finder_handles_swe_saved_description_and_owner_conf
         saved = next(item for item in restarted if item["id"] == created["id"])
         assert saved["workplace_precision"] == "owner-confirmed"
         assert saved["workplace_address"].startswith("1200 Bayview Avenue")
+
+
+def test_saved_search_run_restores_exact_28_job_workplace_cohort_after_restart():
+    with tempfile.TemporaryDirectory() as directory:
+        app_module.DATA_DIR = Path(directory)
+        app_module.DB_PATH = app_module.DATA_DIR / "test.sqlite"
+        app_module._INITIALIZED_DATABASE_PATH = None
+        app_module.app.config.update(TESTING=True)
+        client = app_module.app.test_client()
+        profile = client.post("/api/candidate-profiles", json={"name": "ECE QA", "workflow": "ece"}).get_json()
+        search_id = "e" * 32
+        job_ids = []
+        for index in range(28):
+            job = client.post("/api/jobs", json={
+                "title": "RECE", "company": f"Centre {index}", "location": "Toronto, ON",
+                "url": f"https://example.test/ece/{index}", "source": "indeed",
+                "discovery_first_seen_at": "2026-11-20", "discovery_result_category": "actionable",
+                "candidate_profile_id": profile["id"],
+            }).get_json()
+            job_ids.append(job["id"])
+        with app_module.app.app_context():
+            app_module.get_db().executemany(
+                "INSERT INTO discovery_search_memberships(search_execution_id, job_id, applicant_profile_id, category, criteria_json, created_at) VALUES (?, ?, ?, 'actionable', ?, ?)",
+                [(search_id, job_id, profile["id"], '{"keywords":"RECE","occupation":"ece"}', f"2026-11-20 10:{index:02d}:00") for index, job_id in enumerate(job_ids)],
+            )
+            app_module.get_db().commit()
+        first = client.get(f"/api/discovery/inbox/search-runs?candidate_profile_id={profile['id']}").get_json()
+        assert first[0]["search_id"] == search_id
+        assert first[0]["actionable_count"] == 28
+        assert first[0]["actionable_job_ids"] == job_ids
+        app_module._INITIALIZED_DATABASE_PATH = None
+        restored = client.get(f"/api/discovery/inbox/search-runs?candidate_profile_id={profile['id']}").get_json()
+        assert restored[0]["search_id"] == search_id
+        assert restored[0]["workflow"] == "ece"
+        assert restored[0]["actionable_job_ids"] == job_ids

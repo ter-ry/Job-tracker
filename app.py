@@ -10263,7 +10263,11 @@ def enrich_existing_workplace_locations(*, apply: bool = False, limit: int = 25,
     # The browser may send the durable actionable IDs to prove applicant and
     # search membership.  Keep pagination independent of whether that explicit
     # cohort list was supplied.
-    page_offset = max(0, int(offset or 0)) if (not requested_ids or len(requested_ids) > clamp_int(limit, 1, 50)) else 0
+    # A selected search is a durable cohort. Even when the browser sends all
+    # member IDs as proof of scope, offset must advance through that cohort.
+    # An explicit apply request names only the preview records being applied,
+    # so it must process those IDs regardless of the preview page offset.
+    page_offset = 0 if apply and requested_ids else max(0, int(offset or 0))
     rows = query_db(f"SELECT * FROM jobs WHERE {' AND '.join(conditions)} ORDER BY id LIMIT ? OFFSET ?", [*args, clamp_int(limit, 1, 50), page_offset])
     summary = {**empty, "offset": max(0, int(offset or 0)), "next_offset": max(0, int(offset or 0)) + len(rows), "has_more": max(0, int(offset or 0)) + len(rows) < int(total["count"] or 0), "before_counts": before_counts, "after_counts": dict(before_counts), "cohort_total": len(cohort_ids), "search_execution_id": execution_id}
     for row in rows:

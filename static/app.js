@@ -296,6 +296,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("discovery-test-sources").addEventListener("click", testJobSources);
   document.getElementById("discovery-recalculate-distances")?.addEventListener("click", recalculateDiscoveryDistances);
   document.getElementById("discovery-enrich-workplaces")?.addEventListener("click", previewWorkplaceEnrichment);
+  document.getElementById("workplace-enrichment-search")?.addEventListener("change", (event) => selectWorkplaceSearchRun(event.target.value));
   document.addEventListener("click", (event) => {
     const button = event.target.closest("[data-confirm-workplace]");
     if (button) confirmWorkplace(button.dataset.confirmWorkplace);
@@ -579,6 +580,22 @@ async function loadWorkplaceSearchRuns() {
     const status = document.getElementById("workplace-enrichment-selection-status");
     if (status) status.textContent = `Saved search runs unavailable: ${error.message}`;
   }
+}
+
+function selectWorkplaceSearchRun(searchId) {
+  const run = (state.workplaceEnrichmentRuns || []).find((item) => item.search_id === String(searchId));
+  if (!run) return;
+  state.workplaceEnrichmentSearchId = run.search_id;
+  state.workplaceEnrichmentSearch = run;
+  state.workplaceEnrichmentOffset = 0;
+  state.workplaceEnrichmentNextOffset = 0;
+  state.workplaceEnrichmentHasMore = false;
+  const preview = document.getElementById("workplace-enrichment-preview");
+  if (preview) {
+    preview.classList.add("empty");
+    preview.textContent = "Workplace enrichment preview details will appear here.";
+  }
+  renderWorkplaceSearchRuns();
 }
 
 async function loadCandidateProfiles({ reloadPanelsOnSelectionChange = false } = {}) {
@@ -3685,10 +3702,10 @@ async function previewWorkplaceEnrichment(event, nextBatch = false) {
     const offset = nextBatch ? Number(state.workplaceEnrichmentNextOffset || state.workplaceEnrichmentOffset || 0) : Number(state.workplaceEnrichmentOffset || 0);
     const searchId = state.workplaceEnrichmentSearchId || state.discoveryLastSearchId || "";
     const selectedRun = state.workplaceEnrichmentRuns.find((run) => run.search_id === searchId) || state.workplaceEnrichmentSearch;
-    const visibleJobIds = (state.discoveryResults || [])
-      .filter((job) => ["actionable", "review_required"].includes(job?.discovery_result_category) && Number(job?.id) > 0)
-      .map((job) => Number(job.id));
-    const selectedJobIds = visibleJobIds.length ? visibleJobIds : (selectedRun?.actionable_job_ids || []);
+    if (!searchId || !selectedRun) throw new Error("Choose a completed search before finding workplaces. The selected search could not be restored.");
+    // Durable membership is authoritative after restart; never substitute
+    // current in-memory discovery rows from another search.
+    const selectedJobIds = Array.isArray(selectedRun.actionable_job_ids) ? selectedRun.actionable_job_ids : [];
     const preview = await api.send("/api/jobs/enrich-workplace-locations", "POST", {
       apply: false,
       limit: 25,
