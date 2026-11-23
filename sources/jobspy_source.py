@@ -327,8 +327,10 @@ def _fetch_jobspy_jobs_serial(
                     "country_indeed": country_indeed,
                     "hours_old": hours_old,
                     # Request the provider description when JobSpy supports it.
-                    # Without this, LinkedIn rows often arrive as title/URL-only
-                    # records and cannot be qualified transparently.
+                    # JobSpy 1.4.1 uses fetch_description for Glassdoor and
+                    # other providers; linkedin_fetch_description is only a
+                    # deprecated compatibility alias for LinkedIn.
+                    "fetch_description": True,
                     "linkedin_fetch_description": bool(fetch_linkedin_description),
                     "verbose": 0,
                 }
@@ -742,7 +744,7 @@ STREET_PATTERN = re.compile(
     r"(?:Street|St\.?|Avenue|Ave\.?|Road|Rd\.?|Drive|Dr\.?|Boulevard|Blvd\.?|Way|"
     r"Parkway|Pkwy\.?|Crescent|Cres\.?|Court|Ct\.?|Lane|Ln\.?|Trail|Highway|Hwy\.?|"
     r"Terrace|Ter\.?|Place|Pl\.?|Square|Sq\.?|Circle|Cir\.?|Gate|Gardens?|Garden|"
-    r"Manor|Mews|Path|Row|Quay)\b",
+    r"Manor|Mews|Path|Row|Quay)(?:\s+(?:North|South|East|West|N|S|E|W))?\b",
     re.I,
 )
 WORKPLACE_CUE = re.compile(
@@ -754,6 +756,11 @@ NON_WORKPLACE_CUE = re.compile(r"\b(?:headquarters|corporate|mailing|registered)
 WORKPLACE_LABEL_CUE = re.compile(
     r"\b(?:location|work\s+location|our\s+centre|our\s+center|located\s+at|worksite|campus|"
     r"centre\s+address|center\s+address|reporting\s+location|based\s+at)\b\s*[:\-]?",
+    re.I,
+)
+EARLY_CHILDHOOD_FACILITY_CUE = re.compile(
+    r"\b(?:day\s*care|daycare|child\s*care|childcare|early\s+(?:learning|childhood)|"
+    r"preschool|nursery|kindergarten)\b",
     re.I,
 )
 
@@ -829,7 +836,26 @@ def _structured_location_item(value: Any, evidence_source: str) -> list[dict[str
     return values
 
 
-def _text_workplace_values(text: str, evidence_source: str = "description advertised workplace") -> list[dict[str, Any]]:
+def _has_standalone_facility_context(text: str, match: re.Match[str], context_hint: str = "") -> bool:
+    """Allow an address line under a facility heading, without broad guessing.
+
+    Some provider descriptions preserve a daycare's title/header and address
+    but omit labels such as ``Location:``.  A standalone address line paired
+    with an early-childhood facility title is useful evidence.  Conversational
+    contact text, corporate offices and mailing addresses remain excluded.
+    """
+    nearby = text[max(0, match.start() - 180):min(len(text), match.end() + 100)]
+    if NON_WORKPLACE_CUE.search(nearby):
+        return False
+    line_start = max(text.rfind("\n", 0, match.start()) + 1, text.rfind("|", 0, match.start()) + 1)
+    line_end_candidates = [value for value in (text.find("\n", match.end()), text.find("|", match.end())) if value >= 0]
+    line_end = min(line_end_candidates) if line_end_candidates else len(text)
+    line = text[line_start:line_end].strip(" -•;:")
+    standalone_address = line.startswith(match.group(0)) and len(line) <= 180
+    return bool(standalone_address and EARLY_CHILDHOOD_FACILITY_CUE.search(context_hint))
+
+
+def _text_workplace_values(text: str, evidence_source: str = "description advertised workplace", context_hint: str = "") -> list[dict[str, Any]]:
     """Extract labelled street/postal worksite evidence from plain text."""
     text = _plain_location_text(text)
     candidates: list[dict[str, Any]] = []
@@ -839,7 +865,7 @@ def _text_workplace_values(text: str, evidence_source: str = "description advert
         if NON_WORKPLACE_CUE.search(nearby):
             continue
         label_match = WORKPLACE_LABEL_CUE.search(text[max(0, match.start() - 220):match.start()])
-        if not label_match and not WORKPLACE_CUE.search(text[max(0, match.start() - 220):match.start()]):
+        if not label_match and not WORKPLACE_CUE.search(text[max(0, match.start() - 220):match.start()]) and not _has_standalone_facility_context(text, match, context_hint):
             continue
         address, evidence = _address_evidence(text, match, street_matches[index + 1].start() if index + 1 < len(street_matches) else None)
         postal = re.search(POSTAL_PATTERN, text[match.end():min(len(text), match.end() + 100)], re.I)
@@ -960,7 +986,8 @@ def extract_workplace_alternatives(row: dict[str, Any], description: str, provid
         if not any(clean(item.get("address")).lower() == field_value.lower() for item in candidates):
             candidates.append(provider_candidate)
     plain_description = _plain_location_text(description or "")
-    text_candidates = _text_workplace_values(plain_description)
+    context_hint = " ".join(clean(row.get(key)) for key in ("title", "provider_title", "title_header") if clean(row.get(key)))
+    text_candidates = _text_workplace_values(plain_description, context_hint=context_hint)
     for item in text_candidates:
         if not any(
             clean(existing.get("address")).lower() == clean(item.get("address")).lower()
@@ -978,7 +1005,7 @@ def extract_workplace_alternatives(row: dict[str, Any], description: str, provid
         nearby_context = plain_description[max(0, match.start() - 240):min(len(plain_description), match.end() + 80)]
         if NON_WORKPLACE_CUE.search(nearby_context[-150:]):
             continue
-        if not WORKPLACE_CUE.search(context):
+        if not WORKPLACE_CUE.search(context) and not _has_standalone_facility_context(plain_description, match, context_hint):
             continue
         address, evidence = _address_evidence(plain_description, match, matches[index + 1].start() if index + 1 < len(matches) else None)
         postal_match = re.search(POSTAL_PATTERN, address, re.I)

@@ -22,6 +22,7 @@ def test_adapter_records_full_rows_evidence_and_deduplicates_diagnostic_identity
         assert kwargs["country_indeed"] == "Canada"
         assert kwargs["distance"] == 31  # 50 km converted to JobSpy miles
         assert kwargs["description_format"] == "markdown"
+        assert kwargs["fetch_description"] is True
         return [
             {
                 "id": "same-id",
@@ -172,3 +173,30 @@ def test_second_location_layer_rejects_corporate_address_and_remote_location():
         "description": "Work from home across Canada. Mailing address: 100 Main Street, Toronto, ON M5V 1L9.",
     }, "indeed")
     assert remote["workplace_alternatives"] == []
+
+
+def test_daycare_title_can_authorize_a_standalone_address_line_without_label():
+    from sources.jobspy_source import normalize_jobspy_row
+
+    normalized = normalize_jobspy_row({
+        "title": "RECE - City Place Daycare",
+        "location": "Toronto, ON",
+        "description": "City Place Daycare\n350 Queens Quay West\nToronto, ON",
+    }, "indeed")
+    assert any(item["address"] == "350 Queens Quay West" for item in normalized["workplace_alternatives"])
+
+
+def test_facility_context_does_not_authorize_headquarters_mailing_or_contact_addresses():
+    from sources.jobspy_source import normalize_jobspy_row
+
+    for description in (
+        "City Place Daycare\nCorporate headquarters: 500 King Street, Toronto, ON M5V 1L9.",
+        "City Place Daycare\nMailing address: 500 King Street, Toronto, ON M5V 1L9.",
+        "City Place Daycare\nContact us at 500 King Street, Toronto, ON M5V 1L9.",
+    ):
+        normalized = normalize_jobspy_row({
+            "title": "RECE - City Place Daycare",
+            "location": "Toronto, ON",
+            "description": description,
+        }, "indeed")
+        assert normalized["workplace_alternatives"] == []
