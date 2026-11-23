@@ -98,6 +98,30 @@ def _previous_location(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _raw_location_fields(row: dict[str, Any]) -> list[dict[str, str]]:
+    """Expose saved JobSpy location-shaped fields without treating them as proof."""
+    fields: list[dict[str, str]] = []
+    keys = {"location", "job_location", "joblocation", "location_header", "title_header", "street_address", "postal_code", "postcode", "zip_code", "address"}
+
+    def visit(value: Any, path: str) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                child = f"{path}.{key}" if path else str(key)
+                if str(key).casefold() in keys and not isinstance(item, (dict, list)) and _text(item):
+                    fields.append({"field": child, "value": _text(item)})
+                elif isinstance(item, (dict, list)):
+                    visit(item, child)
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                visit(item, f"{path}[{index}]")
+
+    for key in ("location", "provider_location", "location_header", "title_header", "job_location", "street_address", "postal_code", "address"):
+        if _text(row.get(key)):
+            fields.append({"field": key, "value": _text(row[key])})
+    visit(_json(row.get("provider_raw_json"), {}), "provider_raw_json")
+    return fields
+
+
 def replay_cohort(db: sqlite3.Connection, search_id: str, applicant_id: int, expected_count: int | None = None) -> dict[str, Any]:
     rows = db.execute(
         """SELECT j.*, m.category AS membership_category, m.reason AS membership_reason
@@ -115,6 +139,7 @@ def replay_cohort(db: sqlite3.Connection, search_id: str, applicant_id: int, exp
         description = _text(row.get("job_description"))
         provider_location = _text(row.get("provider_location") or row.get("location"))
         previous = _previous_location(row)
+        raw_location_fields = _raw_location_fields(row)
         alternatives = _dedupe_candidates(extract_workplace_alternatives(row, description, provider_location))
         parsed = extract_workplace_location(row, description, provider_location)
         candidate_keys = {_canonical_address(item.get("address", ""), item.get("postal_code", "")) for item in alternatives}
@@ -134,6 +159,9 @@ def replay_cohort(db: sqlite3.Connection, search_id: str, applicant_id: int, exp
             "title": _text(row.get("title")),
             "employer": _text(row.get("company")),
             "source": _text(row.get("source")),
+            "original_posting_url": _text(row.get("url") or row.get("original_posting_url")),
+            "raw_jobspy_location_fields": raw_location_fields,
+            "normalized_provider_location": provider_location,
             "original_workplace": previous,
             "new_candidates": alternatives,
             "newly_extracted_address": alternatives[0].get("address", "") if len(alternatives) == 1 else "",
@@ -142,6 +170,7 @@ def replay_cohort(db: sqlite3.Connection, search_id: str, applicant_id: int, exp
             "extraction_confidence": max((int(item.get("confidence") or 0) for item in alternatives), default=0),
             "assignment_status": "; ".join(sorted({_text(item.get("assignment_status")) for item in alternatives if _text(item.get("assignment_status"))})),
             "owner_confirmation_required": bool(alternatives),
+            "retrieval_improved_saved_data": outcome == "improved",
             "result": outcome,
             "reason_no_address": reason,
             "parser_result": parsed,
@@ -158,6 +187,7 @@ def replay_cohort(db: sqlite3.Connection, search_id: str, applicant_id: int, exp
         "applicant_profile_id": applicant_id,
         "expected_count": expected_count,
         "cohort_count": len(records),
+        "jobspy_indeed_location_note": "JobSpy 1.4.1's IndeedLocation exposes city, admin1Code and countryCode only; street/postal header evidence is reported when preserved elsewhere, but is not reconstructed from a city-only value.",
         "counts": counts,
         "jobs": records,
     }
@@ -165,9 +195,11 @@ def replay_cohort(db: sqlite3.Connection, search_id: str, applicant_id: int, exp
 
 CSV_FIELDS = (
     "job_id", "title", "employer", "source", "original_workplace",
+    "original_posting_url", "raw_jobspy_location_fields", "normalized_provider_location",
     "newly_extracted_address", "newly_extracted_postal_code",
     "supporting_description_excerpt", "extraction_confidence", "assignment_status",
     "owner_confirmation_required", "result", "reason_no_address",
+    "retrieval_improved_saved_data",
 )
 
 
@@ -178,6 +210,7 @@ def write_csv(report: dict[str, Any], path: str | Path) -> None:
         for item in report["jobs"]:
             row = dict(item)
             row["original_workplace"] = json.dumps(row["original_workplace"], ensure_ascii=False, sort_keys=True)
+            row["raw_jobspy_location_fields"] = json.dumps(row["raw_jobspy_location_fields"], ensure_ascii=False, sort_keys=True)
             writer.writerow({key: row.get(key, "") for key in CSV_FIELDS})
 
 

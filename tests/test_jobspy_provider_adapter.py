@@ -228,6 +228,27 @@ def test_real_st_crispins_address_variants_merge_and_retain_strongest_evidence()
     assert "M1N 1T1" in alternatives[0]["evidence"]
 
 
+def test_indeed_supported_location_header_fields_are_used_when_preserved():
+    from sources.jobspy_source import normalize_jobspy_row
+
+    postal_only = normalize_jobspy_row({
+        "title": "RECE",
+        "location": "Toronto, ON",
+        "location_header": "Toronto, ON M5P 1J4",
+        "description": "Join our early learning team.",
+    }, "indeed")
+    assert postal_only["workplace_postal_code"] == "M5P 1J4"
+
+    street = normalize_jobspy_row({
+        "title": "RECE",
+        "location": "Scarborough, ON",
+        "location_header": "100 Galloway Road, Scarborough, ON M1E 1W7",
+        "description": "Join our early learning team.",
+    }, "indeed")
+    assert street["workplace_address"] == "100 Galloway Road"
+    assert street["workplace_postal_code"] == "M1E 1W7"
+
+
 def test_equivalent_address_merge_keeps_distinct_suites_separate():
     from sources.jobspy_source import extract_workplace_alternatives
 

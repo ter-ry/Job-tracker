@@ -49,6 +49,9 @@ def test_replay_uses_exact_applicant_membership_and_keeps_job_372_unconfirmed(tm
     assert report["network_requests"] == 0
     by_id = {item["job_id"]: item for item in report["jobs"]}
     assert by_id[372]["newly_extracted_address"] == "350 Queens Quay West"
+    assert by_id[372]["original_posting_url"] == "https://example/372"
+    assert by_id[372]["normalized_provider_location"] == "Toronto, ON"
+    assert by_id[372]["raw_jobspy_location_fields"]
     assert by_id[372]["owner_confirmation_required"] is True
     assert by_id[372]["assignment_status"] == "candidate_requires_owner_confirmation"
     assert by_id[373]["result"] == "rejected"
@@ -64,7 +67,7 @@ def test_replay_csv_contains_required_comparison_columns(tmp_path):
     write_csv(report, output)
     with output.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
-    assert {"original_workplace", "newly_extracted_address", "supporting_description_excerpt", "owner_confirmation_required", "result"} <= set(rows[0])
+    assert {"original_posting_url", "raw_jobspy_location_fields", "normalized_provider_location", "original_workplace", "newly_extracted_address", "supporting_description_excerpt", "owner_confirmation_required", "result", "retrieval_improved_saved_data"} <= set(rows[0])
     assert next(row for row in rows if row["job_id"] == "372")["newly_extracted_address"] == "350 Queens Quay West"
 
 
