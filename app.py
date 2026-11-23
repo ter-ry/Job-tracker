@@ -103,6 +103,7 @@ _ACTIVE_DISCOVERY_SEARCHES_LOCK = threading.Lock()
 _ASYNC_DISCOVERY_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="discovery-search")
 _ASYNC_DISCOVERY_LOCK = threading.Lock()
 MAX_FETCH_BYTES = 1_200_000
+MAX_AUTOMATIC_INDEED_WORKPLACE_FETCHES = 5
 # Google remains a backend compatibility key for historical diagnostics, but
 # is intentionally not exposed as a selectable source in the UI.
 DISCOVERY_SOURCES = ["linkedin", "indeed", "zip_recruiter", "glassdoor", "employer_direct"]
@@ -4953,6 +4954,7 @@ def run_discovery_pipeline(
     already_saved_matches = 0
     filtered = 0
     early_filter_reasons: dict[str, int] = {}
+    automatic_workplace_stats = {"considered": 0, "requested": 0, "succeeded": 0, "precise": 0, "city_only": 0, "failed": 0}
     for raw_job in fetched.get("jobs", []):
         clean = normalize_job_payload(jobspy_result_to_job_payload(raw_job))
         clean["candidate_profile_id"] = clamp_int(payload.get("applicant_profile_id") or payload.get("candidate_profile_id"), 0, 10**9)
@@ -4967,6 +4969,12 @@ def run_discovery_pipeline(
         clean["discovery_seniority"] = search.get("seniority")
         clean["title_match_mode"] = search["title_match_mode"]
         clean["discovery_include_internships"] = bool(search.get("include_internships"))
+        clean["source_job_id"] = text(raw_job.get("source_job_id"))
+        remaining_workplace_budget = max(0, MAX_AUTOMATIC_INDEED_WORKPLACE_FETCHES - automatic_workplace_stats["considered"])
+        if remaining_workplace_budget:
+            enrichment = _automatically_enrich_indeed_jobs([clean], limit=remaining_workplace_budget)
+            for key, value in enrichment.items():
+                automatic_workplace_stats[key] += int(value or 0)
         if search["search_mode"] == "title":
             clean["occupation_match_type"], clean["title_match_score"] = classify_title_match(
                 text(clean.get("title")), keywords, search["title_match_mode"]
@@ -4983,7 +4991,6 @@ def run_discovery_pipeline(
         clean["remote_search_eligible"] = "true" if clean.get("remote_search_eligible") is True else "false" if clean.get("remote_search_eligible") is False else "unknown"
         clean["discovery_result_category"], clean["discovery_result_reason"] = discovery_result_category(clean, search["remote_preference"])
         clean["recommendation_eligible"] = clean["discovery_result_category"] == "actionable"
-        clean["source_job_id"] = text(raw_job.get("source_job_id"))
         clean["posted_date"] = text(raw_job.get("posted_date"))
         clean["description_available"] = bool(clean.get("job_description"))
         clean["description_source"] = "jobspy" if clean.get("job_description") else "missing"
@@ -5141,6 +5148,7 @@ def run_discovery_pipeline(
         "origin_geocode_failure_reasons": origin.get("failure_reasons", []),
         "origin_geocode_provider": text(origin.get("provider")),
         "origin_input_redacted": redact_location_input(text(search.get("distance_origin_input"))),
+        "automatic_workplace_enrichment": automatic_workplace_stats,
     }
     save_discovery_search_run(search_key, search, metadata, jobs)
     save_discovery_debug_run(search_key, {**payload, "search_id": search_id}, metadata, fetched.get("source_snapshots", {}))
@@ -5173,6 +5181,7 @@ def run_discovery_pipeline(
             "continuation_available": bool(fetched.get("continuation_available")),
             "continuation_index": int(fetched.get("continuation_index") or 0),
             "pending_query_batches": fetched.get("pending_query_batches", []),
+            "automatic_workplace_enrichment": automatic_workplace_stats,
         },
         "errors": fetched.get("errors", {}),
         "source_counts": fetched.get("source_counts", {}),
@@ -10066,14 +10075,36 @@ def _safe_public_destination(url: str) -> bool:
 
 
 class _SafePublicRedirect(urllib.request.HTTPRedirectHandler):
+    def __init__(self, allowed_hosts: set[str] | None = None):
+        super().__init__()
+        self.allowed_hosts = {text(host).lower().rstrip(".") for host in (allowed_hosts or set()) if text(host)}
+
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         target = urljoin(req.full_url, newurl)
         if not _safe_public_destination(target):
             raise urllib.error.URLError("Redirect target is not a permitted public destination")
+        if self.allowed_hosts and (urlsplit(target).hostname or "").lower().rstrip(".") not in self.allowed_hosts:
+            raise urllib.error.URLError("Redirect target is not an approved job-page host")
         return super().redirect_request(req, fp, code, msg, headers, target)
 
 
-def _enrichment_fetch(url: str, *, max_age_hours: int = 168) -> dict[str, Any]:
+def _approved_job_page_url(job: dict[str, Any], url: str) -> tuple[bool, set[str]]:
+    """Restrict automatic retrieval to the proven Indeed job-page shape."""
+    parsed = urlsplit(normalize_space(url))
+    source = text(job.get("source") or job.get("provider")).lower().replace("-", "_")
+    host = (parsed.hostname or "").lower().rstrip(".")
+    allowed_hosts = {host} if host == "indeed.com" or host.endswith(".indeed.com") else set()
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    job_key = text(job.get("source_job_id") or job.get("job_id"))
+    requested_key = text(query.get("jk"))
+    if source != "indeed" or not allowed_hosts or parsed.scheme not in {"http", "https"} or parsed.path.rstrip("/") != "/viewjob":
+        return False, allowed_hosts
+    if not requested_key or (job_key and requested_key != job_key):
+        return False, allowed_hosts
+    return True, allowed_hosts
+
+
+def _enrichment_fetch(url: str, *, max_age_hours: int = 168, allowed_hosts: set[str] | None = None) -> dict[str, Any]:
     """Fetch one original page with persistent cache and a hard byte/time bound."""
     url = normalize_space(url)
     if not _safe_public_destination(url):
@@ -10088,15 +10119,18 @@ def _enrichment_fetch(url: str, *, max_age_hours: int = 168) -> dict[str, Any]:
             return {"ok": text(cached["status"]) == "ok", "status": text(cached["status"]), "body": text(cached["body"]), "content_type": text(cached["content_type"]), "error": text(cached["error"]), "cached": True}
     request_obj = urllib.request.Request(url, headers={"Accept": "text/html,application/xhtml+xml", "User-Agent": "Job Tracker workplace enrichment/1.0"})
     try:
-        opener = urllib.request.build_opener(_SafePublicRedirect)
+        opener = urllib.request.build_opener(_SafePublicRedirect(allowed_hosts))
         with opener.open(request_obj, timeout=float(os.environ.get("JOB_TRACKER_WORKPLACE_FETCH_TIMEOUT_SECONDS", "8"))) as response:
             body = response.read(1_500_000).decode("utf-8", errors="replace")
             content_type = text(response.headers.get("Content-Type"))
-        result = {"ok": True, "status": "ok", "body": body, "content_type": content_type, "error": "", "cached": False}
+            final_url = text(response.geturl()) if hasattr(response, "geturl") else url
+            if allowed_hosts and (urlsplit(final_url).hostname or "").lower().rstrip(".") not in allowed_hosts:
+                raise urllib.error.URLError("Final URL is not an approved job-page host")
+        result = {"ok": True, "status": "ok", "body": body, "content_type": content_type, "error": "", "cached": False, "final_url": final_url}
     except urllib.error.HTTPError as exc:
-        result = {"ok": False, "status": f"http_{int(exc.code)}", "body": "", "content_type": "", "error": f"HTTP {int(exc.code)}: access denied or unavailable.", "cached": False}
+        result = {"ok": False, "status": f"http_{int(exc.code)}", "body": "", "content_type": "", "error": f"HTTP {int(exc.code)}: access denied or unavailable.", "cached": False, "final_url": ""}
     except Exception as exc:
-        result = {"ok": False, "status": "failed", "body": "", "content_type": "", "error": f"{type(exc).__name__}: {exc}", "cached": False}
+        result = {"ok": False, "status": "failed", "body": "", "content_type": "", "error": f"{type(exc).__name__}: {exc}", "cached": False, "final_url": ""}
     get_db().execute(
         """INSERT INTO workplace_enrichment_cache(url, fetched_at, status, content_type, body, error)
            VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?, ?)
@@ -10117,6 +10151,22 @@ def _visible_job_page_text(page: str) -> str:
     value = re.sub(r"</\s*(?:p|div|li|h[1-6]|tr|td|section)\s*>", "\n", value, flags=re.I)
     value = re.sub(r"<[^>]+>", " ", value)
     return re.sub(r"[ \t]+", " ", value).strip()
+
+
+def _job_page_matches_intended_posting(job: dict[str, Any], page: str, page_url: str) -> bool:
+    """Reject an approved-host page if it no longer identifies this vacancy."""
+    parsed = urlsplit(page_url)
+    if (parsed.hostname or "").lower().endswith("indeed.com"):
+        expected = text(job.get("source_job_id") or job.get("job_id"))
+        page_key = dict(parse_qsl(parsed.query, keep_blank_values=True)).get("jk", "")
+        if expected and page_key and page_key != expected:
+            return False
+        if expected and not page_key:
+            visible = _visible_job_page_text(page).lower()
+            identity_terms = [normalize_space(text(job.get("title"))).lower(), normalize_space(text(job.get("company"))).lower()]
+            identity_terms = [term for term in identity_terms if len(term) >= 4]
+            return any(term in visible for term in identity_terms)
+    return True
 
 
 def _workplace_location_is_plausible(item: dict[str, Any], advertised_location: str) -> bool:
@@ -10171,6 +10221,8 @@ def _extract_workplace_from_page(job: dict[str, Any], page: str, original_url: s
     lowered = page.lower()
     if any(marker in lowered for marker in ("cf-chl-", "__cf$cv$params", "challenge-platform", "just a moment...")):
         return []
+    if not _job_page_matches_intended_posting(job, page, original_url):
+        return []
     structured: list[Any] = []
     for raw in re.findall(r"<script[^>]+type=[\"']application/ld\+json[\"'][^>]*>(.*?)</script>", page, re.I | re.S):
         try:
@@ -10192,6 +10244,72 @@ def _extract_workplace_from_page(job: dict[str, Any], page: str, original_url: s
             continue
         accepted.append(item)
     return accepted
+
+
+def _attach_candidate_workplaces(job: dict[str, Any], alternatives: list[dict[str, Any]], *, source: str) -> dict[str, Any]:
+    """Attach retrieved evidence without turning it into an owner confirmation."""
+    if not alternatives:
+        return job
+    had_existing_precise_workplace = workplace_precision_is_useful(job)
+    alternatives = [dict(item, assignment_status="candidate_unverified") for item in alternatives]
+    job["workplace_alternatives"] = alternatives
+    job["workplace_alternatives_json"] = dumps_json(alternatives)
+    # Keep the legacy scalar fields empty for unconfirmed evidence. The
+    # alternatives remain available to the UI/geocoder and owner confirmation
+    # endpoint, while existing owner-confirmed values are never overwritten.
+    if not had_existing_precise_workplace or "candidate" in text(job.get("workplace_precision")).lower():
+        job["workplace_address"] = ""
+        job["workplace_postal_code"] = ""
+        strongest = max(
+            alternatives,
+            key=lambda item: (text(item.get("precision")).lower() == "street address", bool(item.get("postal_code")), clamp_int(item.get("confidence"), 0, 100)),
+        )
+        job["workplace_precision"] = "candidate street address" if text(strongest.get("precision")).lower() == "street address" else "candidate postal code"
+        job["workplace_confidence"] = clamp_int(strongest.get("confidence"), 0, 100)
+        job["workplace_evidence"] = text(strongest.get("evidence"))
+        job["workplace_evidence_source"] = source
+    return job
+
+
+def _automatically_enrich_indeed_jobs(jobs: list[dict[str, Any]], *, limit: int = MAX_AUTOMATIC_INDEED_WORKPLACE_FETCHES) -> dict[str, int]:
+    """Recover a small number of missing Indeed locations during discovery.
+
+    This deliberately runs after JobSpy normalization but before geographic
+    scoring. It is a bounded sequential queue so Flask/SQLite request state is
+    not shared across worker threads; the persistent URL cache still avoids
+    repeated successful or blocked requests.
+    """
+    stats = {"considered": 0, "requested": 0, "succeeded": 0, "precise": 0, "city_only": 0, "failed": 0}
+    for job in jobs:
+        if stats["considered"] >= max(0, int(limit)):
+            break
+        source = text(job.get("source") or job.get("provider")).lower().replace("-", "_")
+        if source != "indeed" or workplace_precision_is_useful(job):
+            continue
+        original_url = text(job.get("url")) or text(job.get("original_posting_url"))
+        approved, allowed_hosts = _approved_job_page_url(job, original_url)
+        if not approved:
+            continue
+        stats["considered"] += 1
+        stored = _stored_workplace_alternatives(job)
+        if stored:
+            _attach_candidate_workplaces(job, stored, source="saved JobSpy evidence")
+            stats["succeeded"] += 1
+            stats["precise"] += 1
+            continue
+        stats["requested"] += 1
+        fetched = _enrichment_fetch(original_url, allowed_hosts=allowed_hosts)
+        if not fetched.get("ok"):
+            stats["failed"] += 1
+            continue
+        alternatives = _extract_workplace_from_page(job, text(fetched.get("body")), text(fetched.get("final_url")) or original_url)
+        if not alternatives:
+            stats["city_only"] += 1
+            continue
+        _attach_candidate_workplaces(job, alternatives, source="Indeed original posting")
+        stats["succeeded"] += 1
+        stats["precise"] += 1
+    return stats
 
 
 def enrich_existing_workplace_locations(*, apply: bool = False, limit: int = 25, offset: int = 0, candidate_profile_id: int = 0, search_execution_id: str = "", job_ids: list[int] | None = None) -> dict[str, Any]:
@@ -10279,14 +10397,18 @@ def enrich_existing_workplace_locations(*, apply: bool = False, limit: int = 25,
         evidence_source = "saved JobSpy evidence" if alternatives else ""
         fetched = None
         if not alternatives and original_url:
-            fetched = _enrichment_fetch(original_url)
+            approved, allowed_hosts = _approved_job_page_url(job, original_url)
+            if not approved:
+                fetched = {"ok": False, "status": "not_eligible", "error": "Automatic retrieval is limited to approved Indeed job pages."}
+            else:
+                fetched = _enrichment_fetch(original_url, allowed_hosts=allowed_hosts)
             summary["processed"] += 1
             if fetched.get("ok"):
                 alternatives = _extract_workplace_from_page(job, text(fetched.get("body")), original_url)
                 evidence_source = "original posting"
         if not alternatives:
             summary["remained_city_only"] += 1
-            status = "blocked" if fetched and text(fetched.get("status")).startswith("http_") else "city_only"
+            status = "blocked" if fetched and text(fetched.get("status")).startswith("http_") else ("not_eligible" if fetched and text(fetched.get("status")) == "not_eligible" else "city_only")
             if fetched and not fetched.get("ok"):
                 summary["failed"] += 1
             summary["records"].append({"id": job_id, "title": text(job.get("title")), "company": text(job.get("company")), "status": status, "before_precision": before_precision, "after_precision": before_precision, "reason": (fetched or {}).get("error", "No reliable stored workplace evidence."), "url": original_url})

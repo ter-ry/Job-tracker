@@ -34,6 +34,48 @@ def test_workplace_fetch_rejects_local_and_private_destinations():
     assert app_module._safe_public_destination("http://10.0.0.8/job") is False
 
 
+def test_automatic_discovery_enrichment_is_bounded_to_matching_indeed_viewjob(monkeypatch):
+    calls = []
+
+    def fake_fetch(url, **kwargs):
+        calls.append((url, kwargs))
+        return {"ok": True, "body": "<p>Our Centre</p><p>1200 Bayview Avenue, Toronto, ON M4G 1Z8</p>", "final_url": url}
+
+    monkeypatch.setattr(app_module, "_enrichment_fetch", fake_fetch)
+    jobs = [
+        {
+            "source": "Indeed", "source_job_id": "good-1",
+            "url": "https://ca.indeed.com/viewjob?jk=good-1", "location": "Toronto, ON",
+            "title": "RECE", "company": "Example Centre", "workplace_alternatives": [],
+        },
+        {
+            "source": "LinkedIn", "source_job_id": "bad-1",
+            "url": "https://www.linkedin.com/jobs/view/bad-1", "location": "Toronto, ON",
+            "title": "RECE", "company": "Other Centre", "workplace_alternatives": [],
+        },
+    ]
+
+    result = app_module._automatically_enrich_indeed_jobs(jobs, limit=1)
+
+    assert result == {"considered": 1, "requested": 1, "succeeded": 1, "precise": 1, "city_only": 0, "failed": 0}
+    assert len(calls) == 1
+    assert calls[0][0].startswith("https://ca.indeed.com/viewjob?jk=good-1")
+    assert jobs[0]["workplace_alternatives"][0]["assignment_status"] == "candidate_unverified"
+    assert jobs[0]["workplace_precision"] == "candidate street address"
+    assert jobs[1]["workplace_alternatives"] == []
+
+
+def test_indeed_page_identity_mismatch_is_not_used_as_workplace_evidence():
+    job = {
+        "source": "Indeed", "source_job_id": "expected-id", "title": "RECE",
+        "company": "Example Centre", "location": "Toronto, ON",
+    }
+    page = "<h1>RECE</h1><p>Our Centre</p><p>1200 Bayview Avenue, Toronto, ON M4G 1Z8</p>"
+    assert app_module._extract_workplace_from_page(
+        job, page, "https://ca.indeed.com/viewjob?jk=different-id"
+    ) == []
+
+
 def test_workplace_enrichment_is_preview_first_and_persists_evidence():
     with tempfile.TemporaryDirectory() as directory:
         app_module.DATA_DIR = Path(directory)
@@ -44,7 +86,7 @@ def test_workplace_enrichment_is_preview_first_and_persists_evidence():
         profile = client.post("/api/candidate-profiles", json={"name": "ECE QA", "workflow": "ece"}).get_json()
         created = client.post("/api/jobs", json={
             "title": "RECE", "company": "Example Child Care", "location": "Toronto, ON",
-            "url": "https://example.com/jobs/rece-1", "source": "indeed",
+            "url": "https://ca.indeed.com/viewjob?jk=rece-1", "source": "indeed",
             "job_description": "Join our early learning team.", "discovery_first_seen_at": "2026-11-20T00:00:00",
             "discovery_result_category": "actionable", "candidate_profile_id": profile["id"],
         })
@@ -88,7 +130,7 @@ def test_workplace_enrichment_advances_batches_and_requires_selected_applicant()
         for index in range(26):
             response = client.post("/api/jobs", json={
                 "title": "RECE", "company": f"Centre {index}", "location": "Toronto, ON",
-                "url": f"https://example.com/jobs/rece-{index}", "source": "indeed",
+                "url": f"https://ca.indeed.com/viewjob?jk=rece-{index}", "source": "indeed",
                 "job_description": "Join our early learning team.", "discovery_first_seen_at": f"2026-11-20T00:{index:02d}:00",
                 "discovery_result_category": "actionable", "candidate_profile_id": profile["id"],
             })
