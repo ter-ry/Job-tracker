@@ -201,6 +201,44 @@ def test_inline_daycare_sentence_recovers_unconfirmed_workplace_candidate():
     assert recovered[0]["assignment_status"] == "candidate_requires_owner_confirmation"
 
 
+def test_real_macaulay_address_variants_merge_and_retain_postal_code():
+    from sources.jobspy_source import extract_workplace_alternatives
+
+    alternatives = extract_workplace_alternatives(
+        {"title": "RECE - Macaulay Child Development"},
+        "Work location: 270 Laughton Avenue. The centre is at 270 Laughton Avenue Toronto, ON M6N 2X8.",
+        "Toronto, ON",
+    )
+    assert len(alternatives) == 1
+    assert alternatives[0]["address"] == "270 Laughton Avenue Toronto, ON M6N 2X8"
+    assert alternatives[0]["postal_code"] == "M6N 2X8"
+
+
+def test_real_st_crispins_address_variants_merge_and_retain_strongest_evidence():
+    from sources.jobspy_source import extract_workplace_alternatives
+
+    alternatives = extract_workplace_alternatives(
+        {"title": "RECE - St. Crispin's Daycare"},
+        "Work location: 530 Midland Avenue. St. Crispin's Daycare is located at 530 Midland Avenue, Toronto, ON M1N 1T1.",
+        "Toronto, ON",
+    )
+    assert len(alternatives) == 1
+    assert alternatives[0]["address"] == "530 Midland Avenue, Toronto, ON M1N 1T1"
+    assert alternatives[0]["postal_code"] == "M1N 1T1"
+    assert "M1N 1T1" in alternatives[0]["evidence"]
+
+
+def test_equivalent_address_merge_keeps_distinct_suites_separate():
+    from sources.jobspy_source import extract_workplace_alternatives
+
+    alternatives = extract_workplace_alternatives(
+        {"title": "RECE"},
+        "Work locations: 10 Main Street Suite 1, Toronto, ON M5V 1A1; 10 Main Street Suite 2, Toronto, ON M5V 1A1.",
+        "Toronto, ON",
+    )
+    assert len(alternatives) == 2
+
+
 def test_facility_context_does_not_authorize_headquarters_mailing_or_contact_addresses():
     from sources.jobspy_source import normalize_jobspy_row
 

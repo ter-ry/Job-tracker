@@ -747,6 +747,13 @@ STREET_PATTERN = re.compile(
     r"Manor|Mews|Path|Row|Quay)(?:\s+(?:North|South|East|West|N|S|E|W))?\b",
     re.I,
 )
+STREET_TYPE_PATTERN = re.compile(
+    r"\b(?:Street|St\.?|Avenue|Ave\.?|Road|Rd\.?|Drive|Dr\.?|Boulevard|Blvd\.?|Way|"
+    r"Parkway|Pkwy\.?|Crescent|Cres\.?|Court|Ct\.?|Lane|Ln\.?|Trail|Highway|Hwy\.?|"
+    r"Terrace|Ter\.?|Place|Pl\.?|Square|Sq\.?|Circle|Cir\.?|Gate|Gardens?|Garden|"
+    r"Manor|Mews|Path|Row|Quay)(?:\s+(?:North|South|East|West|N|S|E|W))?\b",
+    re.I,
+)
 WORKPLACE_CUE = re.compile(
     r"\b(?:work(?:place|\s+locations?)?|job\s+locations?|locations?|sites?|centres?|centers?|office|"
     r"based|located|report(?:ing)?\s+to|float\s+(?:between|across|among)|work\s+at)\b",
@@ -960,6 +967,74 @@ def _address_evidence(description: str, match: re.Match[str], next_start: int | 
     return address, evidence or address
 
 
+def _workplace_address_parts(address: str) -> tuple[str, str]:
+    """Return a street/unit identity while ignoring appended city text."""
+    raw = clean(address)
+    match = STREET_PATTERN.search(raw)
+    if match:
+        value = match.group(0)
+        first_street_type = STREET_TYPE_PATTERN.search(value)
+        if first_street_type:
+            value = value[:first_street_type.end()]
+        trailing = raw[match.end():]
+        # Preserve unit/suite identity; it can distinguish genuinely
+        # different workplaces in the same building.
+        unit = re.search(r"\b(?:suite|unit|apt\.?|apartment|#)\s*[A-Za-z0-9-]+", trailing, re.I)
+        if unit:
+            value = f"{value} {unit.group(0)}"
+    else:
+        value = raw
+    value = re.sub(r"[^a-z0-9#]+", " ", value.casefold()).strip()
+    replacements = {
+        "street": "st", "avenue": "ave", "road": "rd", "drive": "dr",
+        "boulevard": "blvd", "place": "pl", "court": "ct", "lane": "ln",
+        "west": "w", "east": "e", "north": "n", "south": "s",
+    }
+    value = " ".join(replacements.get(part, part) for part in value.split())
+    postal = re.search(POSTAL_PATTERN, raw, re.I)
+    normalized_postal = re.sub(r"[^a-z0-9]", "", postal.group(0).casefold()) if postal else ""
+    return (value, normalized_postal) if match else ("", normalized_postal)
+
+
+def _same_workplace_address(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    left_street, left_postal = _workplace_address_parts(clean(left.get("address")))
+    right_street, right_postal = _workplace_address_parts(clean(right.get("address")))
+    left_postal = left_postal or re.sub(r"[^a-z0-9]", "", clean(left.get("postal_code")).casefold())
+    right_postal = right_postal or re.sub(r"[^a-z0-9]", "", clean(right.get("postal_code")).casefold())
+    if left_street and right_street:
+        return left_street == right_street and not (left_postal and right_postal and left_postal != right_postal)
+    return bool(left_postal and right_postal and left_postal == right_postal)
+
+
+def _merge_workplace_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Deduplicate equivalent extraction results without choosing branches."""
+    merged: list[dict[str, Any]] = []
+    for candidate in candidates:
+        match = next((item for item in merged if _same_workplace_address(item, candidate)), None)
+        if match is None:
+            merged.append(dict(candidate))
+            continue
+        candidate_postal = clean(candidate.get("postal_code"))
+        match_postal = clean(match.get("postal_code"))
+        if candidate_postal and not match_postal:
+            match["postal_code"] = candidate_postal
+        if len(clean(candidate.get("address"))) > len(clean(match.get("address"))):
+            match["address"] = candidate.get("address")
+        if int(candidate.get("confidence") or 0) > int(match.get("confidence") or 0):
+            match["confidence"] = candidate.get("confidence")
+        evidence_candidates = [match, candidate]
+        strongest = max(evidence_candidates, key=lambda item: (int(item.get("confidence") or 0), len(clean(item.get("evidence")))))
+        for key in ("evidence", "evidence_source", "extraction_method"):
+            if clean(strongest.get(key)):
+                match[key] = strongest.get(key)
+        statuses = {clean(match.get("assignment_status")), clean(candidate.get("assignment_status"))}
+        if "candidate_requires_owner_confirmation" in statuses:
+            match["assignment_status"] = "candidate_requires_owner_confirmation"
+        elif "advertised_alternative" in statuses:
+            match["assignment_status"] = "advertised_alternative"
+    return merged
+
+
 def extract_workplace_alternatives(row: dict[str, Any], description: str, provider_location: str = "") -> list[dict[str, Any]]:
     """Return every explicit advertised workplace without choosing an assigned site."""
     provider_location = clean(provider_location or row.get("location") or row.get("provider_location"))
@@ -993,13 +1068,9 @@ def extract_workplace_alternatives(row: dict[str, Any], description: str, provid
     plain_description = _plain_location_text(description or "")
     context_hint = " ".join(clean(row.get(key)) for key in ("title", "provider_title", "title_header") if clean(row.get(key)))
     text_candidates = _text_workplace_values(plain_description, context_hint=context_hint)
-    for item in text_candidates:
-        if not any(
-            clean(existing.get("address")).lower() == clean(item.get("address")).lower()
-            or (clean(existing.get("postal_code")).upper() and clean(existing.get("postal_code")).upper() == clean(item.get("postal_code")).upper())
-            for existing in candidates
-        ):
-            candidates.append(item)
+    # Keep both extraction passes until the shared merge below so a richer
+    # second pass can supply the postal code/evidence for the same site.
+    candidates.extend(text_candidates)
     matches = list(STREET_PATTERN.finditer(plain_description))
     for index, match in enumerate(matches):
         context = plain_description[max(0, match.start() - 180):match.start()]
@@ -1010,13 +1081,11 @@ def extract_workplace_alternatives(row: dict[str, Any], description: str, provid
         nearby_context = plain_description[max(0, match.start() - 240):min(len(plain_description), match.end() + 80)]
         if NON_WORKPLACE_CUE.search(nearby_context[-150:]):
             continue
-        if not WORKPLACE_CUE.search(context) and not _has_standalone_facility_context(plain_description, match, context_hint):
+        facility_context = _has_standalone_facility_context(plain_description, match, context_hint)
+        if not WORKPLACE_CUE.search(context) and not facility_context:
             continue
         address, evidence = _address_evidence(plain_description, match, matches[index + 1].start() if index + 1 < len(matches) else None)
         postal_match = re.search(POSTAL_PATTERN, address, re.I)
-        canonical = clean(STREET_PATTERN.search(address).group(0) if STREET_PATTERN.search(address) else address).lower()
-        if any(clean(item.get("address")).lower().startswith(canonical) or canonical.startswith(clean(item.get("address")).lower()) for item in candidates):
-            continue
         candidate = {
             "address": address,
             "postal_code": postal_match.group(0).upper() if postal_match else "",
@@ -1024,10 +1093,10 @@ def extract_workplace_alternatives(row: dict[str, Any], description: str, provid
             "confidence": 95,
             "evidence": evidence,
             "evidence_source": "description advertised workplace",
-            "assignment_status": "advertised_alternative" if len(matches) > 1 else "confirmed",
+            "assignment_status": "candidate_requires_owner_confirmation" if facility_context else "confirmed",
         }
-        if not any(clean(item.get("address")).lower().startswith(canonical) or canonical.startswith(clean(item.get("address")).lower()) for item in candidates):
-            candidates.append(candidate)
+        candidates.append(candidate)
+    candidates = _merge_workplace_candidates(candidates)
     if len(candidates) > 1:
         for item in candidates:
             item["assignment_status"] = "advertised_alternative"
