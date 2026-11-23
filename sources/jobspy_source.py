@@ -837,22 +837,25 @@ def _structured_location_item(value: Any, evidence_source: str) -> list[dict[str
 
 
 def _has_standalone_facility_context(text: str, match: re.Match[str], context_hint: str = "") -> bool:
-    """Allow an address line under a facility heading, without broad guessing.
+    """Allow facility-nearby address evidence, without broad guessing.
 
     Some provider descriptions preserve a daycare's title/header and address
     but omit labels such as ``Location:``.  A standalone address line paired
-    with an early-childhood facility title is useful evidence.  Conversational
-    contact text, corporate offices and mailing addresses remain excluded.
+    with an early-childhood facility title, or an inline ``daycare ... at
+    <address>`` sentence, is useful evidence.  Conversational contact text,
+    corporate offices and mailing addresses remain excluded.
     """
     nearby = text[max(0, match.start() - 180):min(len(text), match.end() + 100)]
-    if NON_WORKPLACE_CUE.search(nearby):
+    if NON_WORKPLACE_CUE.search(nearby) or re.search(r"\b(?:contact|call|email)\b", nearby, re.I):
         return False
     line_start = max(text.rfind("\n", 0, match.start()) + 1, text.rfind("|", 0, match.start()) + 1)
     line_end_candidates = [value for value in (text.find("\n", match.end()), text.find("|", match.end())) if value >= 0]
     line_end = min(line_end_candidates) if line_end_candidates else len(text)
     line = text[line_start:line_end].strip(" -•;:")
     standalone_address = line.startswith(match.group(0)) and len(line) <= 180
-    return bool(standalone_address and EARLY_CHILDHOOD_FACILITY_CUE.search(context_hint))
+    facility_context = bool(EARLY_CHILDHOOD_FACILITY_CUE.search(context_hint) or EARLY_CHILDHOOD_FACILITY_CUE.search(nearby))
+    inline_workplace_phrase = bool(re.search(r"\b(?:at|located\s+at|based\s+at|work(?:s|site)?\s+(?:at|from))\b", nearby, re.I))
+    return bool(facility_context and (standalone_address or inline_workplace_phrase))
 
 
 def _text_workplace_values(text: str, evidence_source: str = "description advertised workplace", context_hint: str = "") -> list[dict[str, Any]]:

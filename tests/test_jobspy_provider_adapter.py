@@ -188,6 +188,19 @@ def test_daycare_title_can_authorize_a_standalone_address_line_without_label():
     assert recovered[0]["assignment_status"] == "candidate_requires_owner_confirmation"
 
 
+def test_inline_daycare_sentence_recovers_unconfirmed_workplace_candidate():
+    from sources.jobspy_source import normalize_jobspy_row
+
+    normalized = normalize_jobspy_row({
+        "title": "Registered Early Childhood Educator",
+        "location": "Toronto, ON",
+        "description": "Cityplace Daycare is a brand-new daycare on Toronto’s waterfront at 350 Queens Quay West.",
+    }, "indeed")
+    recovered = [item for item in normalized["workplace_alternatives"] if item["address"] == "350 Queens Quay West"]
+    assert recovered
+    assert recovered[0]["assignment_status"] == "candidate_requires_owner_confirmation"
+
+
 def test_facility_context_does_not_authorize_headquarters_mailing_or_contact_addresses():
     from sources.jobspy_source import normalize_jobspy_row
 
