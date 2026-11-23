@@ -21,6 +21,17 @@ JOBSPY_SOURCE_NAMES = {
 }
 
 
+def normalize_indeed_source_id(value: Any) -> str:
+    """Return Indeed's raw ``jk`` value from Job Tracker's stored identity.
+
+    Job Tracker historically stored Indeed IDs as ``in-<jk>`` while Indeed
+    pages expose only ``<jk>``.  The suffix is intentionally not case-folded
+    or otherwise rewritten because it is the provider's identity value.
+    """
+    normalized = clean(value)
+    return normalized[3:] if normalized[:3].casefold() == "in-" else normalized
+
+
 def _provider_failure_state(exc: Exception) -> str:
     """Classify an adapter failure without claiming that a provider worked."""
     message = str(exc).lower()

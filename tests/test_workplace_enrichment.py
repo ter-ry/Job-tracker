@@ -65,6 +65,36 @@ def test_automatic_discovery_enrichment_is_bounded_to_matching_indeed_viewjob(mo
     assert jobs[1]["workplace_alternatives"] == []
 
 
+def test_indeed_ids_accept_job_tracker_prefix_but_require_exact_jk():
+    from sources.jobspy_source import normalize_indeed_source_id
+
+    assert normalize_indeed_source_id("in-960d67145bdf8eb3") == "960d67145bdf8eb3"
+    assert normalize_indeed_source_id("5b10c60264baec65") == "5b10c60264baec65"
+    assert app_module._approved_job_page_url(
+        {"source": "Indeed", "source_job_id": "in-960d67145bdf8eb3"},
+        "https://ca.indeed.com/viewjob?jk=960d67145bdf8eb3",
+    )[0] is True
+    assert app_module._approved_job_page_url(
+        {"source": "Indeed", "source_job_id": "in-5b10c60264baec65"},
+        "https://ca.indeed.com/viewjob?jk=960d67145bdf8eb3",
+    )[0] is False
+
+
+def test_prefixed_page_identity_is_accepted_and_wrong_id_is_rejected():
+    job = {
+        "source": "Indeed", "source_job_id": "in-5b10c60264baec65", "title": "RECE",
+        "company": "BGC East Scarborough", "location": "Scarborough, ON",
+    }
+    page = "<h1>RECE</h1><p>Work Location: 100 Galloway Road, Scarborough, ON M1E 1W7</p>"
+    accepted = app_module._extract_workplace_from_page(
+        job, page, "https://ca.indeed.com/viewjob?jk=5b10c60264baec65"
+    )
+    assert accepted and accepted[0]["postal_code"] == "M1E 1W7"
+    assert app_module._extract_workplace_from_page(
+        job, page, "https://ca.indeed.com/viewjob?jk=960d67145bdf8eb3"
+    ) == []
+
+
 def test_indeed_page_identity_mismatch_is_not_used_as_workplace_evidence():
     job = {
         "source": "Indeed", "source_job_id": "expected-id", "title": "RECE",

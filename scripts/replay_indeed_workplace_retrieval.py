@@ -61,7 +61,10 @@ def replay_cohort(db: sqlite3.Connection, search_id: str, applicant_id: int, exp
         before = _previous(row)
         saved = app._stored_workplace_alternatives(row)
         alternatives = saved
-        retrieval: dict[str, Any] = {"status": "saved_evidence", "ok": bool(saved)}
+        if saved:
+            retrieval: dict[str, Any] = {"status": "skipped_saved_evidence", "ok": True, "reason": "Saved provider/description evidence already contains a precise candidate; no page request was needed."}
+        else:
+            retrieval = {"status": "not_attempted", "ok": False, "reason": "No retrieval decision made yet."}
         url = _text(row.get("url") or row.get("application_url"))
         approved, allowed_hosts = app._approved_job_page_url(row, url)
         if not alternatives and approved:
@@ -69,6 +72,13 @@ def replay_cohort(db: sqlite3.Connection, search_id: str, applicant_id: int, exp
             retrieval = _fetch_once(url, allowed_hosts, timeout, max_bytes)
             if retrieval.get("ok"):
                 alternatives = app._extract_workplace_from_page(row, _text(retrieval.get("body")), _text(retrieval.get("final_url")) or url)
+        elif not alternatives:
+            source = _text(row.get("source")).lower()
+            retrieval = {
+                "status": "skipped_source_not_indeed" if source != "indeed" else "skipped_url_not_approved",
+                "ok": False,
+                "reason": "The replay only retrieves approved Indeed /viewjob?jk URLs." if source == "indeed" else "The replay does not retrieve non-Indeed sources.",
+            }
         keys = {_canonical_address(item.get("address", ""), item.get("postal_code", "")) for item in alternatives}
         if len(alternatives) > 1:
             result = "ambiguous"
@@ -89,7 +99,7 @@ def replay_cohort(db: sqlite3.Connection, search_id: str, applicant_id: int, exp
             "confidence": max((int(item.get("confidence") or 0) for item in alternatives), default=0),
             "assignment_status": "; ".join(sorted({_text(item.get("assignment_status")) for item in alternatives if _text(item.get("assignment_status"))})),
             "owner_confirmation_required": bool(alternatives), "result": result,
-            "retrieval_status": retrieval.get("status", ""), "retrieval_error": retrieval.get("error", ""),
+            "retrieval_status": retrieval.get("status", ""), "retrieval_reason": retrieval.get("reason", ""), "retrieval_error": retrieval.get("error", ""),
         })
     counts: dict[str, int] = {}
     for item in records:
@@ -97,7 +107,7 @@ def replay_cohort(db: sqlite3.Connection, search_id: str, applicant_id: int, exp
     return {"read_only": True, "network_requests": request_count, "search_execution_id": search_id, "applicant_profile_id": applicant_id, "expected_count": expected_count, "cohort_count": len(records), "counts": counts, "jobs": records}
 
 
-CSV_FIELDS = ("job_id", "title", "employer", "source", "original_posting_url", "original_workplace", "newly_extracted_address", "newly_extracted_postal_code", "supporting_excerpt", "confidence", "assignment_status", "owner_confirmation_required", "result", "retrieval_status", "retrieval_error")
+CSV_FIELDS = ("job_id", "title", "employer", "source", "original_posting_url", "original_workplace", "newly_extracted_address", "newly_extracted_postal_code", "supporting_excerpt", "confidence", "assignment_status", "owner_confirmation_required", "result", "retrieval_status", "retrieval_reason", "retrieval_error")
 
 
 def write_csv(report: dict[str, Any], path: str | Path) -> None:

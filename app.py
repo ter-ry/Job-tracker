@@ -70,6 +70,7 @@ from sources.jobspy_source import (
     extract_workplace_location,
     fetch_jobspy_jobs,
     requirement_phrase_evidence,
+    normalize_indeed_source_id,
 )
 from sources.ats_source import fetch_employer_direct_jobs
 from sources.provider_runtime import ProviderCircuitBreaker
@@ -10095,7 +10096,7 @@ def _approved_job_page_url(job: dict[str, Any], url: str) -> tuple[bool, set[str
     host = (parsed.hostname or "").lower().rstrip(".")
     allowed_hosts = {host} if host == "indeed.com" or host.endswith(".indeed.com") else set()
     query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    job_key = text(job.get("source_job_id") or job.get("job_id"))
+    job_key = normalize_indeed_source_id(job.get("source_job_id") or job.get("job_id"))
     requested_key = text(query.get("jk"))
     if source != "indeed" or not allowed_hosts or parsed.scheme not in {"http", "https"} or parsed.path.rstrip("/") != "/viewjob":
         return False, allowed_hosts
@@ -10157,7 +10158,7 @@ def _job_page_matches_intended_posting(job: dict[str, Any], page: str, page_url:
     """Reject an approved-host page if it no longer identifies this vacancy."""
     parsed = urlsplit(page_url)
     if (parsed.hostname or "").lower().endswith("indeed.com"):
-        expected = text(job.get("source_job_id") or job.get("job_id"))
+        expected = normalize_indeed_source_id(job.get("source_job_id") or job.get("job_id"))
         page_key = dict(parse_qsl(parsed.query, keep_blank_values=True)).get("jk", "")
         if expected and page_key and page_key != expected:
             return False

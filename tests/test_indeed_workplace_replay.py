@@ -24,7 +24,7 @@ def test_read_only_indeed_replay_uses_exact_membership_and_does_not_write(tmp_pa
     )
     db.execute(
         "INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (372, "RECE", "Cityplace Daycare", "Indeed", "https://ca.indeed.com/viewjob?jk=x1", "", "x1", "Toronto, ON", "Toronto, ON", "{}", "", "", "", "", ""),
+        (372, "RECE", "Cityplace Daycare", "Indeed", "https://ca.indeed.com/viewjob?jk=x1", "", "in-x1", "Toronto, ON", "Toronto, ON", "{}", "", "", "", "", ""),
     )
     db.execute("INSERT INTO discovery_search_memberships VALUES (?, ?, ?, ?)", ("a" * 32, 372, 2, "actionable"))
     db.commit()
@@ -44,3 +44,4 @@ def test_read_only_indeed_replay_uses_exact_membership_and_does_not_write(tmp_pa
     assert report["counts"] == {"improved": 1}
     assert report["jobs"][0]["assignment_status"] == "candidate_unverified"
     assert report["jobs"][0]["owner_confirmation_required"] is True
+    assert report["jobs"][0]["retrieval_status"] == "ok"
