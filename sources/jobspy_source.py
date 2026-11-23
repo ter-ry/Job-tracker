@@ -865,7 +865,8 @@ def _text_workplace_values(text: str, evidence_source: str = "description advert
         if NON_WORKPLACE_CUE.search(nearby):
             continue
         label_match = WORKPLACE_LABEL_CUE.search(text[max(0, match.start() - 220):match.start()])
-        if not label_match and not WORKPLACE_CUE.search(text[max(0, match.start() - 220):match.start()]) and not _has_standalone_facility_context(text, match, context_hint):
+        facility_context = _has_standalone_facility_context(text, match, context_hint)
+        if not label_match and not WORKPLACE_CUE.search(text[max(0, match.start() - 220):match.start()]) and not facility_context:
             continue
         address, evidence = _address_evidence(text, match, street_matches[index + 1].start() if index + 1 < len(street_matches) else None)
         postal = re.search(POSTAL_PATTERN, text[match.end():min(len(text), match.end() + 100)], re.I)
@@ -876,9 +877,10 @@ def _text_workplace_values(text: str, evidence_source: str = "description advert
             continue
         candidates.append({
             "address": address, "postal_code": postal.group(0).upper().replace("-", " ") if postal else "",
-            "precision": "street address", "confidence": 95 if label_match else 88,
+            "precision": "street address", "confidence": 95 if label_match else 82,
             "evidence": evidence, "evidence_source": evidence_source,
-            "extraction_method": "labelled_text", "assignment_status": "confirmed",
+            "extraction_method": "labelled_text",
+            "assignment_status": "candidate_requires_owner_confirmation" if facility_context and not label_match else "confirmed",
         })
     for match in re.finditer(POSTAL_PATTERN, text, re.I):
         context = text[max(0, match.start() - 180):min(len(text), match.end() + 100)]

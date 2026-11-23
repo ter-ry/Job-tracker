@@ -183,7 +183,9 @@ def test_daycare_title_can_authorize_a_standalone_address_line_without_label():
         "location": "Toronto, ON",
         "description": "City Place Daycare\n350 Queens Quay West\nToronto, ON",
     }, "indeed")
-    assert any(item["address"] == "350 Queens Quay West" for item in normalized["workplace_alternatives"])
+    recovered = [item for item in normalized["workplace_alternatives"] if item["address"] == "350 Queens Quay West"]
+    assert recovered
+    assert recovered[0]["assignment_status"] == "candidate_requires_owner_confirmation"
 
 
 def test_facility_context_does_not_authorize_headquarters_mailing_or_contact_addresses():
