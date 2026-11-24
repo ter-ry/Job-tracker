@@ -6,7 +6,7 @@ import argparse
 import json
 import re
 import time
-import json as _json
+from decimal import Decimal, InvalidOperation
 from urllib.parse import parse_qsl, urlsplit
 from pathlib import Path
 from typing import Any, Iterable
@@ -31,12 +31,17 @@ def _identity_evidence_is_present(page: str, employer: str, source_job_id: str) 
     # A requested URL is not evidence about the document returned for it. Use
     # only identifiers retained by the returned document: canonical/job links,
     # explicit job-id fields, or JobPosting JSON-LD URLs.
-    identifier = re.escape(source_job_id.casefold())
-    identifier_in_document = bool(re.search(
-        rf"(?:canonical|job\s*[_-]?id|job\s*key|jk|requisition)[^\n]{{0,160}}{identifier}|{identifier}[^\n]{{0,160}}(?:canonical|job\s*[_-]?id|job\s*key|jk|requisition)",
-        page.casefold(), re.I,
-    ))
-    if not identifier_in_document:
+    document_ids: set[str] = set()
+    canonical_tags = re.findall(r"<link\b[^>]*\brel=[\"'][^\"']*canonical[^\"']*[\"'][^>]*>", page, re.I)
+    canonical_tags += re.findall(r"<link\b[^>]*\bcanonical[^>]*>", page, re.I)
+    for tag in canonical_tags:
+        for href in re.findall(r"\bhref=[\"']([^\"']+)", tag, re.I):
+            document_ids.update(dict(parse_qsl(urlsplit(href).query, keep_blank_values=True)).get("jk", "").casefold().split())
+    for raw in re.findall(r"<script[^>]+type=[\"']application/ld\+json[\"'][^>]*>(.*?)</script>", page, re.I | re.S):
+        for found in re.findall(r"(?:[?&]jk=|[\"'](?:jobId|jobKey|jk)[\"']\s*:\s*[\"'])([a-z0-9_-]{6,})", raw, re.I):
+            document_ids.add(found.casefold())
+    expected_id = source_job_id.casefold()
+    if expected_id not in document_ids or any(item != expected_id for item in document_ids):
         return False
 
     # Employer evidence must be in a role-bearing heading or structured
@@ -47,10 +52,10 @@ def _identity_evidence_is_present(page: str, employer: str, source_job_id: str) 
     structured_employer = False
     for raw in re.findall(r"<script[^>]+type=[\"']application/ld\+json[\"'][^>]*>(.*?)</script>", page, re.I | re.S):
         try:
-            payload = _json.loads(raw)
-        except (TypeError, ValueError, _json.JSONDecodeError):
+            payload = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
             continue
-        serialized = _json.dumps(payload, ensure_ascii=False).casefold()
+        serialized = json.dumps(payload, ensure_ascii=False).casefold()
         if any(marker in serialized for marker in ("hiringorganization", "employer", "company")):
             structured_employer = sum(token in serialized for token in tokens) >= min(2, len(tokens))
             if structured_employer:
@@ -61,17 +66,22 @@ def _identity_evidence_is_present(page: str, employer: str, source_job_id: str) 
 def benchmark(urls: list[str], *, config: ScraperApiConfig, max_credits: float) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     attempted = 0
-    consumed = 0.0
+    consumed = Decimal("0")
+    authorized_budget = Decimal(str(max_credits))
     cost_unknown = False
+    budget_exceeded = False
     max_requests = 2
     for url in urls:
         case = CASES.get(url, {})
-        remaining = max_credits - consumed
-        request_max_cost = min(float(config.max_cost), remaining)
-        if attempted >= max_requests or cost_unknown or request_max_cost <= 0:
+        remaining = authorized_budget - consumed
+        configured_cost = Decimal(str(config.max_cost))
+        request_max_cost = min(configured_cost, remaining)
+        if attempted >= max_requests or cost_unknown or budget_exceeded or request_max_cost <= 0:
             reason = "The maximum two-request benchmark limit was reached."
             if cost_unknown:
                 reason = "Previous response did not report sa-credit-cost; stopped conservatively because cumulative cost is unknown."
+            elif budget_exceeded:
+                reason = "Previous response reported consumption above the authorized benchmark budget; stopped conservatively."
             elif remaining <= 0:
                 reason = "Configured ScraperAPI credit budget exhausted."
             results.append({"url": url, "status": "skipped_budget", "retrieval_succeeded": False, "reason": reason})
@@ -85,8 +95,19 @@ def benchmark(urls: list[str], *, config: ScraperApiConfig, max_credits: float) 
             if cost is None:
                 cost_unknown = True
             else:
-                consumed += float(cost)
+                try:
+                    parsed_cost = Decimal(str(cost))
+                except (InvalidOperation, TypeError, ValueError):
+                    parsed_cost = None
+                if parsed_cost is None or not parsed_cost.is_finite() or parsed_cost < 0:
+                    cost_unknown = True
+                else:
+                    consumed += parsed_cost
+                    if parsed_cost > request_max_cost or consumed > authorized_budget:
+                        budget_exceeded = True
         item = {key: value for key, value in page.items() if key != "body"}
+        if budget_exceeded:
+            item["budget_status"] = "exceeded"
         item["latency_ms"] = item.get("latency_ms") or round((time.perf_counter() - started) * 1000, 1)
         if page.get("retrieval_succeeded"):
             job = {"source": "Indeed", "source_job_id": source_job_id, "title": case.get("name", ""), "company": case.get("name", ""), "location": "Ontario"}
@@ -110,8 +131,10 @@ def benchmark(urls: list[str], *, config: ScraperApiConfig, max_credits: float) 
     return {
         "read_only": True, "provider": "scraperapi", "configured": bool(config.api_key and config.enabled),
         "request_budget": max_credits, "max_requests": max_requests, "requests_attempted": attempted,
-        "credits_consumed": None if cost_unknown else round(consumed, 6),
+        "credits_consumed": None if cost_unknown else float(consumed),
         "credits_consumed_status": "unknown" if cost_unknown else "known",
+        "budget_exceeded": budget_exceeded,
+        "timeout_policy": {"default_seconds": config.timeout_seconds, "configured_by": "SCRAPERAPI_TIMEOUT_SECONDS", "owner_note": "Do not cancel or retry a live request solely to shorten it; the provider may charge interrupted synchronous requests."},
         "successful_valid_job_pages": sum(bool(item.get("valid_job_page")) for item in results),
         "precise_evidence_count": sum(bool(item.get("precise_evidence")) for item in results),
         "expected_matches": sum(bool(item.get("expected_match")) for item in results),

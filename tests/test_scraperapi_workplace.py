@@ -1,4 +1,6 @@
 import json
+import io
+import urllib.error
 from urllib.parse import parse_qs, urlsplit
 
 from sources.scraperapi_source import ScraperApiConfig, _parse_credit_cost, approved_indeed_url, fetch_scraperapi_page
@@ -55,6 +57,45 @@ def test_scraperapi_response_does_not_print_or_return_api_key(monkeypatch):
     assert "secret-test-key" in captured["url"]
     query = parse_qs(urlsplit(captured["url"]).query)
     assert query["max_cost"] == ["1"]
+
+
+def test_transport_cap_cannot_be_overridden_by_caller(monkeypatch):
+    captured = {}
+
+    class Response:
+        status = 200
+        headers = {"sa-credit-cost": "0.5"}
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def read(self, _limit): return b"<html></html>"
+
+    def fake_open(request, timeout):
+        captured["url"] = request.full_url
+        return Response()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_open)
+    config = ScraperApiConfig(api_key="test-only", enabled=True, allowed_hosts=("ca.indeed.com",), max_cost=1)
+    fetch_scraperapi_page("https://ca.indeed.com/viewjob?jk=abc", config=config, max_cost=2)
+    assert parse_qs(urlsplit(captured["url"]).query)["max_cost"] == ["1"]
+
+
+def test_http_error_diagnostic_is_bounded_sanitized_and_evidence_classified(monkeypatch):
+    secret = "secret/key+value"
+    body = (b'{"error":"insufficient credits"}' + secret.encode() * 1000)
+    error = urllib.error.HTTPError(
+        "https://api.scraperapi.com/?api_key=secret%2Fkey%2Bvalue", 403, "forbidden",
+        {"Content-Type": "application/json", "sa-credit-cost": "not-a-number"}, io.BytesIO(body),
+    )
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: (_ for _ in ()).throw(error))
+    result = fetch_scraperapi_page(
+        "https://ca.indeed.com/viewjob?jk=abc",
+        config=ScraperApiConfig(api_key=secret, enabled=True, allowed_hosts=("ca.indeed.com",)),
+    )
+    assert result["failure_classification"] == "account_credit_exhaustion"
+    assert result["failure_source"] == "provider"
+    assert len(result["error_body_excerpt"]) <= 2000
+    assert result["credit_cost"] is None
+    assert secret not in json.dumps(result)
 
 
 def test_scraperapi_redacts_credentials_from_transport_errors(monkeypatch):
