@@ -261,3 +261,57 @@ def test_academic_titles_are_rejected_even_when_provider_role_family_is_software
         job = _swe_policy_job(title, "Teach students using Python and software tools.", role_type="software developer")
         assert app.plausible_software_role(job) is False
         assert app.discovery_target_assessment(job, search)[0] == "ineligible"
+
+
+def test_owner_swe_adjacent_technical_roles_are_recall_first_candidates():
+    search = _search(match_policy="apply_broadly", maximum_required_years=4)
+    records = [
+        ("Infrastructure Engineer", "Operate AWS cloud infrastructure, Terraform, Python automation and CI/CD."),
+        ("Junior Solutions Engineer", "Implement customer integrations using APIs, JavaScript and cloud tooling."),
+        ("AWS Developer", "Build Node.js services, deploy with AWS and maintain CI/CD pipelines."),
+        ("Technical Specialist, JavaScript and React", "Implement React applications and Java services for clients."),
+        ("Software Test Engineer", "Create automated software quality tests with Python and CI/CD."),
+        ("Full Stack Developer", "Build full-stack applications with React, Python and SQL."),
+        ("Software Engineer II, AI Engineering", "Build machine learning services and production software in Python."),
+        ("Full-Stack Development Engineer", "Develop web applications and APIs with JavaScript and cloud services."),
+        ("Backend Engineer", "Build backend APIs and database services with Python."),
+        ("Front End Engineer", "Develop React and TypeScript user interfaces."),
+        ("Intermediate Software Developer, DevOps", "Maintain software delivery pipelines, AWS and infrastructure automation."),
+        ("Front End Engineer", "Build frontend applications with React and JavaScript."),
+        ("Software Engineer II", "Develop distributed software services and APIs."),
+        ("Software Engineer II", "Build production software systems and automated tests."),
+        ("Software Dev Engineer II, Goodreads", "Develop web services and full-stack features with Java and APIs."),
+    ]
+    for title, description in records:
+        job = _swe_policy_job(title, description)
+        assert app.plausible_software_role(job), title
+        assert app.discovery_target_assessment(job, search)[0] in {"provisional", "verified"}, title
+
+
+def test_confirmed_unrelated_programming_titles_remain_excluded():
+    for title in ("Community Programming Coordinator", "Fundraising Developer", "Employment Development Specialist"):
+        job = _swe_policy_job(title, "Coordinate community events and employment development programs.")
+        assert app.clearly_non_software_role(job)
+        assert app.discovery_target_assessment(job, _search(match_policy="apply_broadly"))[0] == "ineligible"
+
+
+def test_mojibake_salesjack_range_uses_lower_bound_and_not_upper_bound():
+    description = "Requirements: 2â€“5 years of full-time full stack engineering experience after graduating."
+    analysis = app.analyze_job_seniority({"title": "Software Engineer", "job_description": description})
+    required = analysis["required_experience"]
+    assert required["minimum"] == 2
+    assert required["maximum"] == 5
+    assert "2" in required["text"] and "5" in required["text"]
+    assert app.discovery_target_assessment(
+        {"title": "Software Engineer", "discovery_occupation": "software developer", "job_description": description, "qualification_fit_seniority": analysis},
+        _search(match_policy="apply_broadly", maximum_required_years=3),
+    )[0] != "ineligible"
+
+
+def test_non_internship_and_mentoring_interns_do_not_become_intern_roles():
+    for description in (
+        "This is a non-internship full-time software engineering role.",
+        "Mentor interns while building production APIs as a software engineer.",
+    ):
+        analysis = app.analyze_job_seniority({"title": "Software Engineer", "job_description": description})
+        assert analysis["detected_level"] != "internship"

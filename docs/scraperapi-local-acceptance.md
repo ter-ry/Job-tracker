@@ -87,6 +87,38 @@ launcher with `Ctrl+C`, then rerun the same command to verify restart
 persistence. For a separate fresh disposable session use a different root and
 `--fresh-qa`, which binds port `5002`.
 
+## Read-only SWE audit and requalification
+
+Use the selected SWE profile ID from the local QA UI. The first request is
+preview-only and does not scrape or mutate records:
+
+```powershell
+$profileId = 2 # replace with the selected local QA SWE profile ID
+$base = "http://127.0.0.1:5001"
+$audit = Invoke-RestMethod "$base/api/discovery/inbox/audit?candidate_profile_id=$profileId"
+$audit | ConvertTo-Json -Depth 8
+
+$previewBody = @{ candidate_profile_id = $profileId; workflow = "software"; preview = $true } | ConvertTo-Json
+$preview = Invoke-RestMethod -Method Post -Uri "$base/api/discovery/re-evaluate" -ContentType "application/json" -Body $previewBody
+$preview | ConvertTo-Json -Depth 10
+```
+
+Inspect `jobs`, `current_category`, `proposed_category`, `reason` and
+`search_criteria` before applying anything. Applying is a separate explicit
+owner action using the preview token; it does not scrape or rewrite applicant
+decisions:
+
+```powershell
+$applyBody = @{
+  candidate_profile_id = $profileId
+  workflow = "software"
+  preview = $false
+  confirm_apply = $true
+  preview_token = $preview.preview_token
+} | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri "$base/api/discovery/re-evaluate" -ContentType "application/json" -Body $applyBody | ConvertTo-Json -Depth 10
+```
+
 ## Owner acceptance checklist
 
 - SWE and ECE searches use the intended applicant profile.

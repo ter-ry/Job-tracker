@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -174,7 +175,11 @@ def experience_range_dict(item: ExperienceRange, content: str) -> dict[str, Any]
 
 
 def detect_level(content: str) -> tuple[str, list[str]]:
-    lowered = content.lower()
+    lowered = normalize_experience_text(content).lower()
+    # Policy wording such as ``non-internship`` is not an internship role.
+    # Remove only explicit negations; ordinary internship titles remain
+    # detectable.
+    lowered = re.sub(r"\bnon[- ]?(?:intern|internship)\b", " ", lowered)
     checks = [
         ("director", ["director", "head of", "vp engineering"]),
         ("manager", ["engineering manager", "development manager", "manager, software", "people manager"]),
@@ -237,6 +242,11 @@ def role_has_budget_or_hiring_scope(description: str) -> bool:
 
 
 def extract_experience_ranges(content: str) -> tuple[list[ExperienceRange], list[ExperienceRange], list[ExperienceRange]]:
+    # Job feeds occasionally preserve UTF-8 bytes as mojibake (for example
+    # ``2â€“5``). Normalize before matching so the lower bound of a range is
+    # retained instead of the trailing number being parsed as a standalone
+    # requirement.
+    content = normalize_experience_text(content or "")
     lowered = content.lower()
     required: list[ExperienceRange] = []
     preferred: list[ExperienceRange] = []
@@ -288,6 +298,18 @@ def extract_experience_ranges(content: str) -> tuple[list[ExperienceRange], list
         else:
             ambiguous.append(item)
     return required, preferred, ambiguous
+
+
+def normalize_experience_text(content: str) -> str:
+    """Normalize HTML entities, common mojibake dashes and Unicode spacing."""
+    value = html.unescape(str(content or ""))
+    replacements = {
+        "â€“": "–", "â€”": "—", "â€‘": "‑", "âˆ’": "−",
+        "â€¯": " ", "Â ": " ", "\u00a0": " ",
+    }
+    for source, target in replacements.items():
+        value = value.replace(source, target)
+    return value
 
 
 def classify_experience_section(content: str, position: int) -> str:

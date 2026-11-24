@@ -2489,8 +2489,7 @@ def create_app() -> Flask:
                 [int(row["id"]), applicant_id], one=True,
             )
             criteria = parse_json_object(membership["criteria_json"]) if membership else {}
-            if "include_internships" in criteria:
-                item["discovery_include_internships"] = bool(criteria.get("include_internships"))
+            apply_discovery_criteria_to_item(item, criteria)
             category, reason = discovery_result_category(item, text(item.get("discovery_remote_preference")))
             description = text(item.get("job_description"))
             grounded = bool(len(description) >= 80 and text(item.get("url")))
@@ -2535,6 +2534,14 @@ def create_app() -> Flask:
         examples: dict[str, list[dict[str, Any]]] = {"non_software_title": [], "experience_anomaly": [], "geography": []}
         for row in rows:
             item = job_to_dict(row, include_legacy_details=False)
+            membership = query_db(
+                """SELECT criteria_json FROM discovery_search_memberships
+                   WHERE job_id = ? AND applicant_profile_id IN (0, ?)
+                   ORDER BY created_at DESC, search_execution_id DESC LIMIT 1""",
+                [int(row["id"]), applicant_id], one=True,
+            )
+            criteria = parse_json_object(membership["criteria_json"]) if membership else {}
+            apply_discovery_criteria_to_item(item, criteria)
             category, reason = discovery_result_category(item, text(item.get("discovery_remote_preference")))
             category_counts[category] = category_counts.get(category, 0) + 1
             evidence = text(item.get("job_description") or item.get("qualification_evidence_source") or item.get("workplace_evidence"))
@@ -2586,6 +2593,14 @@ def create_app() -> Flask:
         records = []
         for row in rows:
             item = job_to_dict(row, include_legacy_details=False)
+            membership = query_db(
+                """SELECT criteria_json FROM discovery_search_memberships
+                   WHERE job_id = ? AND applicant_profile_id IN (0, ?)
+                   ORDER BY created_at DESC, search_execution_id DESC LIMIT 1""",
+                [int(row["id"]), applicant_id], one=True,
+            )
+            criteria = parse_json_object(membership["criteria_json"]) if membership else {}
+            apply_discovery_criteria_to_item(item, criteria)
             category, reason = discovery_result_category(item, text(item.get("discovery_remote_preference")))
             memberships = query_db(
                 "SELECT search_execution_id, category, reason, evidence_json, criteria_json, created_at FROM discovery_search_memberships WHERE job_id = ? AND applicant_profile_id IN (0, ?) ORDER BY created_at",
@@ -11713,7 +11728,8 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
     if hard_reason:
         return "excluded", hard_reason
     title = normalize_space(text(job.get("title"))).lower()
-    explicit_internship_title = bool(re.search(r"\b(?:intern|internship|co[- ]?op|cooperative education|placement|trainee)\b", title))
+    title_for_internship = re.sub(r"\bnon[- ]?(?:intern|internship)\b", " ", title)
+    explicit_internship_title = bool(re.search(r"\b(?:intern|internship|co[- ]?op|cooperative education|placement|trainee)\b", title_for_internship))
     provider_internship = text(job.get("role_type")).lower() in {"intern", "internship"}
     # A provider role label is useful evidence only when the title is absent
     # or agrees with it.  Several feeds label ordinary software jobs as
@@ -11779,12 +11795,12 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
 
 
 def plausible_software_role(job: dict[str, Any]) -> bool:
-    """Plausible software IC work, not every job with developer in its name."""
+    """Plausible software/adjacent technical IC work, not every developer title."""
     title = normalize_space(text(job.get("title"))).lower()
     role_type = normalize_space(text(job.get("role_type"))).lower()
     if re.search(r"\b(manager|director|vice president|vp|head of|chief)\b", title):
         return False
-    if re.search(r"\b(academic assistant|teaching assistant|instructor|teacher|faculty|professor|tutor|research assistant|researcher|recruiter|recruitment|human resources|administrator|coordinator|cnc|machinist|metal fabrication|bridge engineer|civil engineer|structural engineer|registered nurse|nurse contractor|provider operations|packaging developer)\b", title):
+    if re.search(r"\b(academic assistant|teaching assistant|instructor|teacher|faculty|professor|tutor|research assistant|researcher|recruiter|recruitment|human resources|administrator|coordinator|cnc|machinist|metal fabrication|bridge engineer|civil engineer|structural engineer|registered nurse|nurse contractor|provider operations|packaging developer|community program(?:ming)?|fundraising|employment development)\b", title):
         return False
     # A title that explicitly says it is not development work is not a SWE
     # match merely because the provider classified it as a 'developer' role.
@@ -11794,8 +11810,16 @@ def plausible_software_role(job: dict[str, Any]) -> bool:
     software_signal = r"\b(?:software|web|application|cloud|api|platform|computer|automation|systems|backend|frontend|full[ -]?stack)\b"
     if re.search(nonsoftware_industries, title) and not re.search(software_signal, title):
         return False
-    software_title = bool(re.search(r"\b(software engineer|software developer|software dev|web developer|application developer|full[ -]?stack|front[ -]?end|back[ -]?end|qa automation|test automation|devops|cloud engineer|api engineer|integration engineer|automation engineer|platform engineer|sdet)\b", title))
-    return software_title or (role_type in ACTIONABLE_DISCOVERY_ROLE_FAMILIES and bool(re.search(r"\b(software|web|application|cloud|api|platform|computer|automation|systems|backend|frontend|full[ -]?stack)\b", title)))
+    software_title = bool(re.search(r"\b(software engineer|software developer|software dev|web developer|application developer|full[ -]?stack|front[ -]?end|back[ -]?end|qa automation|test automation|devops|cloud engineer|api engineer|integration engineer|automation engineer|platform engineer|infrastructure engineer|solutions engineer|technical specialist|sre|site reliability|ai engineer|ml engineer|data engineer|sdet)\b", title))
+    if software_title:
+        return True
+    # Providers often classify adjacent technical roles as generic or
+    # non-software families. Require technical evidence in the title or
+    # description, while leaving clearly unrelated occupations hard excluded.
+    adjacent_title = bool(re.search(r"\b(?:infrastructure|cloud|devops|platform|site reliability|sre|solutions|technical implementation|technical specialist|integration|automation|test|ai|machine learning|aws|azure|gcp)\b", title))
+    technical_evidence = bool(re.search(r"\b(?:software|code|coding|programming|javascript|typescript|python|java|react|node(?:\.js)?|api|cloud|aws|azure|kubernetes|automation|ci/cd|devops|database|sql|machine learning|artificial intelligence|full[ -]?stack|backend|frontend)\b", " ".join(text(job.get(key)) for key in ("job_description", "required_skills", "responsibilities")), re.I))
+    generic_technical_role = bool(re.search(r"\b(?:developer|engineer|specialist|programmer|sdet)\b", title))
+    return (adjacent_title or generic_technical_role) and technical_evidence
 
 
 def clearly_non_software_role(job: dict[str, Any]) -> bool:
@@ -11806,7 +11830,7 @@ def clearly_non_software_role(job: dict[str, Any]) -> bool:
     low-information records into hard exclusions.
     """
     title = normalize_space(text(job.get("title"))).lower()
-    if re.search(r"\b(academic assistant|teaching assistant|instructor|teacher|faculty|professor|tutor|research assistant|researcher|recruiter|recruitment|human resources|administrator|coordinator|cnc|machinist|metal fabrication|bridge engineer|civil engineer|structural engineer|registered nurse|nurse contractor|provider operations|packaging developer)\b", title):
+    if re.search(r"\b(academic assistant|teaching assistant|instructor|teacher|faculty|professor|tutor|research assistant|researcher|recruiter|recruitment|human resources|administrator|coordinator|cnc|machinist|metal fabrication|bridge engineer|civil engineer|structural engineer|registered nurse|nurse contractor|provider operations|packaging developer|community program(?:ming)?|fundraising|employment development)\b", title):
         return True
     if re.search(r"\bproduction\s+support\b", title) and re.search(r"\b(?:not\s+(?:a\s+)?developer|mainframe)\b", title):
         return True
@@ -11936,6 +11960,27 @@ def discovery_exclusion_reason_bucket(job: dict[str, Any]) -> str:
     return "other_confirmed_hard_exclusion"
 
 
+def apply_discovery_criteria_to_item(item: dict[str, Any], criteria: dict[str, Any]) -> dict[str, Any]:
+    """Project immutable search settings onto a read-only reassessment item."""
+    if not isinstance(criteria, dict):
+        return item
+    mapping = {
+        "discovery_occupation": "occupation",
+        "discovery_search_mode": "search_mode",
+        "discovery_match_policy": "match_policy",
+        "discovery_seniority": "seniority",
+        "discovery_maximum_required_years": "maximum_required_years",
+        "discovery_include_internships": "include_internships",
+        "discovery_remote_preference": "remote_preference",
+        "discovery_geographic_match_mode": "geographic_match_mode",
+        "discovery_distance": "distance",
+    }
+    for target, source in mapping.items():
+        if source in criteria and criteria[source] not in (None, ""):
+            item[target] = criteria[source]
+    return item
+
+
 def discovery_diagnostic_breakdown(items: Iterable[dict[str, Any]]) -> dict[str, Any]:
     """Summarize a discovery replay without collapsing review into exclusion.
 
@@ -11992,11 +12037,11 @@ def discovery_is_clear_senior_role(job: dict[str, Any], search: dict[str, Any]) 
     level = text(analysis.get("detected_level") or job.get("seniority_level")).lower().replace("-", "_")
     required = analysis.get("required_experience") or {}
     minimum = required.get("minimum") if isinstance(required, dict) else None
-    try:
-        high_experience = minimum is not None and 5 <= float(minimum) < 20
-    except (TypeError, ValueError):
-        high_experience = False
-    return level in {"senior", "lead", "manager", "director"} or bool(analysis.get("management_role")) or bool(analysis.get("leadership_expectations")) or high_experience
+    # Required-years eligibility is enforced by discovery_hard_exclusion_reason
+    # against the user-selected maximum. Do not impose a second fixed 5-year
+    # gate here: broad Apply Broadly must retain intermediate/stretch roles
+    # when the configured policy permits them.
+    return level in {"senior", "lead", "manager", "director"} or bool(analysis.get("management_role")) or bool(analysis.get("leadership_expectations"))
 
 
 def discovery_target_assessment(job: dict[str, Any], search: dict[str, Any]) -> tuple[str, str]:
@@ -12022,10 +12067,14 @@ def discovery_target_assessment(job: dict[str, Any], search: dict[str, Any]) -> 
         return "ineligible", "Confirmed required professional experience exceeds the selected maximum."
 
     unknown_levels = {"", "unknown", "ambiguous", "unverified"}
-    if selected_levels and "any" not in selected_levels and level not in unknown_levels and level not in selected_levels:
+    broad_software = search.get("match_policy") == "apply_broadly" and search.get("search_mode") == "shortlist"
+    # Strict matching keeps the configured seniority filter. Apply Broadly is
+    # recall-first: intermediate/adjacent levels remain visible as Possible
+    # fit or Stretch unless a hard seniority/experience rule already rejected
+    # them above.
+    if not broad_software and selected_levels and "any" not in selected_levels and level not in unknown_levels and level not in selected_levels:
         return "ineligible", "Confirmed seniority is outside the selected discovery seniority levels."
 
-    broad_software = search.get("match_policy") == "apply_broadly" and search.get("search_mode") == "shortlist"
     if broad_software and not plausible_software_role(job):
         return "ineligible", "Confirmed unrelated or management-only occupation is outside the Apply Broadly software scope."
 

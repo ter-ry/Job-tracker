@@ -75,9 +75,10 @@ def test_confirmed_seven_year_requirement_is_ineligible():
     assert app_module.discovery_target_assessment(job, _search())[0] == "ineligible"
 
 
-def test_intermediate_engineer_not_a_junior_match_when_selected_junior_only():
+def test_intermediate_engineer_is_retained_by_broad_policy_but_strict_matching_excludes_it():
     job = _job(title="Software Engineer II, Backend", qualification_fit_seniority={"detected_level": "intermediate"})
-    assert app_module.discovery_target_assessment(job, _search())[0] == "ineligible"
+    assert app_module.discovery_target_assessment(job, _search())[0] == "provisional"
+    assert app_module.discovery_target_assessment(job, _search(match_policy="strict_matching"))[0] == "ineligible"
 
 
 def test_unknown_local_distance_retained_only_as_labelled_provisional_in_city_mode():
