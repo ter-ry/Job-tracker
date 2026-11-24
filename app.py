@@ -4796,9 +4796,12 @@ def persist_discovery_search_memberships(
             "keywords": text(job.get("discovery_search_keywords")),
             "location": text(job.get("discovery_search_location")),
             "occupation": text(job.get("discovery_occupation")),
+            "match_policy": text(job.get("discovery_match_policy")),
             "seniority": text(job.get("discovery_seniority")),
             "maximum_required_years": job.get("discovery_maximum_required_years"),
             "location_scope": text(job.get("discovery_location_scope")),
+            "distance": job.get("discovery_distance"),
+            "geographic_match_mode": text(job.get("discovery_geographic_match_mode")),
             "remote_preference": text(job.get("discovery_remote_preference")),
             "include_internships": bool(job.get("discovery_include_internships")),
             "search_mode": text(job.get("discovery_search_mode")),
@@ -11750,13 +11753,19 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
             return "excluded", "Confirmed workplace distance is outside the requested radius."
         if text(job.get("distance_radius_status")).lower() == "unknown" and text(job.get("geographic_eligibility")).lower() != "provisional":
             return "review_required", "Exact workplace distance could not be verified under strict-radius matching."
-        if job.get("location_search_eligible") is False or text(job.get("location_search_eligible")).lower() == "false":
+        if (
+            job.get("location_search_eligible") is False
+            or text(job.get("location_search_eligible")).lower() == "false"
+        ) and text(job.get("distance_radius_status")).lower() != "within_radius":
             return "excluded", "Confirmed job location is outside the requested search area."
         if search_mode == "title":
             return title_search_result_category(job)
         role_type = text(job.get("role_type")).lower()
         if broad and search_mode == "shortlist":
-            if not plausible_software_role(job):
+            # Apply Broadly is recall-first.  Missing technical evidence is
+            # uncertainty, not proof that a posting is unrelated; only the
+            # narrower grounded occupation gate may remove it here.
+            if clearly_non_software_role(job):
                 return "excluded", "Confirmed unrelated occupation is outside the Apply Broadly software scope."
             return "actionable", apply_broadly_reason(job)
         if role_type and role_type not in target_role_families:
@@ -11778,7 +11787,7 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
             return title_search_result_category(job)
         role_type = text(job.get("role_type")).lower()
         if broad and search_mode == "shortlist":
-            if not plausible_software_role(job):
+            if clearly_non_software_role(job):
                 return "excluded", "Confirmed unrelated occupation is outside the Apply Broadly software scope."
             return "actionable", apply_broadly_reason(job)
         if role_type and role_type not in target_role_families:
@@ -11800,7 +11809,7 @@ def plausible_software_role(job: dict[str, Any]) -> bool:
     role_type = normalize_space(text(job.get("role_type"))).lower()
     if re.search(r"\b(manager|director|vice president|vp|head of|chief)\b", title):
         return False
-    if re.search(r"\b(academic assistant|teaching assistant|instructor|teacher|faculty|professor|tutor|research assistant|researcher|recruiter|recruitment|human resources|administrator|coordinator|cnc|machinist|metal fabrication|bridge engineer|civil engineer|structural engineer|registered nurse|nurse contractor|provider operations|packaging developer|community program(?:ming)?|fundraising|employment development)\b", title):
+    if re.search(r"\b(academic assistant|teaching assistant|instructor|teacher|faculty|professor|tutor|research assistant|researcher|recruiter|recruitment|human resources|administrator|coordinator|manager|cnc|machinist|metal fabrication|bridge engineer|civil engineer|structural engineer|registered nurse|nurse contractor|provider operations|packaging developer|community program(?:ming)?|fundraising|employment development)\b", title):
         return False
     # A title that explicitly says it is not development work is not a SWE
     # match merely because the provider classified it as a 'developer' role.
@@ -11830,7 +11839,7 @@ def clearly_non_software_role(job: dict[str, Any]) -> bool:
     low-information records into hard exclusions.
     """
     title = normalize_space(text(job.get("title"))).lower()
-    if re.search(r"\b(academic assistant|teaching assistant|instructor|teacher|faculty|professor|tutor|research assistant|researcher|recruiter|recruitment|human resources|administrator|coordinator|cnc|machinist|metal fabrication|bridge engineer|civil engineer|structural engineer|registered nurse|nurse contractor|provider operations|packaging developer|community program(?:ming)?|fundraising|employment development)\b", title):
+    if re.search(r"\b(academic assistant|teaching assistant|instructor|teacher|faculty|professor|tutor|research assistant|researcher|recruiter|recruitment|human resources|administrator|coordinator|manager|cnc|machinist|metal fabrication|bridge engineer|civil engineer|structural engineer|registered nurse|nurse contractor|provider operations|packaging developer|community program(?:ming)?|fundraising|employment development)\b", title):
         return True
     if re.search(r"\bproduction\s+support\b", title) and re.search(r"\b(?:not\s+(?:a\s+)?developer|mainframe)\b", title):
         return True
@@ -11867,7 +11876,8 @@ def discovery_hard_exclusion_reason(job: dict[str, Any], search: dict[str, Any] 
     """
     search = search or {}
     occupation = normalize_space(text(job.get("discovery_occupation") or job.get("occupation"))).lower()
-    broad_scope = text(job.get("discovery_match_policy")).lower() == "apply_broadly" and text(job.get("discovery_search_mode")).lower() == "shortlist"
+    policy = text(search.get("match_policy") or job.get("discovery_match_policy")).lower()
+    broad_scope = policy == "apply_broadly"
     if clearly_non_software_role(job) and (occupation in {"software developer", "software development", "software engineer", "swe"} or broad_scope):
         return "The grounded title or posting evidence identifies a non-software occupation."
     if occupation and occupation not in {"software developer", "software development", "swe", "software engineer"}:
@@ -11898,7 +11908,9 @@ def discovery_hard_exclusion_reason(job: dict[str, Any], search: dict[str, Any] 
     # must never silently remove a potentially eligible junior role.
     if minimum is not None and minimum >= 20:
         return ""
-    if minimum is not None and maximum is not None and minimum > maximum:
+    # Apply Broadly ranks experience mismatch as stretch; it does not make it
+    # a hard exclusion.  Strict matching retains the configured years gate.
+    if not broad_scope and minimum is not None and maximum is not None and minimum > maximum:
         return f"Confirmed required experience starts at {minimum:g} years, above the selected maximum of {maximum:g}."
 
     selected = normalize_space(text(search.get("seniority") or job.get("discovery_seniority"))).lower().replace("-", "_")
@@ -11906,9 +11918,9 @@ def discovery_hard_exclusion_reason(job: dict[str, Any], search: dict[str, Any] 
     if junior_target and not any(token in selected.split(",") for token in ("intermediate", "senior", "lead", "manager", "director", "any")):
         level = text(analysis.get("detected_level") or job.get("seniority_level")).lower().replace("-", "_")
         title = normalize_space(text(job.get("title"))).lower()
-        if level in {"senior", "lead", "manager", "director"} or re.search(r"\b(?:senior|sr\.?|staff|principal|lead|manager|director|head of)\b", title):
+        if not broad_scope and (level in {"senior", "lead", "manager", "director"} or re.search(r"\b(?:senior|sr\.?|staff|principal|lead|manager|director|head of)\b", title)):
             return "Confirmed seniority is outside the selected junior/entry-level target."
-        if bool(analysis.get("management_role")):
+        if not broad_scope and bool(analysis.get("management_role")):
             return "Confirmed management responsibility is outside the selected junior/entry-level target."
     return ""
 
@@ -12030,8 +12042,10 @@ def title_search_result_category(job: dict[str, Any]) -> tuple[str, str]:
 
 
 def discovery_is_clear_senior_role(job: dict[str, Any], search: dict[str, Any]) -> bool:
-    """Keep clearly senior SWE roles out of the requested new-match target."""
+    """Identify seniority for strict targeting without filtering broad recall."""
     if search.get("search_mode") != "shortlist" or search.get("occupation") != "software developer":
+        return False
+    if text(search.get("match_policy")).lower() == "apply_broadly":
         return False
     analysis = job.get("qualification_fit_seniority") or {}
     level = text(analysis.get("detected_level") or job.get("seniority_level")).lower().replace("-", "_")
@@ -12061,7 +12075,8 @@ def discovery_target_assessment(job: dict[str, Any], search: dict[str, Any]) -> 
     except (TypeError, ValueError):
         minimum = None
     maximum = float(search.get("maximum_required_years") if search.get("maximum_required_years") not in (None, "") else 3)
-    if minimum is not None and minimum > maximum:
+    broad_software = search.get("match_policy") == "apply_broadly"
+    if not broad_software and minimum is not None and minimum > maximum:
         if minimum >= 20:
             return "review_required", "The extracted experience value is implausibly high or insufficiently scoped; confirm the employer's actual requirement."
         return "ineligible", "Confirmed required professional experience exceeds the selected maximum."
@@ -12075,7 +12090,7 @@ def discovery_target_assessment(job: dict[str, Any], search: dict[str, Any]) -> 
     if not broad_software and selected_levels and "any" not in selected_levels and level not in unknown_levels and level not in selected_levels:
         return "ineligible", "Confirmed seniority is outside the selected discovery seniority levels."
 
-    if broad_software and not plausible_software_role(job):
+    if broad_software and clearly_non_software_role(job):
         return "ineligible", "Confirmed unrelated or management-only occupation is outside the Apply Broadly software scope."
 
     if search.get("search_mode") == "shortlist":
@@ -12085,15 +12100,15 @@ def discovery_target_assessment(job: dict[str, Any], search: dict[str, Any]) -> 
                 ambiguous_minimum = float(item.get("minimum")) if isinstance(item, dict) else 0
             except (TypeError, ValueError):
                 ambiguous_minimum = 0
-            if ambiguous_minimum > maximum:
+            if not broad_software and ambiguous_minimum > maximum:
                 return "review_required", (
                     f"A possible {ambiguous_minimum:g}-year experience requirement exceeds the {maximum:g}-year maximum; "
                     "confirm the employer's actual required years before including this result."
                 )
         evidence_content = any(text(job.get(key)) for key in ("job_description", "required_skills", "preferred_skills", "responsibilities"))
-        if not evidence_content:
+        if not evidence_content and not broad_software:
             return "review_required", "The provider supplied no usable requirements; experience and technical fit cannot be verified."
-        if text(job.get("qualification_match_status")).lower() == "unavailable":
+        if text(job.get("qualification_match_status")).lower() == "unavailable" and not broad_software:
             return "review_required", "Qualifications could not be assessed from the posting evidence."
         if clamp_int_default(search.get("distance"), 0, 0, 1000) and "remote" not in text(job.get("remote_type")).lower():
             if text(job.get("distance_radius_status")).lower() == "unknown":
@@ -12109,6 +12124,13 @@ def discovery_target_assessment(job: dict[str, Any], search: dict[str, Any]) -> 
                 )
 
     if broad_software:
+        if minimum is not None and minimum >= 4:
+            return "provisional", (
+                f"Relevant technical role retained for Apply Broadly review; the posting states at least {minimum:g} years "
+                "of required experience and is ranked as a stretch opportunity."
+            )
+        if not evidence_content:
+            return "provisional", "Relevant role retained for Apply Broadly review, but qualification evidence is incomplete."
         return "provisional", "Plausible software role with usable posting evidence; review résumé compatibility before applying."
     if level in unknown_levels:
         return "provisional", "Seniority is not stated; title and hard requirements are compatible, but this is not a verified junior role."

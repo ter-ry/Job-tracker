@@ -232,8 +232,8 @@ def test_async_exclusion_tombstone_removes_visible_result_but_keeps_history():
             assert app_module.query_db("SELECT id FROM jobs WHERE id = ?", [job["id"]], one=True) is not None
 
 
-def test_async_raw_provider_td_requirement_is_excluded_and_persisted(monkeypatch, tmp_path):
-    """Real async worker path must not depend on precomputed seniority fields."""
+def test_async_raw_provider_td_requirement_is_retained_by_apply_broadly(monkeypatch, tmp_path):
+    """The async worker applies recall-first policy to raw provider text."""
     app_module.DATA_DIR = Path(tmp_path)
     app_module.DB_PATH = app_module.DATA_DIR / "raw-async.sqlite"
     app_module.app.config.update(TESTING=True)
@@ -268,11 +268,12 @@ def test_async_raw_provider_td_requirement_is_excluded_and_persisted(monkeypatch
             break
         time.sleep(0.01)
     assert final["status"] == "completed"
-    assert final["jobs"] == []
-    assert final["progress"]["confirmed_excluded"] == 1
+    assert len(final["jobs"]) == 1
+    assert final["jobs"][0]["discovery_result_category"] != "excluded"
+    assert final["progress"]["confirmed_excluded"] == 0
     with app_module.app.app_context():
         row = app_module.query_db("SELECT discovery_result_category, job_description FROM jobs WHERE source_job_id = ?", ["td-async-raw"], one=True)
-        assert row["discovery_result_category"] == "excluded"
+        assert row["discovery_result_category"] != "excluded"
         assert "5+ years" in row["job_description"]
 
 

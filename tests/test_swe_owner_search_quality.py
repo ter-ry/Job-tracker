@@ -42,21 +42,20 @@ def test_nonsoftware_developer_titles_are_not_new_swe_matches():
     )[0] == "ineligible"
 
 
-def test_no_glassdoor_description_is_review_only_not_qualified():
+def test_no_glassdoor_description_remains_visible_in_broad_queue():
     job = _job(job_description="", required_skills="", preferred_skills="", responsibilities="")
     status, reason = app_module.discovery_target_assessment(job, _search())
-    assert status == "review_required"
-    assert "no usable requirements" in reason.lower()
-    assert not app_module.discovery_target_eligible(job, _search())
+    assert status == "provisional"
+    assert app_module.discovery_target_eligible(job, _search())
 
 
-def test_qualification_unavailable_is_review_only():
+def test_qualification_unavailable_is_visible_as_low_confidence_broad_match():
     job = _job(qualification_match_status="unavailable")
     status, _ = app_module.discovery_target_assessment(job, _search())
-    assert status == "review_required"
+    assert status == "provisional"
 
 
-def test_unclassified_five_years_is_review_only_until_evidence_classified():
+def test_unclassified_experience_is_visible_until_evidence_is_confirmed():
     job = _job(
         job_description="We seek a developer with 5 to 7 years of experience.",
         qualification_fit_seniority={
@@ -65,14 +64,14 @@ def test_unclassified_five_years_is_review_only_until_evidence_classified():
         },
     )
     status, reason = app_module.discovery_target_assessment(job, _search())
-    assert status == "review_required"
-    assert "5-year" in reason
-    assert not app_module.discovery_target_eligible(job, _search())
+    assert status == "provisional"
+    assert app_module.discovery_target_eligible(job, _search())
 
 
-def test_confirmed_seven_year_requirement_is_ineligible():
+def test_confirmed_seven_year_requirement_is_broad_visible_but_strictly_ineligible():
     job = _job(qualification_fit_seniority={"detected_level": "unknown", "required_experience": {"minimum": 7}})
-    assert app_module.discovery_target_assessment(job, _search())[0] == "ineligible"
+    assert app_module.discovery_target_assessment(job, _search())[0] == "provisional"
+    assert app_module.discovery_target_assessment(job, _search(match_policy="strict_matching"))[0] == "ineligible"
 
 
 def test_intermediate_engineer_is_retained_by_broad_policy_but_strict_matching_excludes_it():
@@ -97,20 +96,21 @@ def test_unknown_local_distance_retained_only_as_labelled_provisional_in_city_mo
     assert not app_module.discovery_target_eligible(job, strict)
 
 
-def test_unknown_distance_never_overrides_confirmed_seniority_or_experience_exclusion():
+def test_unknown_distance_does_not_hide_broad_experience_stretch():
     job = _job(
         remote_type="On-site",
         distance_radius_status="unknown",
         distance_km=9999,
         qualification_fit_seniority={"detected_level": "junior", "required_experience": {"minimum": 7}},
     )
-    assert app_module.discovery_target_assessment(job, _search(geographic_match_mode="provisional"))[0] == "ineligible"
+    assert app_module.discovery_target_assessment(job, _search(geographic_match_mode="provisional"))[0] == "provisional"
+    assert app_module.discovery_target_assessment(job, _search(geographic_match_mode="provisional", match_policy="strict_matching"))[0] == "ineligible"
 
 
-def test_missing_requirements_remain_review_only_even_in_provisional_geography_mode():
+def test_missing_requirements_remain_visible_in_broad_queue_even_in_provisional_geography_mode():
     job = _job(remote_type="On-site", distance_radius_status="unknown", job_description="")
     status, _ = app_module.discovery_target_assessment(job, _search(geographic_match_mode="provisional"))
-    assert status == "review_required"
+    assert status == "provisional"
 
 
 def test_toronto_search_postal_does_not_inherit_an_unrelated_profile_city():
@@ -136,6 +136,53 @@ def test_remote_job_does_not_require_commute_distance():
     job = _job(remote_type="Remote", distance_radius_status="unknown")
     assert app_module.discovery_target_assessment(job, _search())[0] == "provisional"
     assert app_module.discovery_target_eligible(job, _search())
+
+
+def test_apply_broadly_keeps_weak_junior_and_incomplete_roles_accessible():
+    cases = [
+        _job(title="Junior Developer", job_description="Work with an engineering team; technology details are not provided."),
+        _job(title="Junior Software Developer", job_description=""),
+        _job(title="Technical Solutions Specialist", job_description="Support customer systems and integrations."),
+    ]
+    for job in cases:
+        status, _reason = app_module.discovery_target_assessment(job, _search())
+        assert status == "provisional"
+        assert app_module.discovery_target_eligible(job, _search())
+        assert app_module.discovery_result_category(job)[0] != "excluded"
+
+
+def test_apply_broadly_retains_technical_stretch_roles_but_strict_matching_blocks_them():
+    for title, years in (
+        ("Senior Full Stack Developer", 5),
+        ("Senior Software Developer", 7),
+        ("Staff Platform Engineer", 8),
+        ("Principal Infrastructure Engineer", 10),
+    ):
+        job = _job(
+            title=title,
+            job_description="Design and maintain production software systems using Python and cloud APIs.",
+            qualification_fit_seniority={"detected_level": "senior", "required_experience": {"minimum": years}},
+        )
+        assert app_module.discovery_target_assessment(job, _search())[0] == "provisional"
+        assert app_module.discovery_target_assessment(job, _search(match_policy="strict_matching"))[0] == "ineligible"
+
+
+def test_broad_policy_excludes_confirmed_unrelated_but_not_unknown_relevance():
+    unknown = _job(title="Technical Analyst", job_description="Responsibilities are not available.")
+    unrelated = _job(title="CNC Machinist", job_description="Operate machining equipment.")
+    assert app_module.discovery_result_category(unknown)[0] != "excluded"
+    assert app_module.discovery_result_category(unrelated)[0] == "excluded"
+
+
+def test_within_radius_evidence_overrides_stale_location_search_flag():
+    job = _job(
+        title="Junior Software Developer",
+        remote_type="On-site",
+        distance_radius_status="within_radius",
+        location_search_eligible=False,
+        distance_confidence=90,
+    )
+    assert app_module.discovery_result_category(job)[0] != "excluded"
 
 
 def test_failed_postal_origin_is_not_replaced_with_home_coordinates():

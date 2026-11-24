@@ -8,6 +8,7 @@ import app
 def _search(**changes):
     value = {
         "search_mode": "shortlist", "occupation": "software developer",
+        "match_policy": "apply_broadly",
         "seniority": "entry_level,junior", "maximum_required_years": 3,
         "include_provisional_matches": True,
     }
@@ -30,15 +31,18 @@ def test_topbox_like_unknown_seniority_is_provisional_not_senior_mismatch():
     candidate = _job(job_description="Build and maintain Python applications and unit tests.", remote_type="Remote")
     status, reason = app.discovery_target_assessment(candidate, _search())
     assert status == "provisional"
-    assert "not stated" in reason
+    assert "résumé" in reason.lower() or "resume" in reason.lower()
     assert app.discovery_target_eligible(candidate, _search())
 
 
-def test_explicit_senior_and_confirmed_excess_years_are_hard_blockers():
+def test_explicit_senior_and_confirmed_excess_years_are_strict_only_blockers():
     senior = _job(seniority_level="senior", qualification_fit_seniority={"detected_level": "senior", "required_experience": {}})
     years = _job(qualification_fit_seniority={"detected_level": "junior", "required_experience": {"minimum": 5}})
-    assert app.discovery_target_assessment(senior, _search())[0] == "ineligible"
-    assert app.discovery_target_assessment(years, _search())[0] == "ineligible"
+    assert app.discovery_target_assessment(senior, _search())[0] == "provisional"
+    assert app.discovery_target_assessment(years, _search())[0] == "provisional"
+    strict = _search(match_policy="strict_matching")
+    assert app.discovery_target_assessment(senior, strict)[0] == "ineligible"
+    assert app.discovery_target_assessment(years, strict)[0] == "ineligible"
 
 
 def test_provider_intern_label_does_not_exclude_non_intern_title():
@@ -56,8 +60,8 @@ def test_implausibly_large_experience_value_stays_reviewable():
     job = _job(title="Junior Software Developer", job_description="Requirements: 35+ years of experience.",
                qualification_fit_seniority={"detected_level": "unknown", "required_experience": {"minimum": 35}})
     status, reason = app.discovery_target_assessment(job, _search())
-    assert status == "review_required"
-    assert "implausibly high" in reason
+    assert status == "provisional"
+    assert "stretch" in reason.lower()
 
 
 def test_canonical_url_drops_provider_tracking_and_www_aliases():
@@ -100,7 +104,7 @@ def _swe_policy_job(title, description, **changes):
     return value
 
 
-def test_ci73_swe_hard_exclusions_precede_apply_broadly_and_strict_matching():
+def test_ci73_swe_seniority_and_experience_are_ranked_broadly_but_block_strict_matching():
     search = _search(match_policy="apply_broadly", seniority="entry_level,junior", maximum_required_years=3)
     excluded = [
         ("Senior Staff Software Developer", "Requirements: 10+ years of software development experience."),
@@ -113,11 +117,11 @@ def test_ci73_swe_hard_exclusions_precede_apply_broadly_and_strict_matching():
     for title, description in excluded:
         job = _swe_policy_job(title, description)
         category, reason = app.discovery_result_category(job)
-        assert category == "excluded", (title, category, reason)
-        assert "experience" in reason.lower() or "senior" in reason.lower(), reason
-        assert app.discovery_target_assessment(job, search)[0] == "ineligible"
+        assert category != "excluded", (title, category, reason)
+        assert app.discovery_target_assessment(job, search)[0] != "ineligible"
         strict = dict(job, discovery_match_policy="strict_matching")
-        assert app.discovery_result_category(strict)[0] == "excluded"
+        assert app.discovery_result_category(strict)[0] in {"excluded", "review_required"}
+        assert app.discovery_target_assessment(strict, dict(search, match_policy="strict_matching"))[0] == "ineligible"
 
 
 def test_ci73_swe_eligible_junior_and_new_grad_roles_survive_hard_policy():
@@ -145,7 +149,7 @@ def test_seniority_parser_prefers_associate_and_new_grad_title_signals():
     assert senior_staff["detected_level"] in {"senior", "lead"}
 
 
-def test_swe_hard_exclusions_precede_unknown_geography_and_remote_review():
+def test_swe_broad_seniority_remains_visible_while_strict_matching_excludes_it():
     search = _search(match_policy="apply_broadly", maximum_required_years=3)
     unknown_radius = _swe_policy_job(
         "Senior Staff Software Engineer", "10+ years of software engineering experience required.",
@@ -159,9 +163,10 @@ def test_swe_hard_exclusions_precede_unknown_geography_and_remote_review():
     )
     for job in (unknown_radius, unknown_remote):
         category, reason = app.discovery_result_category(job, "remote" if job is unknown_remote else "")
-        assert category == "excluded", (category, reason)
-        assert app.discovery_target_assessment(job, search)[0] == "ineligible"
-        assert "senior" in reason.lower() or "experience" in reason.lower()
+        assert category != "excluded", (category, reason)
+        assert app.discovery_target_assessment(job, search)[0] != "ineligible"
+        strict = dict(search, match_policy="strict_matching")
+        assert app.discovery_target_assessment(job, strict)[0] == "ineligible"
 
 
 def test_ci76_owner_swe_examples_do_not_leak_through_apply_broadly_fallbacks():
@@ -183,8 +188,9 @@ def test_ci76_owner_swe_examples_do_not_leak_through_apply_broadly_fallbacks():
         "Entry-level software engineering role with mentorship.",
         qualification_fit_seniority={"detected_level": "entry_level", "required_experience": {"minimum": 0}},
     )
-    assert app.discovery_target_assessment(td, search)[0] == "ineligible"
-    assert app.discovery_result_category(td)[0] == "excluded"
+    assert app.discovery_target_assessment(td, search)[0] != "ineligible"
+    assert app.discovery_result_category(td)[0] != "excluded"
+    assert app.discovery_target_assessment(td, dict(search, match_policy="strict_matching"))[0] == "ineligible"
     assert app.plausible_software_role(academic) is False
     assert app.plausible_software_role(amex) is True
     assert app.discovery_result_category(amex)[0] != "excluded"
@@ -238,16 +244,16 @@ def test_raw_provider_text_drives_td_five_year_exclusion_without_injected_analys
     }
     with app.app.app_context():
         result = app.run_discovery_pipeline(payload)
-    assert result["jobs"] == []
-    assert result["excluded_jobs"][0]["source_job_id"] == "td-raw-five-years"
-    excluded = result["excluded_jobs"][0]
-    assert excluded["discovery_result_category"] == "excluded"
-    assert excluded["qualification_fit_seniority"]["detected_level"] == "intermediate"
-    assert excluded["experience_requirements"]["required"]["minimum"] == 5
-    assert excluded["experience_requirements"]
+    assert result["jobs"]
+    assert not result["excluded_jobs"]
+    retained = result["jobs"][0]
+    assert retained["discovery_result_category"] != "excluded"
+    assert retained["qualification_fit_seniority"]["detected_level"] == "intermediate"
+    assert retained["experience_requirements"]["required"]["minimum"] == 5
+    assert retained["experience_requirements"]
     with app.app.app_context():
         row = app.query_db("SELECT discovery_result_category, job_description FROM jobs WHERE source_job_id = ?", ["td-raw-five-years"], one=True)
-        assert row["discovery_result_category"] == "excluded"
+        assert row["discovery_result_category"] != "excluded"
         assert "5+ years" in row["job_description"]
 
 
