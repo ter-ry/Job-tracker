@@ -79,10 +79,11 @@ def test_re_evaluate_is_occupation_scoped_and_preserves_history(tmp_path, monkey
 
     saved = client.post(f"/api/discovery/inbox/{software_id}/save", json={"applicant_profile_id": swe, "workflow": "software"})
     assert saved.status_code == 200
-    preview = client.post("/api/discovery/re-evaluate", json={"applicant_profile_id": swe, "workflow": "software"})
+    policy = {"match_policy": "apply_broadly", "geographic_match_mode": "provisional", "distance": 20, "seniority": "entry_level,junior", "maximum_required_years": 3, "include_internships": False}
+    preview = client.post("/api/discovery/re-evaluate", json={"applicant_profile_id": swe, "workflow": "software", **policy})
     assert preview.status_code == 200
     assert preview.get_json()["preview"] is True
-    result = client.post("/api/discovery/re-evaluate", json={"applicant_profile_id": swe, "workflow": "software", "preview": False, "confirm_apply": True, "preview_token": preview.get_json()["preview_token"]})
+    result = client.post("/api/discovery/re-evaluate", json={"applicant_profile_id": swe, "workflow": "software", "preview": False, "confirm_apply": True, "preview_token": preview.get_json()["preview_token"], **policy})
     assert result.status_code == 200
     assert result.get_json()["preview"] is False
 
@@ -101,7 +102,7 @@ def test_history_reassessment_preview_and_audit_are_non_mutating(tmp_path, monke
     job_id = _stored_job(client, occupation="software developer")
     with app_module.app.app_context():
         before = dict(app_module.query_db("SELECT discovery_result_category, discovery_result_reason FROM jobs WHERE id = ?", [job_id], one=True))
-    preview = client.post("/api/discovery/re-evaluate", json={"applicant_profile_id": swe, "workflow": "software", "preview": True})
+    preview = client.post("/api/discovery/re-evaluate", json={"applicant_profile_id": swe, "workflow": "software", "match_policy": "apply_broadly", "geographic_match_mode": "provisional", "distance": 20, "seniority": "entry_level,junior", "maximum_required_years": 3, "include_internships": False, "preview": True})
     assert preview.status_code == 200
     assert preview.get_json()["preview"] is True
     with app_module.app.app_context():
@@ -111,6 +112,38 @@ def test_history_reassessment_preview_and_audit_are_non_mutating(tmp_path, monke
     assert audit.status_code == 200
     assert audit.get_json()["mutated"] is False
     assert audit.get_json()["total"] >= 1
+
+
+def test_legacy_membership_requires_explicit_policy_and_reassesses_recall_first(tmp_path, monkeypatch):
+    client = _isolated_client(tmp_path, monkeypatch)
+    swe = _profile(client, "SWE", "software")
+    job_id = _stored_job(client, category="excluded", occupation="software developer")
+    with app_module.app.app_context():
+        app_module.get_db().execute(
+            """INSERT INTO discovery_search_memberships
+               (search_execution_id, job_id, applicant_profile_id, category, reason, evidence_json, criteria_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            ["legacy-run", job_id, swe, "excluded", "Old strict-looking result", "{}", app_module.dumps_json({
+                "keywords": "software developer; junior software engineer",
+                "location": "m2j0b6", "location_scope": "Toronto, ON",
+                "occupation": "software developer", "seniority": "entry_level,junior",
+                "maximum_required_years": 3, "include_internships": True,
+                "search_mode": "shortlist",
+            })],
+        )
+        app_module.get_db().commit()
+    missing_policy = client.post("/api/discovery/re-evaluate", json={"applicant_profile_id": swe, "workflow": "software"})
+    assert missing_policy.status_code == 400
+    policy = {"match_policy": "apply_broadly", "geographic_match_mode": "provisional", "distance": 20, "seniority": "entry_level,junior", "maximum_required_years": 3, "include_internships": True}
+    preview = client.post("/api/discovery/re-evaluate", json={"applicant_profile_id": swe, "workflow": "software", **policy})
+    assert preview.status_code == 200
+    body = preview.get_json()
+    assert body["effective_policy"]["match_policy"] == "apply_broadly"
+    assert body["effective_policy"]["geographic_match_mode"] == "provisional"
+    assert body["jobs"][0]["effective_policy"] == body["effective_policy"]
+    with app_module.app.app_context():
+        membership = app_module.query_db("SELECT criteria_json FROM discovery_search_memberships WHERE search_execution_id = ?", ["legacy-run"], one=True)
+        assert "match_policy" not in app_module.parse_json_object(membership["criteria_json"])
 
 
 def test_ready_to_apply_excludes_applications_but_keeps_seen_unapplied(tmp_path, monkeypatch):

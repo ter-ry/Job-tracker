@@ -2478,6 +2478,32 @@ def create_app() -> Flask:
                  AND (j.discovery_occupation = ? OR j.discovery_occupation = '' OR j.discovery_occupation IS NULL)""",
             [applicant_id, applicant_id, applicant_id, requested_occupation],
         )
+        historical_seed = {}
+        if rows:
+            seed_membership = query_db(
+                """SELECT criteria_json FROM discovery_search_memberships
+                   WHERE job_id = ? AND applicant_profile_id IN (0, ?)
+                   ORDER BY created_at DESC, search_execution_id DESC LIMIT 1""",
+                [int(rows[0]["id"]), applicant_id], one=True,
+            )
+            historical_seed = parse_json_object(seed_membership["criteria_json"]) if seed_membership else {}
+        try:
+            reassessment_policy = resolve_reassessment_policy(payload, historical_seed, workflow)
+        except ValueError as exc:
+            return jsonify({"error": str(exc), "policy_required": True}), 400
+        evidence_payload = {
+            **payload,
+            "candidate_profile_id": applicant_id,
+            "applicant_profile_id": applicant_id,
+            "workflow": workflow,
+            "search_mode": reassessment_policy["search_mode"],
+        }
+        try:
+            evidence_profile = resolve_discovery_evidence_profile(evidence_payload)
+        except (ValueError, TypeError):
+            # A missing résumé is evidence unavailable, not permission to use
+            # another applicant's résumé or the global profile.
+            evidence_profile = {}
         changed = []
         category_counts: dict[str, int] = {}
         for row in rows:
@@ -2489,15 +2515,47 @@ def create_app() -> Flask:
                 [int(row["id"]), applicant_id], one=True,
             )
             criteria = parse_json_object(membership["criteria_json"]) if membership else {}
-            apply_discovery_criteria_to_item(item, criteria)
+            # Preserve the immutable historical criteria for diagnostics, but
+            # classify using the explicitly authorized effective policy.
+            item["discovery_occupation"] = reassessment_policy["occupation"]
+            item["discovery_search_mode"] = reassessment_policy["search_mode"]
+            item["discovery_match_policy"] = reassessment_policy["match_policy"]
+            item["discovery_seniority"] = reassessment_policy["seniority"]
+            item["discovery_maximum_required_years"] = reassessment_policy["maximum_required_years"]
+            item["discovery_include_internships"] = reassessment_policy["include_internships"]
+            item["discovery_remote_preference"] = reassessment_policy["remote_preference"]
+            item["discovery_location_scope"] = reassessment_policy["location"]
+            item["discovery_geographic_match_mode"] = reassessment_policy["geographic_match_mode"]
+            item["discovery_distance"] = reassessment_policy["distance"]
+            if evidence_profile:
+                qualification = build_qualification_fit(item, evidence_profile)
+                item.update(qualification)
+            # Recompute geographic status from stored evidence. A historical
+            # strict flag with no verified distance cannot override a newly
+            # selected provisional policy.
+            item["location_search_eligible"] = None
+            if reassessment_policy["distance"] and "remote" not in text(item.get("remote_type")).lower():
+                confidence = clamp_int(item.get("distance_confidence"), 0, 100)
+                distance_km = clamp_int(item.get("distance_km"), 0, 9999)
+                if confidence <= 0 or distance_km >= 9999:
+                    item["distance_km"] = 9999
+                    item["distance_confidence"] = 0
+                    item["distance_radius_status"] = "unknown"
+            apply_discovery_search_constraints(
+                item,
+                reassessment_policy["remote_preference"],
+                reassessment_policy["location"],
+                reassessment_policy["distance"],
+                reassessment_policy["geographic_match_mode"],
+            )
             category, reason = discovery_result_category(item, text(item.get("discovery_remote_preference")))
             description = text(item.get("job_description"))
             grounded = bool(len(description) >= 80 and text(item.get("url")))
             category_counts[category] = category_counts.get(category, 0) + 1
-            preview_item = {"id": int(row["id"]), "title": text(item.get("title")), "company": text(item.get("company")), "current_category": text(row["discovery_result_category"]), "proposed_category": category, "reason": reason, "evidence_sufficient": grounded, "source": text(item.get("source")), "url": text(item.get("url")), "search_criteria": criteria}
+            preview_item = {"id": int(row["id"]), "title": text(item.get("title")), "company": text(item.get("company")), "current_category": text(row["discovery_result_category"]), "proposed_category": category, "reason": reason, "evidence_sufficient": grounded, "source": text(item.get("source")), "url": text(item.get("url")), "search_criteria": criteria, "effective_policy": reassessment_policy}
             changed.append(preview_item)
         targeted = [item for item in changed if item["evidence_sufficient"] and item["current_category"] != item["proposed_category"]]
-        preview_token = hashlib.sha256(json.dumps(targeted, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+        preview_token = hashlib.sha256(json.dumps({"policy": reassessment_policy, "targeted": targeted}, sort_keys=True, default=str).encode("utf-8")).hexdigest()
         if not preview:
             if text(payload.get("preview_token")) != preview_token:
                 return jsonify({"error": "A matching reassessment preview token is required before applying changes."}), 409
@@ -2511,7 +2569,19 @@ def create_app() -> Flask:
                         [item["id"], applicant_id, f"Requalified by current matching rules: {item['reason'] or item['proposed_category']}"],
                     )
             db.commit()
-        return jsonify({"preview": preview, "count": len(changed), "targeted_count": len(targeted), "preview_token": preview_token, "category_counts": category_counts, "jobs": changed, "message": "Preview only; no records or applicant decisions changed." if preview else "Targeted history classifications updated; search evidence and applicant decisions were preserved."})
+        explicit_policy = {key: payload[key] for key in ("match_policy", "geographic_match_mode", "distance", "seniority", "maximum_required_years", "include_internships", "remote_preference", "search_mode", "location") if key in payload}
+        return jsonify({
+            "preview": preview,
+            "count": len(changed),
+            "targeted_count": len(targeted),
+            "preview_token": preview_token,
+            "category_counts": category_counts,
+            "original_historical_criteria": historical_seed,
+            "explicit_reassessment_policy": explicit_policy,
+            "effective_policy": reassessment_policy,
+            "jobs": changed,
+            "message": "Preview only; no records or applicant decisions changed." if preview else "Targeted history classifications updated; search evidence and applicant decisions were preserved.",
+        })
 
     @app.get("/api/discovery/inbox/audit")
     def discovery_inbox_audit() -> Response:
@@ -11991,6 +12061,69 @@ def apply_discovery_criteria_to_item(item: dict[str, Any], criteria: dict[str, A
         if source in criteria and criteria[source] not in (None, ""):
             item[target] = criteria[source]
     return item
+
+
+def resolve_reassessment_policy(
+    payload: dict[str, Any], historical_criteria: dict[str, Any], workflow: str,
+) -> dict[str, Any]:
+    """Resolve an explicit, validated policy for historical reassessment.
+
+    Older memberships intentionally lack matching-policy fields.  They must
+    never be interpreted as strict matching by accident; callers must provide
+    the missing policy explicitly unless it is present in trusted membership
+    metadata.  The returned object is also included in the preview token.
+    """
+    historical = historical_criteria if isinstance(historical_criteria, dict) else {}
+
+    def selected(name: str, *aliases: str) -> Any:
+        for key in (name, *aliases):
+            if key in payload and payload[key] not in (None, ""):
+                return payload[key]
+        for key in (name, *aliases):
+            if historical.get(key) not in (None, ""):
+                return historical[key]
+        return None
+
+    required = {
+        "match_policy": selected("match_policy"),
+        "geographic_match_mode": selected("geographic_match_mode"),
+        "distance": selected("distance"),
+        "seniority": selected("seniority"),
+        "maximum_required_years": selected("maximum_required_years"),
+    }
+    missing = [name for name, value in required.items() if value in (None, "")]
+    if missing:
+        raise ValueError(
+            "Explicit reassessment settings are required for this historical cohort: "
+            + ", ".join(missing)
+        )
+    match_policy = normalize_choice(required["match_policy"], {"apply_broadly", "strict_matching"})
+    geographic_mode = normalize_choice(required["geographic_match_mode"], {"strict", "provisional"})
+    if not match_policy or not geographic_mode:
+        raise ValueError("match_policy must be apply_broadly or strict_matching, and geographic_match_mode must be strict or provisional.")
+    try:
+        distance = clamp_int(required["distance"], 0, 1000)
+        maximum = clamp_int(required["maximum_required_years"], 0, 30)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("distance and maximum_required_years must be numeric values within their supported ranges.") from exc
+    seniority = normalize_seniority_levels(required["seniority"])
+    if not seniority:
+        raise ValueError("At least one reassessment seniority level is required.")
+    include_value = payload["include_internships"] if "include_internships" in payload else historical.get("include_internships", False)
+    location = selected("location", "location_scope") or text(historical.get("location_scope"))
+    return {
+        "workflow": workflow,
+        "occupation": "early childhood educator" if workflow == "ece" else "software developer",
+        "match_policy": match_policy,
+        "geographic_match_mode": geographic_mode,
+        "distance": distance,
+        "seniority": seniority,
+        "maximum_required_years": maximum,
+        "include_internships": as_bool(include_value),
+        "remote_preference": text(selected("remote_preference")),
+        "search_mode": text(selected("search_mode")) or "shortlist",
+        "location": location,
+    }
 
 
 def discovery_diagnostic_breakdown(items: Iterable[dict[str, Any]]) -> dict[str, Any]:
