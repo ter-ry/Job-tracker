@@ -6,6 +6,7 @@ import argparse
 import json
 import re
 import time
+import json as _json
 from urllib.parse import parse_qsl, urlsplit
 from pathlib import Path
 from typing import Any, Iterable
@@ -20,10 +21,41 @@ CASES = {
 }
 
 
-def _identity_evidence_is_present(page: str, employer: str) -> bool:
+def _identity_evidence_is_present(page: str, employer: str, source_job_id: str) -> bool:
+    """Require both page-contained identifier and contextual employer evidence."""
     visible = app._visible_job_page_text(page).casefold()
     tokens = [token for token in re.findall(r"[a-z0-9]+", employer.casefold()) if len(token) >= 3]
-    return len(tokens) >= 2 and sum(token in visible for token in tokens) >= min(2, len(tokens))
+    if len(tokens) < 2:
+        return False
+
+    # A requested URL is not evidence about the document returned for it. Use
+    # only identifiers retained by the returned document: canonical/job links,
+    # explicit job-id fields, or JobPosting JSON-LD URLs.
+    identifier = re.escape(source_job_id.casefold())
+    identifier_in_document = bool(re.search(
+        rf"(?:canonical|job\s*[_-]?id|job\s*key|jk|requisition)[^\n]{{0,160}}{identifier}|{identifier}[^\n]{{0,160}}(?:canonical|job\s*[_-]?id|job\s*key|jk|requisition)",
+        page.casefold(), re.I,
+    ))
+    if not identifier_in_document:
+        return False
+
+    # Employer evidence must be in a role-bearing heading or structured
+    # employer field, rather than an arbitrary footer/marketing occurrence.
+    headings = " ".join(re.findall(r"<h[1-3][^>]*>(.*?)</h[1-3]>", page, re.I | re.S))
+    heading_text = app._visible_job_page_text(headings).casefold()
+    heading_match = sum(token in heading_text for token in tokens) >= min(2, len(tokens))
+    structured_employer = False
+    for raw in re.findall(r"<script[^>]+type=[\"']application/ld\+json[\"'][^>]*>(.*?)</script>", page, re.I | re.S):
+        try:
+            payload = _json.loads(raw)
+        except (TypeError, ValueError, _json.JSONDecodeError):
+            continue
+        serialized = _json.dumps(payload, ensure_ascii=False).casefold()
+        if any(marker in serialized for marker in ("hiringorganization", "employer", "company")):
+            structured_employer = sum(token in serialized for token in tokens) >= min(2, len(tokens))
+            if structured_employer:
+                break
+    return heading_match or structured_employer
 
 
 def benchmark(urls: list[str], *, config: ScraperApiConfig, max_credits: float) -> dict[str, Any]:
@@ -35,7 +67,8 @@ def benchmark(urls: list[str], *, config: ScraperApiConfig, max_credits: float) 
     for url in urls:
         case = CASES.get(url, {})
         remaining = max_credits - consumed
-        if attempted >= max_requests or cost_unknown or remaining <= 0:
+        request_max_cost = min(float(config.max_cost), remaining)
+        if attempted >= max_requests or cost_unknown or request_max_cost <= 0:
             reason = "The maximum two-request benchmark limit was reached."
             if cost_unknown:
                 reason = "Previous response did not report sa-credit-cost; stopped conservatively because cumulative cost is unknown."
@@ -45,7 +78,7 @@ def benchmark(urls: list[str], *, config: ScraperApiConfig, max_credits: float) 
             continue
         started = time.perf_counter()
         source_job_id = dict(parse_qsl(urlsplit(url).query, keep_blank_values=True)).get("jk", "")
-        page = fetch_scraperapi_page(url, config=config, source_job_id=source_job_id, max_cost=remaining)
+        page = fetch_scraperapi_page(url, config=config, source_job_id=source_job_id, max_cost=request_max_cost)
         if page.get("request_made"):
             attempted += 1
             cost = page.get("credit_cost")
@@ -58,7 +91,7 @@ def benchmark(urls: list[str], *, config: ScraperApiConfig, max_credits: float) 
         if page.get("retrieval_succeeded"):
             job = {"source": "Indeed", "source_job_id": source_job_id, "title": case.get("name", ""), "company": case.get("name", ""), "location": "Ontario"}
             parsed = app._extract_workplace_from_page(job, page.get("body", ""), url)
-            identity_verified = _identity_evidence_is_present(page.get("body", ""), case.get("name", ""))
+            identity_verified = _identity_evidence_is_present(page.get("body", ""), case.get("name", ""), source_job_id)
             item["identity_status"] = "verified" if identity_verified else "unverified"
             item["valid_job_page"] = bool(parsed) and identity_verified
             item["candidates"] = parsed

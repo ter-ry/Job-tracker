@@ -8,6 +8,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from math import isfinite
 from typing import Any
 
 from sources.jobspy_source import normalize_indeed_source_id
@@ -54,13 +55,22 @@ def _parse_credit_cost(value: Any) -> float | None:
         parsed = Decimal(str(value).strip())
     except (InvalidOperation, TypeError, ValueError):
         return None
-    return float(parsed) if parsed >= 0 else None
+    if not parsed.is_finite() or parsed < 0:
+        return None
+    value = float(parsed)
+    return value if isfinite(value) else None
 
 
 def _redact_secret(value: Any, secret: str) -> str:
     """Make transport errors safe even when urllib embeds the request URL."""
     rendered = str(value)
-    return rendered.replace(secret, "[REDACTED]") if secret else rendered
+    if not secret:
+        return rendered
+    # urllib and proxy errors may render query parameters either literally or
+    # percent-encoded.  Redact both forms before anything reaches a report.
+    for encoded in (secret, urllib.parse.quote(secret, safe=""), urllib.parse.quote_plus(secret)):
+        rendered = rendered.replace(encoded, "[REDACTED]")
+    return rendered
 
 
 def fetch_scraperapi_page(

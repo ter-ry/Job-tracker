@@ -1,7 +1,7 @@
 import json
 from urllib.parse import parse_qs, urlsplit
 
-from sources.scraperapi_source import ScraperApiConfig, approved_indeed_url, fetch_scraperapi_page
+from sources.scraperapi_source import ScraperApiConfig, _parse_credit_cost, approved_indeed_url, fetch_scraperapi_page
 from scripts.benchmark_scraperapi_workplace import CASES, benchmark
 
 
@@ -16,13 +16,13 @@ def test_scraperapi_requires_explicit_configuration_and_strict_url_scope():
 
 
 def test_scraperapi_benchmark_mock_validates_evidence_and_budget(monkeypatch):
-    body = "<h1>BGC East Scarborough</h1><p>Work Location: 100 Galloway Road, Scarborough, ON M1E 1W7</p>"
+    body = '<link rel="canonical" href="https://ca.indeed.com/viewjob?jk=5b10c60264baec65"><h1>BGC East Scarborough</h1><p>Work Location: 100 Galloway Road, Scarborough, ON M1E 1W7</p>'
 
     def fake_fetch(url, *, config, source_job_id="", max_cost=None):
         return {"retrieval_succeeded": True, "request_made": True, "status": "ok", "body": body, "latency_ms": 12.5, "credit_cost": 1.0, "credit_cost_source": "sa-credit-cost", "max_cost": max_cost}
 
     monkeypatch.setattr("scripts.benchmark_scraperapi_workplace.fetch_scraperapi_page", fake_fetch)
-    config = ScraperApiConfig(api_key="test-only", enabled=True, allowed_hosts=("ca.indeed.com",))
+    config = ScraperApiConfig(api_key="test-only", enabled=True, allowed_hosts=("ca.indeed.com",), max_cost=1)
     report = benchmark(["https://ca.indeed.com/viewjob?jk=5b10c60264baec65", "https://ca.indeed.com/viewjob?jk=960d67145bdf8eb3"], config=config, max_credits=1)
 
     assert report["requests_attempted"] == 1
@@ -61,13 +61,26 @@ def test_scraperapi_redacts_credentials_from_transport_errors(monkeypatch):
     secret = "secret-test-key"
 
     def fail(_request, timeout):
-        raise RuntimeError(f"request failed for https://api.scraperapi.com/?api_key={secret}")
+        raise RuntimeError("request failed for https://api.scraperapi.com/?api_key=secret-test-key")
 
     monkeypatch.setattr("urllib.request.urlopen", fail)
     config = ScraperApiConfig(api_key=secret, enabled=True, allowed_hosts=("ca.indeed.com",))
     result = fetch_scraperapi_page("https://ca.indeed.com/viewjob?jk=abc", config=config)
     assert result["status"] == "failed"
     assert secret not in json.dumps(result)
+
+
+def test_scraperapi_redacts_url_encoded_credentials_from_transport_errors(monkeypatch):
+    secret = "secret/key+value"
+
+    def fail(_request, timeout):
+        raise RuntimeError("proxy rejected https://api.scraperapi.com/?api_key=secret%2Fkey%2Bvalue")
+
+    monkeypatch.setattr("urllib.request.urlopen", fail)
+    config = ScraperApiConfig(api_key=secret, enabled=True, allowed_hosts=("ca.indeed.com",))
+    result = fetch_scraperapi_page("https://ca.indeed.com/viewjob?jk=abc", config=config)
+    assert secret not in json.dumps(result)
+    assert "secret%2Fkey%2Bvalue" not in json.dumps(result)
 
 
 def test_unknown_credit_cost_stops_before_a_second_request(monkeypatch):
@@ -101,3 +114,39 @@ def test_benchmark_does_not_count_postal_evidence_without_posting_identity(monke
     assert item["identity_status"] == "unverified"
     assert item["valid_job_page"] is False
     assert report["successful_valid_job_pages"] == 0
+
+
+def test_credit_cost_parser_rejects_missing_malformed_nonfinite_and_negative_values():
+    assert _parse_credit_cost(None) is None
+    assert _parse_credit_cost("not-a-number") is None
+    assert _parse_credit_cost("NaN") is None
+    assert _parse_credit_cost("Infinity") is None
+    assert _parse_credit_cost("-0.5") is None
+    assert _parse_credit_cost("0.25") == 0.25
+
+
+def test_unrelated_document_with_employer_words_is_not_valid_identity(monkeypatch):
+    def fake_fetch(url, *, config, source_job_id="", max_cost=None):
+        body = '<link rel="canonical" href="https://ca.indeed.com/viewjob?jk=other"><h1>BGC East Scarborough</h1><p>Work Location: 100 Galloway Road, Scarborough, ON M1E 1W7</p>'
+        return {"retrieval_succeeded": True, "request_made": True, "status": "ok", "body": body, "credit_cost": 1.0}
+
+    monkeypatch.setattr("scripts.benchmark_scraperapi_workplace.fetch_scraperapi_page", fake_fetch)
+    config = ScraperApiConfig(api_key="test-only", enabled=True, allowed_hosts=("ca.indeed.com",))
+    report = benchmark(["https://ca.indeed.com/viewjob?jk=5b10c60264baec65"], config=config, max_credits=1)
+    assert report["results"][0]["identity_status"] == "unverified"
+    assert report["successful_valid_job_pages"] == 0
+
+
+def test_request_cost_never_exceeds_configured_cap_or_total_budget(monkeypatch):
+    calls = []
+
+    def fake_fetch(url, *, config, source_job_id="", max_cost=None):
+        calls.append(max_cost)
+        return {"retrieval_succeeded": False, "request_made": True, "status": "ok", "credit_cost": 1.0}
+
+    monkeypatch.setattr("scripts.benchmark_scraperapi_workplace.fetch_scraperapi_page", fake_fetch)
+    config = ScraperApiConfig(api_key="test-only", enabled=True, allowed_hosts=("ca.indeed.com",), max_cost=1)
+    report = benchmark(list(CASES), config=config, max_credits=2)
+    assert calls == [1.0, 1.0]
+    assert report["requests_attempted"] == 2
+    assert report["credits_consumed"] == 2.0
