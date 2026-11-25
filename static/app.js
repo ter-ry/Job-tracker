@@ -45,6 +45,10 @@ const state = {
   discoveryInboxSelected: new Set(),
   discoveryInboxBulkAction: "",
   discoveryInboxBulkMessage: "",
+  fastApplyQueue: [],
+  fastApplyIndex: 0,
+  fastApplyStatus: "idle",
+  fastApplyError: "",
   workplaceEnrichmentOffset: 0,
   workplaceEnrichmentSearchId: "",
   workplaceEnrichmentSearch: null,
@@ -428,7 +432,14 @@ async function exitJobTracker() {
   try {
     const response = await fetch("/api/app/exit", { method: "POST", headers: { "X-Job-Tracker-Exit-Token": window.JOB_TRACKER_EXIT_TOKEN } });
     if (!response.ok) throw new Error("The local application could not be stopped safely.");
-    button.textContent = "Job Tracker is stopping…";
+    button.textContent = "Shutdown requested; waiting for exit…";
+    window.setTimeout(() => {
+      if (document.body.contains(button) && button.textContent.includes("waiting for exit")) {
+        button.disabled = false;
+        button.textContent = "Exit Job Tracker";
+        toast("Shutdown was requested but the application did not confirm exit. Check the Job Tracker window before trying again.");
+      }
+    }, 5000);
   } catch (error) {
     button.disabled = false;
     toast(error.message);
@@ -1561,7 +1572,6 @@ function renderDiscoveryInbox(jobs) {
     const runOptions = state.discoveryInboxRuns.map((run) => `<option value="${escapeAttribute(run.search_id)}" ${state.discoveryInboxSearchId === run.search_id ? "selected" : ""}>${escapeHtml(run.search_id.slice(0, 12))} · ${Number(run.review_count || 0)} review · ${Number(run.excluded_count || 0)} excluded</option>`).join("");
     if (showHistoryControls) filters.insertAdjacentHTML("beforeend", `<div class="inbox-history-search"><label>Search title or company<input type="search" data-inbox-history-search value="${escapeAttribute(state.discoveryInboxQuery)}" placeholder="Search history"></label><label>Reason filter<input type="search" data-inbox-reason-filter value="${escapeAttribute(state.discoveryInboxReason)}" placeholder="Reason"></label><label>Source filter<input type="search" data-inbox-source-filter value="${escapeAttribute(state.discoveryInboxSource)}" placeholder="Provider"></label></div>`);
     if (runOptions && showHistoryControls) filters.insertAdjacentHTML("beforeend", `<label class="inbox-search-run">Search run <select data-inbox-search-run><option value="">All runs</option>${runOptions}</select></label>`);
-    if (pagedCategory) filters.insertAdjacentHTML("beforeend", inboxPaginationMarkup("top"));
     filters.querySelectorAll("[data-inbox-primary]").forEach((button) => button.addEventListener("click", async () => {
       state.discoveryInboxSearchId = "";
       state.discoveryInboxCategory = button.dataset.inboxPrimary || "all_discovered";
@@ -1638,7 +1648,7 @@ function renderDiscoveryInbox(jobs) {
       : category === "skipped" ? `<button class="button ghost small" type="button" onclick="restoreInboxJob(${job.id})">Restore</button>${workplaceActions}` : category !== "excluded" ? workplaceActions : "";
     return `<article class="inbox-row"><label><input type="checkbox" data-inbox-select="${job.id}" ${state.discoveryInboxSelected.has(Number(job.id)) ? "checked" : ""}> Select</label><div><span class="inbox-badge">${escapeHtml(label)}</span><strong>${escapeHtml(job.title || "Untitled role")}</strong><span>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(resultWorkplaceLabel(job))}</span><span class="muted">${escapeHtml(job.work_arrangement || job.remote_type || "Unknown arrangement")} · ${escapeHtml(displaySalary(job))} · ${escapeHtml(resultDistanceLabel(job))}</span>${renderExperienceSummary(job)}<details><summary>${category === "excluded" ? "Exclusion evidence" : "Requirements and source evidence"}</summary><span class="muted">Decision: ${escapeHtml(job.discovery_result_category || category)} · Reason: ${escapeHtml(job.discovery_result_reason || "Unverified/missing")} · Source: ${escapeHtml(job.source || membership.source || "Unverified/missing")} · Evidence: ${escapeHtml(job.qualification_evidence_source || membership.qualification_evidence_source || "Unverified/missing")} · Confidence: ${escapeHtml(job.qualification_evidence_confidence || membership.qualification_evidence_confidence || "Unverified/missing")}</span>${evidenceText}${membership.required_experience ? `<p class="muted">Required experience evidence: ${escapeHtml(JSON.stringify(membership.required_experience))}</p>` : ""}${sourceLink}</details>${audit}</div><div class="row-actions">${actions}${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open Original</a>` : ""}</div></article>`;
   };
-  target.innerHTML = `${pagedCategory ? inboxPaginationMarkup("bottom") : ""}${visibleJobs.length ? visibleJobs.map(renderInboxCard).join("") : `No ${(labels[state.discoveryInboxCategory] || "discovery").toLowerCase()} discovery records.`}`;
+  target.innerHTML = `${pagedCategory ? inboxPaginationMarkup("results") : ""}${visibleJobs.length ? visibleJobs.map(renderInboxCard).join("") : `No ${(labels[state.discoveryInboxCategory] || "discovery").toLowerCase()} discovery records.`}`;
   bindInboxPagination(target);
   target.querySelectorAll("[data-inbox-select]").forEach((box) => box.addEventListener("change", () => { const id = Number(box.dataset.inboxSelect); if (box.checked) state.discoveryInboxSelected.add(id); else state.discoveryInboxSelected.delete(id); }));
 }
@@ -3949,26 +3959,67 @@ function openFastApply() {
   const panel = document.getElementById("fast-apply-panel");
   if (!panel) return;
   panel.hidden = false;
+  panel.scrollIntoView({ behavior: "smooth", block: "start" });
+  loadFastApplyQueue();
+}
+
+async function loadFastApplyQueue() {
+  const target = document.getElementById("fast-apply-current");
+  if (!target) return;
+  const profileId = state.selectedCandidateProfileId || value("discovery-profile") || "";
+  if (!profileId) {
+    state.fastApplyStatus = "error";
+    state.fastApplyError = "Select an applicant profile to load its Ready to Apply queue.";
+    renderFastApply();
+    return;
+  }
+  state.fastApplyStatus = "loading";
+  state.fastApplyError = "";
+  renderFastApply();
+  try {
+    const response = await api.getWithMeta(discoveryInboxRequestUrl({ profileId, category: "ready_to_apply", page: 0, pageSize: 500 }));
+    state.fastApplyQueue = Array.isArray(response.data) ? response.data : [];
+    state.fastApplyIndex = 0;
+    state.fastApplyStatus = "ready";
+  } catch (error) {
+    state.fastApplyQueue = [];
+    state.fastApplyStatus = "error";
+    state.fastApplyError = error.message || "Unable to load the persistent application queue.";
+  }
   renderFastApply();
 }
 
 function renderFastApply() {
   const target = document.getElementById("fast-apply-current");
   if (!target) return;
-  const queue = applyDiscoveryClientFiltersAndSort(state.discoveryResults || [], discoveryPreferencesFromControls());
-  const job = queue[0];
+  if (state.fastApplyStatus === "loading") { target.className = "generated-output"; target.innerHTML = "<p>Loading your persistent Ready to Apply queue…</p>"; return; }
+  if (state.fastApplyStatus === "error") { target.className = "generated-output"; target.innerHTML = `<div class="error-message"><p>${escapeHtml(state.fastApplyError)}</p><button class="button ghost small" type="button" data-fast-retry>Retry</button></div>`; target.querySelector("[data-fast-retry]")?.addEventListener("click", loadFastApplyQueue); return; }
+  const queue = state.fastApplyQueue || [];
+  const job = queue[state.fastApplyIndex];
   target.classList.toggle("empty", !job);
-  if (!job) { target.textContent = "No new opportunities remain in this queue."; return; }
-  const key = escapeAttribute(discoveryJobKey(job));
+  if (!job) { target.innerHTML = `<p>${queue.length ? "Fast Apply queue completed." : "No eligible opportunities remain for this applicant."}</p><p class="muted">Queue size: ${queue.length} · Remaining: 0</p>`; return; }
+  const key = escapeAttribute(String(job.id));
   const url = job.application_url || job.url || "";
-  target.innerHTML = `<article class="discovery-card"><h3>${escapeHtml(job.title || "Untitled role")}</h3><p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(resultWorkplaceLabel(job))}</p><p class="muted">${escapeHtml(displaySalary(job))} · ${escapeHtml(job.discovery_fit_label || "Match not fully assessed")} · ${escapeHtml(commuteDisplayLabel(job))}</p><details><summary>Essential requirements</summary>${escapeHtml((job.qualification_requirements || job.required_skills || "Not fully assessed from the posting.").toString())}</details><div class="row-actions">${url ? `<a class="button small" href="${escapeAttribute(url)}" target="_blank" rel="noreferrer">Open Original / Apply</a>` : ""}<button class="button small ghost" data-fast-action="applied" data-job-key="${key}">Confirm Applied</button><button class="button small ghost" data-fast-action="save" data-job-key="${key}">Save for later</button><button class="button small ghost" data-fast-action="skip" data-job-key="${key}">Skip</button></div><p class="muted helper">Opening a posting never marks it applied. Confirm only after submitting externally.</p></article>`;
+  const seniority = job.qualification_fit_seniority?.detected_level || job.seniority_level || "Unknown";
+  const experience = job.experience_requirements || {};
+  const technical = job.technical_compatibility || {};
+  target.innerHTML = `<p class="muted">Applicant: ${escapeHtml(job.qualification_evidence_profile_name || profileId)} · Queue: ${queue.length} · Position ${state.fastApplyIndex + 1} · Remaining ${queue.length - state.fastApplyIndex}</p><article class="discovery-card"><h3>${escapeHtml(job.title || "Untitled role")}</h3><p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(resultWorkplaceLabel(job))}</p><p><strong>Detected seniority:</strong> ${escapeHtml(seniority)} · <strong>Required experience:</strong> ${escapeHtml(JSON.stringify(experience.required || "Not stated"))} · <strong>Preferred:</strong> ${escapeHtml(JSON.stringify(experience.preferred || "Not stated"))}</p><p><strong>Technical compatibility:</strong> ${escapeHtml(job.qualification_fit_label || "Not fully assessed")} · <strong>Application priority:</strong> ${Number(job.application_priority_score || 0)}/100</p><p class="muted">${escapeHtml(displaySalary(job))} · ${escapeHtml(job.work_arrangement || job.remote_type || "Work arrangement unknown")} · ${escapeHtml(commuteDisplayLabel(job))}</p><p>${escapeHtml((job.application_priority_reasons || []).join(" ") || "Priority uses applicant-aware relevance, seniority, experience, technical compatibility and evidence.")}</p><details><summary>Relevant verified skills and missing requirements</summary><p><strong>Verified:</strong> ${escapeHtml((technical.matched || job.qualification_fit_matched_requirements || []).join(", ") || "Not available")}</p><p><strong>Missing / review:</strong> ${escapeHtml((technical.missing || job.qualification_fit_missing_requirements || []).join(", ") || "None recorded")}</p><p><strong>Requirements:</strong> ${escapeHtml((job.qualification_requirements || job.required_skills || "Not fully assessed from the posting.").toString())}</p></details><div class="row-actions">${url ? `<a class="button small" href="${escapeAttribute(url)}" target="_blank" rel="noreferrer">Open Original / Apply</a>` : ""}<button class="button small ghost" data-fast-action="applied" data-job-key="${key}">Confirm Applied</button><button class="button small ghost" data-fast-action="save" data-job-key="${key}">Save for later</button><button class="button small ghost" data-fast-action="skip" data-job-key="${key}">Skip</button><button class="button small ghost" data-fast-close>Close</button></div><p class="muted helper">Opening a posting never marks a job applied. Confirm only after submitting externally.</p></article>`;
   target.querySelectorAll("[data-fast-action]").forEach((button) => button.addEventListener("click", async () => {
     const action = button.dataset.fastAction;
-    if (action === "applied") await applyDiscoveryJob(button.dataset.jobKey);
-    if (action === "save") await saveDiscoveryJob(button.dataset.jobKey);
-    if (action === "skip") await skipDiscoveryJob(button.dataset.jobKey);
-    renderFastApply();
+    try {
+      await fastApplyAction(action === "skip" ? "ignore" : action, job);
+      state.fastApplyQueue.splice(state.fastApplyIndex, 1);
+      state.fastApplyIndex = Math.min(state.fastApplyIndex, state.fastApplyQueue.length);
+      renderFastApply();
+    } catch (error) { state.fastApplyError = error.message || "Action failed"; state.fastApplyStatus = "error"; renderFastApply(); }
   }));
+  target.querySelector("[data-fast-close]")?.addEventListener("click", () => { document.getElementById("fast-apply-panel").hidden = true; });
+}
+
+async function fastApplyAction(action, job) {
+  if (!job?.id) throw new Error("This queue record has no durable job identity.");
+  await api.send(`/api/discovery/inbox/${job.id}/${action}`, "POST", discoveryApplicantActionPayload());
+  toast(action === "save" ? "Saved for later" : action === "ignore" ? "Skipped" : "Marked applied");
 }
 
 function renderDiscoveryOriginSummary() {

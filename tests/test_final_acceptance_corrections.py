@@ -176,6 +176,42 @@ def test_ready_to_apply_excludes_applications_but_keeps_seen_unapplied(tmp_path,
     assert counts["ready_to_apply"] == 2
 
 
+def test_ready_to_apply_is_globally_ranked_before_pagination(tmp_path, monkeypatch):
+    client = _isolated_client(tmp_path, monkeypatch)
+    swe = _profile(client, "SWE", "software")
+    with app_module.app.app_context():
+        ids = []
+        for index, (title, score, level) in enumerate([
+            ("Senior stretch", 95, "senior"),
+            ("Junior opportunity", 70, "junior"),
+            ("Intermediate opportunity", 80, "intermediate"),
+        ]):
+            job = app_module.normalize_job_payload({
+                "source": "fixture", "source_job_id": f"ranked-{index}",
+                "title": title, "company": "Ranking Co", "location": "Toronto, ON",
+                "url": f"https://example.test/ranked-{index}",
+                "description": "A software development position with requirements.",
+                "discovery_first_seen_at": f"2026-01-0{index + 1}T00:00:00",
+                "discovery_result_category": "actionable", "discovery_occupation": "software developer",
+            })
+            job.update({
+                "discovery_first_seen_at": f"2026-01-0{index + 1}T00:00:00",
+                "discovery_result_category": "actionable",
+                "application_priority_score": score,
+                "qualification_fit_seniority": {"detected_level": level, "score": 80},
+            })
+            ids.extend(app_module.persist_discovery_jobs([job], None, None)["new_job_ids"])
+        app_module.get_db().commit()
+    first = client.get(f"/api/discovery/inbox?candidate_profile_id={swe}&category=ready_to_apply&page_size=1&page=0")
+    second = client.get(f"/api/discovery/inbox?candidate_profile_id={swe}&category=ready_to_apply&page_size=1&page=1")
+    assert first.status_code == second.status_code == 200
+    # Senior score is intentionally higher; the applicant-aware tier still
+    # puts junior/intermediate opportunities ahead of weak stretch roles.
+    assert first.get_json()[0]["title"] == "Junior opportunity"
+    assert second.get_json()[0]["title"] == "Intermediate opportunity"
+    assert first.headers["X-Job-Tracker-Total"] == "3"
+
+
 def test_new_count_and_listing_reconcile_with_mixed_applicant_history(tmp_path, monkeypatch):
     client = _isolated_client(tmp_path, monkeypatch)
     swe = _profile(client, "SWE", "software")

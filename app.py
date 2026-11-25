@@ -2760,7 +2760,8 @@ def create_app() -> Flask:
         elif requested_category == "ready_to_apply":
             if not applicant_id:
                 return jsonify({"error": "candidate_profile_id is required for Ready to Apply."}), 400
-            query += " AND discovery_result_category = 'actionable'"
+            query += " AND (discovery_result_category = 'actionable' OR EXISTS (SELECT 1 FROM discovery_requalifications r WHERE r.job_id = jobs.id AND r.applicant_profile_id = ?))"
+            query_args.append(applicant_id)
             query += " AND status NOT IN ('Applied', 'shortlisted')"
             query += " AND NOT EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = jobs.id AND s.applicant_profile_id = ? AND s.state IN ('applied', 'skipped', 'ignored'))"
             query_args.append(applicant_id)
@@ -2848,11 +2849,8 @@ def create_app() -> Flask:
             query += " ORDER BY j.discovery_last_seen_at DESC, j.id DESC"
         page_size = clamp_int_default(request.args.get("page_size"), 500, 1, 500)
         page = clamp_int_default(request.args.get("page"), 0, 0, 100000)
-        if not membership_search:
-            order_alias = "j." if requested_category == "requalified" else ""
-            query += f" ORDER BY {order_alias}discovery_state = 'new' DESC, {order_alias}discovery_last_seen_at DESC, {order_alias}id DESC"
-        query += " LIMIT ? OFFSET ?"
-        query_args.extend([page_size, page * page_size])
+        # Best Match is applicant-aware. Fetch the full filtered relation and
+        # rank it before slicing so page boundaries cannot hide better fits.
         rows = query_db(
             query, query_args
         )
@@ -2967,6 +2965,11 @@ def create_app() -> Flask:
                 category = "archived_unclassified"
             item["discovery_inbox_category"] = category
             jobs.append(item)
+        if not membership_search:
+            jobs = sort_discovery_jobs(jobs, "application_priority_score", "desc")
+        else:
+            jobs.sort(key=lambda item: (text(item.get("discovery_last_seen_at")), int(item.get("id") or 0)), reverse=True)
+        jobs = jobs[page * page_size:(page + 1) * page_size]
         response = jsonify(jobs)
         response.headers["X-Job-Tracker-Total"] = str(total_count)
         response.headers["X-Job-Tracker-Page"] = str(page)
@@ -2998,7 +3001,7 @@ def create_app() -> Flask:
                 counts["all_relevant"] += 1
             globally_applied = text(row["status"]) in {"Applied", "shortlisted"}
             if category == "actionable" and not globally_applied and not presented and not state and not pending_duplicate: counts["new_actionable"] += 1
-            if category == "actionable" and not globally_applied and state not in {"applied", "skipped", "ignored"} and not pending_duplicate: counts["ready_to_apply"] += 1
+            if (category == "actionable" or int(row["requalified"] or 0)) and not globally_applied and state not in {"applied", "skipped", "ignored"} and not pending_duplicate: counts["ready_to_apply"] += 1
             if category == "review_required" or state == "reviewed": counts["review_required"] += 1
             elif category == "excluded": counts["excluded"] += 1
         return jsonify(counts)
