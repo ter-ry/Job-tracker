@@ -207,7 +207,20 @@ def detect_description_level(content: str) -> tuple[str, list[str]]:
     unrelated_reference = re.compile(r"\b(?:with|alongside|among|our|other|team of|reports to|work(?:s)? with)\s+(?:the\s+)?(?:technical\s+)?(?:senior|lead|principal|staff|manager|director|intern|co-?op)\b", re.I)
     for chunk in chunks:
         level, hits = detect_level(chunk)
-        if level == "unknown" or not role_context.search(chunk) or unrelated_reference.search(chunk):
+        # Mentoring, onboarding, or collaborating with junior colleagues is
+        # evidence about the surrounding team, not the advertised role.  Do
+        # not let that sentence turn an ordinary Developer into a junior role.
+        junior_reference = re.search(
+            r"\b(?:mentor(?:ing)?|coach(?:ing)?|support(?:ing)?|train(?:ing)?)\b[^.\n]{0,80}\b(?:junior|early[- ]career|new grad|intern)",
+            chunk,
+            re.I,
+        )
+        surrounding_reference = re.search(
+            r"\b(?:support(?:s|ing)?|assist(?:s|ing)?|collaborat(?:e|es|ing)?|work(?:s|ing)?\s+with|alongside)\b[^.\n]{0,60}\b(?:senior|lead|principal|staff|manager|director)\b",
+            chunk,
+            re.I,
+        )
+        if level == "unknown" or not role_context.search(chunk) or unrelated_reference.search(chunk) or junior_reference or surrounding_reference:
             continue
         candidates.append((level, hits))
     if not candidates:
@@ -317,7 +330,7 @@ def classify_experience_section(content: str, position: int) -> str:
     headings: list[str] = []
     for raw_line in content[:position].splitlines():
         heading = re.sub(r"[*_`#]", "", raw_line).replace(r"\&", "&").replace(r"\-", "-").strip(" -:").lower()
-        if len(heading) <= 120 and not re.search(r"[.!?]", heading) and re.search(r"\b(?:requirements?|qualifications?|experience|what you bring|what we're looking for|what we are looking for|what you’re looking for|what we’re looking for|what you are looking for|who you are|your background|core skills|education and experience|basic qualifications?|minimum qualifications?)\b", heading):
+        if len(heading) <= 120 and not re.search(r"[.!?]", heading) and re.search(r"\b(?:requirements?|qualifications?|experience|preferred|nice to have|bonus|asset|what you bring|what we're looking for|what we are looking for|what you’re looking for|what we’re looking for|what you are looking for|who you are|your background|core skills|education and experience|basic qualifications?|minimum qualifications?)\b", heading):
             headings.append(heading)
     if not headings:
         return ""

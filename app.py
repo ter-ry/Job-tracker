@@ -12387,22 +12387,44 @@ def ece_result_category(job: dict[str, Any]) -> tuple[str, str]:
     title = normalize_space(text(job.get("title"))).lower()
     body = " ".join(text(job.get(key)) for key in ("job_description", "description", "employment_type", "job_type")).lower()
     combined = f"{title} {body}"
-    has_rece_evidence = bool(re.search(r"\b(?:rece|registered early childhood educator|early childhood educator|ece educator)\b", title))
+    has_rece_evidence = bool(re.search(r"\b(?:rece|reces|registered early child(?:hood)? educator|early childhood educator|ece educator)\b", title)) or bool(re.search(r"\bece\s*/\s*eca\b", title))
     if re.search(r"\b(?:eca|early childhood assistant|child care assistant|childcare assistant|aide)\b", title) and not has_rece_evidence:
         return "excluded", "ECA/assistant-only roles are outside the RECE/ECE target."
-    if re.search(r"\b(?:supervisor|supevisor|director|manager|administrator|coordinator)\b", title):
+    mixed_educator_listing = bool(re.search(r"\b(?:rece|reces)\b[^,;]{0,30}\b(?:eca|early childhood assistant)\b|\b(?:eca|early childhood assistant)\b[^,;]{0,30}\b(?:rece|reces)\b", title))
+    if re.search(r"\b(?:supervisor|supevisor|director|manager|administrator|coordinator)\b", title) and not mixed_educator_listing:
         return "excluded", "Supervisory, director, and management roles are outside the ECE target."
     title_match_is_authoritative = text(job.get("occupation_match_type")).lower() == "exact"
-    body_has_ece = bool(re.search(r"\b(?:early childhood education|early years educator|RECE|ECE)\b", body, re.I))
+    body_has_ece = bool(re.search(r"\b(?:early childhood education|early years educator|registered early child(?:hood)? educator|RECEs?|ECE)\b", body, re.I))
+    if re.search(r"\b(?:kindergarten|school|classroom)\s+teacher\b|\bteacher\b", title) and not has_rece_evidence:
+        return "review_required", "A teacher title does not by itself establish RECE/ECE eligibility."
     if not title_match_is_authoritative and not has_rece_evidence and not body_has_ece:
         return "review_required", "The posting does not provide a grounded RECE/ECE educator title."
-    employment_text = normalize_space(" ".join(text(job.get(key)) for key in ("employment_type", "job_type"))).lower()
-    employment_text = employment_text or body
-    if re.search(r"\b(?:not|no longer)\s+(?:a\s+)?(?:supply|casual|part[- ]time|on[- ]call)\b", employment_text):
-        employment_text = re.sub(r"\b(?:not|no longer)\s+(?:a\s+)?(?:supply|casual|part[- ]time|on[- ]call)\b", "", employment_text)
-    supply = bool(re.search(r"\b(?:supply|casual|on[- ]call|occasional)\b", employment_text))
-    part_time = bool(re.search(r"\bpart[- ]time\b", employment_text)) and not supply
-    full_time = bool(re.search(r"\bfull[- ]time\b", employment_text))
+    employment_metadata = normalize_space(" ".join(text(job.get(key)) for key in ("employment_type", "job_type"))).lower()
+    title_employment = title
+    # Metadata and title describe the advertised vacancy.  Body mentions of
+    # casual colleagues, supply lists, or staffing coverage do not change a
+    # full-time vacancy unless they are scoped to the offered position.
+    evidence_text = " ".join(part for part in (employment_metadata, title_employment) if part)
+    if not evidence_text:
+        evidence_text = body
+    negated_supply = bool(re.search(r"\b(?:not|no longer)\s+(?:a\s+)?(?:supply|casual|part[- ]time|on[- ]call)\b", evidence_text))
+    supply = bool(re.search(r"\b(?:supply|casual|on[- ]call|occasional)\b", evidence_text)) and not negated_supply
+    part_time = bool(re.search(r"\bpart[- ]time\b", evidence_text)) and not supply
+    full_time = bool(re.search(r"\bfull[- ]time\b", evidence_text))
+    if not evidence_text.strip() or evidence_text == title_employment and not re.search(r"\b(?:full[- ]time|part[- ]time|supply|casual|on[- ]call|occasional)\b", evidence_text):
+        full_time = full_time or bool(re.search(r"\bfull[- ]time\b", body))
+        part_time = part_time or bool(re.search(r"\bpart[- ]time\b", body))
+        supply = supply or bool(re.search(r"\b(?:supply|casual|on[- ]call|occasional)\s+(?:position|role|educator|RECE|ECE|staff|coverage)\b|\b(?:position|role)\s+(?:is|:)?\s*(?:supply|casual|on[- ]call|occasional)\b", body, re.I))
+    # A mixed title/body advertisement is only a target match if the posting
+    # actually offers RECE work.  ECA-only duties are not rescued by a bare
+    # “ECE/ECA” search title.
+    assistant_only = bool(re.search(r"\b(?:ECAs?|early childhood assistants?|child care assistants?|childcare assistants?)\b", body, re.I)) and not bool(re.search(r"\b(?:RECE|RECEs|registered early child(?:hood)? educator|early childhood educator)\b", body, re.I))
+    assistant_only = assistant_only and (
+        not has_rece_evidence
+        or bool(re.search(r"\b(?:assistant|ECA)s?\b[^.\n]{0,50}\b(?:only|exclusively|solely)\b|\b(?:only|exclusively|solely)\b[^.\n]{0,50}\b(?:assistant|ECA)s?\b", body, re.I))
+    )
+    if assistant_only:
+        return "excluded", "The posting evidence is assistant-only; a mixed or generic title does not establish RECE/ECE work."
     permanent = bool(re.search(r"\b(?:permanent|regular)\b", combined))
     temporary = bool(re.search(r"\b(?:temporary|contract|term|seasonal)\b", combined))
     if supply:
@@ -12412,7 +12434,7 @@ def ece_result_category(job: dict[str, Any]) -> tuple[str, str]:
     if part_time and not full_time:
         return "excluded", "Part-time-only ECE work is outside the full-time target."
     if full_time:
-        job["discovery_employment_status"] = "full_time_temporary_or_permanent" if (permanent or temporary) else "full_time_unspecified_term"
+        job["discovery_employment_status"] = "permanent_full_time" if permanent and not temporary else "temporary_full_time" if temporary and not permanent else "full_time_unspecified_term"
         job["application_priority_score"] = max(clamp_int(job.get("application_priority_score"), 0, 100), 90)
         return "actionable", "Full-time RECE/ECE educator role; employment evidence is grounded in the posting."
     # A title-only provider result is still a valid recall-first opportunity.
@@ -12429,7 +12451,7 @@ def plausible_software_role(job: dict[str, Any]) -> bool:
     role_type = normalize_space(text(job.get("role_type"))).lower()
     if re.search(r"\b(manager|director|vice president|vp|head of|chief)\b", title):
         return False
-    if re.search(r"\b(academic assistant|teaching assistant|instructor|teacher|faculty|professor|tutor|research assistant|researcher|recruiter|recruitment|human resources|administrator|coordinator|manager|cnc|machinist|metal fabrication|bridge engineer|civil engineer|structural engineer|registered nurse|nurse contractor|provider operations|packaging developer|community program(?:ming)?|fundraising|employment development)\b", title):
+    if re.search(r"\b(academic assistant|teaching assistant|instructor|teacher|faculty|professor|tutor|research assistant|researcher|recruiter|recruitment|human resources|(?:office|school|clinic|medical|property|administrative) administrator|coordinator|manager|cnc|machinist|metal fabrication|bridge engineer|civil engineer|structural engineer|registered nurse|nurse contractor|provider operations|packaging developer|community program(?:ming)?|fundraising|employment development|fp&a|client success|customer success|business development|graphic design|margin supervision|growth associate|development officer|producer|talent development|employment consultant|training specialist|accounting|insurance sales|executive assistant|product developer)\b", title):
         return False
     # A title that explicitly says it is not development work is not a SWE
     # match merely because the provider classified it as a 'developer' role.
@@ -12445,7 +12467,7 @@ def plausible_software_role(job: dict[str, Any]) -> bool:
     # Providers often classify adjacent technical roles as generic or
     # non-software families. Require technical evidence in the title or
     # description, while leaving clearly unrelated occupations hard excluded.
-    adjacent_title = bool(re.search(r"\b(?:infrastructure|cloud|devops|platform|site reliability|sre|solutions|technical implementation|technical specialist|integration|automation|test|ai|machine learning|aws|azure|gcp)\b", title))
+    adjacent_title = bool(re.search(r"\b(?:systems? administrator|database administrator|infrastructure|cloud|devops|platform|site reliability|sre|solutions|technical consultant|technical implementation|technical specialist|integration|automation|test|ai|machine learning|aws|azure|gcp)\b", title))
     technical_evidence = bool(re.search(r"\b(?:software|code|coding|programming|javascript|typescript|python|java|react|node(?:\.js)?|api|cloud|aws|azure|kubernetes|automation|ci/cd|devops|database|sql|machine learning|artificial intelligence|full[ -]?stack|backend|frontend)\b", " ".join(text(job.get(key)) for key in ("job_description", "required_skills", "responsibilities")), re.I))
     generic_technical_role = bool(re.search(r"\b(?:developer|engineer|specialist|programmer|sdet)\b", title))
     return (adjacent_title or generic_technical_role) and technical_evidence
@@ -12459,7 +12481,7 @@ def clearly_non_software_role(job: dict[str, Any]) -> bool:
     low-information records into hard exclusions.
     """
     title = normalize_space(text(job.get("title"))).lower()
-    if re.search(r"\b(academic assistant|teaching assistant|instructor|teacher|faculty|professor|tutor|research assistant|researcher|recruiter|recruitment|human resources|administrator|coordinator|manager|cnc|machinist|metal fabrication|bridge engineer|civil engineer|structural engineer|registered nurse|nurse contractor|provider operations|packaging developer|community program(?:ming)?|fundraising|employment development)\b", title):
+    if re.search(r"\b(academic assistant|teaching assistant|instructor|teacher|faculty|professor|tutor|research assistant|researcher|recruiter|recruitment|human resources|(?:office|school|clinic|medical|property|administrative) administrator|administrative assistant|marketing specialist|technical writer|ux designer|coordinator|manager|cnc|machinist|metal fabrication|bridge engineer|civil engineer|structural engineer|registered nurse|nurse contractor|provider operations|packaging developer|community program(?:ming)?|fundraising|employment development|fp&a|client success|customer success|business development|graphic design|margin supervision|growth associate|development officer|producer|talent development|employment consultant|training specialist|accounting|insurance sales|executive assistant|product developer)\b", title) or (re.search(r"\badministrator\b", title) and not re.search(r"\b(?:systems?|database) administrator\b", title)):
         return True
     if re.search(r"\bproduction\s+support\b", title) and re.search(r"\b(?:not\s+(?:a\s+)?developer|mainframe)\b", title):
         return True
@@ -12881,7 +12903,19 @@ def discovery_sort_value(job: dict[str, Any], field: str, direction: str = "desc
     if field in {"match_score", "overall_score", "application_priority_score", "score"}:
         score_value = clamp_int(job.get("match_score") if field == "match_score" else job.get("application_priority_score") if field == "application_priority_score" else job.get("overall_score"), 0, 100)
         level = text((job.get("qualification_fit_seniority") or {}).get("detected_level") or job.get("seniority_level")).lower().replace("-", "_")
-        tier = 0 if level in {"entry_level", "junior", "internship"} else 1 if level == "intermediate" else 2
+        # Unknown seniority is neutral evidence.  It must not be silently
+        # grouped with senior/lead roles, which previously buried ordinary
+        # unlevelled developer postings in the default Inbox order.
+        tier = 0 if level in {"entry_level", "junior", "internship"} else 1 if level in {"intermediate", "unknown", ""} else 2
+        if normalize_space(text(job.get("discovery_occupation") or job.get("occupation"))).lower() == "early childhood educator":
+            employment_rank = {
+                "permanent_full_time": 0,
+                "temporary_full_time": 1,
+                "full_time_unspecified_term": 2,
+                "provisional": 3,
+                "supply_or_casual": 4,
+            }.get(text(job.get("discovery_employment_status")).lower(), 3)
+            return (employment_rank, -score_value if direction == "desc" else score_value, normalize_space(text(job.get("company"))).lower(), normalize_space(text(job.get("title"))).lower())
         return (tier, (-score_value if direction == "desc" else score_value), normalize_space(text(job.get("company"))).lower(), normalize_space(text(job.get("title"))).lower())
     if field == "deadline":
         deadline = text(job.get("deadline")) or "9999-12-31"
