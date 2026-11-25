@@ -29,13 +29,19 @@ def test_goal_b_documented_unrelated_swe_false_positives_are_excluded():
 
 
 def test_goal_b_adjacent_technical_roles_and_senior_stretch_remain_available():
-    for title in ("Systems Administrator", "Database Administrator", "Technical Consultant", "Technical Specialist"):
+    for title in ("Cloud Administrator", "Salesforce Administrator", "Systems Administrator", "Database Administrator", "Technical Consultant", "Technical Specialist", "Software Product Developer", "Research Scientist"):
         job = _swe(title, "Maintain production systems, SQL databases, APIs and automation.")
         assert app.plausible_software_role(job)
         assert app.discovery_result_category(job)[0] != "excluded"
     senior = _swe("Senior Software Engineer", "Required: 8+ years of professional software development.")
     senior["qualification_fit_seniority"] = analyze_job_seniority(senior)
     assert app.discovery_result_category(senior)[0] == "actionable"
+    hands_on_manager = _swe("Technical Engineering Manager", "Build Python services and APIs. This role has no direct reports and no people management.")
+    assert app.plausible_software_role(hands_on_manager)
+    people_manager = _swe("Engineering Manager", "Manage a team of engineers, own hiring and performance reviews.")
+    assert not app.plausible_software_role(people_manager)
+    assert app.discovery_result_category(people_manager)[0] == "excluded"
+    assert app.discovery_result_category(_swe("Commercial Product Developer"))[0] == "excluded"
 
 
 def test_goal_b_description_junior_reference_does_not_override_unlevelled_title():

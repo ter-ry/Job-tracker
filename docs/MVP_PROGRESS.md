@@ -24,6 +24,12 @@ Goal B's detailed acceptance matrix is maintained in
 fixtures are not a substitute for the private 100-posting labelled evaluation;
 no live owner-cohort replay was performed in this environment.
 
+Goal C's durable discovery integration matrix is maintained in
+[`MVP_DISCOVERY_ACCEPTANCE.md`](MVP_DISCOVERY_ACCEPTANCE.md). Durable ECE
+employment status/evidence and the shared Inbox ranking contract are now
+covered by an actual multi-page database reopen test; live owner/provider gates
+remain explicitly outstanding.
+
 Canonical vacancy acceptance evidence is maintained in
 [`MVP_CANONICAL_ACCEPTANCE.md`](MVP_CANONICAL_ACCEPTANCE.md). The A–Q table is
 limited to sanitized database/API fixtures; the owner's 104 duplicate

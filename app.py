@@ -500,6 +500,13 @@ JOB_COLUMNS = {
     "discovery_location_scope": "TEXT NOT NULL DEFAULT ''",
     "remote_search_eligible": "TEXT NOT NULL DEFAULT ''",
     "discovery_occupation": "TEXT NOT NULL DEFAULT ''",
+    "discovery_search_keywords": "TEXT NOT NULL DEFAULT ''",
+    "discovery_distance_origin_input": "TEXT NOT NULL DEFAULT ''",
+    "discovery_resolved_origin": "TEXT NOT NULL DEFAULT ''",
+    "discovery_geographic_match_mode": "TEXT NOT NULL DEFAULT ''",
+    "discovery_distance": "INTEGER NOT NULL DEFAULT 0",
+    "discovery_employment_status": "TEXT NOT NULL DEFAULT ''",
+    "discovery_employment_evidence": "TEXT NOT NULL DEFAULT ''",
     "discovery_profile_independent": "INTEGER NOT NULL DEFAULT 0",
     "candidate_profile_id": "INTEGER NOT NULL DEFAULT 0",
     "discovery_search_mode": "TEXT NOT NULL DEFAULT ''",
@@ -2722,6 +2729,12 @@ def create_app() -> Flask:
                 reassessment_policy["distance"],
                 reassessment_policy["geographic_match_mode"],
             )
+            # Stored employment classification is historical evidence for the
+            # original search.  Reassessment must classify the current posting
+            # under the newly authorized policy rather than letting the
+            # durable-status fast path mask changed evidence.
+            item["discovery_employment_status"] = ""
+            item["discovery_employment_evidence"] = ""
             category, reason = discovery_result_category(item, text(item.get("discovery_remote_preference")))
             description = text(item.get("job_description"))
             grounded = bool(len(description) >= 80 and text(item.get("url")))
@@ -3033,12 +3046,7 @@ def create_app() -> Flask:
         # the full relation, but hydrate only the requested page; job_to_dict
         # performs evidence work that is unnecessary for rows not returned.
         if not membership_search and requested_category == "ready_to_apply":
-            def inbox_rank(row: Any) -> tuple[Any, ...]:
-                analysis = parse_json_object(row["qualification_fit_seniority"]) if "qualification_fit_seniority" in row.keys() else {}
-                level = text(analysis.get("detected_level") or (row["seniority_level"] if "seniority_level" in row.keys() else "")).lower().replace("-", "_")
-                tier = 0 if level in {"entry_level", "junior", "internship"} else 1 if level == "intermediate" else 2
-                return (tier, -clamp_int(row["application_priority_score"], 0, 100), normalize_space(text(row["company"])).lower(), normalize_space(text(row["title"])).lower())
-            rows = sorted(rows, key=inbox_rank)[page * page_size:(page + 1) * page_size]
+            rows = sorted((dict(row) for row in rows), key=application_priority_sort_key)[page * page_size:(page + 1) * page_size]
             pre_paged = True
         evidence_profile = None
         if request.args.get("candidate_profile_id"):
@@ -3745,6 +3753,7 @@ def create_app() -> Flask:
             """
             nonlocal probe_count
             candidate = normalize_job_payload(jobspy_result_to_job_payload(raw_job))
+            candidate["discovery_occupation"] = search["occupation"]
             if any(dedupe_match(candidate, seen) for seen in probe_seen):
                 return False
             title = text(candidate.get("title"))
@@ -3755,6 +3764,10 @@ def create_app() -> Flask:
                 return False
             if occupation == "early childhood educator" and re.search(r"\b(?:accounts? receivable|finance|accounting|sales)\b", lowered):
                 return False
+            if occupation == "early childhood educator":
+                ece_category, _ = ece_result_category(candidate)
+                if ece_category != "actionable" or not discovery_target_eligible(candidate, search):
+                    return False
             existing = find_existing_job_match(candidate)
             if existing is not None:
                 state = applicant_discovery_state(int(existing["id"]), applicant_profile_id(payload))
@@ -3791,6 +3804,11 @@ def create_app() -> Flask:
             clean["discovery_profile_independent"] = int(search["profile_independent"])
             clean["discovery_search_mode"] = search["search_mode"]
             clean["discovery_match_policy"] = search["match_policy"]
+            clean["discovery_search_keywords"] = search.get("keywords", "")
+            clean["discovery_distance_origin_input"] = search.get("distance_origin_input", "")
+            clean["discovery_resolved_origin"] = search.get("distance_origin", "")
+            clean["discovery_geographic_match_mode"] = search.get("geographic_match_mode", "provisional")
+            clean["discovery_distance"] = search.get("distance", 0)
             clean["discovery_maximum_required_years"] = search.get("maximum_required_years")
             clean["discovery_seniority"] = search.get("seniority")
             clean["title_match_mode"] = search["title_match_mode"]
@@ -3972,7 +3990,7 @@ def create_app() -> Flask:
         persisted = persist_discovery_jobs(ordered, None, manual_run_id)
         search_execution_id = uuid.uuid4().hex
         persist_discovery_search_memberships(search_execution_id, ordered, selected_applicant_id, search)
-        target_matching_jobs = [item for item in matching_jobs if text(item.get("discovery_employment_status")).lower() != "supply_or_casual"]
+        target_matching_jobs = [item for item in matching_jobs if search.get("workflow") != "ece" or text(item.get("discovery_employment_status")).lower() != "supply_or_casual"]
         new_matching_jobs = target_matching_jobs[:requested_target]
         # The response is unified: actionable new matches first, followed by a
         # separately labelled review queue. Excluded jobs never enter it.
@@ -4978,14 +4996,20 @@ def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, ru
                 "workplace_evidence", "workplace_evidence_source", "workplace_precision", "workplace_confidence",
                 "workplace_alternatives_json", "remote_classification_conflict", "warnings",
                 "discovery_result_category", "discovery_result_reason", "recommendation_eligible",
-                "discovery_match_status", "discovery_match_explanation",
+                "discovery_match_status", "discovery_match_explanation", "discovery_employment_status",
+                "discovery_employment_evidence",
                 "source_links_json",
             }
-            if canonical_match:
+            incoming_profile_id = clamp_int(job.get("candidate_profile_id"), 0, 1_000_000_000)
+            existing_profile_id = clamp_int(match["candidate_profile_id"], 0, 1_000_000_000)
+            protected_cross_applicant = bool(
+                incoming_profile_id and existing_profile_id and incoming_profile_id != existing_profile_id
+            )
+            if canonical_match or protected_cross_applicant:
                 # These values are applicant/search assessments, not shared
-                # vacancy facts.  Keep the canonical applicant decisions and
-                # historical classification intact when another provider
-                # rediscovers the vacancy.
+                # vacancy facts. Keep the canonical applicant decisions and
+                # historical classification intact when a canonical or
+                # cross-applicant rediscovery sees the vacancy.
                 assessment_columns -= {
                     "overall_score", "score_breakdown", "distance_km", "distance_confidence",
                     "distance_radius_status", "distance_origin_label", "distance_origin_precision",
@@ -4996,6 +5020,11 @@ def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, ru
                     "workplace_postal_code", "workplace_evidence", "workplace_evidence_source",
                     "workplace_precision", "workplace_confidence", "workplace_alternatives_json",
                 }
+            if canonical_match or protected_cross_applicant:
+                # Employment status/evidence is also applicant-scoped: a
+                # second workflow must not replace the first workflow's
+                # durable classification on a shared job row.
+                assessment_columns -= {"discovery_employment_status", "discovery_employment_evidence"}
             updates = {column: job.get(column, "") for column in assessment_columns if column in JOB_COLUMNS}
             if "source_links_json" in JOB_COLUMNS:
                 links = merge_source_links(existing=match, incoming=job)
@@ -5098,12 +5127,14 @@ def persist_discovery_search_memberships(
             "applicant_profile_id": int(applicant_profile_id or 0),
             "distance_origin_input": text(job.get("discovery_distance_origin_input")),
             "resolved_origin": text(job.get("discovery_resolved_origin")),
+            "employment_status": text(job.get("discovery_employment_status")),
+            "employment_evidence": text(job.get("discovery_employment_evidence")),
         }
         # Search configuration is authoritative at the boundary.  Provider
         # rows do not reliably echo origin/workflow fields, so retain the
         # exact effective criteria alongside per-job evidence.
         if isinstance(effective_criteria, dict):
-            for key in ("workflow", "location", "distance_origin_input", "original_origin", "distance", "geographic_match_mode", "remote_preference", "search_mode", "match_policy", "seniority", "maximum_required_years", "include_internships", "enabled_sources"):
+            for key in ("workflow", "policy_version", "location", "discovery_location", "distance_origin_input", "original_origin", "resolved_origin", "origin_coordinates", "origin_precision", "origin_provenance", "distance", "geographic_match_mode", "remote_preference", "search_mode", "match_policy", "seniority", "maximum_required_years", "include_internships", "enabled_sources", "qualification_evidence_profile_id", "qualification_evidence_profile_name"):
                 if key in effective_criteria and effective_criteria[key] not in (None, ""):
                     criteria[key] = effective_criteria[key]
         db.execute(
@@ -5284,6 +5315,10 @@ def run_discovery_pipeline(
         clean["discovery_profile_independent"] = int(search["profile_independent"])
         clean["discovery_search_mode"] = search["search_mode"]
         clean["discovery_match_policy"] = search["match_policy"]
+        clean["discovery_distance_origin_input"] = search.get("distance_origin_input", "")
+        clean["discovery_resolved_origin"] = search.get("distance_origin", "")
+        clean["discovery_geographic_match_mode"] = search.get("geographic_match_mode", "provisional")
+        clean["discovery_distance"] = search.get("distance", 0)
         clean["discovery_maximum_required_years"] = search.get("maximum_required_years")
         clean["discovery_seniority"] = search.get("seniority")
         clean["title_match_mode"] = search["title_match_mode"]
@@ -5391,7 +5426,7 @@ def run_discovery_pipeline(
         # in history but must never consume a new-opportunity slot.
         if item.get("discovery_result_category") == "actionable" and not state and not presented:
             eligible_unpresented.append(item)
-    matching_jobs = [item for item in eligible_unpresented if text(item.get("discovery_employment_status")).lower() != "supply_or_casual"][:requested_target]
+    matching_jobs = [item for item in eligible_unpresented if search.get("workflow") != "ece" or text(item.get("discovery_employment_status")).lower() != "supply_or_casual"][:requested_target]
     # Presentation is acknowledged only after the browser renders final rows;
     # a worker completing while a browser crashes must not silently hide jobs.
     review_required_jobs = [item for item in ordered if item.get("discovery_result_category") == "review_required"]
@@ -9878,12 +9913,17 @@ def discovery_search_config(payload: dict[str, Any]) -> dict[str, Any]:
     occupation = occupation_for_keywords(text(payload.get("keywords")))
     workflow = discovery_workflow(payload, {"occupation": occupation})
     ece_workflow = workflow == "ece"
+    if ece_workflow:
+        occupation = "early childhood educator"
+    elif normalize_space(text(payload.get("workflow"))).lower() == "software":
+        occupation = "software developer"
     origin_input = normalize_space(text(payload.get("distance_origin") or payload.get("distance_origin_input")))
     effective_location = origin_input if workflow == "ece" and origin_input else text(payload.get("location"))
     match_policy = normalize_choice(payload.get("match_policy"), {"apply_broadly", "strict_matching"}) or (
         "apply_broadly" if search_mode == "shortlist" and occupation == "software developer" else "strict_matching"
     )
     return {
+        "policy_version": "goal-c-v1",
         "search_depth": depth,
         "date_window": date_window,
         "hours_old": None if date_window == "any" else DISCOVERY_DATE_WINDOWS.get(date_window, preset["days"]) * 24,
@@ -12384,6 +12424,13 @@ def ece_result_category(job: dict[str, Any]) -> tuple[str, str]:
     educator postings are actionable; unknown wording remains provisional;
     supply/casual is retained for history but is never a target match.
     """
+    durable_status = text(job.get("discovery_employment_status")).lower()
+    if durable_status in {"permanent_full_time", "temporary_full_time", "full_time_unspecified_term", "provisional", "supply_or_casual"}:
+        if durable_status == "supply_or_casual":
+            return "actionable", "Supply/casual RECE/ECE work is retained at the bottom of the durable eligible queue."
+        if durable_status == "provisional":
+            return "actionable", "RECE/ECE employment remains provisional based on the durable search evidence."
+        return "actionable", "RECE/ECE employment classification was persisted with the search evidence."
     title = normalize_space(text(job.get("title"))).lower()
     body = " ".join(text(job.get(key)) for key in ("job_description", "description", "employment_type", "job_type")).lower()
     combined = f"{title} {body}"
@@ -12429,18 +12476,21 @@ def ece_result_category(job: dict[str, Any]) -> tuple[str, str]:
     temporary = bool(re.search(r"\b(?:temporary|contract|term|seasonal)\b", combined))
     if supply:
         job["discovery_employment_status"] = "supply_or_casual"
+        job["discovery_employment_evidence"] = normalize_space(title or body)[:600]
         job["application_priority_score"] = min(clamp_int(job.get("application_priority_score"), 0, 100), 15)
         return "actionable", "Supply/casual RECE/ECE work is visible at the bottom of the eligible queue and does not satisfy the full-time target."
     if part_time and not full_time:
         return "excluded", "Part-time-only ECE work is outside the full-time target."
     if full_time:
         job["discovery_employment_status"] = "permanent_full_time" if permanent and not temporary else "temporary_full_time" if temporary and not permanent else "full_time_unspecified_term"
+        job["discovery_employment_evidence"] = normalize_space(" ".join(part for part in (employment_metadata, title, body) if part))[:600]
         job["application_priority_score"] = max(clamp_int(job.get("application_priority_score"), 0, 100), 90)
         return "actionable", "Full-time RECE/ECE educator role; employment evidence is grounded in the posting."
     # A title-only provider result is still a valid recall-first opportunity.
     # Mark its employment status explicitly so it remains distinguishable from
     # grounded full-time evidence without silently inventing employment facts.
     job["discovery_employment_status"] = "provisional"
+    job["discovery_employment_evidence"] = normalize_space(" ".join(part for part in (title, body) if part))[:600]
     job["application_priority_score"] = max(clamp_int(job.get("application_priority_score"), 0, 100), 50)
     return "actionable", "RECE/ECE title matched; employment status remains provisional pending review."
 
@@ -12449,9 +12499,9 @@ def plausible_software_role(job: dict[str, Any]) -> bool:
     """Plausible software/adjacent technical IC work, not every developer title."""
     title = normalize_space(text(job.get("title"))).lower()
     role_type = normalize_space(text(job.get("role_type"))).lower()
-    if re.search(r"\b(manager|director|vice president|vp|head of|chief)\b", title):
+    if re.search(r"\b(manager|director|vice president|vp|head of|chief)\b", title) and not technical_manager_without_people_scope(job):
         return False
-    if re.search(r"\b(academic assistant|teaching assistant|instructor|teacher|faculty|professor|tutor|research assistant|researcher|recruiter|recruitment|human resources|(?:office|school|clinic|medical|property|administrative) administrator|coordinator|manager|cnc|machinist|metal fabrication|bridge engineer|civil engineer|structural engineer|registered nurse|nurse contractor|provider operations|packaging developer|community program(?:ming)?|fundraising|employment development|fp&a|client success|customer success|business development|graphic design|margin supervision|growth associate|development officer|producer|talent development|employment consultant|training specialist|accounting|insurance sales|executive assistant|product developer)\b", title):
+    if re.search(r"\b(academic assistant|teaching assistant|instructor|teacher|faculty|professor|tutor|research assistant|recruiter|recruitment|human resources|(?:office|school|clinic|medical|property|administrative) administrator|coordinator|cnc|machinist|metal fabrication|bridge engineer|civil engineer|structural engineer|registered nurse|nurse contractor|provider operations|packaging developer|community program(?:ming)?|fundraising|employment development|fp&a|client success|customer success|business development|graphic design|margin supervision|growth associate|development officer|producer|talent development|employment consultant|training specialist|accounting|insurance sales|executive assistant)\b", title):
         return False
     # A title that explicitly says it is not development work is not a SWE
     # match merely because the provider classified it as a 'developer' role.
@@ -12467,10 +12517,21 @@ def plausible_software_role(job: dict[str, Any]) -> bool:
     # Providers often classify adjacent technical roles as generic or
     # non-software families. Require technical evidence in the title or
     # description, while leaving clearly unrelated occupations hard excluded.
-    adjacent_title = bool(re.search(r"\b(?:systems? administrator|database administrator|infrastructure|cloud|devops|platform|site reliability|sre|solutions|technical consultant|technical implementation|technical specialist|integration|automation|test|ai|machine learning|aws|azure|gcp)\b", title))
+    adjacent_title = bool(re.search(r"\b(?:technical|systems?|database|cloud|salesforce) administrator\b|\b(?:technical|engineering|software|development|platform|systems?|data|cloud)\s+(?:\w+\s+){0,2}(?:manager|administrator)\b|\b(?:infrastructure|cloud|devops|platform|site reliability|sre|solutions|technical consultant|technical implementation|technical specialist|integration|automation|test|ai|machine learning|aws|azure|gcp)\b", title))
     technical_evidence = bool(re.search(r"\b(?:software|code|coding|programming|javascript|typescript|python|java|react|node(?:\.js)?|api|cloud|aws|azure|kubernetes|automation|ci/cd|devops|database|sql|machine learning|artificial intelligence|full[ -]?stack|backend|frontend)\b", " ".join(text(job.get(key)) for key in ("job_description", "required_skills", "responsibilities")), re.I))
-    generic_technical_role = bool(re.search(r"\b(?:developer|engineer|specialist|programmer|sdet)\b", title))
+    generic_technical_role = bool(re.search(r"\b(?:developer|engineer|specialist|programmer|scientist|researcher|sdet)\b", title))
     return (adjacent_title or generic_technical_role) and technical_evidence
+
+
+def technical_manager_without_people_scope(job: dict[str, Any]) -> bool:
+    """Recognize hands-on technical manager titles without inventing IC status."""
+    title = normalize_space(text(job.get("title"))).lower()
+    content = " ".join(text(job.get(key)) for key in ("job_description", "responsibilities", "required_skills")).lower()
+    technical_title = bool(re.search(r"\b(?:software|engineering|technical|development|platform|systems?|data|cloud|security)(?:\s+\w+){0,2}\s+manager\b", title))
+    content = re.sub(r"\b(?:no|without|does not have)\s+(?:any\s+)?(?:direct reports?|people management|personnel responsibility|staff responsibility|people leadership)\b", "", content)
+    people_scope = bool(re.search(r"\b(?:manage|lead)\s+(?:a\s+)?team\b|\bdirect reports?\b|\bpeople management\b|\bhiring|performance reviews|headcount|budget responsibility", content))
+    technical_evidence = bool(re.search(r"\b(?:software|code|coding|programming|python|java|javascript|api|cloud|systems?|platform|database|sql|automation|engineering)\b", content))
+    return technical_title and technical_evidence and not people_scope
 
 
 def clearly_non_software_role(job: dict[str, Any]) -> bool:
@@ -12481,7 +12542,11 @@ def clearly_non_software_role(job: dict[str, Any]) -> bool:
     low-information records into hard exclusions.
     """
     title = normalize_space(text(job.get("title"))).lower()
-    if re.search(r"\b(academic assistant|teaching assistant|instructor|teacher|faculty|professor|tutor|research assistant|researcher|recruiter|recruitment|human resources|(?:office|school|clinic|medical|property|administrative) administrator|administrative assistant|marketing specialist|technical writer|ux designer|coordinator|manager|cnc|machinist|metal fabrication|bridge engineer|civil engineer|structural engineer|registered nurse|nurse contractor|provider operations|packaging developer|community program(?:ming)?|fundraising|employment development|fp&a|client success|customer success|business development|graphic design|margin supervision|growth associate|development officer|producer|talent development|employment consultant|training specialist|accounting|insurance sales|executive assistant|product developer)\b", title) or (re.search(r"\badministrator\b", title) and not re.search(r"\b(?:systems?|database) administrator\b", title)):
+    if re.search(r"\b(academic assistant|teaching assistant|instructor|teacher|faculty|professor|tutor|research assistant|recruiter|recruitment|human resources|(?:office|school|clinic|medical|property|administrative) administrator|administrative assistant|marketing specialist|technical writer|ux designer|coordinator|cnc|machinist|metal fabrication|bridge engineer|civil engineer|structural engineer|registered nurse|nurse contractor|provider operations|packaging developer|community program(?:ming)?|fundraising|employment development|fp&a|client success|customer success|business development|graphic design|margin supervision|growth associate|development officer|producer|talent development|employment consultant|training specialist|accounting|insurance sales|executive assistant)\b", title) or (re.search(r"\badministrator\b", title) and not re.search(r"\b(?:cloud|salesforce|systems?|database) administrator\b", title)):
+        return True
+    if re.search(r"\bmanager\b", title) and not technical_manager_without_people_scope(job):
+        return True
+    if re.search(r"\bproduct developer\b", title) and not re.search(r"\bsoftware\b|\bweb\b|\bapplication\b|\btechnical\b", title):
         return True
     if re.search(r"\bproduction\s+support\b", title) and re.search(r"\b(?:not\s+(?:a\s+)?developer|mainframe)\b", title):
         return True
@@ -12660,10 +12725,10 @@ def resolve_reassessment_policy(
         "match_policy": selected("match_policy"),
         "geographic_match_mode": selected("geographic_match_mode"),
         "distance": selected("distance"),
-        "seniority": selected("seniority"),
-        "maximum_required_years": selected("maximum_required_years"),
+        "seniority": selected("seniority") if workflow != "ece" else "",
+        "maximum_required_years": selected("maximum_required_years") if workflow != "ece" else "",
     }
-    missing = [name for name, value in required.items() if value in (None, "")]
+    missing = [name for name, value in required.items() if value in (None, "") and name not in {"seniority", "maximum_required_years"}]
     if missing:
         raise ValueError(
             "Explicit reassessment settings are required for this historical cohort: "
@@ -12678,8 +12743,8 @@ def resolve_reassessment_policy(
         maximum = clamp_int(required["maximum_required_years"], 0, 30)
     except (TypeError, ValueError) as exc:
         raise ValueError("distance and maximum_required_years must be numeric values within their supported ranges.") from exc
-    seniority = normalize_seniority_levels(required["seniority"])
-    if not seniority:
+    seniority = normalize_seniority_levels(required["seniority"]) if workflow != "ece" else ""
+    if workflow != "ece" and not seniority:
         raise ValueError("At least one reassessment seniority level is required.")
     include_value = payload["include_internships"] if "include_internships" in payload else historical.get("include_internships", False)
     location = selected("location", "location_scope") or text(historical.get("location_scope"))
@@ -12690,7 +12755,7 @@ def resolve_reassessment_policy(
         "geographic_match_mode": geographic_mode,
         "distance": distance,
         "seniority": seniority,
-        "maximum_required_years": maximum,
+        "maximum_required_years": maximum if workflow != "ece" else "",
         "include_internships": as_bool(include_value),
         "remote_preference": text(selected("remote_preference")),
         "search_mode": text(selected("search_mode")) or "shortlist",
@@ -12843,8 +12908,11 @@ def discovery_target_assessment(job: dict[str, Any], search: dict[str, Any]) -> 
 
 
 def discovery_target_eligible(job: dict[str, Any], search: dict[str, Any]) -> bool:
-    if normalize_space(text(job.get("discovery_occupation") or job.get("occupation"))).lower() == "early childhood educator" and text(job.get("discovery_employment_status")).lower() == "supply_or_casual":
-        return True
+    if normalize_space(text(job.get("discovery_occupation") or job.get("occupation"))).lower() == "early childhood educator":
+        # Only grounded full-time classifications satisfy the requested ECE
+        # target. Provisional and supply work remain visible but cannot stop
+        # acquisition or consume a full-time target slot.
+        return text(job.get("discovery_employment_status")).lower() != "supply_or_casual"
     status, _ = discovery_target_assessment(job, search)
     return status == "verified" or (status == "provisional" and as_bool(search.get("include_provisional_matches", True)))
 
@@ -12853,6 +12921,34 @@ def discovery_target_ineligibility_reason(job: dict[str, Any], search: dict[str,
     """Explain a user-selected target gate without silently dropping a job."""
     _status, reason = discovery_target_assessment(job, search)
     return reason
+
+
+def application_priority_sort_key(job: dict[str, Any]) -> tuple[Any, ...]:
+    """Canonical default application order shared by discovery and Inbox."""
+    analysis = job.get("qualification_fit_seniority") or {}
+    if not isinstance(analysis, dict):
+        analysis = parse_json_object(analysis)
+    level = text(analysis.get("detected_level") or job.get("seniority_level")).lower().replace("-", "_")
+    score = clamp_int(job.get("application_priority_score"), 0, 100)
+    occupation = normalize_space(text(job.get("discovery_occupation") or job.get("occupation"))).lower()
+    if occupation == "early childhood educator":
+        employment_rank = {
+            "permanent_full_time": 0,
+            "temporary_full_time": 1,
+            "full_time_unspecified_term": 2,
+            "provisional": 3,
+            "supply_or_casual": 4,
+        }.get(text(job.get("discovery_employment_status")).lower(), 3)
+        return (employment_rank, -score, clamp_int(job.get("id"), 0, 10**12))
+    tier = 0 if level in {"entry_level", "junior", "internship"} else 1 if level in {"intermediate", "unknown", ""} else 2
+    return (
+        tier,
+        -score,
+        clamp_int(job.get("id"), 0, 10**12),
+        normalize_space(text(job.get("company"))).lower(),
+        normalize_space(text(job.get("title"))).lower(),
+        text(job.get("source_job_id")),
+    )
 
 
 def discovery_sort_value(job: dict[str, Any], field: str, direction: str = "desc", remote_rule: str = "remote_after_local", unknown_salary_position: str = "last") -> tuple[Any, ...]:
@@ -12906,17 +13002,10 @@ def discovery_sort_value(job: dict[str, Any], field: str, direction: str = "desc
         # Unknown seniority is neutral evidence.  It must not be silently
         # grouped with senior/lead roles, which previously buried ordinary
         # unlevelled developer postings in the default Inbox order.
-        tier = 0 if level in {"entry_level", "junior", "internship"} else 1 if level in {"intermediate", "unknown", ""} else 2
-        if normalize_space(text(job.get("discovery_occupation") or job.get("occupation"))).lower() == "early childhood educator":
-            employment_rank = {
-                "permanent_full_time": 0,
-                "temporary_full_time": 1,
-                "full_time_unspecified_term": 2,
-                "provisional": 3,
-                "supply_or_casual": 4,
-            }.get(text(job.get("discovery_employment_status")).lower(), 3)
-            return (employment_rank, -score_value if direction == "desc" else score_value, normalize_space(text(job.get("company"))).lower(), normalize_space(text(job.get("title"))).lower())
-        return (tier, (-score_value if direction == "desc" else score_value), normalize_space(text(job.get("company"))).lower(), normalize_space(text(job.get("title"))).lower())
+        shared = application_priority_sort_key({**job, "application_priority_score": score_value})
+        if direction == "asc":
+            return tuple(-value if isinstance(value, int) else value for value in shared[:2]) + shared[2:]
+        return shared
     if field == "deadline":
         deadline = text(job.get("deadline")) or "9999-12-31"
         return (deadline if direction == "asc" else "".join(chr(255 - ord(ch)) for ch in deadline), normalize_space(text(job.get("company"))).lower())
