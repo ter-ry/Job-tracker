@@ -80,7 +80,7 @@ assert.match(html, /id="fast-apply-open"/);
 assert.match(js, /function openFastApply/);
 assert.match(js, /function loadFastApplyQueue/);
 assert.match(js, /category: "ready_to_apply"/);
-assert.match(js, /pageSize: 500/);
+assert.match(js, /const pageSize = 500/);
 assert.match(js, /fastApplyQueue\.splice/);
 assert.match(js, /This queue record has no durable job identity/);
 assert.doesNotMatch(js, /function renderFastApply\(\)[\s\S]*?applyDiscoveryClientFiltersAndSort\(state\.discoveryResults/);

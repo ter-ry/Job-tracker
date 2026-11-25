@@ -49,6 +49,12 @@ const state = {
   fastApplyIndex: 0,
   fastApplyStatus: "idle",
   fastApplyError: "",
+  fastApplyActionError: "",
+  fastApplyApplicantId: "",
+  fastApplyWorkflow: "software",
+  fastApplyLoadToken: 0,
+  fastApplyInitialTotal: 0,
+  fastApplyPendingAction: false,
   workplaceEnrichmentOffset: 0,
   workplaceEnrichmentSearchId: "",
   workplaceEnrichmentSearch: null,
@@ -623,6 +629,7 @@ async function loadCandidateProfiles({ reloadPanelsOnSelectionChange = false } =
     state.candidateProfiles = Array.isArray(profiles) ? profiles : [];
     if (!state.candidateProfiles.some((profile) => String(profile.id) === String(state.selectedCandidateProfileId))) {
       const next = state.candidateProfiles[0] ? String(state.candidateProfiles[0].id) : "";
+      if (next !== String(state.selectedCandidateProfileId || "")) invalidateFastApplyQueue();
       state.selectedCandidateProfileId = next;
       if (next) {
         try { localStorage.setItem("jobTracker.selectedCandidateProfileId", next); } catch (_) { /* storage may be disabled */ }
@@ -1967,6 +1974,7 @@ function renderCandidateProfiles() {
     discoveryProfile.innerHTML = `<option value="">Use active Profile</option>${state.candidateProfiles.map((profile) => `<option value="${escapeAttribute(profile.id)}">${escapeHtml(profile.name)}</option>`).join("")}`;
     discoveryProfile.value = state.selectedCandidateProfileId;
     discoveryProfile.onchange = async () => {
+      invalidateFastApplyQueue();
       state.selectedCandidateProfileId = discoveryProfile.value;
       const selected = state.candidateProfiles.find((profile) => String(profile.id) === String(state.selectedCandidateProfileId));
       setValue("discovery-distance-origin", selected?.commute_origin_input || "CF Fairview Mall, 1800 Sheppard Avenue East, Toronto, ON, Canada");
@@ -1989,6 +1997,7 @@ function renderCandidateProfiles() {
 }
 
 async function selectCandidateProfile(profileId) {
+  invalidateFastApplyQueue();
   state.selectedCandidateProfileId = String(profileId);
   const selected = state.candidateProfiles.find((profile) => String(profile.id) === String(profileId));
   setValue("discovery-distance-origin", selected?.commute_origin_input || "CF Fairview Mall, 1800 Sheppard Avenue East, Toronto, ON, Canada");
@@ -3960,13 +3969,29 @@ function openFastApply() {
   if (!panel) return;
   panel.hidden = false;
   panel.scrollIntoView({ behavior: "smooth", block: "start" });
-  loadFastApplyQueue();
+  if (String(state.fastApplyApplicantId) !== String(state.selectedCandidateProfileId || value("discovery-profile") || "")) loadFastApplyQueue();
+  else renderFastApply();
+}
+
+function invalidateFastApplyQueue() {
+  state.fastApplyLoadToken += 1;
+  state.fastApplyQueue = [];
+  state.fastApplyIndex = 0;
+  state.fastApplyStatus = "idle";
+  state.fastApplyError = "";
+  state.fastApplyActionError = "";
+  state.fastApplyApplicantId = "";
+  state.fastApplyInitialTotal = 0;
+  state.fastApplyPendingAction = false;
 }
 
 async function loadFastApplyQueue() {
   const target = document.getElementById("fast-apply-current");
   if (!target) return;
-  const profileId = state.selectedCandidateProfileId || value("discovery-profile") || "";
+  const profileId = String(state.selectedCandidateProfileId || value("discovery-profile") || "");
+  const profile = (state.candidateProfiles || []).find((item) => String(item.id) === profileId);
+  const workflow = String(profile?.workflow || state.discoveryWorkflow || "software");
+  const loadToken = ++state.fastApplyLoadToken;
   if (!profileId) {
     state.fastApplyStatus = "error";
     state.fastApplyError = "Select an applicant profile to load its Ready to Apply queue.";
@@ -3975,13 +4000,34 @@ async function loadFastApplyQueue() {
   }
   state.fastApplyStatus = "loading";
   state.fastApplyError = "";
+  state.fastApplyActionError = "";
+  state.fastApplyApplicantId = profileId;
+  state.fastApplyWorkflow = workflow;
+  state.fastApplyQueue = [];
+  state.fastApplyIndex = 0;
+  state.fastApplyInitialTotal = 0;
   renderFastApply();
   try {
-    const response = await api.getWithMeta(discoveryInboxRequestUrl({ profileId, category: "ready_to_apply", page: 0, pageSize: 500 }));
-    state.fastApplyQueue = Array.isArray(response.data) ? response.data : [];
+    const pageSize = 500;
+    let page = 0;
+    let total = null;
+    const records = [];
+    while (total === null || records.length < total) {
+      const response = await api.getWithMeta(discoveryInboxRequestUrl({ profileId, category: "ready_to_apply", page, pageSize }));
+      if (loadToken !== state.fastApplyLoadToken || profileId !== String(state.selectedCandidateProfileId || "")) return;
+      const batch = Array.isArray(response.data) ? response.data : [];
+      total = response.total || 0;
+      if (page === 0) state.fastApplyInitialTotal = total;
+      records.push(...batch);
+      if (!batch.length || records.length >= total) break;
+      page += 1;
+    }
+    if (loadToken !== state.fastApplyLoadToken || profileId !== String(state.selectedCandidateProfileId || "")) return;
+    state.fastApplyQueue = records;
     state.fastApplyIndex = 0;
     state.fastApplyStatus = "ready";
   } catch (error) {
+    if (loadToken !== state.fastApplyLoadToken) return;
     state.fastApplyQueue = [];
     state.fastApplyStatus = "error";
     state.fastApplyError = error.message || "Unable to load the persistent application queue.";
@@ -3997,29 +4043,51 @@ function renderFastApply() {
   const queue = state.fastApplyQueue || [];
   const job = queue[state.fastApplyIndex];
   target.classList.toggle("empty", !job);
-  if (!job) { target.innerHTML = `<p>${queue.length ? "Fast Apply queue completed." : "No eligible opportunities remain for this applicant."}</p><p class="muted">Queue size: ${queue.length} · Remaining: 0</p>`; return; }
+  if (!job) { target.innerHTML = `<p>${state.fastApplyInitialTotal ? "Fast Apply queue completed." : "No eligible opportunities remain for this applicant."}</p><p class="muted">Initial eligible queue: ${state.fastApplyInitialTotal} · Processed: ${state.fastApplyInitialTotal - queue.length} · Remaining: 0</p>`; return; }
   const key = escapeAttribute(String(job.id));
   const url = job.application_url || job.url || "";
   const seniority = job.qualification_fit_seniority?.detected_level || job.seniority_level || "Unknown";
   const experience = job.experience_requirements || {};
   const technical = job.technical_compatibility || {};
-  target.innerHTML = `<p class="muted">Applicant: ${escapeHtml(job.qualification_evidence_profile_name || profileId)} · Queue: ${queue.length} · Position ${state.fastApplyIndex + 1} · Remaining ${queue.length - state.fastApplyIndex}</p><article class="discovery-card"><h3>${escapeHtml(job.title || "Untitled role")}</h3><p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(resultWorkplaceLabel(job))}</p><p><strong>Detected seniority:</strong> ${escapeHtml(seniority)} · <strong>Required experience:</strong> ${escapeHtml(JSON.stringify(experience.required || "Not stated"))} · <strong>Preferred:</strong> ${escapeHtml(JSON.stringify(experience.preferred || "Not stated"))}</p><p><strong>Technical compatibility:</strong> ${escapeHtml(job.qualification_fit_label || "Not fully assessed")} · <strong>Application priority:</strong> ${Number(job.application_priority_score || 0)}/100</p><p class="muted">${escapeHtml(displaySalary(job))} · ${escapeHtml(job.work_arrangement || job.remote_type || "Work arrangement unknown")} · ${escapeHtml(commuteDisplayLabel(job))}</p><p>${escapeHtml((job.application_priority_reasons || []).join(" ") || "Priority uses applicant-aware relevance, seniority, experience, technical compatibility and evidence.")}</p><details><summary>Relevant verified skills and missing requirements</summary><p><strong>Verified:</strong> ${escapeHtml((technical.matched || job.qualification_fit_matched_requirements || []).join(", ") || "Not available")}</p><p><strong>Missing / review:</strong> ${escapeHtml((technical.missing || job.qualification_fit_missing_requirements || []).join(", ") || "None recorded")}</p><p><strong>Requirements:</strong> ${escapeHtml((job.qualification_requirements || job.required_skills || "Not fully assessed from the posting.").toString())}</p></details><div class="row-actions">${url ? `<a class="button small" href="${escapeAttribute(url)}" target="_blank" rel="noreferrer">Open Original / Apply</a>` : ""}<button class="button small ghost" data-fast-action="applied" data-job-key="${key}">Confirm Applied</button><button class="button small ghost" data-fast-action="save" data-job-key="${key}">Save for later</button><button class="button small ghost" data-fast-action="skip" data-job-key="${key}">Skip</button><button class="button small ghost" data-fast-close>Close</button></div><p class="muted helper">Opening a posting never marks a job applied. Confirm only after submitting externally.</p></article>`;
+  const actionDisabled = state.fastApplyPendingAction ? "disabled" : "";
+  target.innerHTML = `${state.fastApplyActionError ? `<p class="risk high" role="alert">${escapeHtml(state.fastApplyActionError)} Try again; this job remains current.</p>` : ""}<p class="muted">Applicant: ${escapeHtml(state.fastApplyApplicantId)} · Initial eligible queue: ${state.fastApplyInitialTotal} · Processed: ${state.fastApplyInitialTotal - queue.length} · Remaining: ${queue.length - state.fastApplyIndex}</p><article class="discovery-card"><h3>${escapeHtml(job.title || "Untitled role")}</h3><p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(resultWorkplaceLabel(job))}</p><p><strong>Detected seniority:</strong> ${escapeHtml(seniority)} · <strong>Required experience:</strong> ${escapeHtml(JSON.stringify(experience.required || "Not stated"))} · <strong>Preferred:</strong> ${escapeHtml(JSON.stringify(experience.preferred || "Not stated"))}</p><p><strong>Technical compatibility:</strong> ${escapeHtml(job.qualification_fit_label || "Not fully assessed")} · <strong>Application priority:</strong> ${Number(job.application_priority_score || 0)}/100</p><p class="muted">${escapeHtml(displaySalary(job))} · ${escapeHtml(job.work_arrangement || job.remote_type || "Work arrangement unknown")} · ${escapeHtml(commuteDisplayLabel(job))}</p><p>${escapeHtml((job.application_priority_reasons || []).join(" ") || "Priority uses applicant-aware relevance, seniority, experience, technical compatibility and evidence.")}</p><details><summary>Relevant verified skills and missing requirements</summary><p><strong>Verified:</strong> ${escapeHtml((technical.matched || job.qualification_fit_matched_requirements || []).join(", ") || "Not available")}</p><p><strong>Missing / review:</strong> ${escapeHtml((technical.missing || job.qualification_fit_missing_requirements || []).join(", ") || "None recorded")}</p><p><strong>Requirements:</strong> ${escapeHtml((job.qualification_requirements || job.required_skills || "Not fully assessed from the posting.").toString())}</p></details><div class="row-actions">${url ? `<a class="button small" href="${escapeAttribute(url)}" target="_blank" rel="noreferrer">Open Original / Apply</a>` : ""}<button class="button small ghost" ${actionDisabled} data-fast-action="applied" data-job-key="${key}">Confirm Applied</button><button class="button small ghost" ${actionDisabled} data-fast-action="save" data-job-key="${key}">Save for later</button><button class="button small ghost" ${actionDisabled} data-fast-action="skip" data-job-key="${key}">Skip</button><button class="button small ghost" data-fast-close>Close</button></div><p class="muted helper">Opening a posting never marks a job applied. Confirm only after submitting externally.</p></article>`;
   target.querySelectorAll("[data-fast-action]").forEach((button) => button.addEventListener("click", async () => {
     const action = button.dataset.fastAction;
+    if (state.fastApplyPendingAction) return;
+    state.fastApplyPendingAction = true;
+    state.fastApplyActionError = "";
+    renderFastApply();
     try {
       await fastApplyAction(action === "skip" ? "ignore" : action, job);
       state.fastApplyQueue.splice(state.fastApplyIndex, 1);
       state.fastApplyIndex = Math.min(state.fastApplyIndex, state.fastApplyQueue.length);
+      await syncFastApplyCounters();
+      state.fastApplyPendingAction = false;
       renderFastApply();
-    } catch (error) { state.fastApplyError = error.message || "Action failed"; state.fastApplyStatus = "error"; renderFastApply(); }
+    } catch (error) {
+      state.fastApplyPendingAction = false;
+      state.fastApplyActionError = error.message || "Action failed";
+      renderFastApply();
+    }
   }));
   target.querySelector("[data-fast-close]")?.addEventListener("click", () => { document.getElementById("fast-apply-panel").hidden = true; });
 }
 
 async function fastApplyAction(action, job) {
   if (!job?.id) throw new Error("This queue record has no durable job identity.");
-  await api.send(`/api/discovery/inbox/${job.id}/${action}`, "POST", discoveryApplicantActionPayload());
+  await api.send(`/api/discovery/inbox/${job.id}/${action}`, "POST", { applicant_profile_id: state.fastApplyApplicantId, workflow: state.fastApplyWorkflow });
   toast(action === "save" ? "Saved for later" : action === "ignore" ? "Skipped" : "Marked applied");
+}
+
+async function syncFastApplyCounters() {
+  if (!state.fastApplyApplicantId) return;
+  try {
+    const counts = await api.get(`/api/discovery/inbox/counts?candidate_profile_id=${encodeURIComponent(state.fastApplyApplicantId)}`);
+    state.discoveryInboxCounts = counts || {};
+    const ready = document.getElementById("applications-ready-count");
+    if (ready) ready.textContent = String(counts.ready_to_apply ?? 0);
+    if (!document.getElementById("fast-apply-panel")?.hidden && document.querySelector(".discovery-view-inbox:not([hidden])")) await loadDiscoveryInbox(true);
+  } catch (_) { /* queue action already succeeded; counters can refresh on next view load */ }
 }
 
 function renderDiscoveryOriginSummary() {
