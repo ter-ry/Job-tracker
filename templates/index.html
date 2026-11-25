@@ -117,7 +117,7 @@
               </label>
               <label>Job titles<input id="discovery-keywords" required placeholder="software developer; junior software engineer"><small class="muted">Use semicolons for multiple titles.</small></label>
               <label>Search area<input id="discovery-location" placeholder="Toronto, Ontario"></label>
-              <label>Commute From<input id="discovery-distance-origin" placeholder="CF Fairview Mall, 1800 Sheppard Avenue East, Toronto, ON, Canada" value="CF Fairview Mall, 1800 Sheppard Avenue East, Toronto, ON, Canada"><small class="muted">Used only for commute context. A failed lookup stays unresolved; it never falls back to the search area.</small></label>
+              <label>Commute From<input id="discovery-distance-origin" placeholder="Enter an address or postal code"><small class="muted">The selected applicant's saved origin is loaded here. A failed lookup stays unresolved; it never falls back to another location.</small></label>
               <label>Number of new matching jobs<input id="discovery-new-matching-target" type="number" min="1" max="500" step="1" value="50"><small class="muted">Target for qualifying new jobs, not the raw provider-fetch limit.</small></label>
               <label>Distance radius<input id="discovery-distance" type="number" min="0" step="1" placeholder="50 km"></label>
               <label>Remote preference
@@ -222,8 +222,11 @@
                 <h2>Discovery results</h2>
                 <p id="discovery-active-state" class="muted helper">Search results will appear here.</p>
                 <p id="discovery-distance-origin-summary" class="muted helper">Distance calculated from: not configured.</p>
-              <div id="workplace-enrichment-preview" class="generated-output empty" aria-live="polite">Workplace enrichment preview details will appear here.</div>
-              <button class="button ghost small" type="button" id="workplace-enrichment-next" hidden>Next batch</button>
+              <details id="workplace-enrichment-details" open>
+                <summary>Workplace preview <button class="button ghost small" type="button" id="dismiss-workplace-preview">Dismiss</button></summary>
+                <div id="workplace-enrichment-preview" class="generated-output empty" aria-live="polite">Workplace enrichment preview details will appear here.</div>
+              </details>
+              <button class="button ghost small" type="button" id="workplace-enrichment-next" hidden>Next workplace batch</button>
               </div>
               <div class="actions compact discovery-toolbar-actions">
                 <label class="toolbar-select">

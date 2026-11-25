@@ -48,9 +48,13 @@ def test_ece_policy_is_full_time_title_based_and_keeps_supply_out_of_target():
     eca = {**base, "title": "Early Childhood Assistant", "job_description": "Full-time permanent assistant role."}
     assert app_module.discovery_result_category(full_time)[0] == "actionable"
     assert app_module.discovery_result_category(temporary)[0] == "actionable"
-    assert app_module.discovery_result_category(supply)[0] == "archived_low_priority"
+    assert app_module.discovery_result_category(supply)[0] == "actionable"
+    assert supply["discovery_employment_status"] == "supply_or_casual"
     assert app_module.discovery_result_category(part_time)[0] == "excluded"
     assert app_module.discovery_result_category(eca)[0] == "excluded"
+    assert app_module.discovery_result_category({**base, "title": "Kindergarten Teacher", "job_description": "A school teaching role."})[0] == "review_required"
+    assert app_module.discovery_result_category({**base, "title": "RECE / ECA Educator", "job_description": "Full-time classroom educator role."})[0] == "actionable"
+    assert app_module.discovery_result_category({**base, "title": "ECE Supevisor", "job_description": "Full-time centre role."})[0] == "excluded"
 
 
 def test_ece_search_config_uses_commute_origin_as_effective_location():
@@ -63,6 +67,66 @@ def test_ece_search_config_uses_commute_origin_as_effective_location():
     assert config["location"] == "CF Fairview Mall, Toronto, ON"
     assert config["distance_origin_input"] == config["location"]
     assert config["geographic_match_mode"] == "provisional"
+
+
+def test_reconciliation_preview_apply_rollback_is_explicit_and_idempotent(tmp_path, monkeypatch):
+    client = _isolated_client(tmp_path, monkeypatch)
+    client.get("/api/health")
+    with app_module.app.app_context():
+        first = app_module.normalize_job_payload({
+            "source": "indeed", "source_job_id": "indeed-104-a", "company": "Alias Employer Inc.",
+            "title": "Software Engineer", "location": "Toronto, ON",
+            "url": "https://example.test/jobs/requisition-104?utm_source=indeed",
+            "description": "Build and maintain software systems with Python, APIs, testing and production ownership." * 3,
+            "discovery_first_seen_at": "2026-11-25T00:00:00", "discovery_result_category": "actionable",
+        })
+        second = app_module.normalize_job_payload({
+            "source": "employer_direct", "source_job_id": "req-104", "company": "Alias Employer Inc.",
+            "title": "Software Engineer", "location": "Toronto, ON",
+            "url": "https://boards.example.test/roles/requisition-104",
+            "description": "Build and maintain software systems with Python, APIs, testing and production ownership." * 3,
+            "discovery_first_seen_at": "2026-11-25T00:00:00", "discovery_result_category": "actionable",
+        })
+        first_id = app_module.persist_discovery_jobs([first], None, None)["new_job_ids"][0]
+        second_id = app_module.persist_discovery_jobs([second], None, None)["new_job_ids"][0]
+    preview = client.get("/api/discovery/reconciliation/preview").get_json()
+    assert preview["candidate_count"] == 1
+    assert preview["mutated"] is False
+    applied = client.post(f"/api/discovery/reconciliation/{preview['reconciliation_id']}/apply", json={"confirm": True, "confirmation_token": preview["confirmation_token"]})
+    assert applied.status_code == 200
+    with app_module.app.app_context():
+        assert app_module.query_db("SELECT canonical_job_id FROM jobs WHERE id = ?", [second_id], one=True)["canonical_job_id"] == first_id
+    again = client.post(f"/api/discovery/reconciliation/{preview['reconciliation_id']}/apply", json={"confirm": True, "confirmation_token": preview["confirmation_token"]}).get_json()
+    assert again["idempotent"] is True
+    rolled_back = client.post(f"/api/discovery/reconciliation/{preview['reconciliation_id']}/rollback")
+    assert rolled_back.status_code == 200
+    with app_module.app.app_context():
+        assert app_module.query_db("SELECT canonical_job_id FROM jobs WHERE id = ?", [second_id], one=True)["canonical_job_id"] == 0
+
+
+def test_effective_membership_criteria_survive_database_reopen(tmp_path, monkeypatch):
+    client = _isolated_client(tmp_path, monkeypatch)
+    client.get("/api/health")
+    with app_module.app.app_context():
+        job = app_module.normalize_job_payload({
+            "source": "fixture", "source_job_id": "criteria-1", "title": "Registered Early Childhood Educator",
+            "company": "Criteria Centre", "location": "Toronto, ON", "url": "https://criteria.example/1",
+            "description": "Full-time RECE position.", "discovery_first_seen_at": "2026-11-25T00:00:00",
+            "discovery_result_category": "actionable", "discovery_occupation": "early childhood educator",
+        })
+        job_id = app_module.persist_discovery_jobs([job], None, None)["new_job_ids"][0]
+        app_module.persist_discovery_search_memberships("c" * 32, [{**job, "id": job_id}], 27, {
+            "workflow": "ece", "location": "Toronto, ON", "distance_origin_input": "M4P 1E4",
+            "original_origin": "M4P 1E4", "distance": 20, "geographic_match_mode": "provisional",
+            "enabled_sources": ["indeed", "employer_direct"], "match_policy": "strict_matching",
+        })
+    with app_module.app.app_context():
+        row = app_module.query_db("SELECT applicant_profile_id, criteria_json FROM discovery_search_memberships WHERE search_execution_id = ?", ["c" * 32], one=True)
+        criteria = app_module.parse_json_object(row["criteria_json"])
+        assert int(row["applicant_profile_id"]) == 27
+        assert criteria["workflow"] == "ece"
+        assert criteria["distance_origin_input"] == "M4P 1E4"
+        assert criteria["enabled_sources"] == ["indeed", "employer_direct"]
 
 
 def test_server_authoritatively_rejects_wrong_missing_and_unknown_applicants(tmp_path, monkeypatch):

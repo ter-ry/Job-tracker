@@ -531,6 +531,8 @@ JOB_COLUMNS = {
     "commute_assumption": "TEXT NOT NULL DEFAULT ''",
     "possible_duplicate": "INTEGER NOT NULL DEFAULT 0",
     "possible_duplicate_job_id": "INTEGER NOT NULL DEFAULT 0",
+    "canonical_job_id": "INTEGER NOT NULL DEFAULT 0",
+    "canonical_reconciliation_id": "TEXT NOT NULL DEFAULT ''",
 }
 
 PROFILE_COLUMNS = {
@@ -2226,6 +2228,87 @@ def create_app() -> Flask:
         db.commit()
         return jsonify({"ok": True, "id": match_id, "resolution": resolution, "application_date": text(match["application_date"]), "original_job_id": int(match["existing_job_id"]), "imported_job_id": int(match["imported_job_id"])})
 
+    @app.get("/api/discovery/reconciliation/preview")
+    def preview_discovery_reconciliation() -> Response:
+        applicant_id = applicant_profile_id(request.args)
+        candidates = reconciliation_candidate_groups(applicant_id)
+        reconciliation_id = uuid.uuid4().hex
+        token = hashlib.sha256(dumps_json(candidates, sort_keys=True).encode("utf-8")).hexdigest()
+        get_db().execute(
+            "INSERT INTO discovery_reconciliation_runs(reconciliation_id, applicant_profile_id, status, candidate_json) VALUES (?, ?, 'preview', ?)",
+            [reconciliation_id, applicant_id, dumps_json(candidates, sort_keys=True)],
+        )
+        get_db().commit()
+        return jsonify({"preview": True, "reconciliation_id": reconciliation_id, "confirmation_token": token, "candidate_count": len(candidates), "candidates": candidates, "mutated": False})
+
+    @app.post("/api/discovery/reconciliation/<reconciliation_id>/apply")
+    def apply_discovery_reconciliation(reconciliation_id: str) -> Response:
+        payload = request.get_json(silent=True) or {}
+        row = query_db("SELECT * FROM discovery_reconciliation_runs WHERE reconciliation_id = ?", [reconciliation_id], one=True)
+        if row is None:
+            return jsonify({"error": "Reconciliation preview was not found."}), 404
+        if text(row["status"]) == "applied":
+            return jsonify({"ok": True, "idempotent": True, "reconciliation_id": reconciliation_id, "status": "applied"})
+        candidates = parse_json_array(row["candidate_json"])
+        token = hashlib.sha256(dumps_json(candidates, sort_keys=True).encode("utf-8")).hexdigest()
+        if payload.get("confirmation_token") != token or payload.get("confirm") is not True:
+            return jsonify({"error": "Explicit confirmation token and confirm=true are required; no records changed."}), 409
+        db = get_db()
+        backups = []
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            for candidate in candidates:
+                ids = [clamp_int(item, 1, 10**12) for item in candidate.get("job_ids", [])]
+                if len(ids) < 2:
+                    continue
+                canonical_id = clamp_int(candidate.get("canonical_job_id"), 1, 10**12)
+                canonical = db.execute("SELECT id, source_links_json, discovery_result_category, discovery_result_reason FROM jobs WHERE id = ?", [canonical_id]).fetchone()
+                if canonical is None:
+                    continue
+                links = parse_json_values(canonical["source_links_json"])
+                for duplicate_id in ids:
+                    if duplicate_id == canonical_id:
+                        continue
+                    duplicate = db.execute("SELECT id, source, source_job_id, url, application_url, source_links_json, canonical_job_id, discovery_result_category, discovery_result_reason FROM jobs WHERE id = ?", [duplicate_id]).fetchone()
+                    if duplicate is None or int(duplicate["canonical_job_id"] or 0) not in {0, canonical_id}:
+                        continue
+                    backups.append({"duplicate": dict(duplicate), "canonical": dict(canonical)})
+                    links.extend(parse_json_values(duplicate["source_links_json"]))
+                    for key in ("url", "application_url"):
+                        if text(duplicate[key]):
+                            links.append({"url": text(duplicate[key]), "source": text(duplicate["source"]), "source_job_id": text(duplicate["source_job_id"])})
+                    db.execute("UPDATE jobs SET canonical_job_id = ?, canonical_reconciliation_id = ?, discovery_result_category = 'excluded', discovery_result_reason = 'Reconciled to canonical vacancy; original source history retained.', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [canonical_id, reconciliation_id, duplicate_id])
+                    db.execute("INSERT OR REPLACE INTO discovery_reconciliation_changes(reconciliation_id, duplicate_job_id, canonical_job_id, previous_json) VALUES (?, ?, ?, ?)", [reconciliation_id, duplicate_id, canonical_id, dumps_json({"duplicate": dict(duplicate), "canonical": dict(canonical)}, sort_keys=True)])
+                unique_links = {dumps_json(value, sort_keys=True): value for value in links if value}
+                db.execute("UPDATE jobs SET source_links_json = ?, canonical_reconciliation_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [dumps_json(list(unique_links.values()), sort_keys=True), reconciliation_id, canonical_id])
+            db.execute("UPDATE discovery_reconciliation_runs SET status = 'applied', backup_json = ?, applied_at = CURRENT_TIMESTAMP WHERE reconciliation_id = ?", [dumps_json(backups, sort_keys=True), reconciliation_id])
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        return jsonify({"ok": True, "reconciliation_id": reconciliation_id, "status": "applied", "changed": len(backups), "backup_available": bool(backups)})
+
+    @app.post("/api/discovery/reconciliation/<reconciliation_id>/rollback")
+    def rollback_discovery_reconciliation(reconciliation_id: str) -> Response:
+        row = query_db("SELECT * FROM discovery_reconciliation_runs WHERE reconciliation_id = ? AND status = 'applied'", [reconciliation_id], one=True)
+        if row is None:
+            return jsonify({"error": "An applied reconciliation backup was not found."}), 404
+        db = get_db()
+        backups = parse_json_array(row["backup_json"])
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            for backup in backups:
+                duplicate = backup.get("duplicate") or {}
+                canonical = backup.get("canonical") or {}
+                db.execute("UPDATE jobs SET canonical_job_id = ?, canonical_reconciliation_id = '', discovery_result_category = ?, discovery_result_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [duplicate.get("canonical_job_id", 0), duplicate.get("discovery_result_category", ""), duplicate.get("discovery_result_reason", ""), duplicate.get("id")])
+                db.execute("UPDATE jobs SET source_links_json = ?, canonical_reconciliation_id = '', discovery_result_category = ?, discovery_result_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [canonical.get("source_links_json", "[]"), canonical.get("discovery_result_category", ""), canonical.get("discovery_result_reason", ""), canonical.get("id")])
+            db.execute("UPDATE discovery_reconciliation_runs SET status = 'rolled_back', rolled_back_at = CURRENT_TIMESTAMP WHERE reconciliation_id = ?", [reconciliation_id])
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        return jsonify({"ok": True, "reconciliation_id": reconciliation_id, "status": "rolled_back", "restored": len(backups)})
+
     @app.post("/api/discovery/search")
     def discovery_search() -> Response:
         payload = request.get_json(force=True)
@@ -2730,12 +2813,12 @@ def create_app() -> Flask:
                 return jsonify({"error": "A supported discovery Inbox category is required with search_id."}), 400
         if requested_category == "presented" and not applicant_id:
             return jsonify({"error": "candidate_profile_id is required for Presented / Seen history."}), 400
-        query = "SELECT * FROM jobs WHERE discovery_first_seen_at <> ''"
+        query = "SELECT * FROM jobs WHERE discovery_first_seen_at <> '' AND (canonical_job_id = 0 OR canonical_job_id = '')"
         query_args: list[Any] = []
         if requested_category == "requalified":
             query = """SELECT j.* FROM jobs j
                        JOIN discovery_requalifications r ON r.job_id = j.id AND r.applicant_profile_id = ?
-                       WHERE j.discovery_first_seen_at <> ''"""
+                       WHERE j.discovery_first_seen_at <> '' AND (j.canonical_job_id = 0 OR j.canonical_job_id = '')"""
             query_args.append(applicant_id)
         elif requested_category == "all_relevant":
             query += " AND (discovery_result_category IN ('actionable', 'review_required')"
@@ -2803,7 +2886,7 @@ def create_app() -> Flask:
                        FROM jobs j
                        JOIN discovery_search_memberships m ON m.job_id = j.id
                        WHERE j.discovery_first_seen_at <> ''
-                         AND m.search_execution_id = ?"""
+                         AND m.search_execution_id = ? AND (j.canonical_job_id = 0 OR j.canonical_job_id = '')"""
             query_args = [requested_search_id]
             if applicant_id:
                 query += " AND (j.candidate_profile_id IN ('', 0) OR j.candidate_profile_id = ? OR EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = j.id AND p.applicant_profile_id = ?) OR EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = j.id AND s.applicant_profile_id = ?))"
@@ -2854,6 +2937,18 @@ def create_app() -> Flask:
         rows = query_db(
             query, query_args
         )
+        pre_paged = False
+        # Ready-to-apply SQL already excludes terminal applicant states. Rank
+        # the full relation, but hydrate only the requested page; job_to_dict
+        # performs evidence work that is unnecessary for rows not returned.
+        if not membership_search and requested_category == "ready_to_apply":
+            def inbox_rank(row: Any) -> tuple[Any, ...]:
+                analysis = parse_json_object(row["qualification_fit_seniority"]) if "qualification_fit_seniority" in row.keys() else {}
+                level = text(analysis.get("detected_level") or (row["seniority_level"] if "seniority_level" in row.keys() else "")).lower().replace("-", "_")
+                tier = 0 if level in {"entry_level", "junior", "internship"} else 1 if level == "intermediate" else 2
+                return (tier, -clamp_int(row["application_priority_score"], 0, 100), normalize_space(text(row["company"])).lower(), normalize_space(text(row["title"])).lower())
+            rows = sorted(rows, key=inbox_rank)[page * page_size:(page + 1) * page_size]
+            pre_paged = True
         evidence_profile = None
         if request.args.get("candidate_profile_id"):
             try:
@@ -2969,7 +3064,8 @@ def create_app() -> Flask:
             jobs = sort_discovery_jobs(jobs, "application_priority_score", "desc")
         else:
             jobs.sort(key=lambda item: (text(item.get("discovery_last_seen_at")), int(item.get("id") or 0)), reverse=True)
-        jobs = jobs[page * page_size:(page + 1) * page_size]
+        if not pre_paged:
+            jobs = jobs[page * page_size:(page + 1) * page_size]
         response = jsonify(jobs)
         response.headers["X-Job-Tracker-Total"] = str(total_count)
         response.headers["X-Job-Tracker-Page"] = str(page)
@@ -2981,7 +3077,7 @@ def create_app() -> Flask:
         applicant_id = applicant_profile_id(request.args)
         if not applicant_id:
             return jsonify({"error": "candidate_profile_id is required for applicant-specific Inbox counts."}), 400
-        base = "j.discovery_first_seen_at <> '' AND (j.candidate_profile_id IN ('', 0) OR j.candidate_profile_id = ? OR EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = j.id AND p.applicant_profile_id = ?) OR EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = j.id AND s.applicant_profile_id = ?))"
+        base = "j.discovery_first_seen_at <> '' AND (j.canonical_job_id = 0 OR j.canonical_job_id = '') AND (j.candidate_profile_id IN ('', 0) OR j.candidate_profile_id = ? OR EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = j.id AND p.applicant_profile_id = ?) OR EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = j.id AND s.applicant_profile_id = ?))"
         args = [applicant_id, applicant_id, applicant_id]
         rows = query_db(f"SELECT j.id, j.status, j.discovery_result_category, EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = j.id AND p.applicant_profile_id = ?) AS presented, COALESCE((SELECT state FROM discovery_applicant_states s WHERE s.job_id = j.id AND s.applicant_profile_id = ?), '') AS applicant_state, EXISTS (SELECT 1 FROM discovery_requalifications r WHERE r.job_id = j.id AND r.applicant_profile_id = ?) AS requalified, EXISTS (SELECT 1 FROM discovery_applicant_duplicate_matches d WHERE d.existing_job_id = j.id AND d.applicant_profile_id = ? AND d.status = 'pending') AS pending_duplicate FROM jobs j WHERE {base}", [applicant_id, applicant_id, applicant_id, applicant_id, *args])
         counts = {"all_discovered": 0, "all_relevant": 0, "new_actionable": 0, "ready_to_apply": 0, "review_required": 0, "excluded": 0, "presented": 0, "saved": 0, "applied": 0, "skipped": 0, "pending_duplicate": 0}
@@ -3496,7 +3592,7 @@ def create_app() -> Flask:
         applicant_id = clamp_int(payload.get("applicant_profile_id"), 0, 10**9)
         candidate_row = get_db().execute("SELECT * FROM candidate_profiles WHERE id = ?", (applicant_id,)).fetchone() if applicant_id else None
         candidate = dict(candidate_row) if candidate_row else {}
-        default_origin = text(candidate.get("commute_origin_input")) or "CF Fairview Mall, 1800 Sheppard Avenue East, Toronto, ON, Canada"
+        default_origin = text(candidate.get("commute_origin_input"))
         # Legacy/profileless callers retain the historical postal-origin
         # behavior. Applicant-scoped searches use the explicit commute field.
         requested_origin = normalize_space(search.get("distance_origin_input")) or (default_origin if applicant_id else "")
@@ -3785,7 +3881,8 @@ def create_app() -> Flask:
         persisted = persist_discovery_jobs(ordered, None, manual_run_id)
         search_execution_id = uuid.uuid4().hex
         persist_discovery_search_memberships(search_execution_id, ordered, selected_applicant_id, search)
-        new_matching_jobs = matching_jobs[:requested_target]
+        target_matching_jobs = [item for item in matching_jobs if text(item.get("discovery_employment_status")).lower() != "supply_or_casual"]
+        new_matching_jobs = target_matching_jobs[:requested_target]
         # The response is unified: actionable new matches first, followed by a
         # separately labelled review queue. Excluded jobs never enter it.
         jobs = new_matching_jobs + review_required_jobs
@@ -3939,7 +4036,7 @@ def create_app() -> Flask:
         candidate_data = dict(candidate_row) if candidate_row else {}
         origin_input = normalize_space(text(payload.get("distance_origin_input") or payload.get("distance_origin")))
         if not origin_input:
-            origin_input = text(search.get("distance_origin_input")) or text(candidate_data.get("commute_origin_input")) or "CF Fairview Mall, 1800 Sheppard Avenue East, Toronto, ON, Canada"
+            origin_input = text(search.get("distance_origin_input")) or text(candidate_data.get("commute_origin_input"))
         provider = get_geocoding_provider()
         try:
             location_context = resolve_discovery_location_context(
@@ -4670,6 +4767,8 @@ def saved_search_to_discovery_payload(search: dict[str, Any]) -> dict[str, Any]:
 
 def resolve_discovery_evidence_profile(payload: dict[str, Any]) -> dict[str, Any]:
     """Resolve the résumé used for discovery scoring, without mixing profiles."""
+    if normalize_space(text(payload.get("workflow"))).lower() == "ece":
+        return {}
     search_mode = normalize_choice(payload.get("search_mode"), {"title", "explore", "shortlist"}) or "title"
     # The discovery UI uses applicant_profile_id for the selected workflow.
     # Treat it as evidence ownership for shortlist searches too; otherwise the
@@ -5176,7 +5275,7 @@ def run_discovery_pipeline(
         # in history but must never consume a new-opportunity slot.
         if item.get("discovery_result_category") == "actionable" and not state and not presented:
             eligible_unpresented.append(item)
-    matching_jobs = eligible_unpresented[:requested_target]
+    matching_jobs = [item for item in eligible_unpresented if text(item.get("discovery_employment_status")).lower() != "supply_or_casual"][:requested_target]
     # Presentation is acknowledged only after the browser renders final rows;
     # a worker completing while a browser crashes must not silently hide jobs.
     review_required_jobs = [item for item in ordered if item.get("discovery_result_category") == "review_required"]
@@ -8714,6 +8813,55 @@ def dedupe_match(first: dict[str, Any], second: dict[str, Any]) -> bool:
     })
 
 
+def reconciliation_candidate_groups(applicant_profile_id: int = 0) -> list[dict[str, Any]]:
+    """Find reviewable cross-source vacancy candidates without mutating jobs.
+
+    A shared canonical URL is high-confidence identity evidence. When URLs
+    differ, a strong normalized-description match is required in addition to
+    employer/title/location agreement. Employer/title alone is deliberately
+    never sufficient.
+    """
+    rows = query_db("SELECT * FROM jobs WHERE canonical_job_id = 0 OR canonical_job_id = '' ORDER BY id")
+    groups: list[list[Any]] = []
+    for index, left in enumerate(rows):
+        left_item = dict(left)
+        if applicant_profile_id and int(left_item.get("candidate_profile_id") or 0) not in {0, applicant_profile_id}:
+            continue
+        for right in rows[index + 1:]:
+            right_item = dict(right)
+            if int(left_item.get("candidate_profile_id") or 0) and int(right_item.get("candidate_profile_id") or 0) and int(left_item.get("candidate_profile_id")) != int(right_item.get("candidate_profile_id")):
+                continue
+            if normalize_dedupe_text(left_item.get("source")) == normalize_dedupe_text(right_item.get("source")):
+                continue
+            urls_shared = bool(source_link_values(left_item) & source_link_values(right_item))
+            same_context = (
+                normalize_dedupe_company(left_item.get("company")) == normalize_dedupe_company(right_item.get("company"))
+                and normalize_dedupe_text(left_item.get("title")) == normalize_dedupe_text(right_item.get("title"))
+                and normalize_dedupe_location(left_item.get("location")) == normalize_dedupe_location(right_item.get("location"))
+            )
+            description_left = normalize_dedupe_text(left_item.get("job_description"))
+            description_right = normalize_dedupe_text(right_item.get("job_description"))
+            description_score = difflib.SequenceMatcher(None, description_left, description_right).ratio() if description_left and description_right else 0
+            if not urls_shared and not (same_context and len(description_left) >= 120 and description_score >= 0.90):
+                continue
+            evidence = ["shared_canonical_url"] if urls_shared else ["same_employer_title_location", "description_similarity"]
+            confidence = 1.0 if urls_shared else round(description_score, 3)
+            groups.append([left, right, evidence, confidence])
+    candidates = []
+    for left, right, evidence, confidence in groups:
+        candidates.append({
+            "job_ids": [int(left["id"]), int(right["id"])],
+            "canonical_job_id": min(int(left["id"]), int(right["id"])),
+            "confidence": confidence,
+            "evidence": evidence,
+            "sources": [text(left["source"]), text(right["source"])],
+            "titles": [text(left["title"]), text(right["title"])],
+            "companies": [text(left["company"]), text(right["company"])],
+            "urls": sorted(source_link_values(dict(left)) | source_link_values(dict(right))),
+        })
+    return candidates
+
+
 def canonical_url(value: str) -> str:
     if not value:
         return ""
@@ -9400,6 +9548,7 @@ def discovery_search_config(payload: dict[str, Any]) -> dict[str, Any]:
     request_per_source_cap = min(per_source_cap, max(1, total_cap // source_count))
     occupation = occupation_for_keywords(text(payload.get("keywords")))
     workflow = discovery_workflow(payload, {"occupation": occupation})
+    ece_workflow = workflow == "ece"
     origin_input = normalize_space(text(payload.get("distance_origin") or payload.get("distance_origin_input")))
     effective_location = origin_input if workflow == "ece" and origin_input else text(payload.get("location"))
     match_policy = normalize_choice(payload.get("match_policy"), {"apply_broadly", "strict_matching"}) or (
@@ -9426,11 +9575,11 @@ def discovery_search_config(payload: dict[str, Any]) -> dict[str, Any]:
         "search_mode": search_mode,
         "title_match_mode": title_match_mode,
         "match_policy": match_policy,
-        "seniority": normalize_seniority_levels(payload.get("seniority")),
-        "maximum_required_years": clamp_int_default(payload.get("maximum_required_years"), 3, 0, 30),
-        "include_provisional_matches": as_bool(payload.get("include_provisional_matches", True)),
-        "include_internships": as_bool(payload.get("include_internships", False)),
-        "geographic_match_mode": normalize_choice(payload.get("geographic_match_mode"), {"strict", "provisional"}) or "provisional",
+        "seniority": "" if ece_workflow else normalize_seniority_levels(payload.get("seniority")),
+        "maximum_required_years": "" if ece_workflow else clamp_int_default(payload.get("maximum_required_years"), 3, 0, 30),
+        "include_provisional_matches": True if ece_workflow else as_bool(payload.get("include_provisional_matches", True)),
+        "include_internships": False if ece_workflow else as_bool(payload.get("include_internships", False)),
+        "geographic_match_mode": "provisional" if ece_workflow else (normalize_choice(payload.get("geographic_match_mode"), {"strict", "provisional"}) or "provisional"),
         "occupation": occupation,
         "applicant_profile_id": clamp_int(payload.get("applicant_profile_id"), 0, 10**9),
         "profile_independent": search_mode == "title" and not text(payload.get("candidate_profile_id")),
@@ -10987,7 +11136,11 @@ def resolve_discovery_location_context(
     # the search-area geocode and label it with postal precision.
     origin_lookup_input = private_origin or normalized_postal
     distance_origin_lookup = geocode_location_value(origin_lookup_input, lookup_type="distance_origin", profile=profile, provider=provider, use_cache=use_cache) if origin_lookup_input else {}
-    lookup_input = normalized_postal or normalized_input
+    # A single-origin search may intentionally omit the legacy search-area
+    # field. Resolve the saved Commute From value into a provider city/region;
+    # keep it distinct from the geographic origin metadata below.
+    provider_location_input = normalized_postal or normalized_input or private_origin
+    lookup_input = provider_location_input
     if is_countrywide_search_location(normalized_input):
         return {
             "original_input": original_input,
@@ -11065,8 +11218,8 @@ def resolve_discovery_location_context(
         else:
             raise ValueError("Could not resolve the postal code to a discovery city or region.")
     else:
-        discovery_location = normalized_input
-        resolution_method = "normalized_city_region" if normalized_input else "raw"
+        discovery_location = normalized_input or private_origin
+        resolution_method = "normalized_city_region" if discovery_location else "raw"
     return {
         "original_input": original_input,
         "normalized_input": normalized_postal or normalized_input,
@@ -11905,28 +12058,39 @@ def ece_result_category(job: dict[str, Any]) -> tuple[str, str]:
     title = normalize_space(text(job.get("title"))).lower()
     body = " ".join(text(job.get(key)) for key in ("job_description", "description", "employment_type", "job_type")).lower()
     combined = f"{title} {body}"
-    if re.search(r"\b(?:eca|early childhood assistant|child care assistant|childcare assistant|aide)\b", title):
+    has_rece_evidence = bool(re.search(r"\b(?:rece|registered early childhood educator|early childhood educator|ece educator)\b", title))
+    if re.search(r"\b(?:eca|early childhood assistant|child care assistant|childcare assistant|aide)\b", title) and not has_rece_evidence:
         return "excluded", "ECA/assistant-only roles are outside the RECE/ECE target."
-    if re.search(r"\b(?:supervisor|director|manager|administrator|coordinator)\b", title):
+    if re.search(r"\b(?:supervisor|supevisor|director|manager|administrator|coordinator)\b", title):
         return "excluded", "Supervisory, director, and management roles are outside the ECE target."
     title_match_is_authoritative = text(job.get("occupation_match_type")).lower() == "exact"
-    if not title_match_is_authoritative and not re.search(r"\b(?:educator|teacher|registered early childhood|\brece\b|\bece\b)\b", title):
+    body_has_ece = bool(re.search(r"\b(?:early childhood education|early years educator|RECE|ECE)\b", body, re.I))
+    if not title_match_is_authoritative and not has_rece_evidence and not body_has_ece:
         return "review_required", "The posting does not provide a grounded RECE/ECE educator title."
-    supply = bool(re.search(r"\b(?:supply|casual|on[- ]call|occasional)\b", combined))
-    part_time = bool(re.search(r"\bpart[- ]time\b", combined)) and not supply
-    full_time = bool(re.search(r"\bfull[- ]time\b", combined))
+    employment_text = normalize_space(" ".join(text(job.get(key)) for key in ("employment_type", "job_type"))).lower()
+    employment_text = employment_text or body
+    if re.search(r"\b(?:not|no longer)\s+(?:a\s+)?(?:supply|casual|part[- ]time|on[- ]call)\b", employment_text):
+        employment_text = re.sub(r"\b(?:not|no longer)\s+(?:a\s+)?(?:supply|casual|part[- ]time|on[- ]call)\b", "", employment_text)
+    supply = bool(re.search(r"\b(?:supply|casual|on[- ]call|occasional)\b", employment_text))
+    part_time = bool(re.search(r"\bpart[- ]time\b", employment_text)) and not supply
+    full_time = bool(re.search(r"\bfull[- ]time\b", employment_text))
     permanent = bool(re.search(r"\b(?:permanent|regular)\b", combined))
     temporary = bool(re.search(r"\b(?:temporary|contract|term|seasonal)\b", combined))
     if supply:
-        return "archived_low_priority", "Supply/casual ECE work is retained but does not count toward the target."
+        job["discovery_employment_status"] = "supply_or_casual"
+        job["application_priority_score"] = min(clamp_int(job.get("application_priority_score"), 0, 100), 15)
+        return "actionable", "Supply/casual RECE/ECE work is visible at the bottom of the eligible queue and does not satisfy the full-time target."
     if part_time and not full_time:
         return "excluded", "Part-time-only ECE work is outside the full-time target."
-    if full_time and (permanent or temporary):
+    if full_time:
+        job["discovery_employment_status"] = "full_time_temporary_or_permanent" if (permanent or temporary) else "full_time_unspecified_term"
+        job["application_priority_score"] = max(clamp_int(job.get("application_priority_score"), 0, 100), 90)
         return "actionable", "Full-time RECE/ECE educator role; employment evidence is grounded in the posting."
     # A title-only provider result is still a valid recall-first opportunity.
     # Mark its employment status explicitly so it remains distinguishable from
     # grounded full-time evidence without silently inventing employment facts.
     job["discovery_employment_status"] = "provisional"
+    job["application_priority_score"] = max(clamp_int(job.get("application_priority_score"), 0, 100), 50)
     return "actionable", "RECE/ECE title matched; employment status remains provisional pending review."
 
 
@@ -12328,6 +12492,8 @@ def discovery_target_assessment(job: dict[str, Any], search: dict[str, Any]) -> 
 
 
 def discovery_target_eligible(job: dict[str, Any], search: dict[str, Any]) -> bool:
+    if normalize_space(text(job.get("discovery_occupation") or job.get("occupation"))).lower() == "early childhood educator" and text(job.get("discovery_employment_status")).lower() == "supply_or_casual":
+        return True
     status, _ = discovery_target_assessment(job, search)
     return status == "verified" or (status == "provisional" and as_bool(search.get("include_provisional_matches", True)))
 
@@ -12733,6 +12899,28 @@ def init_db() -> None:
         )"""
     )
     db.execute("CREATE INDEX IF NOT EXISTS discovery_applicant_duplicate_matches_profile_idx ON discovery_applicant_duplicate_matches(applicant_profile_id, status)")
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS discovery_reconciliation_runs (
+            reconciliation_id TEXT PRIMARY KEY,
+            applicant_profile_id INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'preview',
+            candidate_json TEXT NOT NULL DEFAULT '[]',
+            backup_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            applied_at TEXT NOT NULL DEFAULT '',
+            rolled_back_at TEXT NOT NULL DEFAULT ''
+        )"""
+    )
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS discovery_reconciliation_changes (
+            reconciliation_id TEXT NOT NULL,
+            duplicate_job_id INTEGER NOT NULL,
+            canonical_job_id INTEGER NOT NULL,
+            previous_json TEXT NOT NULL DEFAULT '{}',
+            PRIMARY KEY (reconciliation_id, duplicate_job_id),
+            FOREIGN KEY(reconciliation_id) REFERENCES discovery_reconciliation_runs(reconciliation_id)
+        )"""
+    )
     # Presented is deliberately separate from a user's Saved/Applied/Skipped
     # choice. It makes New Opportunities applicant-scoped without rewriting
     # legacy job history or hiding a shared posting from another applicant.
@@ -13402,6 +13590,8 @@ def normalize_job_payload(payload: dict[str, Any]) -> dict[str, Any]:
         existing=payload_for_extraction,
     )
     clean = {column: text(payload_for_extraction.get(column, extracted.get(column, ""))) for column in JOB_COLUMNS}
+    clean["canonical_job_id"] = clamp_int(payload.get("canonical_job_id"), 0, 10**12)
+    clean["canonical_reconciliation_id"] = text(payload.get("canonical_reconciliation_id"))
     source_links = payload.get("source_links_json", payload.get("source_links", []))
     if not isinstance(source_links, list):
         source_links = parse_json_values(source_links)

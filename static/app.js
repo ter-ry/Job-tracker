@@ -61,6 +61,7 @@ const state = {
   workplaceEnrichmentRuns: [],
   workplaceEnrichmentNextOffset: 0,
   workplaceEnrichmentHasMore: false,
+  workplaceSearchLoadToken: 0,
   advancedFeatures: (() => { try { return localStorage.getItem("jobTracker.advancedFeatures") === "true"; } catch (_) { return false; } })(),
   pendingAppliedJobs: new Set(),
   tailoring: { draftId: null, jobId: null, profileId: null, resumeId: null, data: null, selectedParagraph: null, selectedKeyword: null, aiImproveJobId: null },
@@ -316,6 +317,11 @@ document.addEventListener("DOMContentLoaded", () => {
     if (button) confirmWorkplace(button.dataset.confirmWorkplace);
   });
   document.getElementById("workplace-enrichment-next")?.addEventListener("click", (event) => previewWorkplaceEnrichment(event, true));
+  document.getElementById("dismiss-workplace-preview")?.addEventListener("click", (event) => {
+    event.preventDefault();
+    const details = document.getElementById("workplace-enrichment-details");
+    if (details) details.hidden = true;
+  });
   document.getElementById("discovery-re-evaluate")?.addEventListener("click", reEvaluateDiscoveryHistory);
   document.getElementById("qa-reset")?.addEventListener("click", resetQASession);
   document.getElementById("save-current-discovery-search").addEventListener("click", saveCurrentDiscoverySearch);
@@ -589,8 +595,10 @@ function renderWorkplaceSearchRuns() {
 async function loadWorkplaceSearchRuns() {
   const profileId = state.selectedCandidateProfileId || value("discovery-profile") || "";
   if (!profileId) return;
+  const loadToken = ++state.workplaceSearchLoadToken;
   try {
     const runs = await api.get(`/api/discovery/inbox/search-runs?candidate_profile_id=${encodeURIComponent(profileId)}`);
+    if (loadToken !== state.workplaceSearchLoadToken || String(profileId) !== String(state.selectedCandidateProfileId || value("discovery-profile") || "")) return;
     state.workplaceEnrichmentRuns = Array.isArray(runs) ? runs : [];
     if (!state.workplaceEnrichmentSearchId || !state.workplaceEnrichmentRuns.some((run) => run.search_id === state.workplaceEnrichmentSearchId)) {
       state.workplaceEnrichmentSearchId = state.workplaceEnrichmentRuns[0]?.search_id || "";
@@ -627,7 +635,11 @@ async function loadCandidateProfiles({ reloadPanelsOnSelectionChange = false } =
   try {
     const profiles = await api.get("/api/candidate-profiles");
     state.candidateProfiles = Array.isArray(profiles) ? profiles : [];
-    if (!state.candidateProfiles.some((profile) => String(profile.id) === String(state.selectedCandidateProfileId))) {
+    // A profile response can complete after the user (or a restoring panel)
+    // has selected an applicant.  Only apply the fallback selection when the
+    // selection is still the one observed before the request started.
+    const selectionChangedWhileLoading = String(state.selectedCandidateProfileId || "") !== String(selectedAtStart || "");
+    if (!selectionChangedWhileLoading && !state.candidateProfiles.some((profile) => String(profile.id) === String(state.selectedCandidateProfileId))) {
       const next = state.candidateProfiles[0] ? String(state.candidateProfiles[0].id) : "";
       if (next !== String(state.selectedCandidateProfileId || "")) invalidateFastApplyQueue();
       state.selectedCandidateProfileId = next;
@@ -638,8 +650,8 @@ async function loadCandidateProfiles({ reloadPanelsOnSelectionChange = false } =
     state.candidateProfilesStatus = "ready";
     renderCandidateProfiles();
     const selectedProfile = state.candidateProfiles.find((profile) => String(profile.id) === String(state.selectedCandidateProfileId));
-    if (selectedProfile && !String(value("discovery-distance-origin") || "").trim()) {
-      setValue("discovery-distance-origin", selectedProfile.commute_origin_input || "CF Fairview Mall, 1800 Sheppard Avenue East, Toronto, ON, Canada");
+    if (selectedProfile && (selectedAtStart !== state.selectedCandidateProfileId || !String(value("discovery-distance-origin") || "").trim())) {
+      setValue("discovery-distance-origin", selectedProfile.commute_origin_input || "");
     }
     if (state.selectedCandidateProfileId) await renderCandidateProfileDocuments();
     if (reloadPanelsOnSelectionChange && selectedAtStart !== state.selectedCandidateProfileId) {
@@ -1977,7 +1989,7 @@ function renderCandidateProfiles() {
       invalidateFastApplyQueue();
       state.selectedCandidateProfileId = discoveryProfile.value;
       const selected = state.candidateProfiles.find((profile) => String(profile.id) === String(state.selectedCandidateProfileId));
-      setValue("discovery-distance-origin", selected?.commute_origin_input || "CF Fairview Mall, 1800 Sheppard Avenue East, Toronto, ON, Canada");
+      setValue("discovery-distance-origin", selected?.commute_origin_input || "");
       try { localStorage.setItem("jobTracker.selectedCandidateProfileId", state.selectedCandidateProfileId); } catch (_) { /* storage may be disabled */ }
       clearVisibleDiscoveryResults();
       state.discoveryInboxJobs = [];
@@ -2000,7 +2012,7 @@ async function selectCandidateProfile(profileId) {
   invalidateFastApplyQueue();
   state.selectedCandidateProfileId = String(profileId);
   const selected = state.candidateProfiles.find((profile) => String(profile.id) === String(profileId));
-  setValue("discovery-distance-origin", selected?.commute_origin_input || "CF Fairview Mall, 1800 Sheppard Avenue East, Toronto, ON, Canada");
+  setValue("discovery-distance-origin", selected?.commute_origin_input || "");
   try { localStorage.setItem("jobTracker.selectedCandidateProfileId", state.selectedCandidateProfileId); } catch (_) { /* storage may be disabled */ }
   state.discoveryInboxJobs = [];
   state.discoveryInboxPage = 0;
@@ -3157,9 +3169,6 @@ function applyDiscoveryWorkflow(workflow = "software", { reset = false } = {}) {
   setValue("discovery-distance", "");
   setValue("discovery-remote-preference", "");
   setValue("discovery-location", "");
-  if (selected === "ece") {
-    setValue("discovery-distance-origin", "CF Fairview Mall, 1800 Sheppard Avenue East, Toronto, ON, Canada");
-  }
   setValue("discovery-seniority", selected === "software" ? "entry_level,junior,intermediate" : "any");
   setValue("discovery-maximum-years", selected === "software" ? 3 : "");
   setValue("discovery-match-policy", selected === "software" ? "apply_broadly" : "strict_matching");
@@ -3173,7 +3182,7 @@ function applyDiscoveryWorkflow(workflow = "software", { reset = false } = {}) {
   const locationControl = document.getElementById("discovery-location");
   if (locationControl) {
     const locationLabel = locationControl.closest("label");
-    if (locationLabel) locationLabel.hidden = selected === "ece";
+    if (locationLabel) locationLabel.hidden = true;
   }
   ["discovery-seniority", "discovery-maximum-years", "discovery-match-policy",
     "discovery-include-provisional", "discovery-include-internships",
@@ -3204,7 +3213,7 @@ function applyDiscoverySearchDefaults() {
   setValue("discovery-date-window", "14d");
   setValue("discovery-sort-mode", "best_match");
   setValue("discovery-distance", "");
-  setValue("discovery-distance-origin", "CF Fairview Mall, 1800 Sheppard Avenue East, Toronto, ON, Canada");
+  setValue("discovery-distance-origin", "");
   setValue("discovery-per-source-cap", 100);
   setValue("discovery-new-matching-target", 50);
   setValue("discovery-seniority", "entry_level,junior,intermediate");
@@ -3269,7 +3278,7 @@ function applyDiscoverySearchCriteriaToControls(criteria = {}) {
   setValue("discovery-title-match-mode", criteria.title_match_mode || "related");
   setValue("discovery-keywords", criteria.keywords || "");
   setValue("discovery-location", criteria.location || criteria.discovery_location || "");
-  setValue("discovery-distance-origin", criteria.distance_origin_input || criteria.distance_origin || "CF Fairview Mall, 1800 Sheppard Avenue East, Toronto, ON, Canada");
+  setValue("discovery-distance-origin", criteria.distance_origin_input || criteria.original_origin || "");
   setValue("discovery-distance", criteria.distance ?? 50);
   setValue("discovery-remote-preference", criteria.remote_preference || "");
   setValue("discovery-search-depth", criteria.search_depth || "standard");
@@ -3787,6 +3796,8 @@ async function previewWorkplaceEnrichment(event, nextBatch = false) {
     const records = preview.records || [];
     const found = records.filter((item) => ["candidate_address", "postal_code"].includes(item.status)).length;
     const previewTarget = document.getElementById("workplace-enrichment-preview");
+    const previewDetails = document.getElementById("workplace-enrichment-details");
+    if (previewDetails) { previewDetails.hidden = false; previewDetails.open = true; }
     if (previewTarget) {
       previewTarget.classList.toggle("empty", !records.length);
       previewTarget.innerHTML = records.length ? `<h3>Workplace preview · ${escapeHtml(String(preview.before_counts?.total || records.length))} selected</h3>${records.map((item) => {
@@ -3816,7 +3827,7 @@ async function previewWorkplaceEnrichment(event, nextBatch = false) {
       if (status) status.textContent = `Workplace enrichment applied: ${applied.gained_candidate || 0} records gained evidence; ${applied.remained_city_only || 0} remained city-only; ${applied.failed || 0} failed.`;
       await loadAll({ skipProfiles: true });
     } else if (status) {
-      status.textContent = `Workplace preview complete: ${found} candidates found; ${preview.remained_city_only || 0} remain unresolved; ${preview.failed || 0} blocked or failed. No workplace changes were applied.${preview.has_more ? " Select Next batch to continue." : ""}`;
+      status.textContent = `Workplace preview complete: ${found} candidates found; ${preview.remained_city_only || 0} remain unresolved; ${preview.failed || 0} blocked or failed. No workplace changes were applied.${preview.has_more ? " Select Next workplace batch to continue." : ""}`;
     }
   } catch (error) {
     if (status) status.textContent = `Workplace enrichment failed: ${error.message}`;
@@ -3963,6 +3974,11 @@ function renderDiscoveryResults(result) {
     ${rawSummary}
     ${body}
   `;
+  container.querySelector("[data-dismiss-discovery-diagnostics]")?.addEventListener("click", (event) => {
+    event.preventDefault();
+    const details = event.currentTarget.closest("details");
+    if (details) details.hidden = true;
+  });
   container.querySelectorAll("[data-discovery-action]").forEach((button) => {
     button.addEventListener("click", () => {
       if (button.dataset.discoveryAction === "save") saveDiscoveryJob(button.dataset.jobKey);
@@ -4234,7 +4250,7 @@ function renderDiscoveryDiagnostics(diagnostics, visibleCount, totalCount) {
   }
   return `
     <details class="score-details">
-      <summary>Discovery diagnostics</summary>
+      <summary>Discovery diagnostics <button class="button ghost small" type="button" data-dismiss-discovery-diagnostics>Dismiss</button></summary>
       <ul class="score-breakdown-list">${details.join("")}</ul>
     </details>
   `;
