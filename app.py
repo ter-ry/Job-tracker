@@ -3784,7 +3784,7 @@ def create_app() -> Flask:
         # prevents stale actionable rows from surviving a stricter recheck.
         persisted = persist_discovery_jobs(ordered, None, manual_run_id)
         search_execution_id = uuid.uuid4().hex
-        persist_discovery_search_memberships(search_execution_id, ordered, selected_applicant_id)
+        persist_discovery_search_memberships(search_execution_id, ordered, selected_applicant_id, search)
         new_matching_jobs = matching_jobs[:requested_target]
         # The response is unified: actionable new matches first, followed by a
         # separately labelled review queue. Excluded jobs never enter it.
@@ -4841,6 +4841,7 @@ def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, ru
 
 def persist_discovery_search_memberships(
     search_execution_id: str | None, jobs: list[dict[str, Any]], applicant_profile_id: int,
+    effective_criteria: dict[str, Any] | None = None,
 ) -> None:
     """Record immutable per-search classification without changing job history."""
     execution_id = text(search_execution_id)
@@ -4878,7 +4879,18 @@ def persist_discovery_search_memberships(
             "remote_preference": text(job.get("discovery_remote_preference")),
             "include_internships": bool(job.get("discovery_include_internships")),
             "search_mode": text(job.get("discovery_search_mode")),
+            "workflow": "ece" if text(job.get("discovery_occupation")).lower() == "early childhood educator" else "software",
+            "applicant_profile_id": int(applicant_profile_id or 0),
+            "distance_origin_input": text(job.get("discovery_distance_origin_input")),
+            "resolved_origin": text(job.get("discovery_resolved_origin")),
         }
+        # Search configuration is authoritative at the boundary.  Provider
+        # rows do not reliably echo origin/workflow fields, so retain the
+        # exact effective criteria alongside per-job evidence.
+        if isinstance(effective_criteria, dict):
+            for key in ("workflow", "location", "distance_origin_input", "original_origin", "distance", "geographic_match_mode", "remote_preference", "search_mode", "match_policy", "seniority", "maximum_required_years", "include_internships", "enabled_sources"):
+                if key in effective_criteria and effective_criteria[key] not in (None, ""):
+                    criteria[key] = effective_criteria[key]
         db.execute(
             """INSERT INTO discovery_search_memberships
                (search_execution_id, job_id, applicant_profile_id, category, reason, evidence_json, criteria_json)
@@ -5144,7 +5156,7 @@ def run_discovery_pipeline(
     # the durable row, async cursor, and inbox category consistent.
     persisted = persist_discovery_jobs(ordered, search_id, run_id)
     selected_applicant_id = applicant_profile_id(payload)
-    persist_discovery_search_memberships(search_execution_id, ordered, selected_applicant_id)
+    persist_discovery_search_memberships(search_execution_id, ordered, selected_applicant_id, search)
     eligible_unpresented: list[dict[str, Any]] = []
     previously_presented_count = 0
     already_actioned_count = 0
@@ -9387,6 +9399,9 @@ def discovery_search_config(payload: dict[str, Any]) -> dict[str, Any]:
     source_count = max(1, len(enabled_sources))
     request_per_source_cap = min(per_source_cap, max(1, total_cap // source_count))
     occupation = occupation_for_keywords(text(payload.get("keywords")))
+    workflow = discovery_workflow(payload, {"occupation": occupation})
+    origin_input = normalize_space(text(payload.get("distance_origin") or payload.get("distance_origin_input")))
+    effective_location = origin_input if workflow == "ece" and origin_input else text(payload.get("location"))
     match_policy = normalize_choice(payload.get("match_policy"), {"apply_broadly", "strict_matching"}) or (
         "apply_broadly" if search_mode == "shortlist" and occupation == "software developer" else "strict_matching"
     )
@@ -9402,8 +9417,10 @@ def discovery_search_config(payload: dict[str, Any]) -> dict[str, Any]:
         "enabled_source_count": len(enabled_sources),
         "remote_preference": normalize_choice(payload.get("remote_preference"), {"remote", "hybrid", "on-site"}),
         "keywords": text(payload.get("keywords")),
-        "location": text(payload.get("location")),
-        "distance_origin_input": normalize_space(text(payload.get("distance_origin") or payload.get("distance_origin_input"))),
+        "location": effective_location,
+        "distance_origin_input": origin_input,
+        "original_origin": origin_input,
+        "workflow": workflow,
         "distance": distance,
         "enabled_sources": enabled_sources,
         "search_mode": search_mode,
@@ -11803,6 +11820,8 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
     hard_reason = discovery_hard_exclusion_reason(job)
     if hard_reason:
         return "excluded", hard_reason
+    if normalize_space(text(job.get("discovery_occupation") or job.get("occupation"))).lower() == "early childhood educator":
+        return ece_result_category(job)
     title = normalize_space(text(job.get("title"))).lower()
     title_for_internship = re.sub(r"\bnon[- ]?(?:intern|internship)\b", " ", title)
     explicit_internship_title = bool(re.search(r"\b(?:intern|internship|co[- ]?op|cooperative education|placement|trainee)\b", title_for_internship))
@@ -11874,6 +11893,41 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
             return "review_required", "Technical fit is uncertain because the posting evidence is incomplete."
         return "actionable", "Remote arrangement and Canadian eligibility are supported by the posting data; commute distance does not apply."
     return "review_required", "Work arrangement or Canadian eligibility requires review."
+
+
+def ece_result_category(job: dict[str, Any]) -> tuple[str, str]:
+    """Classify the bounded ECE policy without résumé or seniority controls.
+
+    Employment evidence is intentionally conservative: explicit full-time
+    educator postings are actionable; unknown wording remains provisional;
+    supply/casual is retained for history but is never a target match.
+    """
+    title = normalize_space(text(job.get("title"))).lower()
+    body = " ".join(text(job.get(key)) for key in ("job_description", "description", "employment_type", "job_type")).lower()
+    combined = f"{title} {body}"
+    if re.search(r"\b(?:eca|early childhood assistant|child care assistant|childcare assistant|aide)\b", title):
+        return "excluded", "ECA/assistant-only roles are outside the RECE/ECE target."
+    if re.search(r"\b(?:supervisor|director|manager|administrator|coordinator)\b", title):
+        return "excluded", "Supervisory, director, and management roles are outside the ECE target."
+    title_match_is_authoritative = text(job.get("occupation_match_type")).lower() == "exact"
+    if not title_match_is_authoritative and not re.search(r"\b(?:educator|teacher|registered early childhood|\brece\b|\bece\b)\b", title):
+        return "review_required", "The posting does not provide a grounded RECE/ECE educator title."
+    supply = bool(re.search(r"\b(?:supply|casual|on[- ]call|occasional)\b", combined))
+    part_time = bool(re.search(r"\bpart[- ]time\b", combined)) and not supply
+    full_time = bool(re.search(r"\bfull[- ]time\b", combined))
+    permanent = bool(re.search(r"\b(?:permanent|regular)\b", combined))
+    temporary = bool(re.search(r"\b(?:temporary|contract|term|seasonal)\b", combined))
+    if supply:
+        return "archived_low_priority", "Supply/casual ECE work is retained but does not count toward the target."
+    if part_time and not full_time:
+        return "excluded", "Part-time-only ECE work is outside the full-time target."
+    if full_time and (permanent or temporary):
+        return "actionable", "Full-time RECE/ECE educator role; employment evidence is grounded in the posting."
+    # A title-only provider result is still a valid recall-first opportunity.
+    # Mark its employment status explicitly so it remains distinguishable from
+    # grounded full-time evidence without silently inventing employment facts.
+    job["discovery_employment_status"] = "provisional"
+    return "actionable", "RECE/ECE title matched; employment status remains provisional pending review."
 
 
 def plausible_software_role(job: dict[str, Any]) -> bool:

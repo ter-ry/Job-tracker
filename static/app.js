@@ -3157,6 +3157,9 @@ function applyDiscoveryWorkflow(workflow = "software", { reset = false } = {}) {
   setValue("discovery-distance", "");
   setValue("discovery-remote-preference", "");
   setValue("discovery-location", "");
+  if (selected === "ece") {
+    setValue("discovery-distance-origin", "CF Fairview Mall, 1800 Sheppard Avenue East, Toronto, ON, Canada");
+  }
   setValue("discovery-seniority", selected === "software" ? "entry_level,junior,intermediate" : "any");
   setValue("discovery-maximum-years", selected === "software" ? 3 : "");
   setValue("discovery-match-policy", selected === "software" ? "apply_broadly" : "strict_matching");
@@ -3167,6 +3170,19 @@ function applyDiscoveryWorkflow(workflow = "software", { reset = false } = {}) {
   const yearsControl = document.getElementById("discovery-maximum-years");
   if (seniorityControl) seniorityControl.disabled = selected === "ece";
   if (yearsControl) yearsControl.disabled = selected === "ece";
+  const locationControl = document.getElementById("discovery-location");
+  if (locationControl) {
+    const locationLabel = locationControl.closest("label");
+    if (locationLabel) locationLabel.hidden = selected === "ece";
+  }
+  ["discovery-seniority", "discovery-maximum-years", "discovery-match-policy",
+    "discovery-include-provisional", "discovery-include-internships",
+    "discovery-geographic-match-mode", "discovery-remote-preference",
+    "discovery-title-match-mode", "discovery-keywords"].forEach((id) => {
+    const control = document.getElementById(id);
+    const label = control && control.closest("label");
+    if (label) label.hidden = selected === "ece";
+  });
   const seniorityHelp = document.getElementById("discovery-seniority-help");
   if (seniorityHelp) seniorityHelp.textContent = selected === "software"
     ? "Senior, lead, manager and director roles stay out of new matches."
@@ -3210,14 +3226,16 @@ function syncDiscoveryDepthDefaults() {
 
 function discoverySearchCriteriaFromControls(continuation = false) {
   const workflow = value("discovery-workflow") || state.discoveryWorkflow || "software";
+  const origin = value("discovery-distance-origin");
   return {
     search_mode: workflow === "software" ? "shortlist" : "title",
     match_policy: workflow === "software" ? (value("discovery-match-policy") || "apply_broadly") : "strict_matching",
     title_match_mode: value("discovery-title-match-mode") || "related",
     keywords: value("discovery-keywords"),
-    location: value("discovery-location"),
-    distance_origin: value("discovery-distance-origin"),
-    distance_origin_input: value("discovery-distance-origin"),
+    location: workflow === "ece" ? origin : value("discovery-location"),
+    distance_origin: origin,
+    distance_origin_input: origin,
+    original_origin: origin,
     enabled_sources: selectedDiscoverySources(),
     remote_preference: value("discovery-remote-preference"),
     distance: value("discovery-distance"),
@@ -3238,7 +3256,7 @@ function discoverySearchCriteriaFromControls(continuation = false) {
     maximum_required_years: workflow === "software" ? value("discovery-maximum-years") : "",
     include_provisional_matches: checked("discovery-include-provisional"),
     include_internships: checked("discovery-include-internships"),
-    geographic_match_mode: value("discovery-geographic-match-mode") || "provisional",
+    geographic_match_mode: workflow === "ece" ? "provisional" : (value("discovery-geographic-match-mode") || "provisional"),
     workflow,
     continuation_index: continuation ? Number(state.discoveryContinuationIndex || 0) : 0,
   };

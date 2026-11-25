@@ -39,6 +39,32 @@ def _stored_job(client, category="excluded", occupation="software developer"):
         return result["new_job_ids"][0]
 
 
+def test_ece_policy_is_full_time_title_based_and_keeps_supply_out_of_target():
+    base = {"discovery_occupation": "early childhood educator", "discovery_search_mode": "title"}
+    full_time = {**base, "title": "Registered Early Childhood Educator", "job_description": "Full-time permanent position in a licensed centre."}
+    temporary = {**base, "title": "RECE Educator", "job_description": "Full-time temporary contract for the school year."}
+    supply = {**base, "title": "Supply RECE Educator", "job_description": "Casual on-call supply coverage as needed."}
+    part_time = {**base, "title": "Early Childhood Educator", "job_description": "Part-time only, weekday mornings."}
+    eca = {**base, "title": "Early Childhood Assistant", "job_description": "Full-time permanent assistant role."}
+    assert app_module.discovery_result_category(full_time)[0] == "actionable"
+    assert app_module.discovery_result_category(temporary)[0] == "actionable"
+    assert app_module.discovery_result_category(supply)[0] == "archived_low_priority"
+    assert app_module.discovery_result_category(part_time)[0] == "excluded"
+    assert app_module.discovery_result_category(eca)[0] == "excluded"
+
+
+def test_ece_search_config_uses_commute_origin_as_effective_location():
+    config = app_module.discovery_search_config({
+        "workflow": "ece", "keywords": "Registered Early Childhood Educator; RECE",
+        "location": "an unrelated stale location",
+        "distance_origin": "CF Fairview Mall, Toronto, ON", "distance": 20,
+    })
+    assert config["workflow"] == "ece"
+    assert config["location"] == "CF Fairview Mall, Toronto, ON"
+    assert config["distance_origin_input"] == config["location"]
+    assert config["geographic_match_mode"] == "provisional"
+
+
 def test_server_authoritatively_rejects_wrong_missing_and_unknown_applicants(tmp_path, monkeypatch):
     client = _isolated_client(tmp_path, monkeypatch)
     swe = _profile(client, "SWE", "software")
