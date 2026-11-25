@@ -19,8 +19,15 @@
 - Workplace enrichment browser regression: passed.
 - Duplicate-resolution browser regression: passed.
 - 10,000-record Inbox benchmark: passed in 0.99 seconds for a 50-row page.
-- Final Python suite after the continuing batches: `522 passed, 1 skipped,
+- Final Python suite before the canonical reconciliation batch: `522 passed, 1 skipped,
   2 warnings`.
+- Canonical reconciliation acceptance suite: `10 passed, 1 warning` in the
+  final focused run.
+- Final Python suite after the canonical reconciliation batch: `532 passed, 1
+  skipped, 2 warnings`.
+- Canonical candidate generation benchmark: 10,000 mixed records, bounded
+  blocking, fewer than 1,000 pair comparisons, under 3 seconds in the
+  executable regression.
 - Fresh Chromium browser suite after the applicant-selection race fix:
   Inbox, Fast Apply, workplace enrichment, and duplicate-resolution scripts all
   passed. The workplace test covers a delayed profile-load scenario and a

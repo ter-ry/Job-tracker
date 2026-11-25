@@ -18,3 +18,8 @@ user-provided and remain untracked.
 | Performance/Issue #41 | 10k Inbox page benchmark implemented; quality gates pending | `test_mvp_performance.py` | Run quality evaluation with independent labels |
 | Windows CI | Previous owner-reported run only | PR history | Verify exact new head |
 | Owner cohort replay | Blocked by private data/authorization | Not available | Owner-side QA only |
+
+Canonical vacancy acceptance evidence is maintained in
+[`MVP_CANONICAL_ACCEPTANCE.md`](MVP_CANONICAL_ACCEPTANCE.md). The A–Q table is
+limited to sanitized database/API fixtures; the owner's 104 duplicate
+candidates were not replayed.

@@ -77,7 +77,7 @@ def test_reconciliation_preview_apply_rollback_is_explicit_and_idempotent(tmp_pa
             "source": "indeed", "source_job_id": "indeed-104-a", "company": "Alias Employer Inc.",
             "title": "Software Engineer", "location": "Toronto, ON",
             "url": "https://example.test/jobs/requisition-104?utm_source=indeed",
-            "description": "Build and maintain software systems with Python, APIs, testing and production ownership." * 3,
+            "description": "Build and maintain software systems with Python, APIs, testing and production ownership. Coordinate delivery, documentation, and support for internal stakeholders." * 2,
             "discovery_first_seen_at": "2026-11-25T00:00:00", "discovery_result_category": "actionable",
         })
         second = app_module.normalize_job_payload({
@@ -92,11 +92,12 @@ def test_reconciliation_preview_apply_rollback_is_explicit_and_idempotent(tmp_pa
     preview = client.get("/api/discovery/reconciliation/preview").get_json()
     assert preview["candidate_count"] == 1
     assert preview["mutated"] is False
-    applied = client.post(f"/api/discovery/reconciliation/{preview['reconciliation_id']}/apply", json={"confirm": True, "confirmation_token": preview["confirmation_token"]})
+    group_key = "group:" + ",".join(map(str, preview["candidates"][0]["job_ids"]))
+    applied = client.post(f"/api/discovery/reconciliation/{preview['reconciliation_id']}/apply", json={"confirm": True, "confirmation_token": preview["confirmation_token"], "resolutions": {group_key: "merge"}})
     assert applied.status_code == 200
     with app_module.app.app_context():
         assert app_module.query_db("SELECT canonical_job_id FROM jobs WHERE id = ?", [second_id], one=True)["canonical_job_id"] == first_id
-    again = client.post(f"/api/discovery/reconciliation/{preview['reconciliation_id']}/apply", json={"confirm": True, "confirmation_token": preview["confirmation_token"]}).get_json()
+    again = client.post(f"/api/discovery/reconciliation/{preview['reconciliation_id']}/apply", json={"confirm": True, "confirmation_token": preview["confirmation_token"], "resolutions": {group_key: "merge"}}).get_json()
     assert again["idempotent"] is True
     rolled_back = client.post(f"/api/discovery/reconciliation/{preview['reconciliation_id']}/rollback")
     assert rolled_back.status_code == 200
