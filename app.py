@@ -2342,6 +2342,11 @@ def create_app() -> Flask:
                         db.execute("UPDATE jobs SET discovery_result_category = 'actionable', discovery_result_reason = ? WHERE id = ?", ["Canonical source retained an actionable equivalent posting.", canonical_id])
                 unique_links = {dumps_json(value, sort_keys=True): value for value in links if value}
                 db.execute("UPDATE jobs SET source_links_json = ?, canonical_reconciliation_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [dumps_json(list(unique_links.values()), sort_keys=True), reconciliation_id, canonical_id])
+            for backup in backups:
+                duplicate_now = db.execute("SELECT canonical_job_id, canonical_reconciliation_id, discovery_result_category, discovery_result_reason FROM jobs WHERE id = ?", [backup["duplicate"]["id"]]).fetchone()
+                canonical_now = db.execute("SELECT source_links_json, canonical_reconciliation_id, discovery_result_category, discovery_result_reason FROM jobs WHERE id = ?", [backup["canonical"]["id"]]).fetchone()
+                backup["applied_duplicate"] = dict(duplicate_now) if duplicate_now else {}
+                backup["applied_canonical"] = dict(canonical_now) if canonical_now else {}
             db.execute("UPDATE discovery_reconciliation_runs SET status = 'applied', backup_json = ?, applied_at = CURRENT_TIMESTAMP WHERE reconciliation_id = ?", [dumps_json(backups, sort_keys=True), reconciliation_id])
             db.commit()
         except Exception:
@@ -2361,8 +2366,14 @@ def create_app() -> Flask:
             for backup in backups:
                 duplicate = backup.get("duplicate") or {}
                 canonical = backup.get("canonical") or {}
-                db.execute("UPDATE jobs SET canonical_job_id = ?, canonical_reconciliation_id = '', discovery_result_category = ?, discovery_result_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [duplicate.get("canonical_job_id", 0), duplicate.get("discovery_result_category", ""), duplicate.get("discovery_result_reason", ""), duplicate.get("id")])
-                db.execute("UPDATE jobs SET source_links_json = ?, canonical_reconciliation_id = '', discovery_result_category = ?, discovery_result_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [canonical.get("source_links_json", "[]"), canonical.get("discovery_result_category", ""), canonical.get("discovery_result_reason", ""), canonical.get("id")])
+                applied_duplicate = backup.get("applied_duplicate") or {}
+                applied_canonical = backup.get("applied_canonical") or {}
+                current_duplicate = db.execute("SELECT canonical_job_id, canonical_reconciliation_id, discovery_result_category, discovery_result_reason FROM jobs WHERE id = ?", [duplicate.get("id")]).fetchone()
+                if current_duplicate and dict(current_duplicate) == applied_duplicate:
+                    db.execute("UPDATE jobs SET canonical_job_id = ?, canonical_reconciliation_id = '', discovery_result_category = ?, discovery_result_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [duplicate.get("canonical_job_id", 0), duplicate.get("discovery_result_category", ""), duplicate.get("discovery_result_reason", ""), duplicate.get("id")])
+                current_canonical = db.execute("SELECT source_links_json, canonical_reconciliation_id, discovery_result_category, discovery_result_reason FROM jobs WHERE id = ?", [canonical.get("id")]).fetchone()
+                if current_canonical and dict(current_canonical) == applied_canonical:
+                    db.execute("UPDATE jobs SET source_links_json = ?, canonical_reconciliation_id = '', discovery_result_category = ?, discovery_result_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [canonical.get("source_links_json", "[]"), canonical.get("discovery_result_category", ""), canonical.get("discovery_result_reason", ""), canonical.get("id")])
                 prior_states = {int(item["applicant_profile_id"]): item for item in backup.get("canonical_states", [])}
                 copied_states = {int(item["applicant_profile_id"]): item for item in backup.get("duplicate_states", [])}
                 applied_states = {int(item["applicant_profile_id"]): item for item in backup.get("applied_states", [])}
@@ -5759,12 +5770,19 @@ def assess_discovery_duplicate(job: dict[str, Any]) -> dict[str, Any]:
 
 
 def find_existing_job_match(job: dict[str, Any]) -> sqlite3.Row | None:
+    def canonical_row(row: sqlite3.Row | None) -> sqlite3.Row | None:
+        seen = set()
+        while row is not None and int(row["canonical_job_id"] or 0) and int(row["id"]) not in seen:
+            seen.add(int(row["id"]))
+            row = query_db("SELECT * FROM jobs WHERE id = ?", [int(row["canonical_job_id"])], one=True)
+        return row
+
     source_id = text(job.get("source_job_id"))
     source = text(job.get("source"))
     if source_id and source:
         row = query_db("SELECT * FROM jobs WHERE source = ? AND source_job_id = ? LIMIT 1", [source, source_id], one=True)
         if row is not None and dedupe_match(job, dict(row)):
-            return row
+            return canonical_row(row)
     # Canonical aliases are persisted separately so a third provider can find
     # a vacancy through a URL that was secondary on the original sighting.
     for alias_type, alias_value, _raw_value in job_source_aliases(job):
@@ -5775,13 +5793,13 @@ def find_existing_job_match(job: dict[str, Any]) -> sqlite3.Row | None:
         )
         for row in rows:
             if dedupe_match(job, dict(row)):
-                return row
+                return canonical_row(row)
     urls = [text(job.get("url")), text(job.get("application_url"))]
     for column, value in (("url", urls[0]), ("application_url", urls[1])):
         if value:
             row = query_db(f"SELECT * FROM jobs WHERE {column} = ? LIMIT 1", [value], one=True)
             if row is not None and dedupe_match(job, dict(row)):
-                return row
+                return canonical_row(row)
     title = normalize_dedupe_text(job.get("title"))
     if not title:
         return None
@@ -5794,9 +5812,9 @@ def find_existing_job_match(job: dict[str, Any]) -> sqlite3.Row | None:
         existing = dict(row)
         if dedupe_match(job, existing):
             if text(existing.get("status")) == "shortlisted":
-                return row
+                return canonical_row(row)
             shortlist = shortlist or row
-    return shortlist
+    return canonical_row(shortlist)
 
 
 def find_canonical_identity_match(job: dict[str, Any]) -> sqlite3.Row | None:
@@ -8922,6 +8940,13 @@ def dedupe_match(first: dict[str, Any], second: dict[str, Any]) -> bool:
         return False
     first_urls = source_link_values(first)
     second_urls = source_link_values(second)
+    first_req, second_req = vacancy_requisition_token(first), vacancy_requisition_token(second)
+    if first_req and second_req and first_req != second_req:
+        return False
+    first_workplace = normalize_dedupe_location(first.get("workplace_address") or first.get("workplace_postal_code"))
+    second_workplace = normalize_dedupe_location(second.get("workplace_address") or second.get("workplace_postal_code"))
+    if first_workplace and second_workplace and first_workplace != second_workplace:
+        return False
     if (first_urls - {""}) & (second_urls - {""}):
         return True
     # ATS requisition identifiers are opaque and case-sensitive. Normalize
@@ -8959,21 +8984,21 @@ def vacancy_identity_pair(first: dict[str, Any], second: dict[str, Any]) -> dict
     """Classify identity evidence without treating title similarity as proof."""
     if normalize_dedupe_text(first.get("source")) == normalize_dedupe_text(second.get("source")):
         return {"identity": "separate", "confidence": 0, "evidence": ["same_source"]}
-    urls_shared = bool(source_link_values(first) & source_link_values(second))
-    if urls_shared:
-        return {"identity": "strong", "confidence": 1.0, "evidence": ["shared_canonical_url"]}
     first_req, second_req = vacancy_requisition_token(first), vacancy_requisition_token(second)
     if first_req and second_req and first_req != second_req:
         return {"identity": "separate", "confidence": 0, "evidence": ["conflicting_requisition_ids"]}
+    first_workplace = normalize_dedupe_location(first.get("workplace_address") or first.get("workplace_postal_code"))
+    second_workplace = normalize_dedupe_location(second.get("workplace_address") or second.get("workplace_postal_code"))
+    if first_workplace and second_workplace and first_workplace != second_workplace:
+        return {"identity": "separate", "confidence": 0, "evidence": ["conflicting_workplaces"]}
+    urls_shared = bool(source_link_values(first) & source_link_values(second))
+    if urls_shared:
+        return {"identity": "strong", "confidence": 1.0, "evidence": ["shared_canonical_url"]}
     same_context = (
         normalize_dedupe_company(first.get("company")) == normalize_dedupe_company(second.get("company"))
         and normalize_dedupe_text(first.get("title")) == normalize_dedupe_text(second.get("title"))
         and normalize_dedupe_location(first.get("location")) == normalize_dedupe_location(second.get("location"))
     )
-    first_workplace = normalize_dedupe_location(first.get("workplace_address") or first.get("workplace_postal_code"))
-    second_workplace = normalize_dedupe_location(second.get("workplace_address") or second.get("workplace_postal_code"))
-    if first_workplace and second_workplace and first_workplace != second_workplace:
-        return {"identity": "separate", "confidence": 0, "evidence": ["conflicting_workplaces"]}
     if not same_context:
         return {"identity": "separate", "confidence": 0, "evidence": ["different_context"]}
     left = normalize_dedupe_text(first.get("job_description"))
@@ -8984,6 +9009,26 @@ def vacancy_identity_pair(first: dict[str, Any], second: dict[str, Any]) -> dict
     if score >= 0.65 or (same_context and (left or right)):
         return {"identity": "uncertain", "confidence": round(score, 3), "evidence": ["same_employer_title_location", "similarity_requires_review"]}
     return {"identity": "separate", "confidence": round(score, 3), "evidence": ["insufficient_identity_evidence"]}
+
+
+def reconciliation_decision_conflicts(job_ids: Iterable[int]) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    """Collect applicant decisions consistently for strong and uncertain proposals."""
+    ids = sorted({int(job_id) for job_id in job_ids if int(job_id or 0) > 0})
+    if not ids:
+        return {}, []
+    states = query_db(
+        f"SELECT job_id, applicant_profile_id, state, date_applied FROM discovery_applicant_states WHERE job_id IN ({','.join('?' for _ in ids)}) ORDER BY applicant_profile_id, job_id",
+        ids,
+    )
+    decisions: dict[str, list[dict[str, Any]]] = {}
+    for state in states:
+        decisions.setdefault(str(state["applicant_profile_id"]), []).append({"job_id": int(state["job_id"]), "state": text(state["state"]), "date_applied": text(state["date_applied"])})
+    conflicts = []
+    for profile, profile_decisions in decisions.items():
+        distinct = {item["state"] for item in profile_decisions if item["state"]}
+        if len(distinct) > 1:
+            conflicts.append({"conflict_key": f"{profile}:{','.join(map(str, ids))}", "applicant_profile_id": int(profile), "job_ids": ids, "decisions": profile_decisions})
+    return decisions, conflicts
 
 
 def reconciliation_state_fingerprint(job_ids: Iterable[int]) -> str:
@@ -9018,12 +9063,33 @@ def reconciliation_candidate_groups(applicant_profile_id: int = 0) -> list[dict[
     pairs: dict[tuple[int, int], dict[str, Any]] = {}
     comparison_count = 0
     max_block = 250
-    for bucket in list(by_block.values()) + list(by_url.values()):
+    incomplete_blocks = 0
+    comparison_buckets = []
+    for bucket in by_url.values():
         if len(bucket) > max_block:
-            # A large generic block is not evidence of identity.  Restrict
-            # comparisons to a bounded deterministic slice; explicit URL
-            # buckets remain fully considered below.
-            bucket = bucket[:max_block]
+            incomplete_blocks += 1
+            comparison_buckets.append(bucket[:max_block])
+        else:
+            comparison_buckets.append(bucket)
+    for bucket in by_block.values():
+        if len(bucket) <= max_block:
+            comparison_buckets.append(bucket)
+            continue
+        # Split large generic blocks by explicit requisition or a stable
+        # description prefix.  This keeps equivalent postings beyond the old
+        # first-250 cutoff discoverable while reporting genuinely ambiguous
+        # oversized buckets as incomplete rather than silently dropping them.
+        subgroups: dict[str, list[dict[str, Any]]] = {}
+        for item in bucket:
+            key = vacancy_requisition_token(item) or normalize_dedupe_text(item.get("job_description"))[:180]
+            subgroups.setdefault(key, []).append(item)
+        for subgroup in subgroups.values():
+            if len(subgroup) > max_block:
+                incomplete_blocks += 1
+                comparison_buckets.append(subgroup[:max_block])
+            else:
+                comparison_buckets.append(subgroup)
+    for bucket in comparison_buckets:
         for index, left in enumerate(bucket):
             for right in bucket[index + 1:]:
                 comparison_count += 1
@@ -9073,19 +9139,11 @@ def reconciliation_candidate_groups(applicant_profile_id: int = 0) -> list[dict[
                 "sources": sorted({text(item["source"]) for item in members}),
                 "source_job_ids": sorted({text(item["source_job_id"]) for item in members}),
                 "urls": sorted({url for item in members for url in source_link_values(item)}),
-                "identity_status": "contradictory", "requires_review": True, "decision_conflicts": [],
+                "identity_status": "contradictory", "requires_review": True, "decision_conflicts": reconciliation_decision_conflicts(member_ids)[1],
             })
             continue
         strong = complete_strong_clique and bool(pair_evidence)
-        states = query_db(f"SELECT job_id, applicant_profile_id, state, date_applied FROM discovery_applicant_states WHERE job_id IN ({','.join('?' for _ in member_ids)}) ORDER BY applicant_profile_id, job_id", member_ids)
-        decisions: dict[str, list[dict[str, Any]]] = {}
-        for state in states:
-            decisions.setdefault(str(state["applicant_profile_id"]), []).append({"job_id": int(state["job_id"]), "state": text(state["state"]), "date_applied": text(state["date_applied"])})
-        conflicts = []
-        for profile, profile_decisions in decisions.items():
-            distinct = {item["state"] for item in profile_decisions if item["state"]}
-            if len(distinct) > 1:
-                conflicts.append({"conflict_key": f"{profile}:{','.join(map(str, member_ids))}", "applicant_profile_id": int(profile), "job_ids": member_ids, "decisions": profile_decisions})
+        _decisions, conflicts = reconciliation_decision_conflicts(member_ids)
         candidates.append({
             "job_ids": member_ids, "canonical_job_id": min(member_ids),
             "confidence": min(float(pair["confidence"]) for pair in pair_evidence),
@@ -9114,10 +9172,10 @@ def reconciliation_candidate_groups(applicant_profile_id: int = 0) -> list[dict[
             "urls": sorted(source_link_values(pair["left"]) | source_link_values(pair["right"])),
             "identity_status": "uncertain",
             "requires_review": True,
-            "decision_conflicts": [],
+            "decision_conflicts": reconciliation_decision_conflicts(ids)[1],
         })
     _LAST_RECONCILIATION_STATS.clear()
-    _LAST_RECONCILIATION_STATS.update({"records": len(records), "comparisons": comparison_count, "candidate_count": len(candidates), "max_block": max_block})
+    _LAST_RECONCILIATION_STATS.update({"records": len(records), "comparisons": comparison_count, "candidate_count": len(candidates), "max_block": max_block, "incomplete_blocks": incomplete_blocks, "coverage_complete": incomplete_blocks == 0})
     return candidates
 
 
@@ -9151,6 +9209,8 @@ def normalize_dedupe_company(value: Any) -> str:
         "microsoft corporation": "microsoft",
         "microsoft canada": "microsoft",
         "rbc royal bank": "royal bank of canada",
+        "healthcare of ontario pension plan": "hoopp",
+        "hoopp": "hoopp",
     }
     return aliases.get(normalized, normalized)
 

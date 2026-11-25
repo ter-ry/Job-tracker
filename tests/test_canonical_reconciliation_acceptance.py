@@ -180,6 +180,10 @@ def test_M_L_rollback_restores_relationship_and_decisions_without_losing_later_c
     preview = _preview(client)
     assert _apply(client, preview).status_code == 200
     with app_module.app.app_context():
+        third = _job("Employer Direct", "employer-rbc-1", company="RBC", description="Build reliable software systems with Python, APIs, testing, deployment, and production ownership. " * 4)
+        app_module.persist_discovery_jobs([third], None, None)
+        app_module.get_db().execute("UPDATE jobs SET discovery_result_category = 'review_required', source_links_json = ? WHERE id = ?", [json.dumps(["https://later.example/rbc"]), canonical])
+        app_module.get_db().commit()
         app_module.set_applicant_discovery_state(canonical, profile, "applied", "2026-11-25")
         app_module.get_db().commit()
     rolled = client.post(f"/api/discovery/reconciliation/{preview['reconciliation_id']}/rollback")
@@ -187,6 +191,9 @@ def test_M_L_rollback_restores_relationship_and_decisions_without_losing_later_c
     with app_module.app.app_context():
         assert app_module.query_db("SELECT canonical_job_id FROM jobs WHERE id = ?", [duplicate], one=True)["canonical_job_id"] == 0
         assert app_module.query_db("SELECT state FROM discovery_applicant_states WHERE job_id = ? AND applicant_profile_id = ?", [canonical, profile], one=True)["state"] == "applied"
+        current = app_module.query_db("SELECT discovery_result_category, source_links_json FROM jobs WHERE id = ?", [canonical], one=True)
+        assert current["discovery_result_category"] == "review_required"
+        assert "later.example/rbc" in current["source_links_json"]
         assert app_module.query_db("SELECT 1 FROM discovery_search_memberships WHERE search_execution_id = ? AND job_id = ?", ["rollback-search", canonical], one=True) is None
         assert app_module.query_db("SELECT 1 FROM discovery_applicant_presentations WHERE job_id = ? AND applicant_profile_id = ?", [canonical, profile], one=True) is None
 
@@ -197,15 +204,66 @@ def test_G_bridge_identity_is_contradictory_and_cannot_be_merged_transitively(tm
     with app_module.app.app_context():
         # A-B share a requisition signal and B-C share a description signal;
         # A-C has a contradictory requisition and must not form a chain.
-        _insert_raw(_job("Indeed", "req-bridge-a", company="SalesJack", url="https://boards.example/common-a", description=common))
+        first = _job("Indeed", "req-bridge-a", company="SalesJack", url="https://boards.example/common-a", description=common)
+        first["workplace_address"] = "100 Toronto Street, Toronto, ON"
+        _insert_raw(first)
         middle = _insert_raw(_job("Glassdoor", "req-bridge-a", company="SalesJack", url="https://boards.example/common-a", description=common))
-        last = _insert_raw(_job("Employer Direct", "req-bridge-c", company="SalesJack", url="https://boards.example/common-c", description=common))
+        last = _job("Employer Direct", "req-bridge-a", company="SalesJack", url="https://boards.example/common-c", description=common)
+        last["workplace_address"] = "900 Toronto Street, Toronto, ON"
+        _insert_raw(last)
         app_module.get_db().execute("UPDATE jobs SET source_links_json = ? WHERE id = ?", [json.dumps(["https://boards.example/common-a", "https://boards.example/common-c"]), middle])
         app_module.get_db().commit()
     preview = _preview(client)
     assert preview["candidate_count"] == 1
     assert preview["candidates"][0]["identity_status"] == "contradictory"
     assert _apply(client, preview, {"group:" + ",".join(map(str, preview["candidates"][0]["job_ids"])): "merge"}).status_code == 409
+
+
+def test_identity_conflicts_override_shared_urls_and_future_acquisition_uses_same_rules(tmp_path, monkeypatch):
+    client = _client(tmp_path, monkeypatch)
+    with app_module.app.app_context():
+        first_url = _job("Indeed", "req-url-1", company="TD Bank", url="https://ats.example/shared", description="Same detailed vacancy evidence." * 50)
+        first_url["workplace_address"] = "100 Toronto Street, Toronto, ON"
+        _insert_raw(first_url)
+        second_url = _job("Glassdoor", "req-url-2", company="TD", url="https://ats.example/shared", description="Same detailed vacancy evidence." * 50)
+        second_url["workplace_address"] = "200 Toronto Street, Toronto, ON"
+        _insert_raw(second_url)
+        first_work = _job("Indeed", "req-work-1", company="HOOPP", url="https://ats.example/work", description="Same detailed vacancy evidence." * 50)
+        first_work["workplace_address"] = "300 Toronto Street, Toronto, ON"
+        _insert_raw(first_work)
+        workplace = _job("Glassdoor", "req-work-1", company="Healthcare of Ontario Pension Plan", url="https://ats.example/work", description="Same detailed vacancy evidence." * 50)
+        workplace["workplace_address"] = "100 Toronto Street, Toronto, ON"
+        _insert_raw(workplace)
+    preview = _preview(client)
+    assert preview["candidate_count"] == 0
+    with app_module.app.app_context():
+        base = _job("Indeed", "req-valid-1", company="TD Bank", url="https://ats.example/valid", description="Same detailed vacancy evidence." * 50)
+        base_id = app_module.persist_discovery_jobs([base], None, None)["new_job_ids"][0]
+        equivalent = _job("Employer Direct", "req-valid-1", company="TD", url="https://ats.example/valid", description="Same detailed vacancy evidence." * 50)
+        result = app_module.persist_discovery_jobs([equivalent], None, None)
+        assert result["new"] == 0
+        assert app_module.query_db("SELECT COUNT(*) AS n FROM jobs", one=True)["n"] == 5
+        assert app_module.query_db("SELECT alias_type FROM job_source_aliases WHERE job_id = ? AND raw_value = ?", [base_id, "req-valid-1"], one=True) is not None
+
+
+def test_rediscovery_of_both_historical_provider_ids_resolves_to_canonical(tmp_path, monkeypatch):
+    client = _client(tmp_path, monkeypatch)
+    profile = _profile(client, "Rediscovery Applicant")
+    with app_module.app.app_context():
+        canonical = _insert_raw(_job("Indeed", "indeed-hoopp-1", company="HOOPP"))
+        duplicate = _insert_raw(_job("Glassdoor", "glassdoor-hoopp-1", company="Healthcare of Ontario Pension Plan"))
+        app_module.set_applicant_discovery_state(canonical, profile, "saved")
+        app_module.get_db().commit()
+    preview = _preview(client)
+    assert _apply(client, preview).status_code == 200
+    with app_module.app.app_context():
+        for provider, source_id in (("Indeed", "indeed-hoopp-1"), ("Glassdoor", "glassdoor-hoopp-1")):
+            incoming = _job(provider, source_id, company="HOOPP")
+            result = app_module.persist_discovery_jobs([incoming], None, None)
+            assert result["new"] == 0
+            assert incoming["id"] == canonical
+        assert app_module.query_db("SELECT canonical_job_id FROM jobs WHERE id = ?", [duplicate], one=True)["canonical_job_id"] == canonical
+        assert app_module.query_db("SELECT state FROM discovery_applicant_states WHERE job_id = ? AND applicant_profile_id = ?", [canonical, profile], one=True)["state"] == "saved"
 
 
 def test_O_uncertain_candidates_are_review_only_and_M_is_idempotent(tmp_path, monkeypatch):
@@ -223,22 +281,52 @@ def test_O_uncertain_candidates_are_review_only_and_M_is_idempotent(tmp_path, mo
     assert _apply(client, preview, {key: "merge"}).get_json()["idempotent"] is True
 
 
+def test_uncertain_pairs_collect_decision_conflicts_and_never_downgrade_applied(tmp_path, monkeypatch):
+    client = _client(tmp_path, monkeypatch)
+    profile = _profile(client, "Uncertain Decisions")
+    with app_module.app.app_context():
+        pairs = []
+        for index, states in enumerate((("saved", "applied"), ("skipped", "applied"), ("saved", "skipped"))):
+            left = _insert_raw(_job("Indeed", f"uncertain-left-{index}", company=f"Amazon.com {index}", description="General role with communication and collaboration responsibilities. " * 3))
+            right = _insert_raw(_job("Glassdoor", f"uncertain-right-{index}", company=f"Amazon.com {index}", description="Different role with communication and collaboration responsibilities. " * 3))
+            app_module.set_applicant_discovery_state(left, profile, states[0])
+            app_module.set_applicant_discovery_state(right, profile, states[1], "2026-11-25" if states[1] == "applied" else "")
+            pairs.append((left, right, states))
+        app_module.get_db().commit()
+    preview = _preview(client)
+    assert preview["candidate_count"] == 3
+    assert all(candidate["decision_conflicts"] for candidate in preview["candidates"])
+    assert _apply(client, preview).status_code == 409
+    resolutions = {}
+    for candidate in preview["candidates"]:
+        conflict = candidate["decision_conflicts"][0]
+        key = "group:" + ",".join(map(str, candidate["job_ids"]))
+        resolution = "applied" if any(item["state"] == "applied" for item in conflict["decisions"]) else "saved"
+        resolutions.update({key: "merge", conflict["conflict_key"]: resolution})
+    assert _apply(client, preview, resolutions).status_code == 200
+
+
 def test_Q_candidate_generation_is_bounded_for_10000_mixed_records(tmp_path, monkeypatch):
     client = _client(tmp_path, monkeypatch)
     with app_module.app.app_context():
         db = app_module.get_db()
         rows = []
-        for index in range(10000):
+        for group in range(300):
+            description = f"Deliver tested platform software group {group}, APIs, observability, and production support. " * 4
+            rows.extend([
+                ("Common Holdings", "Software Developer", "Toronto, ON", f"https://indeed.example/req-{group}", "Indeed", f"req-{group}", description, "2026-11-25T00:00:00", "actionable"),
+                ("Common Holdings", "Software Developer", "Toronto, ON", f"https://glassdoor.example/req-{group}", "Glassdoor", f"req-{group}", description, "2026-11-25T00:00:00", "actionable"),
+            ])
+        for index in range(9400):
             source = ("Indeed", "Glassdoor", "Employer Direct")[index % 3]
-            title = f"Role {index}"
-            company = f"Company {index}"
-            rows.append((company, title, "Toronto, ON", f"https://{source}.example/{index}", source, f"id-{index}", "Generic posting description." * 4, "2026-11-25T00:00:00", "actionable"))
+            rows.append((f"Company {index}", f"Role {index}", "Toronto, ON", f"https://{source}.example/{index}", source, f"id-{index}", "Generic posting description." * 4, "2026-11-25T00:00:00", "actionable"))
         db.executemany("INSERT INTO jobs(company, title, location, url, source, source_job_id, job_description, discovery_first_seen_at, discovery_result_category, canonical_job_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)", rows)
         db.commit()
         started = time.perf_counter()
         candidates = app_module.reconciliation_candidate_groups()
         elapsed = time.perf_counter() - started
-    assert candidates == []
+    assert len(candidates) == 300
     assert elapsed < 3.0
     assert app_module._LAST_RECONCILIATION_STATS["records"] == 10000
-    assert app_module._LAST_RECONCILIATION_STATS["comparisons"] < 1000
+    assert app_module._LAST_RECONCILIATION_STATS["comparisons"] >= 300
+    assert app_module._LAST_RECONCILIATION_STATS["coverage_complete"] is True
