@@ -18,8 +18,10 @@ owner database.
 | Canonical duplicate safety and geographic compatibility | `tests/test_canonical_reconciliation_acceptance.py`, `tests/test_final_acceptance_corrections.py` | Pass |
 | SWE / ECE recall-first classification corrections | `tests/test_goal_c_integration.py`, `tests/test_goal_d_integration.py`, `tests/test_final_acceptance_corrections.py` | Pass |
 | Historical reassessment preview and apply persistence | Goal C/D integration regressions cover preview-before-apply and derived-field persistence | Pass |
-| Latest ECE acquisition accounting | Synthetic integration fixtures cover acquisition outcomes; no owner search replay was possible | Fixture evidence only |
-| Owner-cohort replay and named owner evidence exports | Only `audit/quality-audit-2026-11-06.json` is available locally; the listed owner exports were not present | Not performed |
+| Historical reassessment with unchanged category (Samsara-style) | `test_samsara_reassessment_updates_unchanged_actionable_derived_fields_and_reopens` covers preview, confirmed apply, and database reopen | Pass |
+| Latest ECE acquisition accounting | `test_ece_persisted_search_accounting_distinguishes_new_represented_and_reclassified`; UI exposes canonical/source-attachment/previously-acquired/reclassified/presented counts | Fixture evidence only |
+| Owner replay harness | `scripts/replay_owner_cohort.py --audit-dir <private-export-dir> --db-path <qa-db> --output <report.json>` copies the DB and emits duplicate groups, rejection reasons, occupational classifications and ranking fields | Executable; owner export required |
+| Owner-cohort replay and named owner evidence exports | Repository audit exports loaded 78 records in an isolated copy; the documented 104-candidate owner export was not present | Not performed |
 
 ## Verification boundary
 

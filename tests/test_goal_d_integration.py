@@ -99,3 +99,34 @@ def test_workplace_denial_circuit_stops_repeated_401s_and_preserves_partial_resu
     assert result["blocked_providers"] == ["ca.indeed.com"]
     assert len(result["records"]) == 22
     assert all(record["status"] == "blocked" for record in result["records"])
+
+
+def test_ece_persisted_search_accounting_distinguishes_new_represented_and_reclassified(tmp_path, monkeypatch):
+    monkeypatch.setattr(app_module, "DATA_DIR", Path(tmp_path))
+    monkeypatch.setattr(app_module, "DB_PATH", Path(tmp_path) / "accounting.sqlite")
+    monkeypatch.setattr(app_module, "_INITIALIZED_DATABASE_PATH", None)
+    client = app_module.app.test_client()
+    profile = client.post("/api/candidate-profiles", json={"name": "Accounting ECE", "workflow": "ece"}).get_json()
+    postings = [
+        {"source_job_id": "ft-1", "title": "Registered Early Childhood Educator", "description": "Full-time permanent educator role."},
+        {"source_job_id": "supply-1", "title": "Supply RECE", "description": "Supply educator position."},
+    ]
+
+    def fake_fetch(**_kwargs):
+        return {"jobs": [{"source_job_id": item["source_job_id"], "source": "indeed", "title": item["title"], "company": "Accounting Centre", "location": "Toronto, ON", "job_url": f"https://example.test/{item['source_job_id']}", "description": item["description"]} for item in postings], "errors": {}, "source_counts": {"indeed": 2}, "source_diagnostics": {}, "source_snapshots": {}}
+
+    payload = {"workflow": "ece", "keywords": "RECE", "location": "Toronto, ON", "distance": 50, "distance_origin": "Toronto, ON", "enabled_sources": ["indeed"], "applicant_profile_id": profile["id"], "new_matching_target": 1, "total_cap": 10, "per_source_cap": 10}
+    with patch.object(app_module, "fetch_jobspy_jobs", side_effect=fake_fetch):
+        first = client.post("/api/discovery/jobspy", json=payload).get_json()
+        with app_module.app.app_context():
+            app_module.mark_discovery_jobs_presented([item["id"] for item in first["jobs"]], profile["id"])
+            app_module.get_db().commit()
+        postings[1]["title"] = "Registered Early Childhood Educator"
+        postings[1]["description"] = "Full-time permanent educator role after classification correction."
+        second = client.post("/api/discovery/jobspy", json=payload).get_json()
+    diagnostics = second["diagnostics"]
+    assert diagnostics["newly_acquired_count"] == 0
+    assert diagnostics["previously_acquired_unseen_count"] >= 0
+    assert diagnostics["previously_acquired_newly_presented_count"] >= 0
+    assert "reclassified_count" in diagnostics
+    assert diagnostics["newly_acquired_count"] != diagnostics["newly_presented_count"]

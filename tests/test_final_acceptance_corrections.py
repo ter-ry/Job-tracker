@@ -170,7 +170,7 @@ def test_re_evaluate_is_occupation_scoped_and_preserves_history(tmp_path, monkey
 
     saved = client.post(f"/api/discovery/inbox/{software_id}/save", json={"applicant_profile_id": swe, "workflow": "software"})
     assert saved.status_code == 200
-    policy = {"match_policy": "apply_broadly", "geographic_match_mode": "provisional", "distance": 20, "seniority": "entry_level,junior", "maximum_required_years": 3, "include_internships": False}
+    policy = {"match_policy": "apply_broadly", "geographic_match_mode": "provisional", "distance": 20, "seniority": "any", "maximum_required_years": 10, "include_internships": False}
     preview = client.post("/api/discovery/re-evaluate", json={"applicant_profile_id": swe, "workflow": "software", **policy})
     assert preview.status_code == 200
     assert preview.get_json()["preview"] is True
@@ -203,6 +203,38 @@ def test_history_reassessment_preview_and_audit_are_non_mutating(tmp_path, monke
     assert audit.status_code == 200
     assert audit.get_json()["mutated"] is False
     assert audit.get_json()["total"] >= 1
+
+
+def test_samsara_reassessment_updates_unchanged_actionable_derived_fields_and_reopens(tmp_path, monkeypatch):
+    client = _isolated_client(tmp_path, monkeypatch)
+    swe = _profile(client, "Samsara Applicant", "software")
+    job_id = _stored_job(client, category="actionable", occupation="software developer")
+    with app_module.app.app_context():
+        app_module.get_db().execute(
+            "UPDATE jobs SET company = ?, title = ?, job_description = ?, qualification_fit_seniority = ?, application_priority_score = ?, discovery_employment_status = ? WHERE id = ?",
+            ["Samsara", "Software Engineer", "Build and maintain production software services with APIs, testing, deployment, and ownership. Requires 5+ years of software development experience.", app_module.dumps_json({"detected_level": "entry_level", "required_experience": {"minimum": 0}}), 25, "full_time", job_id],
+        )
+        app_module.get_db().commit()
+    policy = {"match_policy": "apply_broadly", "geographic_match_mode": "provisional", "distance": 20, "seniority": "any", "maximum_required_years": 10, "include_internships": False}
+    preview = client.post("/api/discovery/re-evaluate", json={"applicant_profile_id": swe, "workflow": "software", **policy})
+    assert preview.status_code == 200
+    body = preview.get_json()
+    item = next(row for row in body["jobs"] if row["id"] == job_id)
+    assert item["current_category"] == item["proposed_category"] == "actionable"
+    assert "qualification_fit_seniority" in item["changed_fields"]
+    assert body["targeted_count"] >= 1
+    applied = client.post("/api/discovery/re-evaluate", json={"applicant_profile_id": swe, "workflow": "software", "preview": False, "confirm_apply": True, "preview_token": body["preview_token"], **policy})
+    assert applied.status_code == 200
+    with app_module.app.app_context():
+        row = app_module.query_db("SELECT discovery_result_category, qualification_fit_seniority, application_priority_score FROM jobs WHERE id = ?", [job_id], one=True)
+        assert row["discovery_result_category"] == "actionable"
+        assert app_module.parse_json_object(row["qualification_fit_seniority"])["detected_level"] == "senior"
+        assert row["application_priority_score"] != 25
+        app_module.get_db().close()
+        app_module._INITIALIZED_DATABASE_PATH = None
+    reopened = client.get(f"/api/discovery/inbox?candidate_profile_id={swe}&category=all_discovered&include_history=1")
+    assert reopened.status_code == 200
+    assert next(row for row in reopened.get_json() if row["id"] == job_id)["qualification_fit_seniority"]["detected_level"] == "senior"
 
 
 def test_legacy_membership_requires_explicit_policy_and_reassesses_recall_first(tmp_path, monkeypatch):

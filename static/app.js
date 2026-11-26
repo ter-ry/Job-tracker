@@ -2108,6 +2108,9 @@ function organizeWorkspaceDom() {
   controls.forEach((control) => content.appendChild(control));
   details.appendChild(content);
   form.querySelector(".source-picker")?.before(details);
+  form.querySelectorAll("details.settings-block:not(#discovery-advanced-settings)").forEach((emptyDetails) => {
+    if (!emptyDetails.querySelector(".swe-advanced-control")) emptyDetails.remove();
+  });
 }
 
 function setPrimaryWorkspace(workspace = "discover") {
@@ -3212,16 +3215,21 @@ function clearVisibleDiscoveryResults() {
 function applyDiscoveryWorkflow(workflow = "software", { reset = false } = {}) {
   const selected = workflow === "ece" ? "ece" : "software";
   state.discoveryWorkflow = selected;
+  const advancedSettings = document.getElementById("discovery-advanced-settings");
+  if (advancedSettings) advancedSettings.hidden = selected === "ece";
+  const initializeControls = reset || !String(value("discovery-keywords") || "").trim();
   setValue("discovery-workflow", selected);
-  setValue("discovery-search-mode", selected === "software" ? "shortlist" : "title");
-  setValue("discovery-title-match-mode", "related");
-  setValue("discovery-keywords", selected === "software" ? "software developer; junior software engineer" : "Registered Early Childhood Educator; RECE");
-  setValue("discovery-distance", "");
-  setValue("discovery-remote-preference", "");
-  setValue("discovery-location", "");
-  setValue("discovery-seniority", selected === "software" ? "entry_level,junior,intermediate" : "any");
-  setValue("discovery-maximum-years", selected === "software" ? 3 : "");
-  setValue("discovery-match-policy", selected === "software" ? "apply_broadly" : "strict_matching");
+  if (initializeControls) {
+    setValue("discovery-search-mode", selected === "software" ? "shortlist" : "title");
+    setValue("discovery-title-match-mode", "related");
+    setValue("discovery-keywords", selected === "software" ? "software developer; junior software engineer" : "Registered Early Childhood Educator; RECE");
+    setValue("discovery-distance", "");
+    setValue("discovery-remote-preference", "");
+    setValue("discovery-location", "");
+    setValue("discovery-seniority", selected === "software" ? "entry_level,junior,intermediate" : "any");
+    setValue("discovery-maximum-years", selected === "software" ? 3 : "");
+    setValue("discovery-match-policy", selected === "software" ? "apply_broadly" : "strict_matching");
+  }
   const policyControl = document.getElementById("discovery-match-policy");
   if (policyControl) policyControl.disabled = selected === "ece";
   setChecked("discovery-include-internships", false);
@@ -3244,8 +3252,8 @@ function applyDiscoveryWorkflow(workflow = "software", { reset = false } = {}) {
   });
   const seniorityHelp = document.getElementById("discovery-seniority-help");
   if (seniorityHelp) seniorityHelp.textContent = selected === "software"
-    ? "Senior, lead, manager and director roles stay out of new matches."
-    : "ECE uses its independent title and seniority policy.";
+    ? "Seniority guides ranking; Apply Broadly keeps plausible technical stretch roles visible."
+    : "ECE uses its independent title and employment policy; SWE seniority controls are hidden.";
   setChecked("discovery-strict-technical", selected === "software");
   const help = document.getElementById("discovery-profile-help");
   if (help) help.textContent = selected === "software"
@@ -4011,6 +4019,11 @@ function renderDiscoveryResults(result) {
         <div><strong>${fetchedCount}</strong><span>Raw jobs inspected</span></div>
         <div><strong>${Number(progress.unique_jobs_found ?? diagnostics.unique_jobs_found ?? totalCount)}</strong><span>Unique jobs found</span></div>
         <div><strong>${Number(progress.previously_processed ?? diagnostics.processed_count ?? 0)}</strong><span>Previously processed</span></div>
+        <div><strong>${Number(diagnostics.newly_acquired_count ?? 0)}</strong><span>New canonical vacancies</span></div>
+        <div><strong>${Number(diagnostics.new_source_attachment_count ?? 0)}</strong><span>New source attachments</span></div>
+        <div><strong>${Number(diagnostics.previously_acquired_unseen_count ?? 0)}</strong><span>Previously acquired, newly seen</span></div>
+        <div><strong>${Number(diagnostics.previously_acquired_newly_presented_count ?? 0)}</strong><span>Previously acquired, newly presented</span></div>
+        <div><strong>${Number(diagnostics.reclassified_count ?? 0)}</strong><span>Reclassified</span></div>
         <div><strong>${Number(progress.skipped ?? diagnostics.skipped_count ?? 0)}</strong><span>Previously skipped</span></div>
         <div><strong>${Number(progress.disqualified ?? diagnostics.excluded_count ?? 0)}</strong><span>Disqualified</span></div>
         <div><strong>${Number(progress.verified_matches ?? diagnostics.verified_matches ?? jobs.filter((job) => job.discovery_match_status === "verified").length)}</strong><span>Verified new matches</span></div>

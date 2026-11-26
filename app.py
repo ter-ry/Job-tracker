@@ -2786,16 +2786,20 @@ def create_app() -> Flask:
             )
             after = {column: item.get(column) for column in derived_columns if column in JOB_COLUMNS or column in {"qualification_fit_seniority", "experience_requirements", "technical_compatibility", "application_priority_reasons", "qualification_fit_reasons", "qualification_fit_missing_requirements", "qualification_fit_matched_requirements"}}
             before = {column: job_to_dict(row, include_legacy_details=False).get(column) for column in after}
-            preview_item = {"id": int(row["id"]), "title": text(item.get("title")), "company": text(item.get("company")), "current_category": text(row["discovery_result_category"]), "proposed_category": category, "reason": reason, "evidence_sufficient": grounded, "source": text(item.get("source")), "url": text(item.get("url")), "search_criteria": criteria, "effective_policy": reassessment_policy, "before": before, "after": after}
+            changed_fields = [column for column in after if before.get(column) != after.get(column)]
+            preview_item = {"id": int(row["id"]), "title": text(item.get("title")), "company": text(item.get("company")), "current_category": text(row["discovery_result_category"]), "proposed_category": category, "reason": reason, "evidence_sufficient": grounded, "changed_fields": changed_fields, "source": text(item.get("source")), "url": text(item.get("url")), "search_criteria": criteria, "effective_policy": reassessment_policy, "before": before, "after": after}
             changed.append(preview_item)
-        targeted = [item for item in changed if item["evidence_sufficient"] and item["current_category"] != item["proposed_category"]]
+        # Reassessment is about durable derived truth, not only category
+        # transitions.  A record can remain actionable while its seniority,
+        # experience, employment, geography, or ranking evidence changes.
+        targeted = [item for item in changed if item["evidence_sufficient"] and item.get("changed_fields")]
         preview_token = hashlib.sha256(json.dumps({"policy": reassessment_policy, "targeted": targeted}, sort_keys=True, default=str).encode("utf-8")).hexdigest()
         if not preview:
             if text(payload.get("preview_token")) != preview_token:
                 return jsonify({"error": "A matching reassessment preview token is required before applying changes."}), 409
             db = get_db()
             for item in targeted:
-                updates = {"discovery_result_category": item["proposed_category"], "discovery_result_reason": item["reason"], **(item.get("after") or {})}
+                updates = {**(item.get("after") or {}), "discovery_result_category": item["proposed_category"], "discovery_result_reason": item["reason"]}
                 assignments = []
                 values = []
                 for column, value in updates.items():
@@ -4080,6 +4084,7 @@ def create_app() -> Flask:
         diagnostics["skipped_count"] = skipped_count
         diagnostics["newly_acquired_count"] = int(persisted.get("new") or 0)
         diagnostics["new_source_attachment_count"] = int(persisted.get("new_source_attachments") or 0)
+        diagnostics["reclassified_count"] = int(persisted.get("reclassified") or 0)
         diagnostics["previously_acquired_unseen_count"] = sum(
             1 for item in matching_jobs
             if item.get("_acquisition_outcome") == "previously_acquired" and not item.get("presented_to_applicant")
@@ -4087,6 +4092,9 @@ def create_app() -> Flask:
         diagnostics["previously_presented_count"] = sum(1 for item in ordered if item.get("presented_to_applicant"))
         diagnostics["previously_processed_count"] = processed_count
         diagnostics["newly_presented_count"] = len(jobs)
+        diagnostics["previously_acquired_newly_presented_count"] = sum(
+            1 for item in jobs if item.get("_acquisition_outcome") in {"previously_acquired", "new_source_attachment"}
+        )
         diagnostics["requested_target"] = requested_target
         diagnostics["new_matching_count"] = len(new_matching_jobs)
         diagnostics["target_eligible_count"] = len(target_matching_jobs)
@@ -5081,7 +5089,8 @@ def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, ru
     counts: dict[str, Any] = {
         "new": 0, "duplicate": 0, "new_job_ids": [],
         "new_source_attachments": 0, "previously_acquired": 0,
-        "source_attachment_job_ids": [],
+        "source_attachment_job_ids": [], "reclassified": 0,
+        "reclassified_job_ids": [],
     }
     db = get_db()
     for job in jobs:
@@ -5096,6 +5105,11 @@ def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, ru
             canonical_match = match is not None
         if match is not None:
             counts["duplicate"] += 1
+            previous_category = text(match["discovery_result_category"])
+            incoming_category = text(job.get("discovery_result_category"))
+            if previous_category and incoming_category and previous_category != incoming_category:
+                counts["reclassified"] += 1
+                counts["reclassified_job_ids"].append(int(match["id"]))
             if canonical_match:
                 job["_acquisition_outcome"] = "new_source_attachment"
                 counts["new_source_attachments"] += 1
@@ -5611,12 +5625,16 @@ def run_discovery_pipeline(
         "previously_processed": int(persisted.get("duplicate") or 0),
         "newly_acquired_count": int(persisted.get("new") or 0),
         "new_source_attachment_count": int(persisted.get("new_source_attachments") or 0),
+        "reclassified_count": int(persisted.get("reclassified") or 0),
         "previously_acquired_unseen_count": sum(
             1 for item in matching_jobs if item.get("_acquisition_outcome") == "previously_acquired" and not item.get("presented_to_applicant")
         ),
         "previously_presented_count": previously_presented_count,
         "previously_processed_count": int(persisted.get("duplicate") or 0),
         "newly_presented_count": len(jobs),
+        "previously_acquired_newly_presented_count": sum(
+            1 for item in jobs if item.get("_acquisition_outcome") in {"previously_acquired", "new_source_attachment"}
+        ),
         "skipped_count": sum(1 for item in jobs if text(item.get("discovery_state")) == "ignored"),
         "disqualified_count": len(excluded_jobs),
         "review_required_count": len(review_required_jobs),
@@ -9443,23 +9461,39 @@ def geographic_location_compatible(first: Any, second: Any) -> bool:
     province suffixes may be omitted, while a different city remains a hard
     conflict. Exact workplace fields are checked separately by callers.
     """
-    def location_core(value: Any) -> str:
+    province_names = {
+        "ontario": "on", "on": "on", "quebec": "qc", "qc": "qc",
+        "alberta": "ab", "ab": "ab", "british columbia": "bc", "bc": "bc",
+        "manitoba": "mb", "mb": "mb", "saskatchewan": "sk", "sk": "sk",
+        "nova scotia": "ns", "ns": "ns", "new brunswick": "nb", "nb": "nb",
+        "newfoundland and labrador": "nl", "nl": "nl", "prince edward island": "pe", "pe": "pe",
+    }
+
+    def location_parts(value: Any) -> tuple[str, str]:
         raw = normalize_space(text(value)).lower()
-        raw = re.sub(r"\b(?:canada|ca)\b", " ", raw)
-        raw = re.sub(r"\b(?:ontario|quebec|alberta|british columbia|manitoba|saskatchewan|nova scotia|new brunswick|newfoundland and labrador|prince edward island|on|qc|ab|bc|mb|sk|ns|nb|nl|pe)\b", " ", raw)
-        parts = [normalize_dedupe_text(part) for part in raw.split(",") if normalize_dedupe_text(part)]
-        return parts[0] if parts else normalize_dedupe_text(raw)
-    left = location_core(first)
-    right = location_core(second)
-    if not left or not right:
+        segments = [normalize_dedupe_text(part) for part in raw.split(",") if normalize_dedupe_text(part)]
+        city = segments[0] if segments else ""
+        province = ""
+        for segment in segments[1:] + [city]:
+            normalized = normalize_space(segment)
+            if normalized in province_names:
+                province = province_names[normalized]
+                break
+            match = re.search(r"\b(on|qc|ab|bc|mb|sk|ns|nb|nl|pe)\b", normalized)
+            if match:
+                province = match.group(1)
+                break
+        city = re.sub(r"\b(?:canada|ca|on|qc|ab|bc|mb|sk|ns|nb|nl|pe|ontario|quebec|alberta|british columbia|manitoba|saskatchewan|nova scotia|new brunswick|newfoundland and labrador|prince edward island)\b", " ", city)
+        return normalize_dedupe_text(city), province
+
+    left, left_province = location_parts(first)
+    right, right_province = location_parts(second)
+    if not left or not right or left != right:
         return False
-    if left == right:
-        return True
-    if left == right:
-        return True
-    # A provider may return “Toronto / GTA” versus “Toronto”. Treat this as
-    # compatible, but never make two distinct city cores compatible.
-    return len(left) >= 4 and len(right) >= 4 and (left in right or right in left)
+    # Omitted province/country suffixes are compatible, but two explicit
+    # provinces are a hard conflict. Exact workplace identity is handled by
+    # the callers' address/requisition checks and never by this regional gate.
+    return not left_province or not right_province or left_province == right_province
 
 
 def determine_salary(job: dict[str, Any]) -> dict[str, Any]:
@@ -12784,11 +12818,28 @@ def clearly_non_software_role(job: dict[str, Any]) -> bool:
     low-information records into hard exclusions.
     """
     title = normalize_space(text(job.get("title"))).lower()
-    if re.search(r"\b(academic assistant|teaching assistant|instructor|teacher|faculty|professor|tutor|research assistant|recruiter|recruitment|human resources|(?:office|school|clinic|medical|property|administrative) administrator|administrative assistant|marketing specialist|technical writer|ux designer|coordinator|cnc|machinist|metal fabrication|bridge engineer|civil engineer|structural engineer|registered nurse|nurse contractor|provider operations|packaging developer|community program(?:ming)?|fundraising|employment development|fp&a|client success|customer success|business development|graphic design|margin supervision|growth associate|development officer|producer|talent development|employment consultant|training specialist|accounting|insurance sales|executive assistant)\b", title) or (re.search(r"\badministrator\b", title) and not re.search(r"\b(?:cloud|salesforce|systems?|database) administrator\b", title)):
+    content = " ".join(text(job.get(key)) for key in ("job_description", "responsibilities", "required_skills", "preferred_skills")).lower()
+    technical_responsibility = bool(re.search(r"\b(?:build|develop|design|implement|maintain|test|debug|deploy|code|coding|program(?:ming)?|software|web application|full[ -]?stack|backend|frontend|api|database|automation|cloud infrastructure)\b", content))
+    explicit_software_title = bool(re.search(r"\b(?:software|web|application|full[ -]?stack|front[ -]?end|back[ -]?end|devops|sre|api|data engineer|qa automation|sdet)\b", title))
+    educational_title = bool(re.search(r"\b(?:academic assistant|teaching assistant|instructor|teacher|faculty|professor|tutor)\b", title))
+    if educational_title:
+        return True
+    unrelated_title = re.search(r"\b(academic assistant|teaching assistant|instructor|teacher|faculty|professor|tutor|research assistant|recruiter|recruitment|human resources|(?:office|school|clinic|medical|property|administrative) administrator|administrative assistant|marketing specialist|technical writer|ux designer|coordinator|cnc|machinist|metal fabrication|bridge engineer|civil engineer|structural engineer|registered nurse|nurse contractor|provider operations|packaging developer|community program(?:ming)?|fundraising|employment development|fp&a|finance|treasury|account executive|client success|customer success|customer support|business development|graphic design|margin supervision|growth associate|development officer|producer|talent development|employment consultant|training specialist|accounting|accounts receivable|ar specialist|insurance sales|executive assistant|hr specialist|benefits|credit risk|wealth advisor|art director)\b", title)
+    # A title may contain an adjacent occupation label while the actual
+    # responsibilities are unmistakably software work (for example FSRA's
+    # Full Stack Developer). Responsibilities outrank the adjacent title.
+    if (explicit_software_title or technical_responsibility) and re.search(r"\b(?:full[ -]?stack|software|web|application)\b", title) and technical_responsibility:
+        return False
+    if unrelated_title or (re.search(r"\badministrator\b", title) and not re.search(r"\b(?:cloud|salesforce|systems?|database) administrator\b", title)):
+        if not technical_responsibility:
+            return True
+        if not re.search(r"\b(?:build|develop|implement|code|coding|software|full[ -]?stack|backend|frontend|api)\b", content):
+            return True
+    if re.search(r"\b(?:finance|treasury|hr|human resources|customer success|client success|account executive|benefits|credit risk|wealth advisor|art director)\b", title) and not technical_responsibility:
         return True
     if re.search(r"\bmanager\b", title) and not technical_manager_without_people_scope(job):
         return True
-    if re.search(r"\bproduct developer\b", title) and not re.search(r"\bsoftware\b|\bweb\b|\bapplication\b|\btechnical\b", title):
+    if re.search(r"\bproduct developer\b", title) and not re.search(r"\bsoftware\b|\bweb\b|\bapplication\b|\btechnical\b", title) and not technical_responsibility:
         return True
     if re.search(r"\bproduction\s+support\b", title) and re.search(r"\b(?:not\s+(?:a\s+)?developer|mainframe)\b", title):
         return True

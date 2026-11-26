@@ -42,6 +42,13 @@ async function main() {
   assert.strictEqual(await page.locator("#discovery-form").isVisible(), false);
   assert.strictEqual(await page.locator("#discovery-inbox").isVisible(), false);
 
+  await page.getByRole("button", { name: "Applications", exact: true }).click();
+  assert.strictEqual(await page.locator("#tracker").isVisible(), true);
+  assert.strictEqual(await page.locator("#discovery-form").isVisible(), false);
+  await page.getByRole("button", { name: "Settings / Profiles", exact: true }).click();
+  assert.strictEqual(await page.locator("#profile").isVisible(), true);
+  assert.strictEqual(await page.locator("#candidate-profile-list").isVisible(), true);
+
   await page.locator("#global-applicant-selector").selectOption("2");
   await page.waitForFunction(() => state.selectedCandidateProfileId === "2" && state.discoveryWorkflow === "ece");
   assert.strictEqual(await page.locator("#discovery-workflow").inputValue(), "ece");
@@ -49,6 +56,8 @@ async function main() {
   assert.strictEqual(await page.locator("#discovery-search-area").count(), 0);
   assert.strictEqual(await page.locator("#discovery-enrich-workplaces").count(), 0);
   await page.getByRole("button", { name: "Discover", exact: true }).click();
+  assert.strictEqual(await page.locator("#discovery-advanced-settings").isVisible(), false);
+  await page.setViewportSize({ width: 1920, height: 1080 });
   await page.screenshot({ path: `${outputDir}/owner-acceptance-ece-1920.png`, fullPage: true });
 
   assert.deepStrictEqual(errors, [], errors.join("\n"));

@@ -28,6 +28,14 @@ def test_goal_b_documented_unrelated_swe_false_positives_are_excluded():
     assert all(app.discovery_result_category(_swe(title))[0] == "excluded" for title in titles)
 
 
+def test_owner_false_positive_titles_use_responsibilities_and_keep_fsra_full_stack():
+    for title in ("Maple AR Specialist", "Achievers Customer Support Associate", "Clearco Finance Analyst", "Wealthsimple HR Benefits Specialist", "Clearco Account Executive", "PolicyMe Insurance Sales Associate", "Wealthsimple Art Director"):
+        assert app.discovery_result_category(_swe(title))[0] == "excluded"
+    fsra = _swe("Technical Lead (Full Stack Developer)", "Build and maintain full-stack web applications, APIs, automated tests, and deployment pipelines.")
+    assert not app.clearly_non_software_role(fsra)
+    assert app.discovery_result_category(fsra)[0] != "excluded"
+
+
 def test_goal_b_adjacent_technical_roles_and_senior_stretch_remain_available():
     for title in ("Cloud Administrator", "Salesforce Administrator", "Systems Administrator", "Database Administrator", "Technical Consultant", "Technical Specialist", "Software Product Developer", "Research Scientist"):
         job = _swe(title, "Maintain production systems, SQL databases, APIs and automation.")

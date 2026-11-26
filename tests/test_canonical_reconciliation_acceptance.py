@@ -167,6 +167,12 @@ def test_H_I_distinct_requisitions_and_workplaces_remain_separate(tmp_path, monk
     assert preview["candidate_count"] == 0
 
 
+def test_regional_location_compatibility_keeps_province_and_exact_workplace_conflicts(tmp_path, monkeypatch):
+    assert app_module.geographic_location_compatible("Toronto, ON, Canada", "Toronto, Canada")
+    assert not app_module.geographic_location_compatible("Toronto, ON, Canada", "Toronto, BC, Canada")
+    assert not app_module.geographic_location_compatible("Toronto, ON", "North York, ON")
+
+
 def test_M_L_rollback_restores_relationship_and_decisions_without_losing_later_change(tmp_path, monkeypatch):
     client = _client(tmp_path, monkeypatch)
     profile = _profile(client, "Rollback Applicant")
