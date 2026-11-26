@@ -212,7 +212,7 @@ def test_samsara_reassessment_updates_unchanged_actionable_derived_fields_and_re
     with app_module.app.app_context():
         app_module.get_db().execute(
             "UPDATE jobs SET company = ?, title = ?, job_description = ?, qualification_fit_seniority = ?, application_priority_score = ?, discovery_employment_status = ? WHERE id = ?",
-            ["Samsara", "Software Engineer", "Build and maintain production software services with APIs, testing, deployment, and ownership. Requires 5+ years of software development experience.", app_module.dumps_json({"detected_level": "entry_level", "required_experience": {"minimum": 0}}), 25, "full_time", job_id],
+            ["Samsara", "Sr Software Engineer I/II, Operational AI", "Build and maintain production software services with APIs, testing, deployment, and ownership. Requires 5+ years of software development experience.", app_module.dumps_json({"detected_level": "entry_level", "required_experience": {"minimum": 0}}), 25, "full_time", job_id],
         )
         app_module.get_db().commit()
     policy = {"match_policy": "apply_broadly", "geographic_match_mode": "provisional", "distance": 20, "seniority": "any", "maximum_required_years": 10, "include_internships": False}
@@ -235,6 +235,46 @@ def test_samsara_reassessment_updates_unchanged_actionable_derived_fields_and_re
     reopened = client.get(f"/api/discovery/inbox?candidate_profile_id={swe}&category=all_discovered&include_history=1")
     assert reopened.status_code == 200
     assert next(row for row in reopened.get_json() if row["id"] == job_id)["qualification_fit_seniority"]["detected_level"] == "senior"
+
+
+def test_ece_reassessment_revalidates_stale_supply_occupation(tmp_path, monkeypatch):
+    client = _isolated_client(tmp_path, monkeypatch)
+    ece = _profile(client, "ECE Applicant", "ece")
+    with app_module.app.app_context():
+        job = app_module.normalize_job_payload({
+            "source": "fixture", "source_job_id": "withrow-472",
+            "title": "Withrow ECE/ECA Supply", "company": "Withrow Centre",
+            "location": "Toronto, ON", "url": "https://example.test/withrow-472",
+            "description": "Seeking early childhood assistants only. The assistant will plan curriculum, supervise children, and support classroom learning.",
+        })
+        job.update({
+            "discovery_first_seen_at": "2026-01-01T00:00:00",
+            "discovery_result_category": "actionable",
+            "discovery_result_reason": "Stale supply classification",
+            "discovery_occupation": "early childhood educator",
+            "discovery_employment_status": "supply_or_casual",
+            "candidate_profile_id": ece,
+        })
+        job_id = app_module.persist_discovery_jobs([job], None, None)["new_job_ids"][0]
+        app_module.get_db().execute(
+            "INSERT INTO discovery_applicant_presentations(job_id, applicant_profile_id) VALUES (?, ?)",
+            [job_id, ece],
+        )
+        app_module.get_db().commit()
+    policy = {"match_policy": "strict_matching", "geographic_match_mode": "provisional", "distance": 20}
+    preview = client.post("/api/discovery/re-evaluate", json={"applicant_profile_id": ece, "workflow": "ece", **policy})
+    assert preview.status_code == 200
+    body = preview.get_json()
+    item = next(row for row in body["jobs"] if row["id"] == job_id)
+    assert item["proposed_category"] == "excluded"
+    applied = client.post("/api/discovery/re-evaluate", json={
+        "applicant_profile_id": ece, "workflow": "ece", "preview": False,
+        "confirm_apply": True, "preview_token": body["preview_token"], **policy,
+    })
+    assert applied.status_code == 200
+    with app_module.app.app_context():
+        row = app_module.query_db("SELECT discovery_result_category FROM jobs WHERE id = ?", [job_id], one=True)
+        assert row["discovery_result_category"] == "excluded"
 
 
 def test_legacy_membership_requires_explicit_policy_and_reassesses_recall_first(tmp_path, monkeypatch):

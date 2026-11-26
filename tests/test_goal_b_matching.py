@@ -34,6 +34,10 @@ def test_owner_false_positive_titles_use_responsibilities_and_keep_fsra_full_sta
     fsra = _swe("Technical Lead (Full Stack Developer)", "Build and maintain full-stack web applications, APIs, automated tests, and deployment pipelines.")
     assert not app.clearly_non_software_role(fsra)
     assert app.discovery_result_category(fsra)[0] != "excluded"
+    for title in ("Accounting Manager", "Treasury Analyst", "Marketing Specialist", "Customer Success Associate", "Registered Nurse", "HR Business Partner", "CNC Programmer", "Bridge Engineer"):
+        generic_technology = _swe(title, "Build relationships, develop reports, implement process improvements, and use software, systems, technology and automation.")
+        assert app.clearly_non_software_role(generic_technology)
+        assert app.discovery_result_category(generic_technology)[0] == "excluded"
 
 
 def test_goal_b_adjacent_technical_roles_and_senior_stretch_remain_available():
@@ -95,11 +99,11 @@ def test_goal_b_ece_contextual_employment_and_mixed_titles():
     assert supply == "actionable"
     mixed, _ = classify("Withrow ECE/ECA Supply", "Seeking early childhood assistants only.")
     assert mixed == "excluded"
-    educator_duties, _ = classify(
+    assistant_with_educator_duties, _ = classify(
         "Withrow ECE/ECA Supply",
-        "Seeking early childhood assistants only. The educator will plan curriculum, supervise children, document observations, and lead classroom learning.",
+        "Seeking early childhood assistants only. The assistant will plan curriculum, supervise children, document observations, and lead classroom learning.",
     )
-    assert educator_duties == "actionable"
+    assert assistant_with_educator_duties == "excluded"
     teacher, _ = classify("Kindergarten Teacher", "ECE eligibility is an asset.")
     assert teacher == "review_required"
     full_time, _ = classify("Full-time RECE Educator", "The educator works alongside casual colleagues.")

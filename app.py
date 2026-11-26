@@ -12702,12 +12702,6 @@ def ece_result_category(job: dict[str, Any]) -> tuple[str, str]:
     supply/casual is retained for history but is never a target match.
     """
     durable_status = text(job.get("discovery_employment_status")).lower()
-    if durable_status in {"permanent_full_time", "temporary_full_time", "full_time_unspecified_term", "provisional", "supply_or_casual"}:
-        if durable_status == "supply_or_casual":
-            return "actionable", "Supply/casual RECE/ECE work is retained at the bottom of the durable eligible queue."
-        if durable_status == "provisional":
-            return "actionable", "RECE/ECE employment remains provisional based on the durable search evidence."
-        return "actionable", "RECE/ECE employment classification was persisted with the search evidence."
     title = normalize_space(text(job.get("title"))).lower()
     body = " ".join(text(job.get(key)) for key in ("job_description", "description", "employment_type", "job_type")).lower()
     combined = f"{title} {body}"
@@ -12747,17 +12741,22 @@ def ece_result_category(job: dict[str, Any]) -> tuple[str, str]:
         not has_rece_evidence
         or bool(re.search(r"\b(?:assistant|ECA)s?\b[^.\n]{0,50}\b(?:only|exclusively|solely)\b|\b(?:only|exclusively|solely)\b[^.\n]{0,50}\b(?:assistant|ECA)s?\b", body, re.I))
     )
-    educator_responsibilities = bool(re.search(
-        r"\b(?:plan|implement|lead|deliver|document|observe|supervise|teach|educate|develop)\b[^.\n]{0,100}\b(?:curriculum|programming|lesson|classroom|children|child development|learning|pedagog(?:y|ical))\b|\b(?:curriculum|classroom|child development|learning plan)\b[^.\n]{0,100}\b(?:plan|lead|teach|supervise|document|educat)",
-        body,
-        re.I,
-    ))
     assistant_only = assistant_only or (
         not re.search(r"\b(?:RECE|registered early child(?:hood)? educator|early childhood educator)\b", body, re.I)
         and bool(re.search(r"\b(?:seeking|looking for|hiring|need|requires?)\b[^.\n]{0,80}\b(?:assistant|ECA)s?\b", body, re.I))
     )
-    if assistant_only and not educator_responsibilities:
+    if assistant_only:
         return "excluded", "The posting evidence is assistant-only; a mixed or generic title does not establish RECE/ECE work."
+    # Durable employment metadata is not occupational evidence.  Only use it
+    # after the current title/body has passed the same occupation gates as a
+    # fresh discovery result; this prevents stale supply classifications from
+    # rescuing an assistant-only vacancy during reassessment.
+    if durable_status in {"permanent_full_time", "temporary_full_time", "full_time_unspecified_term", "provisional", "supply_or_casual"}:
+        if durable_status == "supply_or_casual":
+            return "actionable", "Supply/casual RECE/ECE work is retained at the bottom of the durable eligible queue."
+        if durable_status == "provisional":
+            return "actionable", "RECE/ECE employment remains provisional based on the durable search evidence."
+        return "actionable", "RECE/ECE employment classification was persisted with the search evidence."
     permanent = bool(re.search(r"\b(?:permanent|regular)\b", combined))
     temporary = bool(re.search(r"\b(?:temporary|contract|term|seasonal)\b", combined))
     if supply:
@@ -12829,7 +12828,14 @@ def clearly_non_software_role(job: dict[str, Any]) -> bool:
     """
     title = normalize_space(text(job.get("title"))).lower()
     content = " ".join(text(job.get(key)) for key in ("job_description", "responsibilities", "required_skills", "preferred_skills")).lower()
-    technical_responsibility = bool(re.search(r"\b(?:build|develop|design|implement|maintain|test|debug|deploy|code|coding|program(?:ming)?|software|web application|full[ -]?stack|backend|frontend|api|database|automation|cloud infrastructure)\b", content))
+    # Generic verbs and broad technology nouns are deliberately insufficient:
+    # an accounting, marketing, nursing or customer-success posting can say it
+    # will build, develop or use software without being software engineering.
+    technical_responsibility = bool(re.search(
+        r"\b(?:write|writes|writing|code|coding|program(?:ming)?|software\s+(?:applications?|services?|systems?|development|engineering)|develop(?:ing)?\s+(?:software|applications?|services?|systems?)|build(?:ing)?\s+(?:software|applications?|services?|systems?)|maintain(?:ing)?\s+(?:software|applications?|services?|systems?)|web\s+applications?|full[ -]?stack|back[- ]?end|front[- ]?end|api(?:s)?|database\s+(?:schema|design|development)|deploy(?:ing)?\s+(?:software|applications?|services?|to\s+production)|ci/cd|code\s+review|version\s+control|\bgit\b|javascript|typescript|python|java|c#|ruby|golang|react|node(?:\.js)?)\b",
+        content,
+        re.I,
+    ))
     explicit_software_title = bool(re.search(r"\b(?:software|web|application|full[ -]?stack|front[ -]?end|back[ -]?end|devops|sre|api|data engineer|qa automation|sdet)\b", title))
     educational_title = bool(re.search(r"\b(?:academic assistant|teaching assistant|instructor|teacher|faculty|professor|tutor)\b", title))
     if educational_title:
@@ -12838,13 +12844,14 @@ def clearly_non_software_role(job: dict[str, Any]) -> bool:
     # A title may contain an adjacent occupation label while the actual
     # responsibilities are unmistakably software work (for example FSRA's
     # Full Stack Developer). Responsibilities outrank the adjacent title.
-    if (explicit_software_title or technical_responsibility) and re.search(r"\b(?:full[ -]?stack|software|web|application)\b", title) and technical_responsibility:
+    if explicit_software_title and technical_responsibility:
         return False
     if unrelated_title or (re.search(r"\badministrator\b", title) and not re.search(r"\b(?:cloud|salesforce|systems?|database) administrator\b", title)):
-        if not technical_responsibility:
-            return True
-        if not re.search(r"\b(?:build|develop|implement|code|coding|software|full[ -]?stack|backend|frontend|api)\b", content):
-            return True
+        # An unrelated advertised occupation remains excluded even when its
+        # description contains generic technology language. Only an explicit
+        # software/full-stack title with concrete engineering evidence above
+        # can override the adjacent occupation label.
+        return True
     if re.search(r"\b(?:finance|treasury|hr|human resources|customer success|client success|account executive|benefits|credit risk|wealth advisor|art director)\b", title) and not technical_responsibility:
         return True
     if re.search(r"\bmanager\b", title) and not technical_manager_without_people_scope(job):

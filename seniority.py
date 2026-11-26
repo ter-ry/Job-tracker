@@ -184,7 +184,9 @@ def detect_level(content: str) -> tuple[str, list[str]]:
         ("director", ["director", "head of", "vp engineering"]),
         ("manager", ["engineering manager", "development manager", "manager, software", "people manager"]),
         ("lead", ["lead ", "tech lead", "technical lead", "principal", "staff engineer", "staff software engineer"]),
-        ("senior", ["senior", "sr.", "sr "]),
+        # Providers often omit the period in ``Sr Software Engineer``. This
+        # must be recognized before Roman I/II entry-level signals.
+        ("senior", ["senior", "sr.", "sr"]),
         ("intermediate", ["intermediate", "mid-level", "mid level", "level 2", "engineer ii"]),
         ("junior", ["junior", "jr.", "jr ", "associate", "early career"]),
         ("entry_level", ["entry level", "entry-level", "new grad", "recent graduate", "graduate developer", "software engineer i", "engineer i", "no experience required"]),
