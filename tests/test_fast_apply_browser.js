@@ -29,7 +29,7 @@ async function main() {
     const start = pageNumber * 500;
     const rows = Array.from({ length: Math.max(0, Math.min(500, total - start)) }, (_, index) => ({
       id: start + index + 1,
-      title: `Persisted role ${start + index + 1}`,
+      title: profile === "2" ? `ECE persisted role ${start + index + 1}` : `Persisted role ${start + index + 1}`,
       company: "Fast Apply Fixture",
       location: "Toronto, ON",
       url: `https://example.test/${start + index + 1}`,
@@ -38,6 +38,7 @@ async function main() {
       qualification_fit_seniority: { detected_level: "unknown" },
       experience_requirements: { required: { minimum: 1 } },
       application_priority_score: 70,
+      experience_requirements: { required: { minimum: 0, maximum: 3 }, preferred: { minimum: 4, maximum: 5 } },
     }));
     return route.fulfill({ status: 200, contentType: "application/json", headers: { "X-Job-Tracker-Total": String(total), "X-Job-Tracker-Page": String(pageNumber), "X-Job-Tracker-Page-Size": "500" }, body: JSON.stringify(rows) });
   });
@@ -51,6 +52,12 @@ async function main() {
   });
   await page.waitForFunction(() => state.fastApplyQueue.length === 501);
   assert.match(await page.locator("#fast-apply-current").innerText(), /Persisted role 1/);
+  await page.evaluate(() => { state.selectedCandidateProfileId = "2"; return loadFastApplyQueue(); });
+  await page.waitForFunction(() => state.fastApplyApplicantId === "2" && state.fastApplyQueue.length === 1);
+  assert.match(await page.locator("#fast-apply-current").innerText(), /ECE persisted role 1/);
+  await page.evaluate(() => { state.selectedCandidateProfileId = "1"; return loadFastApplyQueue(); });
+  await page.waitForFunction(() => state.fastApplyApplicantId === "1" && state.fastApplyQueue.length === 501);
+  assert.match(await page.locator("#fast-apply-current").innerText(), /0–3 years/);
   assert.doesNotMatch(await page.locator("#fast-apply-current").innerText(), /profileId is not defined/);
 
   await page.evaluate(async () => {

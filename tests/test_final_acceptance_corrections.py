@@ -339,6 +339,26 @@ def test_ready_to_apply_excludes_applications_but_keeps_seen_unapplied(tmp_path,
     assert counts["ready_to_apply"] == 2
 
 
+def test_saved_vacancy_is_durable_outside_ready_until_explicit_restore(tmp_path, monkeypatch):
+    client = _isolated_client(tmp_path, monkeypatch)
+    swe = _profile(client, "SWE", "software")
+    job_id = _stored_job(client, category="actionable", occupation="software developer")
+    with app_module.app.app_context():
+        app_module.set_applicant_discovery_state(job_id, swe, "saved")
+        app_module.get_db().commit()
+    ready = f"/api/discovery/inbox?candidate_profile_id={swe}&category=ready_to_apply&include_history=1"
+    saved = f"/api/discovery/inbox?candidate_profile_id={swe}&category=saved&include_history=1"
+    assert client.get(ready).get_json() == []
+    assert [row["id"] for row in client.get(saved).get_json()] == [job_id]
+    with app_module.app.app_context():
+        app_module.get_db().close()
+        app_module.g.pop("db", None)
+    assert client.get(ready).get_json() == []
+    restored = client.post(f"/api/discovery/inbox/{job_id}/restore", json={"applicant_profile_id": swe, "workflow": "software"})
+    assert restored.status_code == 200
+    assert [row["id"] for row in client.get(ready).get_json()] == [job_id]
+
+
 def test_current_exclusion_cannot_be_resurrected_by_historical_requalification(tmp_path, monkeypatch):
     client = _isolated_client(tmp_path, monkeypatch)
     swe = _profile(client, "SWE", "software")

@@ -299,6 +299,12 @@ document.addEventListener("DOMContentLoaded", () => {
     if (filter) filter.value = "Applied";
     renderJobs();
   });
+  ["saved", "skipped"].forEach((status) => document.getElementById(`open-${status}-applications`)?.addEventListener("click", () => {
+    document.querySelector('.tab[data-tab="tracker"]')?.click();
+    const filter = document.getElementById("status-filter");
+    if (filter) filter.value = status === "skipped" ? "Skipped" : "Saved";
+    renderJobs();
+  }));
   document.getElementById("open-ready-applications")?.addEventListener("click", () => {
     document.querySelector('.tab[data-tab="discovery"]')?.click();
     state.discoveryInboxCategory = "ready_to_apply";
@@ -1653,7 +1659,9 @@ function renderDiscoveryInbox(jobs) {
       `<button class="button ghost small" type="button" onclick="reassessInboxJob(${job.id})">Reassess now</button>`,
     ].join("") : "";
     const workplaceActions = `${!job.workplace_address && !job.workplace_postal_code ? `<button class="button ghost small" type="button" data-find-workplace-job="${escapeAttribute(job.id)}">Verify workplace</button>` : ""}${renderMapLinks(job)}`;
-    const actions = category === "new_actionable" || category === "ready_to_apply" || category === "review_required" || category === "requalified" || category === "presented" || category === "saved" || category === "applied"
+    const actions = category === "saved"
+      ? `<button class="button ghost small" type="button" onclick="restoreInboxJob(${job.id})">Restore to Ready</button>${workplaceActions}`
+      : category === "new_actionable" || category === "ready_to_apply" || category === "review_required" || category === "requalified" || category === "presented" || category === "applied"
       ? `<button class="button ghost small" type="button" onclick="saveInboxJob(${job.id})">Save</button><button class="button ghost small" type="button" onclick="applyInboxJob(${job.id})">Confirm Applied</button><button class="button ghost small" type="button" onclick="ignoreInboxJob(${job.id})">Skip</button>${workplaceActions}`
       : category === "skipped" ? `<button class="button ghost small" type="button" onclick="restoreInboxJob(${job.id})">Restore</button>${workplaceActions}` : category !== "excluded" ? workplaceActions : "";
     return `<article class="inbox-row"><label><input type="checkbox" data-inbox-select="${job.id}" ${state.discoveryInboxSelected.has(Number(job.id)) ? "checked" : ""}> Select</label><div><span class="inbox-badge">${escapeHtml(label)}</span><strong>${escapeHtml(job.title || "Untitled role")}</strong><span>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(resultWorkplaceLabel(job))}</span><span class="muted">${escapeHtml(job.work_arrangement || job.remote_type || "Unknown arrangement")} · ${escapeHtml(displaySalary(job))} · ${escapeHtml(resultDistanceLabel(job))}</span>${renderExperienceSummary(job)}<details><summary>${category === "excluded" ? "Exclusion evidence" : "Requirements and source evidence"}</summary><span class="muted">Decision: ${escapeHtml(job.discovery_result_category || category)} · Reason: ${escapeHtml(job.discovery_result_reason || "Unverified/missing")} · Source: ${escapeHtml(job.source || membership.source || "Unverified/missing")} · Evidence: ${escapeHtml(job.qualification_evidence_source || membership.qualification_evidence_source || "Unverified/missing")} · Confidence: ${escapeHtml(job.qualification_evidence_confidence || membership.qualification_evidence_confidence || "Unverified/missing")}</span>${evidenceText}${membership.required_experience ? `<p class="muted">Required experience evidence: ${escapeHtml(JSON.stringify(membership.required_experience))}</p>` : ""}${sourceLink}</details>${audit}</div><div class="row-actions">${actions}${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open Original</a>` : ""}</div></article>`;
@@ -2019,7 +2027,16 @@ async function selectCandidateProfile(profileId) {
   clearVisibleDiscoveryResults();
   renderCandidateProfiles();
   await renderCandidateProfileDocuments();
-  await loadDiscoveryInbox(true);
+  const activeWorkspace = document.querySelector(".tab.active")?.dataset.workspace || "discover";
+  if (activeWorkspace === "fastapply") {
+    const panel = document.getElementById("fast-apply-panel");
+    if (panel) panel.hidden = false;
+    await loadFastApplyQueue();
+  } else if (activeWorkspace === "applications") {
+    await loadAll({ skipProfiles: true });
+  } else {
+    await loadDiscoveryInbox(true);
+  }
 }
 
 async function renderCandidateProfileDocuments() {
@@ -2087,6 +2104,9 @@ function switchTab(event) {
       loadFastApplyQueue();
     }
     if (workspace === "inbox") loadDiscoveryInbox(true);
+  } else if (workspace === "applications" && !value("status-filter")) {
+    setValue("status-filter", "Applied");
+    renderJobs();
   }
 }
 
@@ -4147,6 +4167,11 @@ function invalidateApplicantContext() {
   state.generationSelections = {};
   state.shortlistRegenerations = {};
   invalidateFastApplyQueue();
+  const fastApplyTarget = document.getElementById("fast-apply-current");
+  if (fastApplyTarget) {
+    fastApplyTarget.classList.add("empty");
+    fastApplyTarget.textContent = "Loading the selected applicant's queue…";
+  }
   clearVisibleDiscoveryResults();
   const inbox = document.getElementById("discovery-inbox");
   if (inbox) inbox.textContent = "Loading this applicant's Inbox…";
@@ -4216,18 +4241,21 @@ function renderFastApply() {
   if (!job) { target.innerHTML = `<p>${state.fastApplyInitialTotal ? "Fast Apply queue completed." : "No eligible opportunities remain for this applicant."}</p><p class="muted">Initial eligible queue: ${state.fastApplyInitialTotal} · Processed: ${state.fastApplyInitialTotal - queue.length} · Remaining: 0</p>`; return; }
   const key = escapeAttribute(String(job.id));
   const url = job.application_url || job.url || "";
-  const seniority = job.qualification_fit_seniority?.detected_level || job.seniority_level || "Unknown";
+  const seniority = readableSeniority(job.qualification_fit_seniority?.detected_level || job.seniority_level);
   const experience = job.experience_requirements || {};
   const technical = job.technical_compatibility || {};
   const queueApplicantId = String(state.fastApplyApplicantId || "");
   const queueLoadToken = state.fastApplyLoadToken;
   const isEce = String(state.fastApplyWorkflow || "").toLowerCase() === "ece";
   const employment = readableEmploymentStatus(job.discovery_employment_status || job.employment_type);
-  const registration = job.registration_requirements || job.qualification_requirements || "";
-  const registrationMarkup = registration ? ` · <strong>Registration:</strong> ${escapeHtml(String(registration))}` : "";
+  const registrationRaw = job.registration_requirements || job.qualification_requirements || "";
+  const registration = Array.isArray(registrationRaw) ? registrationRaw.filter((item) => String(item || "").trim()).join(", ") : String(registrationRaw || "").trim();
+  const registrationMarkup = registration ? ` · <strong>Registration:</strong> ${escapeHtml(registration)}` : "";
+  const requiredExperience = formatExperienceRange(experience.required);
+  const preferredExperience = formatExperienceRange(experience.preferred);
   const relevance = isEce
     ? `<p><strong>Employment:</strong> ${escapeHtml(employment)}${registrationMarkup}</p><p>${escapeHtml((job.discovery_result_reason || job.discovery_employment_evidence || "Educator opportunity retained under the ECE policy.").toString())}</p>`
-    : `<p><strong>Detected seniority:</strong> ${escapeHtml(seniority)} · <strong>Required experience:</strong> ${escapeHtml(JSON.stringify(experience.required || "Not stated"))} · <strong>Preferred:</strong> ${escapeHtml(JSON.stringify(experience.preferred || "Not stated"))}</p><p><strong>Technical compatibility:</strong> ${escapeHtml(job.qualification_fit_label || "Not fully assessed")} · <strong>Application priority:</strong> ${Number(job.application_priority_score || 0)}/100</p><p>${escapeHtml((job.application_priority_reasons || []).join(" ") || "Priority uses applicant-aware relevance, seniority, experience, technical compatibility and evidence.")}</p><details><summary>Relevant verified skills and missing requirements</summary><p><strong>Verified:</strong> ${escapeHtml((technical.matched || job.qualification_fit_matched_requirements || []).join(", ") || "Not available")}</p><p><strong>Missing / review:</strong> ${escapeHtml((technical.missing || job.qualification_fit_missing_requirements || []).join(", ") || "None recorded")}</p><p><strong>Requirements:</strong> ${escapeHtml((job.qualification_requirements || job.required_skills || "Not fully assessed from the posting.").toString())}</p></details>`;
+    : `<p><strong>Detected seniority:</strong> ${escapeHtml(seniority)} · <strong>Required experience:</strong> ${escapeHtml(requiredExperience)} · <strong>Preferred:</strong> ${escapeHtml(preferredExperience)}</p><p><strong>Technical compatibility:</strong> ${escapeHtml(job.qualification_fit_label || "Not fully assessed")} · <strong>Application priority:</strong> ${Number(job.application_priority_score || 0)}/100</p><p>${escapeHtml((job.application_priority_reasons || []).join(" ") || "Priority uses applicant-aware relevance, seniority, experience, technical compatibility and evidence.")}</p><details><summary>Relevant verified skills and missing requirements</summary><p><strong>Verified:</strong> ${escapeHtml((technical.matched || job.qualification_fit_matched_requirements || []).join(", ") || "Not available")}</p><p><strong>Missing / review:</strong> ${escapeHtml((technical.missing || job.qualification_fit_missing_requirements || []).join(", ") || "None recorded")}</p><p><strong>Requirements:</strong> ${escapeHtml((job.qualification_requirements || job.required_skills || "Not fully assessed from the posting.").toString())}</p></details>`;
   const actionDisabled = state.fastApplyPendingAction ? "disabled" : "";
   const queueApplicant = state.candidateProfiles.find((profile) => String(profile.id) === String(queueApplicantId));
   const queueApplicantLabel = queueApplicant?.name || queueApplicant?.display_name || `Profile ${queueApplicantId}`;
@@ -4628,6 +4656,12 @@ function formatExperienceRange(range) {
   const maximum = range.maximum === undefined || range.maximum === null ? null : Number(range.maximum);
   if (maximum !== null && maximum !== minimum) return `${minimum}–${maximum}${/(?:\+|\\\+)/.test(String(range.text || "")) ? "+" : ""} years`;
   return `${minimum}+ years`;
+}
+
+function readableSeniority(value) {
+  const labels = { entry_level: "Entry-level", junior: "Junior", intermediate: "Intermediate", senior: "Senior", lead: "Lead", manager: "Manager", director: "Director", internship: "Internship", unknown: "Unknown" };
+  const key = String(value || "unknown").toLowerCase().replaceAll("-", "_");
+  return labels[key] || String(value || "Unknown");
 }
 
 function renderExperienceSummary(job) {

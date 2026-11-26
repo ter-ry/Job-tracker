@@ -1610,8 +1610,11 @@ def create_app() -> Flask:
 
     @app.get("/api/jobs")
     def list_jobs() -> Response:
-        rows = query_db("SELECT * FROM jobs ORDER BY date_added DESC, id DESC")
         selected_applicant_id = applicant_profile_id(request.args)
+        # Canonical children remain available through audit/reconciliation
+        # views, but ordinary user-facing job/application lists show one
+        # vacancy identity only.
+        rows = query_db("SELECT * FROM jobs WHERE canonical_job_id IN (0, '') ORDER BY date_added DESC, id DESC")
         evidence_profile = None
         if request.args.get("candidate_profile_id"):
             try:
@@ -3058,7 +3061,7 @@ def create_app() -> Flask:
             # queue; otherwise a later exclusion can be resurrected here.
             query += " AND discovery_result_category = 'actionable'"
             query += " AND status NOT IN ('Applied', 'shortlisted')"
-            query += " AND NOT EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = jobs.id AND s.applicant_profile_id = ? AND s.state IN ('applied', 'skipped', 'ignored'))"
+            query += " AND NOT EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = jobs.id AND s.applicant_profile_id = ? AND s.state IN ('saved', 'applied', 'skipped', 'ignored'))"
             query_args.append(applicant_id)
             query += " AND NOT EXISTS (SELECT 1 FROM discovery_applicant_duplicate_matches d WHERE d.existing_job_id = jobs.id AND d.applicant_profile_id = ? AND d.status = 'pending')"
             query_args.append(applicant_id)
@@ -3304,7 +3307,7 @@ def create_app() -> Flask:
                 counts["all_relevant"] += 1
             globally_applied = text(row["status"]) in {"Applied", "shortlisted"}
             if category == "actionable" and not globally_applied and not presented and not state and not pending_duplicate: counts["new_actionable"] += 1
-            if category == "actionable" and not globally_applied and state not in {"applied", "skipped", "ignored"} and not pending_duplicate: counts["ready_to_apply"] += 1
+            if category == "actionable" and not globally_applied and state not in {"saved", "applied", "skipped", "ignored"} and not pending_duplicate: counts["ready_to_apply"] += 1
             if category == "review_required" or state == "reviewed": counts["review_required"] += 1
             elif category == "excluded": counts["excluded"] += 1
         return jsonify(counts)
@@ -14592,7 +14595,16 @@ def job_to_dict(
     data["qualification_fit_seniority"] = parse_json_object(data.get("qualification_fit_seniority"))
     if text(data.get("discovery_location_scope")) and normalize_space(text(data.get("discovery_remote_preference"))).lower() != "remote":
         data["location_search_eligible"] = not outside_requested_location(data, text(data.get("discovery_location_scope")))
-    data["discovery_result_category"], data["discovery_result_reason"] = discovery_result_category(data, text(data.get("discovery_remote_preference")))
+    stored_category = text(data.get("discovery_result_category"))
+    stored_reason = text(data.get("discovery_result_reason"))
+    if not stored_category:
+        data["discovery_result_category"], data["discovery_result_reason"] = discovery_result_category(data, text(data.get("discovery_remote_preference")))
+    else:
+        # Persisted historical reassessment is the current source of truth.
+        # Re-running the classifier here can apply obsolete search policy and
+        # replace an owner-confirmed ECE/SWE reason during response hydration.
+        data["discovery_result_category"] = stored_category
+        data["discovery_result_reason"] = stored_reason
     data["recommendation_eligible"] = data["discovery_result_category"] == "actionable"
     data["score_breakdown"] = parse_json_object(data.get("score_breakdown"))
     for field in ("qualification_fit_matched_requirements", "qualification_fit_missing_requirements", "qualification_fit_partial_requirements", "warnings"):

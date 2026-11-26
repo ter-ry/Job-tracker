@@ -18,7 +18,7 @@ async function main() {
   await page.route("**/api/discovery/inbox**", (route) => {
     const url = new URL(route.request().url());
     if (url.pathname.endsWith("/counts")) return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ready_to_apply: 1, new_actionable: 1 }) });
-    return route.fulfill({ status: 200, contentType: "application/json", headers: { "X-Job-Tracker-Total": "1", "X-Job-Tracker-Page-Size": "50" }, body: JSON.stringify([{ id: 1, title: "RECE Educator", company: "Fixture Centre", discovery_inbox_category: "ready_to_apply", discovery_result_category: "actionable", discovery_employment_status: "Full-time", registration_requirements: "RECE preferred" }]) });
+    return route.fulfill({ status: 200, contentType: "application/json", headers: { "X-Job-Tracker-Total": "1", "X-Job-Tracker-Page-Size": "50" }, body: JSON.stringify([{ id: 1, title: "RECE Educator", company: "Fixture Centre", discovery_inbox_category: "ready_to_apply", discovery_result_category: "actionable", discovery_result_reason: "Persisted ECE reassessment: full-time educator retained.", discovery_employment_status: "Full-time", registration_requirements: [] }]) });
   });
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
   await page.waitForFunction(() => state.candidateProfiles.length === 2);
@@ -57,6 +57,9 @@ async function main() {
   assert.strictEqual(await page.locator("#discovery-enrich-workplaces").count(), 0);
   await page.getByRole("button", { name: "Discover", exact: true }).click();
   assert.strictEqual(await page.locator("#discovery-advanced-settings").isVisible(), false);
+  await page.getByRole("button", { name: "Fast Apply", exact: true }).click();
+  await page.waitForTimeout(100);
+  assert.match(await page.locator("#fast-apply-current").innerText(), /Persisted ECE reassessment|No eligible/);
   await page.setViewportSize({ width: 1920, height: 1080 });
   await page.screenshot({ path: `${outputDir}/owner-acceptance-ece-1920.png`, fullPage: true });
 

@@ -314,6 +314,10 @@ def test_selective_strong_only_reconciliation_leaves_uncertain_group_and_decisio
         assert app_module.query_db("SELECT canonical_job_id FROM jobs WHERE id = ?", [uncertain["job_ids"][1]], one=True)["canonical_job_id"] == 0
         assert app_module.query_db("SELECT state FROM discovery_applicant_states WHERE job_id = ? AND applicant_profile_id = ?", [strong_left, profile], one=True)["state"] == "saved"
         assert app_module.query_db("SELECT state FROM discovery_applicant_states WHERE job_id = ? AND applicant_profile_id = ?", [uncertain_left, profile], one=True)["state"] == "skipped"
+    listed = client.get(f"/api/jobs?candidate_profile_id={profile}").get_json()
+    listed_ids = {int(item["id"]) for item in listed}
+    assert strong_left in listed_ids and strong_right not in listed_ids
+    assert uncertain_left in listed_ids and uncertain_right in listed_ids
 
 
 def test_uncertain_pairs_collect_decision_conflicts_and_never_downgrade_applied(tmp_path, monkeypatch):
