@@ -55,8 +55,10 @@ const state = {
   fastApplyLoadToken: 0,
   fastApplyInitialTotal: 0,
   fastApplyProcessedCount: 0,
-  fastApplyPrefetchedQueue: [],
   fastApplyPendingAction: false,
+  applicationsHistoryPage: 0,
+  applicationsHistoryPageSize: 50,
+  applicationsHistoryTotal: 0,
   advancedFeatures: (() => { try { return localStorage.getItem("jobTracker.advancedFeatures") === "true"; } catch (_) { return false; } })(),
   pendingAppliedJobs: new Set(),
   tailoring: { draftId: null, jobId: null, profileId: null, resumeId: null, data: null, selectedParagraph: null, selectedKeyword: null, aiImproveJobId: null },
@@ -298,19 +300,19 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("open-all-processed-applications")?.addEventListener("click", () => {
     document.querySelector('.tab[data-tab="tracker"]')?.click();
     setValue("status-filter", "");
-    void loadApplicationsHistory();
+    void loadApplicationsHistory({ page: 0 });
   });
   document.getElementById("open-applied-applications")?.addEventListener("click", () => {
     document.querySelector('.tab[data-tab="tracker"]')?.click();
     const filter = document.getElementById("status-filter");
     if (filter) filter.value = "Applied";
-    renderJobs();
+    void loadApplicationsHistory({ page: 0 });
   });
   ["saved", "skipped"].forEach((status) => document.getElementById(`open-${status}-applications`)?.addEventListener("click", () => {
     document.querySelector('.tab[data-tab="tracker"]')?.click();
     const filter = document.getElementById("status-filter");
     if (filter) filter.value = status === "skipped" ? "Skipped" : "Saved";
-    renderJobs();
+    void loadApplicationsHistory({ page: 0 });
   }));
   document.getElementById("open-ready-applications")?.addEventListener("click", () => {
     document.querySelector('.tab[data-tab="discovery"]')?.click();
@@ -361,6 +363,9 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("copy-output").addEventListener("click", copyOutput);
   document.getElementById("extract-description").addEventListener("click", extractDescription);
   document.getElementById("extract-url").addEventListener("click", extractUrl);
+  document.getElementById("edit-job-dialog-form")?.addEventListener("submit", saveEditDialog);
+  document.getElementById("copy-follow-up-dialog")?.addEventListener("click", () => copyElement("follow-up-dialog-message"));
+  document.querySelectorAll("[data-close-dialog]").forEach((button) => button.addEventListener("click", () => document.getElementById(button.dataset.closeDialog)?.close()));
   document.getElementById("profile-test-location").addEventListener("click", testAndSaveLocation);
   document.getElementById("resume-upload").addEventListener("change", uploadResume);
   document.getElementById("cover-letter-template-upload").addEventListener("change", uploadCoverLetterTemplate);
@@ -377,10 +382,12 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("fast-apply-open")?.addEventListener("click", openFastApply);
   document.getElementById("fast-apply-close")?.addEventListener("click", () => { document.querySelector('.primary-nav [data-workspace="discover"]')?.click(); });
   applyAdvancedFeaturesVisibility();
-  ["search", "status-filter", "fit-filter", "role-filter", "remote-filter", "risk-filter", "sort-by"].forEach((id) => {
-    document.getElementById(id)?.addEventListener("input", renderJobs);
-    document.getElementById(id)?.addEventListener("change", renderJobs);
+  ["search", "status-filter", "sort-by"].forEach((id) => {
+    document.getElementById(id)?.addEventListener("input", () => refreshApplicationsHistory());
+    document.getElementById(id)?.addEventListener("change", () => refreshApplicationsHistory());
   });
+  document.getElementById("applications-previous")?.addEventListener("click", () => loadApplicationsHistory({ page: Math.max(0, state.applicationsHistoryPage - 1) }));
+  document.getElementById("applications-next")?.addEventListener("click", () => loadApplicationsHistory({ page: state.applicationsHistoryPage + 1 }));
   [
     "discovery-sort-mode",
     "discovery-date-window",
@@ -418,7 +425,7 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   applyDiscoverySearchDefaults();
   setDiscoveryControlsEnabled(false);
-  loadAll();
+  loadAll({ lightweight: true });
   loadSavedSearches();
   loadDiscoveryScheduler();
   loadDiscoveryTaskStatus();
@@ -513,13 +520,13 @@ function setDiscoverySection(view) {
   if (selected === "inbox") loadDiscoveryInbox(true);
 }
 
-async function loadAll({ skipProfiles = false } = {}) {
+async function loadAll({ skipProfiles = false, lightweight = false } = {}) {
   const loadToken = ++state.loadToken;
   const loadStart = performance.now();
   performance.mark("job-tracker-loadAll-start");
   try {
-    const profilesPromise = skipProfiles ? Promise.resolve(false) : loadCandidateProfiles({ reloadPanelsOnSelectionChange: true });
-    const profileQuery = state.selectedCandidateProfileId ? `?candidate_profile_id=${encodeURIComponent(state.selectedCandidateProfileId)}` : "";
+    const profilesPromise = skipProfiles ? Promise.resolve(false) : loadCandidateProfiles({ reloadPanelsOnSelectionChange: !lightweight });
+    const profileQuery = state.selectedCandidateProfileId ? `?candidate_profile_id=${encodeURIComponent(state.selectedCandidateProfileId)}${lightweight ? "&lightweight=1" : ""}` : (lightweight ? "?lightweight=1" : "");
     const [jobs, dashboard, profile, systemHealth, evidence] = await Promise.all([
       api.get(`/api/jobs${profileQuery}`),
       api.get(`/api/dashboard${profileQuery}`),
@@ -2043,7 +2050,7 @@ async function selectCandidateProfile(profileId) {
   } else if (activeWorkspace === "applications") {
     // Applications is applicant-scoped and paginated; do not initialize the
     // discovery, inbox, and profile workspaces just to refresh this table.
-    await loadApplicationsHistory();
+    await loadApplicationsHistory({ page: 0 });
   } else {
     await loadDiscoveryInbox(true);
   }
@@ -2116,7 +2123,7 @@ function switchTab(event) {
     if (workspace === "inbox") loadDiscoveryInbox(true);
   } else if (workspace === "applications") {
     setValue("status-filter", "");
-    void loadApplicationsHistory();
+    void loadApplicationsHistory({ page: 0 });
   }
 }
 
@@ -2616,20 +2623,43 @@ function renderEvidenceLibrary(items) {
   `;
 }
 
-async function loadApplicationsHistory() {
+function applicationsWorkspaceActive() {
+  return document.querySelector('.tab.active')?.dataset.workspace === "applications";
+}
+
+function refreshApplicationsHistory() {
+  if (applicationsWorkspaceActive()) void loadApplicationsHistory({ page: 0 });
+  else renderJobs();
+}
+
+async function loadApplicationsHistory({ page = state.applicationsHistoryPage || 0 } = {}) {
   const tbody = document.getElementById("jobs-table");
   const profileId = String(state.selectedCandidateProfileId || "");
   if (!tbody || !profileId) return;
+  const category = value("status-filter").toLowerCase();
+  const query = value("search").trim();
+  const sort = value("sort-by") || "date";
+  const pageSize = state.applicationsHistoryPageSize || 50;
   tbody.innerHTML = '<tr><td colspan="7" class="muted">Loading this applicant\'s processed applications…</td></tr>';
   try {
-    const response = await api.getWithMeta(`/api/jobs?candidate_profile_id=${encodeURIComponent(profileId)}&application_history=1&lightweight=1&page=0&page_size=50`);
+    const params = new URLSearchParams({ candidate_profile_id: profileId, application_history: "1", lightweight: "1", page: String(Math.max(0, page)), page_size: String(pageSize), history_category: category, history_q: query, history_sort: sort });
+    const response = await api.getWithMeta(`/api/jobs?${params.toString()}`);
     if (profileId !== String(state.selectedCandidateProfileId || "")) return;
+    state.applicationsHistoryPage = response.page;
+    state.applicationsHistoryPageSize = response.pageSize || pageSize;
+    state.applicationsHistoryTotal = response.total || 0;
     state.jobs = Array.isArray(response.data) ? response.data : [];
-    state.applicationsHistoryTotal = response.total || state.jobs.length;
     const counts = await api.get(`/api/discovery/inbox/counts?candidate_profile_id=${encodeURIComponent(profileId)}`);
     setText("applications-applied-count", counts.applied ?? 0);
     setText("applications-saved-count", counts.saved ?? 0);
     setText("applications-skipped-count", counts.skipped ?? 0);
+    const first = state.applicationsHistoryTotal ? state.applicationsHistoryPage * state.applicationsHistoryPageSize + 1 : 0;
+    const last = Math.min(state.applicationsHistoryTotal, (state.applicationsHistoryPage + 1) * state.applicationsHistoryPageSize);
+    setText("applications-page-status", state.applicationsHistoryTotal ? `${first}–${last} of ${state.applicationsHistoryTotal}` : "0 records");
+    const previous = document.getElementById("applications-previous");
+    const next = document.getElementById("applications-next");
+    if (previous) previous.disabled = state.applicationsHistoryPage <= 0;
+    if (next) next.disabled = last >= state.applicationsHistoryTotal;
     renderJobs();
   } catch (error) {
     tbody.innerHTML = `<tr><td colspan="7" class="risk high">Unable to load application history: ${escapeHtml(error.message || "unknown error")}</td></tr>`;
@@ -2652,7 +2682,10 @@ function renderJobs() {
     );
   });
 
-  jobs = sortJobs(jobs, sortBy);
+  // Application history is already filtered and sorted across the complete
+  // applicant-scoped relation by the server. Local sorting would only reorder
+  // the current page and make pagination appear inconsistent.
+  if (!applicationsWorkspaceActive()) jobs = sortJobs(jobs, sortBy);
 
   if (!jobs.length) {
     tbody.innerHTML = `<tr><td colspan="7" class="muted">No processed applications match this view.</td></tr>`;
@@ -3192,7 +3225,36 @@ function renderScore(job) {
 
 function editJob(id) {
   const job = state.jobs.find((item) => item.id === id);
-  if (job) fillJobForm(job);
+  if (!job) return;
+  setValue("edit-dialog-job-id", job.id);
+  setValue("edit-dialog-company", job.company || "");
+  setValue("edit-dialog-title", job.title || "");
+  setValue("edit-dialog-status", job.status || "Discovered");
+  setValue("edit-dialog-date-applied", job.date_applied || "");
+  setValue("edit-dialog-notes", job.notes || "");
+  const error = document.getElementById("edit-dialog-error");
+  if (error) { error.hidden = true; error.textContent = ""; }
+  document.getElementById("edit-job-dialog")?.showModal();
+}
+
+async function saveEditDialog(event) {
+  event.preventDefault();
+  const id = value("edit-dialog-job-id");
+  if (!id) return;
+  const error = document.getElementById("edit-dialog-error");
+  try {
+    await api.send(`/api/jobs/${id}`, "PUT", {
+      company: value("edit-dialog-company"), title: value("edit-dialog-title"),
+      status: value("edit-dialog-status"), date_applied: value("edit-dialog-date-applied"),
+      notes: value("edit-dialog-notes"), candidate_profile_id: state.selectedCandidateProfileId || "",
+    });
+    document.getElementById("edit-job-dialog")?.close();
+    if (applicationsWorkspaceActive()) await loadApplicationsHistory({ page: state.applicationsHistoryPage });
+    else renderJobs();
+    toast("Vacancy updated");
+  } catch (requestError) {
+    if (error) { error.hidden = false; error.textContent = requestError.message || "Could not update vacancy."; }
+  }
 }
 
 async function followUp(id) {
@@ -3201,18 +3263,8 @@ async function followUp(id) {
   try {
     const result = await api.send("/api/follow-up", "POST", job);
     state.generatedText = result.message;
-    document.getElementById("generated-output").classList.remove("empty");
-    document.getElementById("generated-output").innerHTML = `
-      <section>
-        <h3>Follow-up message</h3>
-        <textarea id="follow-up-edit" rows="9">${escapeHtml(result.message)}</textarea>
-        <div class="actions compact">
-          <button class="button small ghost" type="button" onclick="copyElement('follow-up-edit')">Copy follow-up</button>
-        </div>
-      </section>
-    `;
-    document.querySelector('[data-tab="tracker"]').click();
-    window.scrollTo({ top: 0, behavior: "smooth" });
+    setValue("follow-up-dialog-message", result.message || "");
+    document.getElementById("follow-up-dialog")?.showModal();
   } catch (error) {
     toast(error.message);
   }
@@ -4229,7 +4281,6 @@ async function loadFastApplyQueue({ append = false } = {}) {
     state.fastApplyIndex = 0;
     state.fastApplyInitialTotal = 0;
     state.fastApplyProcessedCount = 0;
-    state.fastApplyPrefetchedQueue = [];
   }
   renderFastApply();
   try {
@@ -4241,7 +4292,6 @@ async function loadFastApplyQueue({ append = false } = {}) {
     state.fastApplyQueue = records;
     state.fastApplyIndex = 0;
     state.fastApplyStatus = "ready";
-    if (!append && (response.total || 0) > pageSize) void prefetchFastApplyBatch(profileId, loadToken);
   } catch (error) {
     if (loadToken !== state.fastApplyLoadToken) return;
     state.fastApplyQueue = [];
@@ -4249,16 +4299,6 @@ async function loadFastApplyQueue({ append = false } = {}) {
     state.fastApplyError = error.message || "Unable to load the persistent application queue.";
   }
   renderFastApply();
-}
-
-async function prefetchFastApplyBatch(profileId, loadToken) {
-  try {
-    const response = await api.getWithMeta(discoveryInboxRequestUrl({ profileId, category: "ready_to_apply", page: 1, pageSize: 10, lightweight: 1 }));
-    if (loadToken !== state.fastApplyLoadToken || profileId !== String(state.selectedCandidateProfileId || "")) return;
-    state.fastApplyPrefetchedQueue = Array.isArray(response.data) ? response.data : [];
-  } catch (_) {
-    state.fastApplyPrefetchedQueue = [];
-  }
 }
 
 function renderFastApply() {
@@ -4310,14 +4350,9 @@ function renderFastApply() {
       state.fastApplyProcessedCount += 1;
       await syncFastApplyCounters();
       if (!state.fastApplyQueue.length) {
-        if (state.fastApplyPrefetchedQueue.length) {
-          state.fastApplyQueue = state.fastApplyPrefetchedQueue.splice(0);
-          state.fastApplyIndex = 0;
-          renderFastApply();
-          void prefetchFastApplyBatch(String(state.fastApplyApplicantId || state.selectedCandidateProfileId || ""), state.fastApplyLoadToken);
-        } else {
-          await loadFastApplyQueue({ append: true });
-        }
+        // Requery page 0 after every bounded batch. Decisions shrink the
+        // eligible relation, so offset-prefetched pages are never trusted.
+        await loadFastApplyQueue({ append: true });
       }
       state.fastApplyPendingAction = false;
       renderFastApply();

@@ -503,7 +503,32 @@
               <tbody id="jobs-table"></tbody>
             </table>
           </div>
+          <div class="actions compact applications-pagination" aria-label="Applications pagination">
+            <button class="button ghost small" type="button" id="applications-previous" disabled>Previous</button>
+            <span class="muted" id="applications-page-status">0 records</span>
+            <button class="button ghost small" type="button" id="applications-next" disabled>Next</button>
+          </div>
         </section>
+        <dialog id="edit-job-dialog" aria-labelledby="edit-job-dialog-title">
+          <form method="dialog" id="edit-job-dialog-form" class="compact-dialog-form">
+            <h3 id="edit-job-dialog-title">Edit vacancy</h3>
+            <input type="hidden" id="edit-dialog-job-id">
+            <label>Company<input id="edit-dialog-company" required></label>
+            <label>Job title<input id="edit-dialog-title" required></label>
+            <label>Status<select id="edit-dialog-status"><option>Discovered</option><option>Saved</option><option>shortlisted</option><option>Applied</option><option>Interview</option><option>Offer</option><option>Rejected</option><option>Archived</option></select></label>
+            <label>Application date<input id="edit-dialog-date-applied" type="date"></label>
+            <label>Notes<textarea id="edit-dialog-notes" rows="4"></textarea></label>
+            <p id="edit-dialog-error" class="risk high" role="alert" hidden></p>
+            <div class="actions compact"><button class="button ghost" type="button" data-close-dialog="edit-job-dialog">Cancel</button><button class="button" type="submit">Save changes</button></div>
+          </form>
+        </dialog>
+        <dialog id="follow-up-dialog" aria-labelledby="follow-up-dialog-title">
+          <form method="dialog" class="compact-dialog-form">
+            <h3 id="follow-up-dialog-title">Follow-up message</h3>
+            <textarea id="follow-up-dialog-message" rows="10"></textarea>
+            <div class="actions compact"><button class="button ghost" type="button" data-close-dialog="follow-up-dialog">Close</button><button class="button" type="button" id="copy-follow-up-dialog">Copy follow-up</button></div>
+          </form>
+        </dialog>
       </section>
 
       <section id="profile" class="tab-panel">

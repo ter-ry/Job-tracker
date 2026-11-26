@@ -113,3 +113,40 @@ def test_applications_history_is_applicant_scoped_and_paginated_for_10000_record
     assert len(response.get_json()) == 50
     assert response.headers["X-Job-Tracker-Total"] == "10000"
     assert elapsed < 2.0
+
+
+def test_applications_history_filters_searches_and_sorts_server_side(tmp_path, monkeypatch):
+    monkeypatch.setattr(app_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(app_module, "DB_PATH", tmp_path / "history-filters.sqlite")
+    monkeypatch.setattr(app_module, "_INITIALIZED_DATABASE_PATH", None)
+    client = app_module.app.test_client()
+    client.get("/api/health")
+    profile = client.post("/api/candidate-profiles", json={"name": "History filters", "workflow": "software"}).get_json()
+    with app_module.app.app_context():
+        db = app_module.get_db()
+        jobs = []
+        for index, company, title, salary in [
+            (1, "Zeta", "Applied Engineer", "$70,000"),
+            (2, "Alpha", "Saved Engineer", "$120,000"),
+            (3, "Beta", "Skipped Analyst", "$80,000"),
+        ]:
+            cursor = db.execute(
+                """INSERT INTO jobs(company, title, location, url, source, source_job_id,
+                   discovery_first_seen_at, discovery_result_category, canonical_job_id, salary)
+                   VALUES (?, ?, 'Toronto, ON', ?, 'fixture', ?, '2026-11-25T00:00:00', 'actionable', 0, ?)""",
+                (company, title, f"https://history-filter/{index}", f"hf-{index}", salary),
+            )
+            jobs.append(cursor.lastrowid)
+        db.executemany(
+            "INSERT INTO discovery_applicant_states(job_id, applicant_profile_id, state, updated_at) VALUES (?, ?, ?, '2026-11-25T00:00:00')",
+            [(jobs[0], profile["id"], "applied"), (jobs[1], profile["id"], "saved"), (jobs[2], profile["id"], "skipped")],
+        )
+        db.commit()
+    base = f"/api/jobs?candidate_profile_id={profile['id']}&application_history=1&lightweight=1&page_size=1"
+    response = client.get(base + "&history_category=saved&history_sort=salary")
+    assert response.status_code == 200
+    assert response.headers["X-Job-Tracker-Total"] == "1"
+    assert response.get_json()[0]["company"] == "Alpha"
+    response = client.get(base + "&history_q=Analyst&history_category=skipped")
+    assert response.status_code == 200
+    assert response.get_json()[0]["title"] == "Skipped Analyst"

@@ -52,7 +52,6 @@ async function main() {
     openFastApply();
   });
   await page.waitForFunction(() => state.fastApplyQueue.length === 10 && state.fastApplyInitialTotal === 501);
-  await page.waitForFunction(() => state.fastApplyPrefetchedQueue.length === 10);
   assert.match(await page.locator("#fast-apply-current").innerText(), /Persisted role 1/);
   await page.evaluate(() => { state.selectedCandidateProfileId = "2"; return loadFastApplyQueue(); });
   await page.waitForFunction(() => state.fastApplyApplicantId === "2" && state.fastApplyQueue.length === 1);

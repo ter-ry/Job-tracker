@@ -1613,6 +1613,9 @@ def create_app() -> Flask:
         selected_applicant_id = applicant_profile_id(request.args)
         application_history = as_bool(request.args.get("application_history"))
         lightweight = as_bool(request.args.get("lightweight"))
+        history_category = text(request.args.get("history_category")).lower()
+        history_query = normalize_space(text(request.args.get("history_q")))
+        history_sort = text(request.args.get("history_sort") or "date").lower()
         if application_history and not selected_applicant_id:
             return jsonify({"error": "candidate_profile_id is required for application history."}), 400
         # Canonical children remain available through audit/reconciliation
@@ -1621,14 +1624,33 @@ def create_app() -> Flask:
         history_where = ""
         history_args: list[Any] = []
         if application_history:
-            history_where = " AND EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = jobs.id AND s.applicant_profile_id = ? AND s.state IN ('applied', 'saved', 'skipped', 'ignored'))"
-            history_args.append(selected_applicant_id)
+            category_states = {
+                "applied": ("applied",),
+                "saved": ("saved",),
+                "skipped": ("skipped", "ignored"),
+            }
+            states = category_states.get(history_category, ("applied", "saved", "skipped", "ignored"))
+            placeholders = ",".join("?" for _ in states)
+            history_where = f" AND EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = jobs.id AND s.applicant_profile_id = ? AND s.state IN ({placeholders}))"
+            history_args.extend([selected_applicant_id, *states])
+            if history_query:
+                pattern = f"%{history_query}%"
+                history_where += " AND (jobs.company LIKE ? OR jobs.title LIKE ? OR jobs.location LIKE ? OR jobs.notes LIKE ? OR jobs.required_skills LIKE ?)"
+                history_args.extend([pattern] * 5)
         base_query = "SELECT * FROM jobs WHERE canonical_job_id IN (0, '')" + history_where
         if application_history:
             total = query_db("SELECT COUNT(*) AS total FROM jobs WHERE canonical_job_id IN (0, '')" + history_where, history_args, one=True)
             page_size = clamp_int_default(request.args.get("page_size"), 50, 1, 100)
             page = clamp_int_default(request.args.get("page"), 0, 0, 100000)
-            rows = query_db(base_query + " ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?", [*history_args, page_size, page * page_size])
+            sort_columns = {
+                "date": "updated_at DESC, id DESC",
+                "salary": "salary DESC, updated_at DESC, id DESC",
+                "location": "location COLLATE NOCASE ASC, updated_at DESC, id DESC",
+                "company": "company COLLATE NOCASE ASC, title COLLATE NOCASE ASC, id DESC",
+                "title": "title COLLATE NOCASE ASC, company COLLATE NOCASE ASC, id DESC",
+            }
+            order_by = sort_columns.get(history_sort, sort_columns["date"])
+            rows = query_db(base_query + f" ORDER BY {order_by} LIMIT ? OFFSET ?", [*history_args, page_size, page * page_size])
         else:
             total = None
             page_size = page = None
