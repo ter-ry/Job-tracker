@@ -62,7 +62,8 @@ def test_target_pacing_continues_until_qualifying_target(monkeypatch):
     assert len(result["jobs"]) == 2
     assert len(calls) == 2
     assert calls[0] != calls[1]
-    assert result["continuation_available"] is False
+    # Target completion no longer hides legitimate pending provider work.
+    assert result["continuation_available"] is True
 
 
 def test_ece_title_variants_keep_classroom_roles_and_separate_supervisory_roles():
@@ -159,9 +160,13 @@ def test_ece_fifty_target_runs_full_discovery_pipeline_and_persists_inbox(monkey
         body = response.get_json()
         assert len(calls) == 4
         assert body["diagnostics"]["raw_jobs_inspected"] == 52
-        assert body["diagnostics"]["new_matching_count"] == 50
+        assert body["diagnostics"]["new_matching_count"] == 52
+        assert body["diagnostics"]["target_eligible_count"] == 0
+        assert body["diagnostics"]["target_reached"] is False
         assert body["diagnostics"]["excluded_count"] == 0
-        assert len(body["jobs"]) == 50
+        # Title-only educator rows are provisional: they remain actionable in
+        # the queue, but none satisfies the grounded full-time target.
+        assert len(body["jobs"]) == 52
         persisted = client.get("/api/discovery/inbox?include_history=1").get_json()
         saved_ids = {item.get("source_job_id") for item in persisted}
         assert {f"pipeline-ece-{index}" for index in range(52)} <= saved_ids
@@ -272,9 +277,9 @@ def test_linkedin_failure_does_not_stop_later_indeed_batches(monkeypatch):
     assert result["errors"]["linkedin"].startswith("TimeoutError")
     assert len(result["completed_work_items"]) == 3
     assert len(result["pending_query_batches"]) == 8
-    # The requested target was reached; retryable failed-provider work remains
-    # visible in diagnostics but does not require a Continue action.
-    assert result["continuation_available"] is False
+    # Retryable and pending provider work remains available even after the
+    # requested target has been reached.
+    assert result["continuation_available"] is True
 
 
 def test_continuation_retries_failed_provider_without_repeating_successful_provider(monkeypatch):

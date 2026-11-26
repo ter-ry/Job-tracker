@@ -2368,6 +2368,36 @@ def create_app() -> Flask:
             return jsonify({"error": "An applied reconciliation backup was not found."}), 404
         db = get_db()
         backups = parse_json_array(row["backup_json"])
+        # Rollback is all-or-nothing.  A conditional best-effort rollback can
+        # otherwise report success while leaving relationships, evidence, or
+        # applicant decisions only partially restored.  Require every backed
+        # up row and decision to still match the exact applied snapshot before
+        # opening the write transaction.
+        conflicts: list[dict[str, Any]] = []
+        for backup in backups:
+            duplicate = backup.get("duplicate") or {}
+            canonical = backup.get("canonical") or {}
+            applied_duplicate = backup.get("applied_duplicate") or {}
+            applied_canonical = backup.get("applied_canonical") or {}
+            current_duplicate = db.execute("SELECT canonical_job_id, canonical_reconciliation_id, discovery_result_category, discovery_result_reason FROM jobs WHERE id = ?", [duplicate.get("id")]).fetchone()
+            current_canonical = db.execute("SELECT source_links_json, canonical_reconciliation_id, discovery_result_category, discovery_result_reason FROM jobs WHERE id = ?", [canonical.get("id")]).fetchone()
+            if current_duplicate is None or dict(current_duplicate) != applied_duplicate:
+                conflicts.append({"job_id": duplicate.get("id"), "kind": "duplicate"})
+            if current_canonical is None or dict(current_canonical) != applied_canonical:
+                conflicts.append({"job_id": canonical.get("id"), "kind": "canonical"})
+            prior_states = {int(item["applicant_profile_id"]): item for item in backup.get("canonical_states", [])}
+            copied_states = {int(item["applicant_profile_id"]): item for item in backup.get("duplicate_states", [])}
+            applied_states = {int(item["applicant_profile_id"]): item for item in backup.get("applied_states", [])}
+            for profile_id in set(prior_states) | set(copied_states) | set(applied_states):
+                current = db.execute("SELECT state, date_applied, decision_revision FROM discovery_applicant_states WHERE job_id = ? AND applicant_profile_id = ?", [canonical.get("id"), profile_id]).fetchone()
+                applied = applied_states.get(profile_id)
+                if applied is None:
+                    if current is not None:
+                        conflicts.append({"job_id": canonical.get("id"), "kind": "decision", "applicant_profile_id": profile_id})
+                elif current is None or text(current["state"]) != text(applied.get("state")) or text(current["date_applied"]) != text(applied.get("date_applied")) or int(current["decision_revision"] or 0) != int(applied.get("decision_revision") or 0):
+                    conflicts.append({"job_id": canonical.get("id"), "kind": "decision", "applicant_profile_id": profile_id})
+        if conflicts:
+            return jsonify({"error": "Rollback was rejected because subsequent relationship, evidence, or applicant-decision changes prevent a consistent atomic restoration.", "rollback_rejected": True, "conflicts": conflicts}), 409
         try:
             db.execute("BEGIN IMMEDIATE")
             for backup in backups:
@@ -3978,9 +4008,15 @@ def create_app() -> Flask:
         for item in ordered:
             if item.get("discovery_result_category") == "actionable":
                 item["discovery_match_status"], item["discovery_match_explanation"] = discovery_target_assessment(item, search)
-        for item in target_review_jobs:
-            item["discovery_result_category"] = "review_required"
-            item["discovery_result_reason"] = discovery_target_ineligibility_reason(item, search)
+        # Target eligibility is an acquisition/accounting concept.  For ECE,
+        # genuine provisional and supply/casual roles remain actionable in the
+        # normal queue (after geographic eligibility), with their employment
+        # uncertainty expressed by status/evidence and ranking.  They simply
+        # cannot satisfy the full-time target.
+        if search.get("workflow") != "ece":
+            for item in target_review_jobs:
+                item["discovery_result_category"] = "review_required"
+                item["discovery_result_reason"] = discovery_target_ineligibility_reason(item, search)
         for item in ordered:
             item["recommendation_eligible"] = item.get("discovery_result_category") == "actionable"
         matching_jobs = [item for item in ordered if item.get("discovery_result_category") == "actionable"]
@@ -3990,8 +4026,16 @@ def create_app() -> Flask:
         persisted = persist_discovery_jobs(ordered, None, manual_run_id)
         search_execution_id = uuid.uuid4().hex
         persist_discovery_search_memberships(search_execution_id, ordered, selected_applicant_id, search)
-        target_matching_jobs = [item for item in matching_jobs if search.get("workflow") != "ece" or text(item.get("discovery_employment_status")).lower() != "supply_or_casual"]
-        new_matching_jobs = target_matching_jobs[:requested_target]
+        target_matching_jobs = [item for item in matching_jobs if discovery_target_eligible(item, search)]
+        if search.get("workflow") == "ece":
+            # Full-time roles fill the requested acquisition target first;
+            # provisional and supply/casual actionable roles remain visible in
+            # the same application queue and rank below them.
+            new_matching_jobs = target_matching_jobs[:requested_target] + [
+                item for item in matching_jobs if not discovery_target_eligible(item, search)
+            ]
+        else:
+            new_matching_jobs = matching_jobs[:requested_target]
         # The response is unified: actionable new matches first, followed by a
         # separately labelled review queue. Excluded jobs never enter it.
         jobs = new_matching_jobs + review_required_jobs
@@ -4006,26 +4050,47 @@ def create_app() -> Flask:
         )
         diagnostics["processed_count"] = processed_count
         diagnostics["skipped_count"] = skipped_count
+        diagnostics["newly_acquired_count"] = int(persisted.get("new") or 0)
+        diagnostics["new_source_attachment_count"] = int(persisted.get("new_source_attachments") or 0)
+        diagnostics["previously_acquired_unseen_count"] = sum(
+            1 for item in matching_jobs
+            if text(item.get("saved_job_id")) and not item.get("presented_to_applicant")
+        )
+        diagnostics["previously_presented_count"] = sum(1 for item in ordered if item.get("presented_to_applicant"))
+        diagnostics["previously_processed_count"] = processed_count
+        diagnostics["newly_presented_count"] = len(jobs)
         diagnostics["requested_target"] = requested_target
         diagnostics["new_matching_count"] = len(new_matching_jobs)
+        diagnostics["target_eligible_count"] = len(target_matching_jobs)
+        diagnostics["application_queue_count"] = len(new_matching_jobs)
         diagnostics["review_required_count"] = len(review_required_jobs)
         diagnostics["unique_jobs_found"] = len(seen_jobs)
         diagnostics["raw_jobs_inspected"] = len(raw_jobs)
-        diagnostics["search_complete"] = not bool(fetched.get("errors"))
+        diagnostics["search_complete"] = not bool(fetched.get("errors") or fetched.get("continuation_available") or fetched.get("pending_work_items"))
         diagnostics["attempted_query_batches"] = fetched.get("attempted_query_batches", [])
         diagnostics["completed_query_batches"] = fetched.get("completed_query_batches", [])
         diagnostics["pending_query_batches"] = fetched.get("pending_query_batches", [])
-        diagnostics["target_reached"] = len(new_matching_jobs) >= requested_target
+        diagnostics["target_reached"] = len(target_matching_jobs) >= requested_target
+        diagnostics["continuation_available"] = bool(fetched.get("errors") or fetched.get("pending_query_batches") or fetched.get("pending_work_items"))
         timeout_error = any("timeout" in text(error).lower() or "timed out" in text(error).lower() for error in (fetched.get("errors") or {}).values())
         diagnostics["search_termination_reason"] = (
+            "target_achieved_more_work_available" if diagnostics["target_reached"] and diagnostics["continuation_available"] else
             "target_reached" if diagnostics["target_reached"] else
             "timed_out" if timeout_error else
             "provider_blocked_or_unavailable" if fetched.get("errors") else
             "request_budget_reached_resumable" if fetched.get("pending_query_batches") else
             "planned_queries_completed"
         )
-        diagnostics["continuation_available"] = bool(not diagnostics["target_reached"] and (fetched.get("errors") or fetched.get("pending_query_batches")))
         diagnostics["target_unmet_reason"] = "" if diagnostics["target_reached"] else ("Provider failures, timeouts, or rate limits interrupted the search; continuation is resumable." if fetched.get("errors") else ("All distinct planned query batches completed; this does not establish total provider exhaustion." if not fetched.get("pending_query_batches") else "The acquisition budget ended before the target; continue search to inspect pending distinct batches."))
+        diagnostics["work_state"] = {
+            "target_achieved": bool(diagnostics["target_reached"]),
+            "batch_complete": not bool(fetched.get("errors")),
+            "all_planned_queries_completed": bool(fetched.get("planned_queries_completed")),
+            "additional_work_available": bool(diagnostics["continuation_available"]),
+            "provider_exhausted": bool(fetched.get("providers_exhausted")),
+            "provider_blocked": bool(fetched.get("errors")),
+            "provider_interrupted": bool(fetched.get("pending_budget")),
+        }
         diagnostics["persisted"] = persisted
         diagnostics["jobs_returned_to_frontend"] = len(jobs)
         diagnostics["post_processing_row_count"] = len(jobs)
@@ -4523,7 +4588,24 @@ def validate_discovery_action_owner(row: Any, payload: dict[str, Any] | None = N
             raise ValueError(f"This stored discovery is a {known_workflow.upper()} job; the requested workflow is not compatible.")
         if not profile_id:
             raise ValueError("Select the compatible applicant profile before acting on this discovery.")
-        return validate_discovery_applicant({**payload, "workflow": known_workflow}, known_workflow)
+        validated = validate_discovery_applicant({**payload, "workflow": known_workflow}, known_workflow)
+        stored_owner = clamp_int(row["candidate_profile_id"] if "candidate_profile_id" in row.keys() else 0, 0, 10**9)
+        owned = stored_owner in {0, validated} or bool(query_db(
+            """SELECT 1 FROM discovery_search_memberships
+               WHERE job_id = ? AND applicant_profile_id IN (0, ?) LIMIT 1""",
+            [int(row["id"]), validated], one=True,
+        )) or bool(query_db(
+            """SELECT 1 FROM discovery_applicant_presentations
+               WHERE job_id = ? AND applicant_profile_id = ? LIMIT 1""",
+            [int(row["id"]), validated], one=True,
+        )) or bool(query_db(
+            """SELECT 1 FROM discovery_applicant_states
+               WHERE job_id = ? AND applicant_profile_id = ? LIMIT 1""",
+            [int(row["id"]), validated], one=True,
+        ))
+        if not owned:
+            raise ValueError("This discovery is not owned by the selected applicant profile.")
+        return validated
     # A blank occupation is retained only for genuinely old profileless rows.
     # Once candidate profiles exist, callers cannot turn an unknown legacy row
     # into an applicant-specific action by omitting ownership fields.
@@ -4968,7 +5050,11 @@ def merge_source_links(*, existing: sqlite3.Row | dict[str, Any] | None, incomin
 
 def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, run_id: int | None) -> dict[str, Any]:
     now = datetime.now().isoformat(timespec="seconds")
-    counts: dict[str, Any] = {"new": 0, "duplicate": 0, "new_job_ids": []}
+    counts: dict[str, Any] = {
+        "new": 0, "duplicate": 0, "new_job_ids": [],
+        "new_source_attachments": 0, "previously_acquired": 0,
+        "source_attachment_job_ids": [],
+    }
     db = get_db()
     for job in jobs:
         canonical_match = False
@@ -4982,6 +5068,11 @@ def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, ru
             canonical_match = match is not None
         if match is not None:
             counts["duplicate"] += 1
+            if canonical_match:
+                counts["new_source_attachments"] += 1
+                counts["source_attachment_job_ids"].append(int(match["id"]))
+            else:
+                counts["previously_acquired"] += 1
             # Refresh shared, source-owned facts on repeat sightings.  Scores,
             # qualification evidence, categories and profile ids are derived
             # from the selected applicant and must never be overwritten by a
@@ -5397,9 +5488,10 @@ def run_discovery_pipeline(
     for item in ordered:
         if item.get("discovery_result_category") == "actionable":
             item["discovery_match_status"], item["discovery_match_explanation"] = discovery_target_assessment(item, search)
-    for item in target_review_jobs:
-        item["discovery_result_category"] = "review_required"
-        item["discovery_result_reason"] = discovery_target_ineligibility_reason(item, search)
+    if search.get("workflow") != "ece":
+        for item in target_review_jobs:
+            item["discovery_result_category"] = "review_required"
+            item["discovery_result_reason"] = discovery_target_ineligibility_reason(item, search)
     for item in ordered:
         item["recommendation_eligible"] = item.get("discovery_result_category") == "actionable"
     # Persist only after the final hard and target gates have run. This keeps
@@ -5426,7 +5518,14 @@ def run_discovery_pipeline(
         # in history but must never consume a new-opportunity slot.
         if item.get("discovery_result_category") == "actionable" and not state and not presented:
             eligible_unpresented.append(item)
-    matching_jobs = [item for item in eligible_unpresented if search.get("workflow") != "ece" or text(item.get("discovery_employment_status")).lower() != "supply_or_casual"][:requested_target]
+    matching_candidates = list(eligible_unpresented)
+    target_matching_jobs = [item for item in matching_candidates if discovery_target_eligible(item, search)]
+    if search.get("workflow") == "ece":
+        matching_jobs = target_matching_jobs[:requested_target] + [
+            item for item in matching_candidates if not discovery_target_eligible(item, search)
+        ]
+    else:
+        matching_jobs = matching_candidates[:requested_target]
     # Presentation is acknowledged only after the browser renders final rows;
     # a worker completing while a browser crashes must not silently hide jobs.
     review_required_jobs = [item for item in ordered if item.get("discovery_result_category") == "review_required"]
@@ -5453,6 +5552,15 @@ def run_discovery_pipeline(
         "completed_query_batches": fetched.get("completed_query_batches", []),
         "pending_query_batches": fetched.get("pending_query_batches", []),
         "continuation_available": bool(fetched.get("continuation_available")),
+        "work_state": {
+            "target_achieved": bool(fetched.get("target_reached") or len(target_matching_jobs) >= requested_target),
+            "batch_complete": not bool(fetched.get("errors")),
+            "all_planned_queries_completed": bool(fetched.get("planned_queries_completed")),
+            "additional_work_available": bool(fetched.get("continuation_available") or fetched.get("pending_work_items")),
+            "provider_exhausted": bool(fetched.get("providers_exhausted")),
+            "provider_blocked": bool(fetched.get("errors")),
+            "provider_interrupted": bool(fetched.get("pending_budget")),
+        },
         "continuation_index": int(fetched.get("continuation_index") or 0),
         "pending_work_items": fetched.get("pending_work_items", []),
         "countrywide_region_queries": fetched.get("countrywide_region_queries", []),
@@ -5470,12 +5578,22 @@ def run_discovery_pipeline(
         "raw_jobs_inspected": len(fetched.get("jobs", [])),
         "unique_jobs_found": len(seen_jobs),
         "previously_processed": int(persisted.get("duplicate") or 0),
+        "newly_acquired_count": int(persisted.get("new") or 0),
+        "new_source_attachment_count": int(persisted.get("new_source_attachments") or 0),
+        "previously_acquired_unseen_count": sum(
+            1 for item in matching_jobs if text(item.get("saved_job_id")) and not item.get("presented_to_applicant")
+        ),
+        "previously_presented_count": previously_presented_count,
+        "previously_processed_count": int(persisted.get("duplicate") or 0),
+        "newly_presented_count": len(jobs),
         "skipped_count": sum(1 for item in jobs if text(item.get("discovery_state")) == "ignored"),
         "disqualified_count": len(excluded_jobs),
         "review_required_count": len(review_required_jobs),
         "review_reason_counts": review_reason_counts,
         "exclusion_reason_counts": exclusion_reason_counts,
         "new_matching_count": len(matching_jobs),
+        "target_eligible_count": len(target_matching_jobs),
+        "application_queue_count": len(matching_jobs),
         "eligible_previously_presented_count": previously_presented_count,
         "eligible_already_actioned_count": already_actioned_count,
         "target_unmet_reason": (
@@ -5522,6 +5640,8 @@ def run_discovery_pipeline(
             "review_reason_counts": review_reason_counts,
             "exclusion_reason_counts": exclusion_reason_counts,
             "new_matching_jobs": len(matching_jobs),
+            "target_eligible_count": len(target_matching_jobs),
+            "application_queue_count": len(matching_jobs),
             "previously_presented": previously_presented_count,
             "already_actioned": already_actioned_count,
             "early_filtered": filtered,
@@ -5532,7 +5652,7 @@ def run_discovery_pipeline(
             "requested_target": requested_target,
             "target_unmet_reason": metadata["target_unmet_reason"],
             "incomplete": bool(fetched.get("errors") or fetched.get("continuation_available")),
-            "continuation_available": bool(fetched.get("continuation_available")),
+            "continuation_available": bool(fetched.get("continuation_available") or fetched.get("pending_work_items")),
             "continuation_index": int(fetched.get("continuation_index") or 0),
             "pending_query_batches": fetched.get("pending_query_batches", []),
             "automatic_workplace_enrichment": automatic_workplace_stats,
@@ -10907,6 +11027,9 @@ def _automatically_enrich_indeed_jobs(jobs: list[dict[str, Any]], *, limit: int 
     repeated successful or blocked requests.
     """
     stats = {"considered": 0, "requested": 0, "succeeded": 0, "precise": 0, "city_only": 0, "failed": 0}
+    denial_attempts = 0
+    provider_blocked = False
+    denial_limit = 3
     for job in jobs:
         if stats["considered"] >= max(0, int(limit)):
             break
@@ -10924,8 +11047,14 @@ def _automatically_enrich_indeed_jobs(jobs: list[dict[str, Any]], *, limit: int 
             stats["succeeded"] += 1
             stats["precise"] += 1
             continue
+        if provider_blocked:
+            continue
         stats["requested"] += 1
         fetched = _enrichment_fetch(original_url, allowed_hosts=allowed_hosts)
+        if text(fetched.get("status")) in {"http_401", "http_403"}:
+            denial_attempts += 1
+            if denial_attempts >= denial_limit:
+                provider_blocked = True
         if not fetched.get("ok"):
             stats["failed"] += 1
             continue
@@ -10941,7 +11070,7 @@ def _automatically_enrich_indeed_jobs(jobs: list[dict[str, Any]], *, limit: int 
 
 def enrich_existing_workplace_locations(*, apply: bool = False, limit: int = 25, offset: int = 0, candidate_profile_id: int = 0, search_execution_id: str = "", job_ids: list[int] | None = None) -> dict[str, Any]:
     """Preview/apply bounded workplace enrichment for any job category."""
-    empty = {"processed": 0, "gained_verified": 0, "gained_candidate": 0, "remained_city_only": 0, "failed": 0, "preview": not apply, "records": []}
+    empty = {"processed": 0, "gained_verified": 0, "gained_candidate": 0, "remained_city_only": 0, "failed": 0, "preview": not apply, "records": [], "blocked_providers": [], "provider_denial_attempts": {}}
     if not candidate_profile_id:
         return {**empty, "error": "Select an applicant profile before enriching workplace locations."}
     execution_id = text(search_execution_id)
@@ -11015,6 +11144,9 @@ def enrich_existing_workplace_locations(*, apply: bool = False, limit: int = 25,
     page_offset = 0 if apply and requested_ids else max(0, int(offset or 0))
     rows = query_db(f"SELECT * FROM jobs WHERE {' AND '.join(conditions)} ORDER BY id LIMIT ? OFFSET ?", [*args, clamp_int(limit, 1, 50), page_offset])
     summary = {**empty, "offset": max(0, int(offset or 0)), "next_offset": max(0, int(offset or 0)) + len(rows), "has_more": max(0, int(offset or 0)) + len(rows) < int(total["count"] or 0), "before_counts": before_counts, "after_counts": dict(before_counts), "cohort_total": len(cohort_ids), "search_execution_id": execution_id}
+    denial_attempts: dict[str, int] = {}
+    blocked_providers: set[str] = set()
+    denial_limit = 3
     for row in rows:
         job = dict(row)
         job_id = int(job["id"])
@@ -11023,19 +11155,29 @@ def enrich_existing_workplace_locations(*, apply: bool = False, limit: int = 25,
         alternatives = _stored_workplace_alternatives(job)
         evidence_source = "saved JobSpy evidence" if alternatives else ""
         fetched = None
-        if not alternatives and original_url:
+        if not alternatives and "remote" in text(job.get("remote_type") or job.get("work_arrangement")).lower():
+            summary["records"].append({"id": job_id, "title": text(job.get("title")), "company": text(job.get("company")), "status": "remote_not_required", "before_precision": before_precision, "after_precision": before_precision, "reason": "Remote posting does not require workplace retrieval.", "url": original_url})
+            continue
+        provider_host = (urlsplit(original_url).hostname or "").lower().rstrip(".")
+        if not alternatives and original_url and provider_host in blocked_providers:
+            fetched = {"ok": False, "status": "provider_blocked", "error": f"Provider access was stopped after {denial_limit} repeated HTTP denial responses."}
+        elif not alternatives and original_url:
             approved, allowed_hosts = _approved_job_page_url(job, original_url)
             if not approved:
                 fetched = {"ok": False, "status": "not_eligible", "error": "Automatic retrieval is limited to approved Indeed job pages."}
             else:
                 fetched = _enrichment_fetch(original_url, allowed_hosts=allowed_hosts)
+                if text(fetched.get("status")) in {"http_401", "http_403"}:
+                    denial_attempts[provider_host] = denial_attempts.get(provider_host, 0) + 1
+                    if denial_attempts[provider_host] >= denial_limit:
+                        blocked_providers.add(provider_host)
             summary["processed"] += 1
             if fetched.get("ok"):
                 alternatives = _extract_workplace_from_page(job, text(fetched.get("body")), original_url)
                 evidence_source = "original posting"
         if not alternatives:
             summary["remained_city_only"] += 1
-            status = "blocked" if fetched and text(fetched.get("status")).startswith("http_") else ("not_eligible" if fetched and text(fetched.get("status")) == "not_eligible" else "city_only")
+            status = "blocked" if fetched and (text(fetched.get("status")).startswith("http_") or text(fetched.get("status")) == "provider_blocked") else ("not_eligible" if fetched and text(fetched.get("status")) == "not_eligible" else "city_only")
             if fetched and not fetched.get("ok"):
                 summary["failed"] += 1
             summary["records"].append({"id": job_id, "title": text(job.get("title")), "company": text(job.get("company")), "status": status, "before_precision": before_precision, "after_precision": before_precision, "reason": (fetched or {}).get("error", "No reliable stored workplace evidence."), "url": original_url})
@@ -11052,6 +11194,8 @@ def enrich_existing_workplace_locations(*, apply: bool = False, limit: int = 25,
                     """UPDATE jobs SET workplace_alternatives_json = ?, workplace_address = '', workplace_postal_code = '', workplace_evidence = ?, workplace_evidence_source = ?, workplace_precision = ?, workplace_confidence = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
                     [dumps_json(alternatives), text(update.get("evidence")) if update else "", text(update.get("evidence_source")) if update else evidence_source, "candidate street address" if has_street else "postal code", clamp_int(update.get("confidence"), 0, 100) if update else 0, job_id],
                 )
+    summary["blocked_providers"] = sorted(blocked_providers)
+    summary["provider_denial_attempts"] = denial_attempts
     if apply:
         get_db().commit()
         refreshed = query_db(f"SELECT * FROM jobs WHERE id IN ({placeholders}) ORDER BY id", cohort_ids)
@@ -11844,7 +11988,13 @@ def fetch_discovery_jobs_for_search(
     combined["target_reached"] = target_reached
     combined["probe_qualifying_count"] = qualified_count
     combined["planned_queries_completed"] = pending_batches == 0 and not pending_work_items and not combined.get("errors") and not target_reached
-    combined["continuation_available"] = not target_reached and (bool(combined.get("errors")) or bool(pending_work_items) or pending_batches > 0)
+    # Target completion does not prove that the supported provider work is
+    # exhausted.  Continue Search remains available for pending batches or
+    # retryable/provider work, while diagnostics separately report whether the
+    # requested target has already been met.
+    combined["continuation_available"] = bool(
+        combined.get("errors") or pending_work_items or pending_batches > 0
+    )
     combined["continuation_index"] = len(completed_query_keys)
     combined["attempted_queries_exhausted"] = bool(combined["planned_queries_completed"])
     # A short provider page is not proof of total provider exhaustion. It only
@@ -12343,6 +12493,15 @@ def discovery_result_category(job: dict[str, Any], remote_preference: str = "") 
     if hard_reason:
         return "excluded", hard_reason
     if normalize_space(text(job.get("discovery_occupation") or job.get("occupation"))).lower() == "early childhood educator":
+        # ECE employment classification must not bypass the shared geographic
+        # gate.  Supply/provisional roles remain queue-eligible only when the
+        # posting itself is geographically eligible or explicitly provisional.
+        if text(job.get("distance_radius_status")).lower() == "outside_radius" and clamp_int(job.get("distance_confidence"), 0, 100) > 0:
+            return "excluded", "Confirmed workplace distance is outside the requested radius."
+        if job.get("location_search_eligible") is False or text(job.get("location_search_eligible")).lower() == "false":
+            return "excluded", "Confirmed job location is outside the requested search area."
+        if text(job.get("distance_radius_status")).lower() == "unknown" and text(job.get("discovery_geographic_match_mode")).lower() == "strict":
+            return "review_required", "Exact workplace distance could not be verified under strict-radius matching."
         return ece_result_category(job)
     title = normalize_space(text(job.get("title"))).lower()
     title_for_internship = re.sub(r"\bnon[- ]?(?:intern|internship)\b", " ", title)
@@ -12910,9 +13069,12 @@ def discovery_target_assessment(job: dict[str, Any], search: dict[str, Any]) -> 
 def discovery_target_eligible(job: dict[str, Any], search: dict[str, Any]) -> bool:
     if normalize_space(text(job.get("discovery_occupation") or job.get("occupation"))).lower() == "early childhood educator":
         # Only grounded full-time classifications satisfy the requested ECE
-        # target. Provisional and supply work remain visible but cannot stop
-        # acquisition or consume a full-time target slot.
-        return text(job.get("discovery_employment_status")).lower() != "supply_or_casual"
+        # target. Provisional, supply/casual, and other non-full-time work
+        # remain application-queue opportunities but cannot stop acquisition
+        # or consume a full-time target slot.
+        return text(job.get("discovery_employment_status")).lower() in {
+            "permanent_full_time", "temporary_full_time", "full_time_unspecified_term",
+        }
     status, _ = discovery_target_assessment(job, search)
     return status == "verified" or (status == "provisional" and as_bool(search.get("include_provisional_matches", True)))
 

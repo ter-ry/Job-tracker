@@ -57,7 +57,7 @@ def test_automatic_discovery_enrichment_is_bounded_to_matching_indeed_viewjob(mo
 
     result = app_module._automatically_enrich_indeed_jobs(jobs, limit=1)
 
-    assert result == {"considered": 1, "requested": 1, "succeeded": 1, "precise": 1, "city_only": 0, "failed": 0}
+    assert {key: result[key] for key in ("considered", "requested", "succeeded", "precise", "city_only", "failed")} == {"considered": 1, "requested": 1, "succeeded": 1, "precise": 1, "city_only": 0, "failed": 0}
     assert len(calls) == 1
     assert calls[0][0].startswith("https://ca.indeed.com/viewjob?jk=good-1")
     assert jobs[0]["workplace_alternatives"][0]["assignment_status"] == "candidate_unverified"

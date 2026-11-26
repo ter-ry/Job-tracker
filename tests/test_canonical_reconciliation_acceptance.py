@@ -187,15 +187,16 @@ def test_M_L_rollback_restores_relationship_and_decisions_without_losing_later_c
         app_module.set_applicant_discovery_state(canonical, profile, "applied", "2026-11-25")
         app_module.get_db().commit()
     rolled = client.post(f"/api/discovery/reconciliation/{preview['reconciliation_id']}/rollback")
-    assert rolled.status_code == 200
+    assert rolled.status_code == 409
+    assert rolled.get_json()["rollback_rejected"] is True
     with app_module.app.app_context():
-        assert app_module.query_db("SELECT canonical_job_id FROM jobs WHERE id = ?", [duplicate], one=True)["canonical_job_id"] == 0
+        assert app_module.query_db("SELECT canonical_job_id FROM jobs WHERE id = ?", [duplicate], one=True)["canonical_job_id"] == canonical
         assert app_module.query_db("SELECT state FROM discovery_applicant_states WHERE job_id = ? AND applicant_profile_id = ?", [canonical, profile], one=True)["state"] == "applied"
         current = app_module.query_db("SELECT discovery_result_category, source_links_json FROM jobs WHERE id = ?", [canonical], one=True)
         assert current["discovery_result_category"] == "review_required"
         assert "later.example/rbc" in current["source_links_json"]
-        assert app_module.query_db("SELECT 1 FROM discovery_search_memberships WHERE search_execution_id = ? AND job_id = ?", ["rollback-search", canonical], one=True) is None
-        assert app_module.query_db("SELECT 1 FROM discovery_applicant_presentations WHERE job_id = ? AND applicant_profile_id = ?", [canonical, profile], one=True) is None
+        assert app_module.query_db("SELECT 1 FROM discovery_search_memberships WHERE search_execution_id = ? AND job_id = ?", ["rollback-search", canonical], one=True) is not None
+        assert app_module.query_db("SELECT 1 FROM discovery_applicant_presentations WHERE job_id = ? AND applicant_profile_id = ?", [canonical, profile], one=True) is not None
 
 
 def test_G_bridge_identity_is_contradictory_and_cannot_be_merged_transitively(tmp_path, monkeypatch):

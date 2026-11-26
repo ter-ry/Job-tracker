@@ -1954,7 +1954,10 @@ async function saveCandidateProfile(event) {
 }
 
 async function refreshCandidateProfiles(selectId = "") {
-  if (selectId) state.selectedCandidateProfileId = String(selectId);
+  if (selectId && String(selectId) !== String(state.selectedCandidateProfileId || "")) {
+    invalidateApplicantContext();
+    state.selectedCandidateProfileId = String(selectId);
+  }
   await loadCandidateProfiles({ reloadPanelsOnSelectionChange: true });
 }
 
@@ -1986,7 +1989,7 @@ function renderCandidateProfiles() {
     discoveryProfile.innerHTML = `<option value="">Use active Profile</option>${state.candidateProfiles.map((profile) => `<option value="${escapeAttribute(profile.id)}">${escapeHtml(profile.name)}</option>`).join("")}`;
     discoveryProfile.value = state.selectedCandidateProfileId;
     discoveryProfile.onchange = async () => {
-      invalidateFastApplyQueue();
+      invalidateApplicantContext();
       state.selectedCandidateProfileId = discoveryProfile.value;
       const selected = state.candidateProfiles.find((profile) => String(profile.id) === String(state.selectedCandidateProfileId));
       setValue("discovery-distance-origin", selected?.commute_origin_input || "");
@@ -2009,7 +2012,7 @@ function renderCandidateProfiles() {
 }
 
 async function selectCandidateProfile(profileId) {
-  invalidateFastApplyQueue();
+  if (String(profileId) !== String(state.selectedCandidateProfileId || "")) invalidateApplicantContext();
   state.selectedCandidateProfileId = String(profileId);
   const selected = state.candidateProfiles.find((profile) => String(profile.id) === String(profileId));
   setValue("discovery-distance-origin", selected?.commute_origin_input || "");
@@ -4017,6 +4020,47 @@ function invalidateFastApplyQueue() {
   state.fastApplyApplicantId = "";
   state.fastApplyInitialTotal = 0;
   state.fastApplyPendingAction = false;
+}
+
+function invalidateApplicantContext() {
+  // Applicant/workflow data is a transaction boundary for the UI. Invalidate
+  // every panel token before changing selection so delayed responses from the
+  // previous applicant cannot repopulate the new applicant's view.
+  state.loadToken += 1;
+  state.discoveryInboxLoadToken += 1;
+  state.workplaceSearchLoadToken += 1;
+  state.fastApplyLoadToken += 1;
+  state.discoveryActiveSearchId = "";
+  state.discoveryLastSearchId = "";
+  state.discoverySearchKey = "";
+  state.discoverySearchCriteria = null;
+  state.discoveryMeta = {};
+  state.discoveryResults = [];
+  state.discoveryAllResults = [];
+  state.discoveryExcludedResults = [];
+  state.discoveryInboxJobs = [];
+  state.discoveryInboxRuns = [];
+  state.discoveryInboxPage = 0;
+  state.discoveryInboxTotal = 0;
+  state.discoveryInboxHasMore = false;
+  state.discoveryInboxSelected.clear();
+  state.workplaceEnrichmentRuns = [];
+  state.workplaceEnrichmentSearch = null;
+  state.workplaceEnrichmentSearchId = "";
+  state.workplaceEnrichmentOffset = 0;
+  state.workplaceEnrichmentNextOffset = 0;
+  state.workplaceEnrichmentHasMore = false;
+  state.preparationQueue = [];
+  state.preparationPreviews = {};
+  state.generationSelections = {};
+  state.shortlistRegenerations = {};
+  invalidateFastApplyQueue();
+  clearVisibleDiscoveryResults();
+  const inbox = document.getElementById("discovery-inbox");
+  if (inbox) inbox.textContent = "Loading this applicant's Inbox…";
+  const workplace = document.getElementById("workplace-enrichment-preview");
+  if (workplace) { workplace.classList.add("empty"); workplace.textContent = "Workplace enrichment preview details will appear here."; }
+  renderWorkplaceSearchRuns();
 }
 
 async function loadFastApplyQueue() {
