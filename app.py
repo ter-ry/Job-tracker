@@ -1611,12 +1611,30 @@ def create_app() -> Flask:
     @app.get("/api/jobs")
     def list_jobs() -> Response:
         selected_applicant_id = applicant_profile_id(request.args)
+        application_history = as_bool(request.args.get("application_history"))
+        lightweight = as_bool(request.args.get("lightweight"))
+        if application_history and not selected_applicant_id:
+            return jsonify({"error": "candidate_profile_id is required for application history."}), 400
         # Canonical children remain available through audit/reconciliation
         # views, but ordinary user-facing job/application lists show one
         # vacancy identity only.
-        rows = query_db("SELECT * FROM jobs WHERE canonical_job_id IN (0, '') ORDER BY date_added DESC, id DESC")
+        history_where = ""
+        history_args: list[Any] = []
+        if application_history:
+            history_where = " AND EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = jobs.id AND s.applicant_profile_id = ? AND s.state IN ('applied', 'saved', 'skipped', 'ignored'))"
+            history_args.append(selected_applicant_id)
+        base_query = "SELECT * FROM jobs WHERE canonical_job_id IN (0, '')" + history_where
+        if application_history:
+            total = query_db("SELECT COUNT(*) AS total FROM jobs WHERE canonical_job_id IN (0, '')" + history_where, history_args, one=True)
+            page_size = clamp_int_default(request.args.get("page_size"), 50, 1, 100)
+            page = clamp_int_default(request.args.get("page"), 0, 0, 100000)
+            rows = query_db(base_query + " ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?", [*history_args, page_size, page * page_size])
+        else:
+            total = None
+            page_size = page = None
+            rows = query_db(base_query + " ORDER BY date_added DESC, id DESC")
         evidence_profile = None
-        if request.args.get("candidate_profile_id"):
+        if request.args.get("candidate_profile_id") and not lightweight:
             try:
                 selected = resolve_tailoring_resume_profile({"candidate_profile_id": request.args.get("candidate_profile_id"), "resume_id": request.args.get("resume_id")})
                 evidence_profile = selected["profile"]
@@ -1629,11 +1647,16 @@ def create_app() -> Flask:
         statuses = _preparation_statuses([int(row["id"]) for row in rows])
         result = []
         for row in rows:
-            item = job_to_dict(row, evidence_profile, include_legacy_details=False, preparation_status=statuses.get(int(row["id"])))
+            item = job_to_dict(row, evidence_profile, include_qualification=not lightweight, include_legacy_details=False, preparation_status=statuses.get(int(row["id"])))
             if selected_applicant_id:
                 apply_applicant_lifecycle_to_job(item, selected_applicant_id)
             result.append(item)
-        return jsonify(result)
+        response = jsonify(result)
+        if application_history:
+            response.headers["X-Job-Tracker-Total"] = str(int(total["total"] or 0) if total else 0)
+            response.headers["X-Job-Tracker-Page"] = str(page)
+            response.headers["X-Job-Tracker-Page-Size"] = str(page_size)
+        return response
 
     @app.post("/api/jobs/<int:job_id>/applied")
     def mark_job_applied(job_id: int) -> Response:
@@ -3009,6 +3032,7 @@ def create_app() -> Flask:
     @app.get("/api/discovery/inbox")
     def discovery_inbox() -> Response:
         include_history = as_bool(request.args.get("include_history"))
+        lightweight = as_bool(request.args.get("lightweight"))
         requested_category = text(request.args.get("category")).lower()
         search_query = normalize_space(text(request.args.get("q")))
         reason_filter = normalize_space(text(request.args.get("reason")))
@@ -3160,7 +3184,7 @@ def create_app() -> Flask:
             rows = sorted((dict(row) for row in rows), key=application_priority_sort_key)[page * page_size:(page + 1) * page_size]
             pre_paged = True
         evidence_profile = None
-        if request.args.get("candidate_profile_id"):
+        if request.args.get("candidate_profile_id") and not lightweight:
             try:
                 selected = resolve_tailoring_resume_profile({"candidate_profile_id": request.args.get("candidate_profile_id"), "resume_id": request.args.get("resume_id")})
                 evidence_profile = selected["profile"]
@@ -3171,7 +3195,7 @@ def create_app() -> Flask:
         statuses = _preparation_statuses([int(row["id"]) for row in rows])
         jobs = []
         for row in rows:
-            item = job_to_dict(row, evidence_profile, include_legacy_details=False, preparation_status=statuses.get(int(row["id"])))
+            item = job_to_dict(row, evidence_profile, include_qualification=not lightweight, include_legacy_details=False, preparation_status=statuses.get(int(row["id"])))
             state = applicant_discovery_state(int(row["id"]), applicant_id)
             if state:
                 item["discovery_state"] = state

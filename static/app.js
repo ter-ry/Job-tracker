@@ -54,6 +54,8 @@ const state = {
   fastApplyWorkflow: "software",
   fastApplyLoadToken: 0,
   fastApplyInitialTotal: 0,
+  fastApplyProcessedCount: 0,
+  fastApplyPrefetchedQueue: [],
   fastApplyPendingAction: false,
   advancedFeatures: (() => { try { return localStorage.getItem("jobTracker.advancedFeatures") === "true"; } catch (_) { return false; } })(),
   pendingAppliedJobs: new Set(),
@@ -293,6 +295,11 @@ document.addEventListener("DOMContentLoaded", () => {
     setDiscoverySection("inbox");
     loadDiscoveryInbox(true);
   });
+  document.getElementById("open-all-processed-applications")?.addEventListener("click", () => {
+    document.querySelector('.tab[data-tab="tracker"]')?.click();
+    setValue("status-filter", "");
+    void loadApplicationsHistory();
+  });
   document.getElementById("open-applied-applications")?.addEventListener("click", () => {
     document.querySelector('.tab[data-tab="tracker"]')?.click();
     const filter = document.getElementById("status-filter");
@@ -371,8 +378,8 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("fast-apply-close")?.addEventListener("click", () => { document.querySelector('.primary-nav [data-workspace="discover"]')?.click(); });
   applyAdvancedFeaturesVisibility();
   ["search", "status-filter", "fit-filter", "role-filter", "remote-filter", "risk-filter", "sort-by"].forEach((id) => {
-    document.getElementById(id).addEventListener("input", renderJobs);
-    document.getElementById(id).addEventListener("change", renderJobs);
+    document.getElementById(id)?.addEventListener("input", renderJobs);
+    document.getElementById(id)?.addEventListener("change", renderJobs);
   });
   [
     "discovery-sort-mode",
@@ -1712,10 +1719,11 @@ async function bulkInboxAction(action) {
   await loadDiscoveryInbox(true);
 }
 
-function discoveryInboxRequestUrl({ profileId = "", category = "all_relevant", searchId = "", page = 0, pageSize = 50, query = "", reason = "", source = "" } = {}) {
+function discoveryInboxRequestUrl({ profileId = "", category = "all_relevant", searchId = "", page = 0, pageSize = 50, query = "", reason = "", source = "", lightweight = 0 } = {}) {
   const params = new URLSearchParams();
   if (profileId) params.set("candidate_profile_id", String(profileId));
   params.set("include_history", "1");
+  if (lightweight) params.set("lightweight", "1");
   if (query) params.set("q", String(query));
   if (reason) params.set("reason", String(reason));
   if (source) params.set("source", String(source));
@@ -1845,7 +1853,7 @@ function discoveryApplicantActionPayload() {
 }
 async function reviewInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/review`, "POST", discoveryApplicantActionPayload()); updateInboxLocalJob(id, { discovery_state: "reviewed" }); } catch (error) { toast(error.message); } }
 async function ignoreInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/ignore`, "POST", discoveryApplicantActionPayload()); updateInboxLocalJob(id, { discovery_state: "ignored" }); } catch (error) { toast(error.message); } }
-async function restoreInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/restore`, "POST", discoveryApplicantActionPayload()); updateInboxLocalJob(id, { discovery_state: "new", status: "Discovered" }); toast("Job restored to new matches"); } catch (error) { toast(error.message); } }
+async function restoreInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/restore`, "POST", discoveryApplicantActionPayload()); updateInboxLocalJob(id, { discovery_state: "new", status: "Discovered" }); if (document.querySelector('.tab.active')?.dataset.workspace === "applications") await loadApplicationsHistory(); toast("Job restored to new matches"); } catch (error) { toast(error.message); } }
 async function applyInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/applied`, "POST", discoveryApplicantActionPayload()); toast("Marked applied for the selected applicant."); updateInboxLocalJob(id, { discovery_state: "applied" }); } catch (error) { toast(error.message); } }
 async function saveInboxJob(id) {
   try { await api.send(`/api/discovery/inbox/${id}/save`, "POST", discoveryApplicantActionPayload()); toast("Saved for the selected applicant"); updateInboxLocalJob(id, { discovery_state: "saved" }); }
@@ -2033,7 +2041,9 @@ async function selectCandidateProfile(profileId) {
     if (panel) panel.hidden = false;
     await loadFastApplyQueue();
   } else if (activeWorkspace === "applications") {
-    await loadAll({ skipProfiles: true });
+    // Applications is applicant-scoped and paginated; do not initialize the
+    // discovery, inbox, and profile workspaces just to refresh this table.
+    await loadApplicationsHistory();
   } else {
     await loadDiscoveryInbox(true);
   }
@@ -2104,9 +2114,9 @@ function switchTab(event) {
       loadFastApplyQueue();
     }
     if (workspace === "inbox") loadDiscoveryInbox(true);
-  } else if (workspace === "applications" && !value("status-filter")) {
-    setValue("status-filter", "Applied");
-    renderJobs();
+  } else if (workspace === "applications") {
+    setValue("status-filter", "");
+    void loadApplicationsHistory();
   }
 }
 
@@ -2438,7 +2448,14 @@ async function confirmWorkplace(jobId) {
   try {
     await api.send(`/api/jobs/${encodeURIComponent(jobId)}/workplace`, "POST", { candidate_profile_id: profileId, address, postal_code: address });
     toast("Workplace saved for this applicant.");
-    await loadAll({ skipProfiles: true });
+    const updated = { workplace_address: address, workplace_postal_code: address, workplace_precision: "owner-confirmed", workplace_confidence: 100 };
+    [state.jobs, state.discoveryInboxJobs, state.fastApplyQueue].forEach((collection) => {
+      const item = collection?.find((candidate) => Number(candidate.id) === Number(jobId));
+      if (item) Object.assign(item, updated);
+    });
+    renderJobs();
+    renderDiscoveryInbox(state.discoveryInboxJobs);
+    renderFastApply();
   } catch (error) { toast(error.message); }
 }
 
@@ -2599,14 +2616,30 @@ function renderEvidenceLibrary(items) {
   `;
 }
 
+async function loadApplicationsHistory() {
+  const tbody = document.getElementById("jobs-table");
+  const profileId = String(state.selectedCandidateProfileId || "");
+  if (!tbody || !profileId) return;
+  tbody.innerHTML = '<tr><td colspan="7" class="muted">Loading this applicant\'s processed applications…</td></tr>';
+  try {
+    const response = await api.getWithMeta(`/api/jobs?candidate_profile_id=${encodeURIComponent(profileId)}&application_history=1&lightweight=1&page=0&page_size=50`);
+    if (profileId !== String(state.selectedCandidateProfileId || "")) return;
+    state.jobs = Array.isArray(response.data) ? response.data : [];
+    state.applicationsHistoryTotal = response.total || state.jobs.length;
+    const counts = await api.get(`/api/discovery/inbox/counts?candidate_profile_id=${encodeURIComponent(profileId)}`);
+    setText("applications-applied-count", counts.applied ?? 0);
+    setText("applications-saved-count", counts.saved ?? 0);
+    setText("applications-skipped-count", counts.skipped ?? 0);
+    renderJobs();
+  } catch (error) {
+    tbody.innerHTML = `<tr><td colspan="7" class="risk high">Unable to load application history: ${escapeHtml(error.message || "unknown error")}</td></tr>`;
+  }
+}
+
 function renderJobs() {
   const tbody = document.getElementById("jobs-table");
   const search = value("search").toLowerCase();
   const status = value("status-filter");
-  const fit = Number(value("fit-filter") || 0);
-  const role = value("role-filter");
-  const remote = value("remote-filter");
-  const risk = value("risk-filter");
   const sortBy = value("sort-by");
 
   let jobs = state.jobs.filter((job) => {
@@ -2615,10 +2648,6 @@ function renderJobs() {
     return (
       (!search || content.includes(search)) &&
       (!status || (job.applicant_status || job.status) === status) &&
-      (!fit || Number(job.fit_score || 0) >= fit) &&
-      (!role || job.role_type === role) &&
-      (!remote || job.remote_type === remote) &&
-      (!risk || (risk === "high" ? Number(job.coding_risk_score || 100) < 60 : Number(job.coding_risk_score || 0) >= 60)) &&
       salaryFilter
     );
   });
@@ -2626,7 +2655,7 @@ function renderJobs() {
   jobs = sortJobs(jobs, sortBy);
 
   if (!jobs.length) {
-    tbody.innerHTML = `<tr><td colspan="9" class="muted">No applications match this view.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="7" class="muted">No processed applications match this view.</td></tr>`;
     return;
   }
 
@@ -2637,17 +2666,14 @@ function renderJobs() {
           <td><strong>${escapeHtml(job.company)}</strong><br>${linkFor(job.url || job.application_url)}</td>
           <td>${escapeHtml(job.title)}<br><span class="muted">${escapeHtml(job.role_type || "")}</span></td>
           <td>${escapeHtml(job.location || "")}<br><span class="muted">${escapeHtml(job.remote_type || "")}</span></td>
-          <td>${scorePill(job.fit_score)}<div class="mini-breakdown">${miniBreakdown(job)}</div></td>
-          <td>${riskLabel(job)}</td>
           <td>${escapeHtml(job.applicant_status || job.status)}</td>
           <td>${escapeHtml(job.salary || "Missing")}</td>
-          <td>${escapeHtml(job.deadline || "")}</td>
+          <td>${escapeHtml(job.date_applied || job.updated_at || job.date_added || "")}</td>
           <td>
             <div class="row-actions">
+              ${["Saved", "Skipped"].includes(job.applicant_status) ? `<button class="button small ghost" type="button" onclick="restoreInboxJob(${job.id})">Restore</button>` : ""}
+              ${job.applicant_status === "Applied" ? `<button class="button small ghost" type="button" onclick="followUp(${job.id})">Follow-up</button>` : ""}
               <button class="button small ghost" type="button" onclick="editJob(${job.id})">Edit</button>
-              <button class="button small ghost" type="button" onclick="generateForJob(${job.id})">Tailor</button>
-              <button class="button small ghost" type="button" onclick="followUp(${job.id})">Follow-up</button>
-              <button class="button small ghost danger" type="button" onclick="deleteJob(${job.id})">Delete</button>
             </div>
           </td>
         </tr>
@@ -4180,7 +4206,7 @@ function invalidateApplicantContext() {
   renderWorkplaceSearchRuns();
 }
 
-async function loadFastApplyQueue() {
+async function loadFastApplyQueue({ append = false } = {}) {
   const target = document.getElementById("fast-apply-current");
   if (!target) return;
   const profileId = String(state.selectedCandidateProfileId || value("discovery-profile") || "");
@@ -4198,29 +4224,24 @@ async function loadFastApplyQueue() {
   state.fastApplyActionError = "";
   state.fastApplyApplicantId = profileId;
   state.fastApplyWorkflow = workflow;
-  state.fastApplyQueue = [];
-  state.fastApplyIndex = 0;
-  state.fastApplyInitialTotal = 0;
+  if (!append) {
+    state.fastApplyQueue = [];
+    state.fastApplyIndex = 0;
+    state.fastApplyInitialTotal = 0;
+    state.fastApplyProcessedCount = 0;
+    state.fastApplyPrefetchedQueue = [];
+  }
   renderFastApply();
   try {
-    const pageSize = 500;
-    let page = 0;
-    let total = null;
-    const records = [];
-    while (total === null || records.length < total) {
-      const response = await api.getWithMeta(discoveryInboxRequestUrl({ profileId, category: "ready_to_apply", page, pageSize }));
-      if (loadToken !== state.fastApplyLoadToken || profileId !== String(state.selectedCandidateProfileId || "")) return;
-      const batch = Array.isArray(response.data) ? response.data : [];
-      total = response.total || 0;
-      if (page === 0) state.fastApplyInitialTotal = total;
-      records.push(...batch);
-      if (!batch.length || records.length >= total) break;
-      page += 1;
-    }
+    const pageSize = 10;
+    const response = await api.getWithMeta(discoveryInboxRequestUrl({ profileId, category: "ready_to_apply", page: 0, pageSize, lightweight: 1 }));
     if (loadToken !== state.fastApplyLoadToken || profileId !== String(state.selectedCandidateProfileId || "")) return;
+    const records = Array.isArray(response.data) ? response.data : [];
+    if (!append) state.fastApplyInitialTotal = response.total || 0;
     state.fastApplyQueue = records;
     state.fastApplyIndex = 0;
     state.fastApplyStatus = "ready";
+    if (!append && (response.total || 0) > pageSize) void prefetchFastApplyBatch(profileId, loadToken);
   } catch (error) {
     if (loadToken !== state.fastApplyLoadToken) return;
     state.fastApplyQueue = [];
@@ -4228,6 +4249,16 @@ async function loadFastApplyQueue() {
     state.fastApplyError = error.message || "Unable to load the persistent application queue.";
   }
   renderFastApply();
+}
+
+async function prefetchFastApplyBatch(profileId, loadToken) {
+  try {
+    const response = await api.getWithMeta(discoveryInboxRequestUrl({ profileId, category: "ready_to_apply", page: 1, pageSize: 10, lightweight: 1 }));
+    if (loadToken !== state.fastApplyLoadToken || profileId !== String(state.selectedCandidateProfileId || "")) return;
+    state.fastApplyPrefetchedQueue = Array.isArray(response.data) ? response.data : [];
+  } catch (_) {
+    state.fastApplyPrefetchedQueue = [];
+  }
 }
 
 function renderFastApply() {
@@ -4238,7 +4269,7 @@ function renderFastApply() {
   const queue = state.fastApplyQueue || [];
   const job = queue[state.fastApplyIndex];
   target.classList.toggle("empty", !job);
-  if (!job) { target.innerHTML = `<p>${state.fastApplyInitialTotal ? "Fast Apply queue completed." : "No eligible opportunities remain for this applicant."}</p><p class="muted">Initial eligible queue: ${state.fastApplyInitialTotal} · Processed: ${state.fastApplyInitialTotal - queue.length} · Remaining: 0</p>`; return; }
+  if (!job) { target.innerHTML = `<p>${state.fastApplyInitialTotal ? "Fast Apply queue completed." : "No eligible opportunities remain for this applicant."}</p><p class="muted">Initial eligible queue: ${state.fastApplyInitialTotal} · Processed: ${state.fastApplyProcessedCount} · Remaining: 0</p>`; return; }
   const key = escapeAttribute(String(job.id));
   const url = job.application_url || job.url || "";
   const seniority = readableSeniority(job.qualification_fit_seniority?.detected_level || job.seniority_level);
@@ -4253,13 +4284,17 @@ function renderFastApply() {
   const registrationMarkup = registration ? ` · <strong>Registration:</strong> ${escapeHtml(registration)}` : "";
   const requiredExperience = formatExperienceRange(experience.required);
   const preferredExperience = formatExperienceRange(experience.preferred);
+  const workplace = isEce
+    ? `<p><strong>Workplace:</strong> ${escapeHtml(resultWorkplaceLabel(job))} · <strong>Distance:</strong> ${escapeHtml(resultDistanceLabel(job))}</p><div class="row-actions workplace-actions">${renderMapLinks(job)}</div>`
+    : "";
   const relevance = isEce
     ? `<p><strong>Employment:</strong> ${escapeHtml(employment)}${registrationMarkup}</p><p>${escapeHtml((job.discovery_result_reason || job.discovery_employment_evidence || "Educator opportunity retained under the ECE policy.").toString())}</p>`
     : `<p><strong>Detected seniority:</strong> ${escapeHtml(seniority)} · <strong>Required experience:</strong> ${escapeHtml(requiredExperience)} · <strong>Preferred:</strong> ${escapeHtml(preferredExperience)}</p><p><strong>Technical compatibility:</strong> ${escapeHtml(job.qualification_fit_label || "Not fully assessed")} · <strong>Application priority:</strong> ${Number(job.application_priority_score || 0)}/100</p><p>${escapeHtml((job.application_priority_reasons || []).join(" ") || "Priority uses applicant-aware relevance, seniority, experience, technical compatibility and evidence.")}</p><details><summary>Relevant verified skills and missing requirements</summary><p><strong>Verified:</strong> ${escapeHtml((technical.matched || job.qualification_fit_matched_requirements || []).join(", ") || "Not available")}</p><p><strong>Missing / review:</strong> ${escapeHtml((technical.missing || job.qualification_fit_missing_requirements || []).join(", ") || "None recorded")}</p><p><strong>Requirements:</strong> ${escapeHtml((job.qualification_requirements || job.required_skills || "Not fully assessed from the posting.").toString())}</p></details>`;
   const actionDisabled = state.fastApplyPendingAction ? "disabled" : "";
   const queueApplicant = state.candidateProfiles.find((profile) => String(profile.id) === String(queueApplicantId));
   const queueApplicantLabel = queueApplicant?.name || queueApplicant?.display_name || `Profile ${queueApplicantId}`;
-  target.innerHTML = `${state.fastApplyActionError ? `<p class="risk high" role="alert">${escapeHtml(state.fastApplyActionError)} Try again; this job remains current.</p>` : ""}<p class="muted">Applicant: ${escapeHtml(queueApplicantLabel)} · Initial eligible queue: ${state.fastApplyInitialTotal} · Processed: ${state.fastApplyInitialTotal - queue.length} · Remaining: ${queue.length - state.fastApplyIndex}</p><article class="discovery-card"><h3>${escapeHtml(job.title || "Untitled role")}</h3><p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(resultWorkplaceLabel(job))}</p>${relevance}<p class="muted">${escapeHtml(displaySalary(job))} · ${escapeHtml(job.work_arrangement || job.remote_type || "Work arrangement unknown")} · ${escapeHtml(commuteDisplayLabel(job))}</p><div class="row-actions">${url ? `<a class="button small" href="${escapeAttribute(url)}" target="_blank" rel="noreferrer">Open Application</a>` : ""}<button class="button small ghost" ${actionDisabled} data-fast-action="applied" data-job-key="${key}">Confirm Applied</button><button class="button small ghost" ${actionDisabled} data-fast-action="save" data-job-key="${key}">Save for later</button><button class="button small ghost" ${actionDisabled} data-fast-action="skip" data-job-key="${key}">Skip</button><button class="button small ghost" data-fast-close>Close</button></div><p class="muted helper">Opening a posting never marks a job applied. Confirm only after submitting externally.</p></article>`;
+  const remaining = Math.max(0, state.fastApplyInitialTotal - state.fastApplyProcessedCount);
+  target.innerHTML = `${state.fastApplyActionError ? `<p class="risk high" role="alert">${escapeHtml(state.fastApplyActionError)} Try again; this job remains current.</p>` : ""}<p class="muted">Applicant: ${escapeHtml(queueApplicantLabel)} · Initial eligible queue: ${state.fastApplyInitialTotal} · Processed: ${state.fastApplyProcessedCount} · Remaining: ${remaining}</p><article class="discovery-card"><h3>${escapeHtml(job.title || "Untitled role")}</h3><p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(resultWorkplaceLabel(job))}</p>${relevance}${workplace}<p class="muted">${escapeHtml(displaySalary(job))} · ${escapeHtml(job.work_arrangement || job.remote_type || "Work arrangement unknown")} · ${escapeHtml(commuteDisplayLabel(job))}</p><div class="row-actions">${url ? `<a class="button small" href="${escapeAttribute(url)}" target="_blank" rel="noreferrer">Open Application</a>` : ""}<button class="button small ghost" ${actionDisabled} data-fast-action="applied" data-job-key="${key}">Confirm Applied</button><button class="button small ghost" ${actionDisabled} data-fast-action="save" data-job-key="${key}">Save for later</button><button class="button small ghost" ${actionDisabled} data-fast-action="skip" data-job-key="${key}">Skip</button><button class="button small ghost" data-fast-close>Close</button></div><p class="muted helper">Opening a posting never marks a job applied. Confirm only after submitting externally.</p></article>`;
   target.querySelectorAll("[data-fast-action]").forEach((button) => button.addEventListener("click", async () => {
     const action = button.dataset.fastAction;
     if (state.fastApplyPendingAction) return;
@@ -4272,7 +4307,18 @@ function renderFastApply() {
       if (queueLoadToken !== state.fastApplyLoadToken || queueApplicantId !== String(state.fastApplyApplicantId || "") || queueApplicantId !== String(state.selectedCandidateProfileId || "")) return;
       state.fastApplyQueue.splice(state.fastApplyIndex, 1);
       state.fastApplyIndex = Math.min(state.fastApplyIndex, state.fastApplyQueue.length);
+      state.fastApplyProcessedCount += 1;
       await syncFastApplyCounters();
+      if (!state.fastApplyQueue.length) {
+        if (state.fastApplyPrefetchedQueue.length) {
+          state.fastApplyQueue = state.fastApplyPrefetchedQueue.splice(0);
+          state.fastApplyIndex = 0;
+          renderFastApply();
+          void prefetchFastApplyBatch(String(state.fastApplyApplicantId || state.selectedCandidateProfileId || ""), state.fastApplyLoadToken);
+        } else {
+          await loadFastApplyQueue({ append: true });
+        }
+      }
       state.fastApplyPendingAction = false;
       renderFastApply();
     } catch (error) {

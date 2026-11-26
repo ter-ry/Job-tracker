@@ -337,7 +337,7 @@
       </section>
 
       <section id="tracker" class="tab-panel">
-        <section class="dashboard" aria-label="Application dashboard">
+        <section class="dashboard" aria-label="Application dashboard" hidden>
           <article><span id="jobs-saved">0</span><p>jobs saved</p></article>
           <article><span id="applications-this-week">0</span><p>applied this week</p></article>
           <article><span id="follow-ups-needed">0</span><p>need follow-up</p></article>
@@ -347,7 +347,7 @@
           <article><span id="missing-salary">0</span><p>missing salary</p></article>
           <article><span id="high-coding-risk">0</span><p>coding-risk jobs</p></article>
         </section>
-        <section class="workspace">
+        <section class="workspace" hidden>
           <form id="job-form" class="panel">
             <div class="panel-header">
               <h2>Add or update a job</h2>
@@ -453,27 +453,19 @@
         <section class="panel table-panel">
           <div class="panel-header">
             <h2>Applications</h2>
-            <button class="button ghost small" type="button" id="open-all-discovered">All Discovered history</button>
+            <button class="button ghost small" type="button" id="open-all-processed-applications">All Processed</button>
+            <span id="open-all-discovered" hidden aria-hidden="true"></span>
             <button class="button ghost small" type="button" id="open-applied-applications">Applied <span id="applications-applied-count">0</span></button>
-            <button class="button ghost small" type="button" id="open-saved-applications">Saved</button>
-            <button class="button ghost small" type="button" id="open-skipped-applications">Skipped</button>
-            <button class="button ghost small" type="button" id="open-ready-applications">Ready to Apply <span id="applications-ready-count">0</span></button>
+            <button class="button ghost small" type="button" id="open-saved-applications">Saved <span id="applications-saved-count">0</span></button>
+            <button class="button ghost small" type="button" id="open-skipped-applications">Skipped <span id="applications-skipped-count">0</span></button>
+            <span class="muted" id="applications-ready-count" hidden>0</span>
             <span class="muted" id="applications-selected-applicant" aria-live="polite"></span>
-            <div class="filter-row">
+            <div class="filter-row applications-filters">
               <input id="search" placeholder="Search company, title, notes">
-              <select id="status-filter"><option value="">All statuses</option>{% for status in statuses %}<option>{{ status }}</option>{% endfor %}</select>
-              <select id="fit-filter"><option value="">Any fit</option><option value="75">75+</option><option value="60">60+</option><option value="40">40+</option></select>
-              <select id="role-filter"><option value="">Any role</option>{% for role_type in role_types %}<option>{{ role_type }}</option>{% endfor %}</select>
-              <select id="remote-filter"><option value="">Any remote</option><option>Remote</option><option>Hybrid</option><option>On-site</option></select>
-              <select id="risk-filter"><option value="">Any risk</option><option value="high">High coding risk</option><option value="low">Low coding risk</option></select>
+              <select id="status-filter" hidden><option value="">All Processed</option><option>Applied</option><option>Saved</option><option>Skipped</option></select>
               <select id="sort-by">
-                <option value="fit">Sort: fit</option>
+                <option value="date">Sort: most recent</option>
                 <option value="salary">Sort: salary</option>
-                <option value="distance">Sort: distance</option>
-                <option value="date">Sort: date added</option>
-                <option value="posted">Sort: posting date</option>
-                <option value="discovered">Sort: date discovered</option>
-                <option value="deadline">Sort: deadline</option>
                 <option value="location">Sort: location</option>
               </select>
             </div>
@@ -502,11 +494,9 @@
                   <th>Company</th>
                   <th>Title</th>
                   <th>Location</th>
-                  <th>Score</th>
-                  <th>Risk</th>
                   <th>Status</th>
                   <th>Salary</th>
-                  <th>Deadline</th>
+                  <th>Decision / application date</th>
                   <th>Actions</th>
                 </tr>
               </thead>
