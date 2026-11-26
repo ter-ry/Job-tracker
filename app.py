@@ -5061,6 +5061,14 @@ def saved_search_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:
     if row is None:
         return {}
     data = dict(row)
+    provider_evidence = parse_json_object(data.get("provider_raw_json"))
+    hiring_organization = provider_evidence.get("hiringOrganization") if isinstance(provider_evidence.get("hiringOrganization"), dict) else {}
+    data["provider_evidence_employer"] = (
+        text(data.get("provider_company"))
+        or text(provider_evidence.get("employer"))
+        or text(provider_evidence.get("company"))
+        or text(hiring_organization.get("name"))
+    )
     data["enabled"] = bool(data.get("enabled"))
     try:
         sources = json.loads(data.get("enabled_sources_json") or "[]")

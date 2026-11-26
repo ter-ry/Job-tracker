@@ -159,6 +159,13 @@ a {
   width: 100%;
 }
 
+/* Applications keeps the legacy dashboard/editor in the DOM for compatibility,
+   but neither section is part of the visible history workspace. */
+#tracker > .dashboard[hidden],
+#tracker > .workspace[hidden] {
+  display: none !important;
+}
+
 .panel {
   padding: 18px;
 }
@@ -459,8 +466,26 @@ legend {
 }
 
 .inbox-row {
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
 }
+
+.inbox-row > .row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  gap: 6px;
+  width: 100%;
+}
+
+.inbox-info-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px 14px;
+  margin-top: 6px;
+}
+
+.inbox-info-grid span { min-width: 0; }
 
 .inbox-row > label {
   display: inline-flex;
@@ -1355,9 +1380,8 @@ th {
   }
 
   .saved-search-row,
-  .inbox-row {
-    grid-template-columns: 1fr;
-  }
+  .inbox-row { grid-template-columns: 1fr; }
+  .inbox-info-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 
   .discovery-subnav { overflow-x: auto; }
   .discovery-subnav-button { flex: 1 0 auto; }
@@ -1555,7 +1579,7 @@ input, select, textarea { background: #111; border-color: #303030; color: #eee; 
 .discovery-results-panel #workplace-enrichment-details { margin-top: 10px; max-width: 720px; }
 .discovery-results-panel #workplace-enrichment-preview { max-height: 230px; overflow: auto; }
 .inbox-primary-views, .inbox-history-views { gap: 6px; padding: 7px 0; border-bottom: 1px solid #292929; }
-.inbox-row { grid-template-columns: 70px minmax(0, 1fr) auto; gap: 12px; padding: 12px 0; }
+.inbox-row { grid-template-columns: minmax(0, 1fr); gap: 8px; padding: 12px 0; }
 .fast-apply-panel .discovery-card { max-width: 980px; margin: 12px auto; padding: 22px; border-color: #476a7a; }
 .fast-apply-panel .discovery-card h3 { font-size: 1.3rem; }
 .fast-apply-panel .row-actions { margin-top: 18px; }

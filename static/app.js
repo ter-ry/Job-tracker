@@ -1652,6 +1652,8 @@ function renderDiscoveryInbox(jobs) {
   target.classList.toggle("empty", !visibleJobs.length);
   const renderInboxCard = (job) => {
     const category = categoryFor(job);
+    const selectedProfile = state.candidateProfiles.find((profile) => String(profile.id) === String(state.selectedCandidateProfileId || ""));
+    const isEce = String(job.workflow || job.discovery_workflow || selectedProfile?.workflow || state.discoveryWorkflow || "").toLowerCase() === "ece";
     const membership = job.search_membership_evidence || {};
     const flag = job.reassessment_flag;
     const label = labels[category] || "Archived";
@@ -1672,13 +1674,17 @@ function renderDiscoveryInbox(jobs) {
       `<button class="button ghost small" type="button" onclick="flagInboxReassessment(${job.id})">Flag for reassessment</button>`,
       `<button class="button ghost small" type="button" onclick="reassessInboxJob(${job.id})">Reassess now</button>`,
     ].join("") : "";
-    const workplaceActions = `${!job.workplace_address && !job.workplace_postal_code ? `<button class="button ghost small" type="button" data-find-workplace-job="${escapeAttribute(job.id)}">Verify workplace</button>` : ""}${renderMapLinks(job)}`;
+    const workplaceActions = isEce ? renderEceInboxWorkplaceActions(job) : `${!job.workplace_address && !job.workplace_postal_code ? `<button class="button ghost small" type="button" data-find-workplace-job="${escapeAttribute(job.id)}">Verify workplace</button>` : ""}${renderMapLinks(job)}`;
     const actions = category === "saved"
       ? `<button class="button ghost small" type="button" onclick="restoreInboxJob(${job.id})">Restore to Ready</button>${workplaceActions}`
       : category === "new_actionable" || category === "ready_to_apply" || category === "review_required" || category === "requalified" || category === "presented" || category === "applied"
       ? `<button class="button ghost small" type="button" onclick="saveInboxJob(${job.id})">Save</button><button class="button ghost small" type="button" onclick="applyInboxJob(${job.id})">Confirm Applied</button><button class="button ghost small" type="button" onclick="ignoreInboxJob(${job.id})">Skip</button>${workplaceActions}`
       : category === "skipped" ? `<button class="button ghost small" type="button" onclick="restoreInboxJob(${job.id})">Restore</button>${workplaceActions}` : category !== "excluded" ? workplaceActions : "";
-    return `<article class="inbox-row"><label><input type="checkbox" data-inbox-select="${job.id}" ${state.discoveryInboxSelected.has(Number(job.id)) ? "checked" : ""}> Select</label><div><span class="inbox-badge">${escapeHtml(label)}</span><strong>${escapeHtml(job.title || "Untitled role")}</strong><span>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(resultWorkplaceLabel(job))}</span><span class="muted">${escapeHtml(job.work_arrangement || job.remote_type || "Unknown arrangement")} · ${escapeHtml(displaySalary(job))} · ${escapeHtml(resultDistanceLabel(job))}</span>${renderExperienceSummary(job)}<details><summary>${category === "excluded" ? "Exclusion evidence" : "Requirements and source evidence"}</summary><span class="muted">Decision: ${escapeHtml(job.discovery_result_category || category)} · Reason: ${escapeHtml(job.discovery_result_reason || "Unverified/missing")} · Source: ${escapeHtml(job.source || membership.source || "Unverified/missing")} · Evidence: ${escapeHtml(job.qualification_evidence_source || membership.qualification_evidence_source || "Unverified/missing")} · Confidence: ${escapeHtml(job.qualification_evidence_confidence || membership.qualification_evidence_confidence || "Unverified/missing")}</span>${evidenceText}${membership.required_experience ? `<p class="muted">Required experience evidence: ${escapeHtml(JSON.stringify(membership.required_experience))}</p>` : ""}${sourceLink}</details>${audit}</div><div class="row-actions">${actions}${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open Original</a>` : ""}</div></article>`;
+    const employer = job.provider_evidence_employer || job.provider_company || job.company || "Unknown employer";
+    const info = isEce
+      ? `<div class="inbox-info-grid"><span><strong>Employer:</strong> ${escapeHtml(employer)}</span><span><strong>Title:</strong> ${escapeHtml(job.title || "Untitled role")}</span><span><strong>Employment:</strong> ${escapeHtml(readableEmploymentStatus(job.discovery_employment_status || job.employment_type))}</span><span><strong>Salary:</strong> ${escapeHtml(displaySalary(job))}</span><span><strong>Workplace:</strong> ${escapeHtml(resultWorkplaceLabel(job))}</span><span><strong>Distance:</strong> ${escapeHtml(resultDistanceLabel(job))}</span></div>`
+      : `<strong>${escapeHtml(job.title || "Untitled role")}</strong><span>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(resultWorkplaceLabel(job))}</span><span class="muted">${escapeHtml(job.work_arrangement || job.remote_type || "Unknown arrangement")} · ${escapeHtml(displaySalary(job))} · ${escapeHtml(resultDistanceLabel(job))}</span>${renderExperienceSummary(job)}`;
+    return `<article class="inbox-row"><div class="inbox-vacancy"><label><input type="checkbox" data-inbox-select="${job.id}" ${state.discoveryInboxSelected.has(Number(job.id)) ? "checked" : ""}> Select</label><span class="inbox-badge">${escapeHtml(label)}</span>${info}<details><summary>${category === "excluded" ? "Exclusion evidence" : "Requirements and source evidence"}</summary><span class="muted">Decision: ${escapeHtml(job.discovery_result_category || category)} · Reason: ${escapeHtml(job.discovery_result_reason || "Unverified/missing")} · Source: ${escapeHtml(job.source || membership.source || "Unverified/missing")} · Evidence: ${escapeHtml(job.qualification_evidence_source || membership.qualification_evidence_source || "Unverified/missing")} · Confidence: ${escapeHtml(job.qualification_evidence_confidence || membership.qualification_evidence_confidence || "Unverified/missing")}</span>${evidenceText}${membership.required_experience ? `<p class="muted">Required experience evidence: ${escapeHtml(JSON.stringify(membership.required_experience))}</p>` : ""}${sourceLink}</details>${audit}</div><div class="row-actions">${actions}${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open Original</a>` : ""}</div></article>`;
   };
   target.innerHTML = `${pagedCategory ? inboxPaginationMarkup("results") : ""}${visibleJobs.length ? visibleJobs.map(renderInboxCard).join("") : `No ${(labels[state.discoveryInboxCategory] || "discovery").toLowerCase()} discovery records.`}`;
   bindInboxPagination(target);
@@ -2439,6 +2445,13 @@ function renderMapLinks(job) {
   return `${workplaceConfirmationButton(job)}${employerMapSearchLink(job)}${areaMapLink(job)}`;
 }
 
+function renderEceInboxWorkplaceActions(job) {
+  const destination = mapDestination(job) || String(job?.location || "").trim();
+  const mapUrl = destination ? (googleMapsUrl(job) || `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(destination)}`) : "";
+  const confirmed = String(job?.workplace_precision || "").toLowerCase() === "owner-confirmed";
+  return `<span class="map-links ece-workplace-actions" aria-label="ECE workplace actions">${mapUrl ? `<a class="button ghost small" href="${escapeAttribute(mapUrl)}" target="_blank" rel="noreferrer">Open Map</a>` : ""}${confirmed ? "" : `<button class="button ghost small" type="button" data-confirm-workplace="${escapeAttribute(job.id)}">Confirm Workplace</button>`}</span>`;
+}
+
 function employerMapSearchLink(job) {
   const employer = String(job?.company || job?.employer || "").trim();
   const location = String(job?.location || "").trim();
@@ -2649,6 +2662,8 @@ async function loadApplicationsHistory({ page = state.applicationsHistoryPage ||
     state.applicationsHistoryPageSize = response.pageSize || pageSize;
     state.applicationsHistoryTotal = response.total || 0;
     state.jobs = Array.isArray(response.data) ? response.data : [];
+    const selectedProfile = state.candidateProfiles.find((profile) => String(profile.id) === profileId);
+    setText("applications-selected-applicant", selectedProfile ? `Applicant: ${selectedProfile.name || selectedProfile.display_name || `Profile ${profileId}`}` : `Applicant: Profile ${profileId}`);
     const counts = await api.get(`/api/discovery/inbox/counts?candidate_profile_id=${encodeURIComponent(profileId)}`);
     setText("applications-applied-count", counts.applied ?? 0);
     setText("applications-saved-count", counts.saved ?? 0);
