@@ -458,11 +458,10 @@ legend {
   padding: 12px 0;
 }
 
-.saved-search-row > div:first-child,
-.inbox-row > div:first-child,
-.inbox-row > div:nth-child(2) {
+.saved-search-row > .saved-search-content,
+.inbox-vacancy {
   display: grid;
-  gap: 3px;
+  gap: 4px;
 }
 
 .inbox-row {
@@ -476,6 +475,14 @@ legend {
   justify-content: flex-start;
   gap: 6px;
   width: 100%;
+  align-items: center;
+}
+
+.inbox-row > .row-actions .button {
+  width: auto;
+  min-height: 32px;
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .inbox-info-grid {
@@ -487,24 +494,66 @@ legend {
 
 .inbox-info-grid span { min-width: 0; }
 
-.inbox-row > label {
+.inbox-heading {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.inbox-heading label {
   display: inline-flex;
   align-items: center;
   gap: 6px;
   min-width: 0;
 }
 
-.inbox-row > label input[type="checkbox"] {
+.inbox-heading input[type="checkbox"] {
   flex: 0 0 auto;
-  width: 1rem;
-  height: 1rem;
+  width: 16px;
+  height: 16px;
   margin: 0;
+  padding: 0;
 }
 
 .saved-search-row .actions,
 .inbox-row .row-actions {
-  justify-content: flex-end;
+  justify-content: flex-start;
 }
+
+.inbox-pagination {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  width: auto;
+  margin: 8px 0;
+}
+
+.inbox-pagination label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: auto;
+  font-size: .82rem;
+}
+
+.inbox-pagination select {
+  width: auto;
+  min-width: 4.5rem;
+  padding: 5px 8px;
+  font-size: .85rem;
+}
+
+.applications-status-tabs {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.inbox-evidence-dialog-form { min-width: min(620px, calc(100vw - 2rem)); }
+.inbox-evidence-body { max-height: min(65vh, 30rem); overflow: auto; padding: 4px 2px; }
 
 .inbox-primary-views,
 .inbox-history-views {

@@ -36,6 +36,12 @@
     <div class="context-strip" role="status"><span id="workspace-title">Discover</span><span class="context-separator">·</span><span id="workspace-context-help">Search and review newly acquired opportunities.</span><span id="global-selection-status" class="muted"></span></div>
 
     <main class="layout">
+      <dialog id="inbox-evidence-dialog" aria-labelledby="inbox-evidence-title">
+        <form method="dialog" class="inbox-evidence-dialog-form">
+          <div class="panel-header"><h3 id="inbox-evidence-title">Source evidence</h3><button class="button ghost small" value="close">Close</button></div>
+          <div id="inbox-evidence-body" class="inbox-evidence-body"></div>
+        </form>
+      </dialog>
       <section id="discovery" class="tab-panel active">
         <section class="pipeline-dashboard beta-secondary" aria-labelledby="pipeline-title" hidden>
           <div class="pipeline-heading">
@@ -453,11 +459,13 @@
         <section class="panel table-panel">
           <div class="panel-header">
             <h2>Applications</h2>
-            <button class="button ghost small" type="button" id="open-all-processed-applications">All Processed</button>
-            <span id="open-all-discovered" hidden aria-hidden="true"></span>
-            <button class="button ghost small" type="button" id="open-applied-applications">Applied <span id="applications-applied-count">0</span></button>
-            <button class="button ghost small" type="button" id="open-saved-applications">Saved <span id="applications-saved-count">0</span></button>
-            <button class="button ghost small" type="button" id="open-skipped-applications">Skipped <span id="applications-skipped-count">0</span></button>
+            <div class="applications-status-tabs" role="tablist" aria-label="Application status filters">
+              <button class="button ghost small" type="button" id="open-all-processed-applications">All Processed</button>
+              <span id="open-all-discovered" hidden aria-hidden="true"></span>
+              <button class="button ghost small" type="button" id="open-applied-applications">Applied <span id="applications-applied-count">0</span></button>
+              <button class="button ghost small" type="button" id="open-saved-applications">Saved <span id="applications-saved-count">0</span></button>
+              <button class="button ghost small" type="button" id="open-skipped-applications">Skipped <span id="applications-skipped-count">0</span></button>
+            </div>
             <span class="muted" id="applications-ready-count" hidden>0</span>
             <span class="muted" id="applications-selected-applicant" aria-live="polite"></span>
             <div class="filter-row applications-filters">

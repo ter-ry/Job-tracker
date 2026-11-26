@@ -338,6 +338,10 @@ document.addEventListener("DOMContentLoaded", () => {
     const button = event.target.closest("[data-confirm-workplace]");
     if (button) confirmWorkplace(button.dataset.confirmWorkplace);
   });
+  document.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-inbox-evidence]");
+    if (button) openInboxEvidence(button.dataset.inboxEvidence);
+  });
   document.getElementById("discovery-re-evaluate")?.addEventListener("click", reEvaluateDiscoveryHistory);
   document.getElementById("qa-reset")?.addEventListener("click", resetQASession);
   document.getElementById("save-current-discovery-search").addEventListener("click", saveCurrentDiscoverySearch);
@@ -1438,7 +1442,7 @@ async function loadSavedSearches() {
     const searches = await api.get("/api/discovery/searches");
     list.innerHTML = searches.length ? searches.map((search) => `
       <article class="saved-search-row">
-        <div><strong>${escapeHtml(search.name)}</strong><span class="muted">${escapeHtml(search.keywords)} · ${escapeHtml(search.location || "Anywhere")}</span><span class="muted">${search.enabled ? "Scheduled" : "Manual only"} · ${escapeHtml((search.enabled_sources || []).map(sourceLabel).join(", "))} · ${Number(search.total_cap || 200)} aggregate / ${Number(search.per_source_cap || 100)} per source · ${search.auto_prepare_enabled ? `Auto preparation at ${Number(search.auto_prepare_min_priority || 75)}+ for new discovery results` : "Preparation manual"}</span></div>
+        <div class="saved-search-content"><strong>${escapeHtml(search.name)}</strong><span class="muted">${escapeHtml(search.keywords)} · ${escapeHtml(search.location || "Anywhere")}</span><span class="muted">${search.enabled ? "Scheduled" : "Manual only"} · ${escapeHtml((search.enabled_sources || []).map(sourceLabel).join(", "))} · ${Number(search.total_cap || 200)} aggregate / ${Number(search.per_source_cap || 100)} per source · ${search.auto_prepare_enabled ? `Auto preparation at ${Number(search.auto_prepare_min_priority || 75)}+ for new discovery results` : "Preparation manual"}</span></div>
         <div class="actions compact"><button class="button small" type="button" onclick="runSavedSearch(${search.id})">Run now</button><button class="button ghost small" type="button" onclick='editSavedSearch(${JSON.stringify(search).replaceAll("'", "&apos;")} )'>Edit</button></div>
       </article>`).join("") : `<p class="muted">No saved searches yet.</p>`;
   } catch (error) { list.innerHTML = `<p class="muted">${escapeHtml(error.message)}</p>`; }
@@ -1682,13 +1686,28 @@ function renderDiscoveryInbox(jobs) {
       : category === "skipped" ? `<button class="button ghost small" type="button" onclick="restoreInboxJob(${job.id})">Restore</button>${workplaceActions}` : category !== "excluded" ? workplaceActions : "";
     const employer = job.provider_evidence_employer || job.provider_company || job.company || "Unknown employer";
     const info = isEce
-      ? `<div class="inbox-info-grid"><span><strong>Employer:</strong> ${escapeHtml(employer)}</span><span><strong>Title:</strong> ${escapeHtml(job.title || "Untitled role")}</span><span><strong>Employment:</strong> ${escapeHtml(readableEmploymentStatus(job.discovery_employment_status || job.employment_type))}</span><span><strong>Salary:</strong> ${escapeHtml(displaySalary(job))}</span><span><strong>Workplace:</strong> ${escapeHtml(resultWorkplaceLabel(job))}</span><span><strong>Distance:</strong> ${escapeHtml(resultDistanceLabel(job))}</span></div>`
-      : `<strong>${escapeHtml(job.title || "Untitled role")}</strong><span>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(resultWorkplaceLabel(job))}</span><span class="muted">${escapeHtml(job.work_arrangement || job.remote_type || "Unknown arrangement")} · ${escapeHtml(displaySalary(job))} · ${escapeHtml(resultDistanceLabel(job))}</span>${renderExperienceSummary(job)}`;
-    return `<article class="inbox-row"><div class="inbox-vacancy"><label><input type="checkbox" data-inbox-select="${job.id}" ${state.discoveryInboxSelected.has(Number(job.id)) ? "checked" : ""}> Select</label><span class="inbox-badge">${escapeHtml(label)}</span>${info}<details><summary>${category === "excluded" ? "Exclusion evidence" : "Requirements and source evidence"}</summary><span class="muted">Decision: ${escapeHtml(job.discovery_result_category || category)} · Reason: ${escapeHtml(job.discovery_result_reason || "Unverified/missing")} · Source: ${escapeHtml(job.source || membership.source || "Unverified/missing")} · Evidence: ${escapeHtml(job.qualification_evidence_source || membership.qualification_evidence_source || "Unverified/missing")} · Confidence: ${escapeHtml(job.qualification_evidence_confidence || membership.qualification_evidence_confidence || "Unverified/missing")}</span>${evidenceText}${membership.required_experience ? `<p class="muted">Required experience evidence: ${escapeHtml(JSON.stringify(membership.required_experience))}</p>` : ""}${sourceLink}</details>${audit}</div><div class="row-actions">${actions}${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open Original</a>` : ""}</div></article>`;
+      ? `<div class="inbox-info-grid"><span><strong>Employer:</strong> ${escapeHtml(employer)}</span><span><strong>Employment:</strong> ${escapeHtml(readableEmploymentStatus(job.discovery_employment_status || job.employment_type))}</span><span><strong>Salary:</strong> ${escapeHtml(displaySalary(job))}</span><span><strong>Workplace:</strong> ${escapeHtml(resultWorkplaceLabel(job))}</span><span><strong>Distance:</strong> ${escapeHtml(resultDistanceLabel(job))}</span></div>`
+      : `<span>${escapeHtml(job.company || "Unknown company")} · ${escapeHtml(resultWorkplaceLabel(job))}</span><span class="muted">${escapeHtml(job.work_arrangement || job.remote_type || "Unknown arrangement")} · ${escapeHtml(displaySalary(job))} · ${escapeHtml(resultDistanceLabel(job))}</span>${renderExperienceSummary(job)}`;
+    const evidenceButton = `<button class="button ghost small" type="button" data-inbox-evidence="${escapeAttribute(job.id)}">${category === "excluded" ? "View exclusion evidence" : "View source evidence"}</button>`;
+    return `<article class="inbox-row"><div class="inbox-vacancy"><div class="inbox-heading"><label><input type="checkbox" data-inbox-select="${job.id}" ${state.discoveryInboxSelected.has(Number(job.id)) ? "checked" : ""}><span class="muted">Select</span></label><span class="inbox-badge">${escapeHtml(label)}</span><strong>${escapeHtml(job.title || "Untitled role")}</strong></div>${info}${audit}</div><div class="row-actions">${actions}${evidenceButton}${job.url ? `<a class="button ghost small" href="${escapeAttribute(job.url)}" target="_blank" rel="noreferrer">Open Original</a>` : ""}</div></article>`;
   };
   target.innerHTML = `${pagedCategory ? inboxPaginationMarkup("results") : ""}${visibleJobs.length ? visibleJobs.map(renderInboxCard).join("") : `No ${(labels[state.discoveryInboxCategory] || "discovery").toLowerCase()} discovery records.`}`;
   bindInboxPagination(target);
   target.querySelectorAll("[data-inbox-select]").forEach((box) => box.addEventListener("change", () => { const id = Number(box.dataset.inboxSelect); if (box.checked) state.discoveryInboxSelected.add(id); else state.discoveryInboxSelected.delete(id); }));
+  target.querySelectorAll("[data-inbox-evidence]").forEach((button) => button.addEventListener("click", () => openInboxEvidence(button.dataset.inboxEvidence)));
+}
+
+function openInboxEvidence(jobId) {
+  const job = state.discoveryInboxJobs.find((item) => Number(item.id) === Number(jobId));
+  const dialog = document.getElementById("inbox-evidence-dialog");
+  const body = document.getElementById("inbox-evidence-body");
+  if (!job || !dialog || !body) return;
+  const membership = job.search_membership_evidence || {};
+  const excerpt = membership.source_excerpt || job.qualification_evidence_excerpt || job.job_description || "No readable source excerpt is stored.";
+  const source = job.source || membership.source || "Source unavailable";
+  const url = job.url || membership.url || "";
+  body.innerHTML = `<p><strong>${escapeHtml(job.company || "Unknown employer")}</strong> · ${escapeHtml(job.title || "Untitled role")}</p><p><strong>Decision:</strong> ${escapeHtml(job.discovery_result_category || "Unverified")}<br><strong>Reason:</strong> ${escapeHtml(job.discovery_result_reason || "No persisted reason")}</p><p><strong>Source:</strong> ${escapeHtml(source)}${url ? ` · <a href="${escapeAttribute(url)}" target="_blank" rel="noreferrer">Open original</a>` : ""}</p><hr><p><strong>Readable evidence</strong></p><p>${escapeHtml(String(excerpt).slice(0, 4000))}</p>`;
+  dialog.showModal();
 }
 
 async function findWorkplaceForJob(jobId) {
