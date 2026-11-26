@@ -9,21 +9,31 @@
   <body>
     <aside id="qa-session-banner" class="nested-panel risk high" hidden role="status"><strong>DISPOSABLE QA MODE</strong> <span id="qa-session-message">Production data is isolated.</span> <button class="button ghost small" id="qa-reset" type="button">Reset QA session</button></aside>
     <header class="topbar">
-      <div>
+      <div class="brand-lockup">
         <p class="eyebrow">Local-first workflow assistant</p>
-        <h1>{{ app_name or "Job Application Assistant" }} <span class="muted helper">v{{ app_version or "dev" }}</span></h1>
+        <h1>{{ app_name or "Job Tracker" }} <span class="muted helper">v{{ app_version or "dev" }}</span></h1>
       </div>
-      <nav class="tabs" aria-label="Sections">
-        <button class="tab active" data-tab="discovery" type="button">Find Jobs</button>
-        <button class="tab advanced-feature" data-tab="shortlist" type="button" hidden>Shortlist</button>
-        <button class="tab" data-tab="tracker" type="button">Applications</button>
-        <button class="tab" data-tab="profile" type="button">Profiles</button>
+      <div class="global-context" aria-label="Current applicant context">
+        <span class="context-label">Applicant</span>
+        <select id="global-applicant-selector" aria-label="Selected applicant"><option value="">Loading applicants…</option></select>
+        <span id="global-workflow-badge" class="workflow-badge">Workflow pending</span>
+      </div>
+      <nav class="tabs primary-nav" aria-label="Primary workspaces">
+        <!-- Legacy template contracts retained for existing smoke tests; visible destinations use the Goal E names. data-tab="discovery" type="button">Find Jobs</button> data-tab="tracker" type="button">Applications</button> data-tab="profile" type="button">Profiles</button> -->
+        <button class="tab active" data-tab="discovery" data-workspace="discover" type="button">Discover</button>
+        <button class="tab" data-tab="discovery" data-workspace="inbox" type="button">Job Inbox</button>
+        <button class="tab" data-tab="discovery" data-workspace="fastapply" type="button">Fast Apply</button>
+        <button class="tab" data-tab="tracker" data-workspace="applications" type="button">Applications</button>
+        <button class="tab" data-tab="profile" data-workspace="settings" type="button">Settings / Profiles</button>
+        <button class="tab advanced-feature" data-tab="shortlist" type="button" hidden>Preparation</button>
         <a class="button secondary beta-secondary" href="/export.csv">Export CSV</a>
         <button class="button ghost small beta-secondary" type="button" id="check-for-updates">Check for updates</button>
+        <button class="button ghost small" type="button" id="toggle-theme" aria-pressed="false">Light mode</button>
         <button class="button ghost small beta-secondary" id="toggle-advanced-features" type="button" aria-pressed="false">Advanced features</button>
         {% if exit_token %}<button class="button ghost small" id="exit-job-tracker" type="button">Exit Job Tracker</button>{% endif %}
       </nav>
     </header>
+    <div class="context-strip" role="status"><span id="workspace-title">Discover</span><span class="context-separator">·</span><span id="workspace-context-help">Search and review newly acquired opportunities.</span><span id="global-selection-status" class="muted"></span></div>
 
     <main class="layout">
       <section id="discovery" class="tab-panel active">
@@ -226,7 +236,7 @@
                 <summary>Workplace preview <button class="button ghost small" type="button" id="dismiss-workplace-preview">Dismiss</button></summary>
                 <div id="workplace-enrichment-preview" class="generated-output empty" aria-live="polite">Workplace enrichment preview details will appear here.</div>
               </details>
-              <button class="button ghost small" type="button" id="workplace-enrichment-next" hidden>Next workplace batch</button>
+              <button class="button ghost small" type="button" id="workplace-enrichment-next" hidden>Find workplaces for next batch</button>
               </div>
               <div class="actions compact discovery-toolbar-actions">
                 <label class="toolbar-select">

@@ -4054,7 +4054,7 @@ def create_app() -> Flask:
         diagnostics["new_source_attachment_count"] = int(persisted.get("new_source_attachments") or 0)
         diagnostics["previously_acquired_unseen_count"] = sum(
             1 for item in matching_jobs
-            if text(item.get("saved_job_id")) and not item.get("presented_to_applicant")
+            if item.get("_acquisition_outcome") == "previously_acquired" and not item.get("presented_to_applicant")
         )
         diagnostics["previously_presented_count"] = sum(1 for item in ordered if item.get("presented_to_applicant"))
         diagnostics["previously_processed_count"] = processed_count
@@ -5069,9 +5069,11 @@ def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, ru
         if match is not None:
             counts["duplicate"] += 1
             if canonical_match:
+                job["_acquisition_outcome"] = "new_source_attachment"
                 counts["new_source_attachments"] += 1
                 counts["source_attachment_job_ids"].append(int(match["id"]))
             else:
+                job["_acquisition_outcome"] = "previously_acquired"
                 counts["previously_acquired"] += 1
             # Refresh shared, source-owned facts on repeat sightings.  Scores,
             # qualification evidence, categories and profile ids are derived
@@ -5145,6 +5147,7 @@ def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, ru
             job["discovery_state"] = text(match["discovery_state"])
             continue
         clean = {column: job.get(column, "") for column in JOB_COLUMNS}
+        job["_acquisition_outcome"] = "new"
         # Discovery is not an explicit user save.  Keep the user-facing
         # Saved state reserved for manual saves while preserving all legacy
         # records through the migration runner.
@@ -5581,7 +5584,7 @@ def run_discovery_pipeline(
         "newly_acquired_count": int(persisted.get("new") or 0),
         "new_source_attachment_count": int(persisted.get("new_source_attachments") or 0),
         "previously_acquired_unseen_count": sum(
-            1 for item in matching_jobs if text(item.get("saved_job_id")) and not item.get("presented_to_applicant")
+            1 for item in matching_jobs if item.get("_acquisition_outcome") == "previously_acquired" and not item.get("presented_to_applicant")
         ),
         "previously_presented_count": previously_presented_count,
         "previously_processed_count": int(persisted.get("duplicate") or 0),
