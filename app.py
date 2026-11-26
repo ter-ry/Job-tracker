@@ -2775,6 +2775,11 @@ def create_app() -> Flask:
             description = text(item.get("job_description"))
             grounded = bool(len(description) >= 80 and text(item.get("url")))
             category_counts[category] = category_counts.get(category, 0) + 1
+            # Materialize the exact category/reason selected by this effective
+            # policy before serializing `after`.  Otherwise preview could show
+            # one result while confirmation persisted a stale row category.
+            item["discovery_result_category"] = category
+            item["discovery_result_reason"] = reason
             derived_columns = (
                 "discovery_result_category", "discovery_result_reason", "discovery_employment_status",
                 "discovery_employment_evidence", "qualification_fit_seniority", "experience_requirements",
@@ -12742,11 +12747,16 @@ def ece_result_category(job: dict[str, Any]) -> tuple[str, str]:
         not has_rece_evidence
         or bool(re.search(r"\b(?:assistant|ECA)s?\b[^.\n]{0,50}\b(?:only|exclusively|solely)\b|\b(?:only|exclusively|solely)\b[^.\n]{0,50}\b(?:assistant|ECA)s?\b", body, re.I))
     )
+    educator_responsibilities = bool(re.search(
+        r"\b(?:plan|implement|lead|deliver|document|observe|supervise|teach|educate|develop)\b[^.\n]{0,100}\b(?:curriculum|programming|lesson|classroom|children|child development|learning|pedagog(?:y|ical))\b|\b(?:curriculum|classroom|child development|learning plan)\b[^.\n]{0,100}\b(?:plan|lead|teach|supervise|document|educat)",
+        body,
+        re.I,
+    ))
     assistant_only = assistant_only or (
         not re.search(r"\b(?:RECE|registered early child(?:hood)? educator|early childhood educator)\b", body, re.I)
         and bool(re.search(r"\b(?:seeking|looking for|hiring|need|requires?)\b[^.\n]{0,80}\b(?:assistant|ECA)s?\b", body, re.I))
     )
-    if assistant_only:
+    if assistant_only and not educator_responsibilities:
         return "excluded", "The posting evidence is assistant-only; a mixed or generic title does not establish RECE/ECE work."
     permanent = bool(re.search(r"\b(?:permanent|regular)\b", combined))
     temporary = bool(re.search(r"\b(?:temporary|contract|term|seasonal)\b", combined))

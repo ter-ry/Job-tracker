@@ -3254,6 +3254,8 @@ function applyDiscoveryWorkflow(workflow = "software", { reset = false } = {}) {
   if (seniorityHelp) seniorityHelp.textContent = selected === "software"
     ? "Seniority guides ranking; Apply Broadly keeps plausible technical stretch roles visible."
     : "ECE uses its independent title and employment policy; SWE seniority controls are hidden.";
+  const targetLabel = document.getElementById("discovery-target-label");
+  if (targetLabel) targetLabel.firstChild.textContent = selected === "ece" ? "Target full-time jobs" : "Number of new matching jobs";
   setChecked("discovery-strict-technical", selected === "software");
   const help = document.getElementById("discovery-profile-help");
   if (help) help.textContent = selected === "software"
@@ -3263,6 +3265,16 @@ function applyDiscoveryWorkflow(workflow = "software", { reset = false } = {}) {
     clearDiscoveryFilters();
     clearVisibleDiscoveryResults();
   }
+}
+
+function readableEmploymentStatus(value) {
+  return {
+    permanent_full_time: "Permanent full-time",
+    temporary_full_time: "Temporary full-time",
+    full_time_unspecified_term: "Full-time (term not stated)",
+    supply_or_casual: "Supply / casual",
+    provisional: "Employment type unconfirmed",
+  }[String(value || "").toLowerCase()] || value || "Employment type unconfirmed";
 }
 
 function applyDiscoverySearchDefaults() {
@@ -4210,13 +4222,16 @@ function renderFastApply() {
   const queueApplicantId = String(state.fastApplyApplicantId || "");
   const queueLoadToken = state.fastApplyLoadToken;
   const isEce = String(state.fastApplyWorkflow || "").toLowerCase() === "ece";
-  const employment = job.discovery_employment_status || job.employment_type || "Employment type unconfirmed";
-  const registration = job.registration_requirements || job.qualification_requirements || "Registration requirements not listed";
+  const employment = readableEmploymentStatus(job.discovery_employment_status || job.employment_type);
+  const registration = job.registration_requirements || job.qualification_requirements || "";
+  const registrationMarkup = registration ? ` · <strong>Registration:</strong> ${escapeHtml(String(registration))}` : "";
   const relevance = isEce
-    ? `<p><strong>Employment:</strong> ${escapeHtml(employment)} · <strong>Registration:</strong> ${escapeHtml(String(registration))}</p><p>${escapeHtml((job.discovery_result_reason || job.discovery_employment_evidence || "Educator opportunity retained under the ECE policy.").toString())}</p>`
+    ? `<p><strong>Employment:</strong> ${escapeHtml(employment)}${registrationMarkup}</p><p>${escapeHtml((job.discovery_result_reason || job.discovery_employment_evidence || "Educator opportunity retained under the ECE policy.").toString())}</p>`
     : `<p><strong>Detected seniority:</strong> ${escapeHtml(seniority)} · <strong>Required experience:</strong> ${escapeHtml(JSON.stringify(experience.required || "Not stated"))} · <strong>Preferred:</strong> ${escapeHtml(JSON.stringify(experience.preferred || "Not stated"))}</p><p><strong>Technical compatibility:</strong> ${escapeHtml(job.qualification_fit_label || "Not fully assessed")} · <strong>Application priority:</strong> ${Number(job.application_priority_score || 0)}/100</p><p>${escapeHtml((job.application_priority_reasons || []).join(" ") || "Priority uses applicant-aware relevance, seniority, experience, technical compatibility and evidence.")}</p><details><summary>Relevant verified skills and missing requirements</summary><p><strong>Verified:</strong> ${escapeHtml((technical.matched || job.qualification_fit_matched_requirements || []).join(", ") || "Not available")}</p><p><strong>Missing / review:</strong> ${escapeHtml((technical.missing || job.qualification_fit_missing_requirements || []).join(", ") || "None recorded")}</p><p><strong>Requirements:</strong> ${escapeHtml((job.qualification_requirements || job.required_skills || "Not fully assessed from the posting.").toString())}</p></details>`;
   const actionDisabled = state.fastApplyPendingAction ? "disabled" : "";
-  target.innerHTML = `${state.fastApplyActionError ? `<p class="risk high" role="alert">${escapeHtml(state.fastApplyActionError)} Try again; this job remains current.</p>` : ""}<p class="muted">Applicant: ${escapeHtml(state.fastApplyApplicantId)} · Initial eligible queue: ${state.fastApplyInitialTotal} · Processed: ${state.fastApplyInitialTotal - queue.length} · Remaining: ${queue.length - state.fastApplyIndex}</p><article class="discovery-card"><h3>${escapeHtml(job.title || "Untitled role")}</h3><p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(resultWorkplaceLabel(job))}</p>${relevance}<p class="muted">${escapeHtml(displaySalary(job))} · ${escapeHtml(job.work_arrangement || job.remote_type || "Work arrangement unknown")} · ${escapeHtml(commuteDisplayLabel(job))}</p><div class="row-actions">${url ? `<a class="button small" href="${escapeAttribute(url)}" target="_blank" rel="noreferrer">Open Application</a>` : ""}<button class="button small ghost" ${actionDisabled} data-fast-action="applied" data-job-key="${key}">Confirm Applied</button><button class="button small ghost" ${actionDisabled} data-fast-action="save" data-job-key="${key}">Save for later</button><button class="button small ghost" ${actionDisabled} data-fast-action="skip" data-job-key="${key}">Skip</button><button class="button small ghost" data-fast-close>Close</button></div><p class="muted helper">Opening a posting never marks a job applied. Confirm only after submitting externally.</p></article>`;
+  const queueApplicant = state.candidateProfiles.find((profile) => String(profile.id) === String(queueApplicantId));
+  const queueApplicantLabel = queueApplicant?.name || queueApplicant?.display_name || `Profile ${queueApplicantId}`;
+  target.innerHTML = `${state.fastApplyActionError ? `<p class="risk high" role="alert">${escapeHtml(state.fastApplyActionError)} Try again; this job remains current.</p>` : ""}<p class="muted">Applicant: ${escapeHtml(queueApplicantLabel)} · Initial eligible queue: ${state.fastApplyInitialTotal} · Processed: ${state.fastApplyInitialTotal - queue.length} · Remaining: ${queue.length - state.fastApplyIndex}</p><article class="discovery-card"><h3>${escapeHtml(job.title || "Untitled role")}</h3><p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(resultWorkplaceLabel(job))}</p>${relevance}<p class="muted">${escapeHtml(displaySalary(job))} · ${escapeHtml(job.work_arrangement || job.remote_type || "Work arrangement unknown")} · ${escapeHtml(commuteDisplayLabel(job))}</p><div class="row-actions">${url ? `<a class="button small" href="${escapeAttribute(url)}" target="_blank" rel="noreferrer">Open Application</a>` : ""}<button class="button small ghost" ${actionDisabled} data-fast-action="applied" data-job-key="${key}">Confirm Applied</button><button class="button small ghost" ${actionDisabled} data-fast-action="save" data-job-key="${key}">Save for later</button><button class="button small ghost" ${actionDisabled} data-fast-action="skip" data-job-key="${key}">Skip</button><button class="button small ghost" data-fast-close>Close</button></div><p class="muted helper">Opening a posting never marks a job applied. Confirm only after submitting externally.</p></article>`;
   target.querySelectorAll("[data-fast-action]").forEach((button) => button.addEventListener("click", async () => {
     const action = button.dataset.fastAction;
     if (state.fastApplyPendingAction) return;

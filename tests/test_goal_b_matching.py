@@ -95,6 +95,11 @@ def test_goal_b_ece_contextual_employment_and_mixed_titles():
     assert supply == "actionable"
     mixed, _ = classify("Withrow ECE/ECA Supply", "Seeking early childhood assistants only.")
     assert mixed == "excluded"
+    educator_duties, _ = classify(
+        "Withrow ECE/ECA Supply",
+        "Seeking early childhood assistants only. The educator will plan curriculum, supervise children, document observations, and lead classroom learning.",
+    )
+    assert educator_duties == "actionable"
     teacher, _ = classify("Kindergarten Teacher", "ECE eligibility is an asset.")
     assert teacher == "review_required"
     full_time, _ = classify("Full-time RECE Educator", "The educator works alongside casual colleagues.")
