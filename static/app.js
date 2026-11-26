@@ -30,7 +30,7 @@ const state = {
   candidateProfilesError: "",
   loadToken: 0,
   discoveryInboxJobs: [],
-  discoveryInboxCategory: "new_actionable",
+  discoveryInboxCategory: "ready_to_apply",
   discoveryInboxSearchId: "",
   discoveryInboxPage: 0,
   discoveryInboxQuery: "",
@@ -55,13 +55,6 @@ const state = {
   fastApplyLoadToken: 0,
   fastApplyInitialTotal: 0,
   fastApplyPendingAction: false,
-  workplaceEnrichmentOffset: 0,
-  workplaceEnrichmentSearchId: "",
-  workplaceEnrichmentSearch: null,
-  workplaceEnrichmentRuns: [],
-  workplaceEnrichmentNextOffset: 0,
-  workplaceEnrichmentHasMore: false,
-  workplaceSearchLoadToken: 0,
   advancedFeatures: (() => { try { return localStorage.getItem("jobTracker.advancedFeatures") === "true"; } catch (_) { return false; } })(),
   pendingAppliedJobs: new Set(),
   tailoring: { draftId: null, jobId: null, profileId: null, resumeId: null, data: null, selectedParagraph: null, selectedKeyword: null, aiImproveJobId: null },
@@ -269,6 +262,8 @@ async function resolveHistoricalDuplicateMatch(matchId, resolution) {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+  organizeWorkspaceDom();
+  setPrimaryWorkspace("discover");
   applyAppearance();
   document.getElementById("toggle-theme")?.addEventListener("click", () => { state.appearance = state.appearance === "light" ? "dark" : "light"; try { localStorage.setItem("jobTracker.appearance", state.appearance); } catch (_) { /* storage may be disabled */ } applyAppearance(); });
   document.querySelectorAll(".tab").forEach((tab) => tab.addEventListener("click", switchTab));
@@ -320,8 +315,6 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("historical-application-confirm")?.addEventListener("click", confirmHistoricalApplications);
   document.getElementById("discovery-test-sources").addEventListener("click", testJobSources);
   document.getElementById("discovery-recalculate-distances")?.addEventListener("click", recalculateDiscoveryDistances);
-  document.getElementById("discovery-enrich-workplaces")?.addEventListener("click", previewWorkplaceEnrichment);
-  document.getElementById("workplace-enrichment-search")?.addEventListener("change", (event) => selectWorkplaceSearchRun(event.target.value));
   document.addEventListener("click", (event) => {
     const button = event.target.closest("[data-find-workplace-job]");
     if (button) findWorkplaceForJob(button.dataset.findWorkplaceJob);
@@ -329,12 +322,6 @@ document.addEventListener("DOMContentLoaded", () => {
   document.addEventListener("click", (event) => {
     const button = event.target.closest("[data-confirm-workplace]");
     if (button) confirmWorkplace(button.dataset.confirmWorkplace);
-  });
-  document.getElementById("workplace-enrichment-next")?.addEventListener("click", (event) => previewWorkplaceEnrichment(event, true));
-  document.getElementById("dismiss-workplace-preview")?.addEventListener("click", (event) => {
-    event.preventDefault();
-    const details = document.getElementById("workplace-enrichment-details");
-    if (details) details.hidden = true;
   });
   document.getElementById("discovery-re-evaluate")?.addEventListener("click", reEvaluateDiscoveryHistory);
   document.getElementById("qa-reset")?.addEventListener("click", resetQASession);
@@ -375,8 +362,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("discovery-clear-filters").addEventListener("click", clearDiscoveryFilters);
   document.getElementById("discovery-filter-show-all")?.addEventListener("click", showAllFetchedDiscoveryJobs);
   document.getElementById("fast-apply-open")?.addEventListener("click", openFastApply);
-  document.getElementById("fast-apply-close")?.addEventListener("click", () => { document.getElementById("fast-apply-panel").hidden = true; });
-  setDiscoverySection("find");
+  document.getElementById("fast-apply-close")?.addEventListener("click", () => { document.querySelector('.primary-nav [data-workspace="discover"]')?.click(); });
   applyAdvancedFeaturesVisibility();
   ["search", "status-filter", "fit-filter", "role-filter", "remote-filter", "risk-filter", "sort-by"].forEach((id) => {
     document.getElementById(id).addEventListener("input", renderJobs);
@@ -509,17 +495,8 @@ function toggleAdvancedFeatures() {
 }
 
 function setDiscoverySection(view) {
-  const selected = ["pipeline", "find", "inbox", "saved"].includes(view) ? view : "find";
-  document.querySelectorAll("[data-discovery-view]").forEach((button) => {
-    const active = button.dataset.discoveryView === selected;
-    button.classList.toggle("active", active);
-    button.setAttribute("aria-selected", active ? "true" : "false");
-  });
-  const pipeline = document.querySelector(".pipeline-dashboard");
-  if (pipeline) pipeline.hidden = selected !== "pipeline";
-  document.querySelectorAll(".discovery-view-find").forEach((element) => { element.hidden = selected !== "find"; });
-  document.querySelectorAll(".discovery-view-saved").forEach((element) => { element.hidden = selected !== "saved" && selected !== "inbox"; });
-  document.querySelectorAll(".discovery-view-inbox").forEach((element) => { element.hidden = selected !== "inbox"; });
+  const selected = view === "inbox" ? "inbox" : "discover";
+  setPrimaryWorkspace(selected);
   if (selected === "inbox") loadDiscoveryInbox(true);
 }
 
@@ -539,7 +516,6 @@ async function loadAll({ skipProfiles = false } = {}) {
     ]);
     const shortlist = await api.get("/api/shortlist");
     await profilesPromise;
-    await loadWorkplaceSearchRuns();
     if (loadToken !== state.loadToken) return;
     state.jobs = jobs;
     state.discoveryInboxJobs = jobs.filter((job) => job.discovery_first_seen_at);
@@ -664,6 +640,7 @@ async function loadCandidateProfiles({ reloadPanelsOnSelectionChange = false } =
     state.candidateProfilesStatus = "ready";
     renderCandidateProfiles();
     const selectedProfile = state.candidateProfiles.find((profile) => String(profile.id) === String(state.selectedCandidateProfileId));
+    if (selectedProfile) applyDiscoveryWorkflow(selectedProfile.workflow === "ece" ? "ece" : "software", { reset: selectedAtStart !== state.selectedCandidateProfileId });
     if (selectedProfile && (selectedAtStart !== state.selectedCandidateProfileId || !String(value("discovery-distance-origin") || "").trim())) {
       setValue("discovery-distance-origin", selectedProfile.commute_origin_input || "");
     }
@@ -1499,7 +1476,7 @@ async function saveSavedSearch(event) {
 function saveCurrentDiscoverySearch() {
   const criteria = discoverySearchCriteriaFromControls();
   toggleSavedSearchForm(true);
-  setDiscoverySection("saved");
+  document.querySelector('.primary-nav [data-workspace="settings"]')?.click();
   setValue("saved-search-id", "");
   setValue("saved-search-name", criteria.keywords ? `${criteria.keywords} search` : "New job search");
   setValue("saved-search-keywords", criteria.keywords);
@@ -1584,8 +1561,8 @@ function renderDiscoveryInbox(jobs) {
     if (button) button.disabled = Boolean(state.discoveryInboxBulkAction);
   });
   const labels = { all_relevant: "All Relevant", new_actionable: "New Opportunities", ready_to_apply: "Ready to Apply", review_required: "Needs Review", presented: "Presented / Seen", excluded: "Excluded Jobs", requalified: "Requalified Since Update", saved: "Saved", applied: "Applied", skipped: "Skipped", all_discovered: "All Discovered" };
-  const primaryViews = { new_actionable: "New Jobs", review_required: "Needs Review", all_discovered: "History" };
-  const historyViews = ["all_relevant", "ready_to_apply", "presented", "saved", "applied", "skipped", "excluded", "requalified", "all_discovered"];
+  const primaryViews = { ready_to_apply: "Ready to Apply", new_actionable: "New", saved: "Saved", review_required: "Needs Review", applied: "Applied", skipped: "Skipped", all_discovered: "All Discovered" };
+  const historyViews = ["saved", "applied", "skipped", "all_discovered"];
   const pagedCategory = ["new", "new_actionable", "review", "review_required", "ready_to_apply", "requalified", "presented", "saved", "applied", "skipped", "excluded", "all_relevant", "all_discovered"].includes(state.discoveryInboxCategory);
   const counts = jobs.reduce((result, job) => {
     const category = job.discovery_inbox_category || discoveryInboxCategory(job);
@@ -1675,7 +1652,7 @@ function renderDiscoveryInbox(jobs) {
       `<button class="button ghost small" type="button" onclick="flagInboxReassessment(${job.id})">Flag for reassessment</button>`,
       `<button class="button ghost small" type="button" onclick="reassessInboxJob(${job.id})">Reassess now</button>`,
     ].join("") : "";
-    const workplaceActions = `${!job.workplace_address && !job.workplace_postal_code ? `<button class="button ghost small" type="button" data-find-workplace-job="${escapeAttribute(job.id)}">Find workplace</button>` : ""}${renderMapLinks(job)}`;
+    const workplaceActions = `${!job.workplace_address && !job.workplace_postal_code ? `<button class="button ghost small" type="button" data-find-workplace-job="${escapeAttribute(job.id)}">Verify workplace</button>` : ""}${renderMapLinks(job)}`;
     const actions = category === "new_actionable" || category === "ready_to_apply" || category === "review_required" || category === "requalified" || category === "presented" || category === "saved" || category === "applied"
       ? `<button class="button ghost small" type="button" onclick="saveInboxJob(${job.id})">Save</button><button class="button ghost small" type="button" onclick="applyInboxJob(${job.id})">Confirm Applied</button><button class="button ghost small" type="button" onclick="ignoreInboxJob(${job.id})">Skip</button>${workplaceActions}`
       : category === "skipped" ? `<button class="button ghost small" type="button" onclick="restoreInboxJob(${job.id})">Restore</button>${workplaceActions}` : category !== "excluded" ? workplaceActions : "";
@@ -2031,6 +2008,7 @@ async function selectCandidateProfile(profileId) {
   if (String(profileId) !== String(state.selectedCandidateProfileId || "")) invalidateApplicantContext();
   state.selectedCandidateProfileId = String(profileId);
   const selected = state.candidateProfiles.find((profile) => String(profile.id) === String(profileId));
+  applyDiscoveryWorkflow(selected?.workflow === "ece" ? "ece" : "software", { reset: true });
   setValue("discovery-distance-origin", selected?.commute_origin_input || "");
   try { localStorage.setItem("jobTracker.selectedCandidateProfileId", state.selectedCandidateProfileId); } catch (_) { /* storage may be disabled */ }
   state.discoveryInboxJobs = [];
@@ -2100,13 +2078,46 @@ function switchTab(event) {
   setText("workspace-context-help", help);
   const discovery = document.getElementById("discovery");
   if (target === "discovery") {
-    const view = workspace === "inbox" ? "inbox" : "find";
-    setDiscoverySection(view);
-    const fastPanel = document.getElementById("fast-apply-panel");
-    if (fastPanel) fastPanel.hidden = workspace !== "fastapply";
-    if (workspace === "fastapply") loadFastApplyQueue();
+    setPrimaryWorkspace(workspace);
+    if (workspace === "fastapply") {
+      // Keep the focused card visible even when a late startup render finishes
+      // while the user is switching workspaces.
+      const fastApplyPanel = document.getElementById("fast-apply-panel");
+      if (fastApplyPanel) fastApplyPanel.hidden = false;
+      loadFastApplyQueue();
+    }
     if (workspace === "inbox") loadDiscoveryInbox(true);
   }
+}
+
+function organizeWorkspaceDom() {
+  const settingsHost = document.querySelector("#profile .candidate-profile-manager");
+  if (settingsHost) {
+    document.querySelectorAll(".workspace-settings-content").forEach((panel) => settingsHost.appendChild(panel));
+  }
+  const form = document.getElementById("discovery-form");
+  if (!form || document.getElementById("discovery-advanced-settings")) return;
+  const controls = [...form.querySelectorAll(".swe-advanced-control")];
+  if (!controls.length) return;
+  const details = document.createElement("details");
+  details.id = "discovery-advanced-settings";
+  details.className = "settings-block discovery-advanced-settings";
+  details.innerHTML = "<summary>Advanced SWE preferences</summary><p class=\"muted helper\">Apply Broadly keeps genuine technical stretch roles visible; these preferences affect ranking and review, not recall.</p>";
+  const content = document.createElement("div");
+  content.className = "grid three";
+  controls.forEach((control) => content.appendChild(control));
+  details.appendChild(content);
+  form.querySelector(".source-picker")?.before(details);
+}
+
+function setPrimaryWorkspace(workspace = "discover") {
+  const normalized = ["discover", "inbox", "fastapply"].includes(workspace) ? workspace : "discover";
+  document.querySelectorAll("#discovery .workspace-discover-content").forEach((panel) => { panel.hidden = normalized !== "discover"; });
+  document.querySelectorAll("#discovery .workspace-inbox").forEach((panel) => { panel.hidden = normalized !== "inbox"; });
+  document.querySelectorAll("#discovery .workspace-fastapply").forEach((panel) => { panel.hidden = normalized !== "fastapply"; });
+  const inbox = document.querySelector("#discovery .workspace-inbox");
+  if (normalized === "inbox" && inbox) inbox.hidden = false;
+  if (normalized === "fastapply") document.getElementById("fast-apply-current")?.focus?.();
 }
 
 async function focusPreparationPackage(itemId) {
@@ -3280,7 +3291,9 @@ function discoverySearchCriteriaFromControls(continuation = false) {
     match_policy: workflow === "software" ? (value("discovery-match-policy") || "apply_broadly") : "strict_matching",
     title_match_mode: value("discovery-title-match-mode") || "related",
     keywords: value("discovery-keywords"),
-    location: workflow === "ece" ? origin : value("discovery-location"),
+    // Commute From is the single location authority for both workflows. The
+    // provider query must never depend on a hidden Search Area field.
+    location: origin,
     distance_origin: origin,
     distance_origin_input: origin,
     original_origin: origin,
@@ -3612,7 +3625,6 @@ async function stopProgressiveDiscoverySearch() {
 
 async function searchDiscovery(event, continuation = false) {
   event.preventDefault();
-  if (!continuation) state.workplaceEnrichmentOffset = 0;
   const button = document.getElementById("discovery-submit");
   const status = document.getElementById("discovery-status");
   const criteria = discoverySearchCriteriaFromControls(continuation);
@@ -4090,7 +4102,6 @@ function invalidateApplicantContext() {
   // previous applicant cannot repopulate the new applicant's view.
   state.loadToken += 1;
   state.discoveryInboxLoadToken += 1;
-  state.workplaceSearchLoadToken += 1;
   state.fastApplyLoadToken += 1;
   state.discoveryActiveSearchId = "";
   state.discoveryLastSearchId = "";
@@ -4106,12 +4117,6 @@ function invalidateApplicantContext() {
   state.discoveryInboxTotal = 0;
   state.discoveryInboxHasMore = false;
   state.discoveryInboxSelected.clear();
-  state.workplaceEnrichmentRuns = [];
-  state.workplaceEnrichmentSearch = null;
-  state.workplaceEnrichmentSearchId = "";
-  state.workplaceEnrichmentOffset = 0;
-  state.workplaceEnrichmentNextOffset = 0;
-  state.workplaceEnrichmentHasMore = false;
   state.preparationQueue = [];
   state.preparationPreviews = {};
   state.generationSelections = {};
@@ -4191,8 +4196,14 @@ function renderFastApply() {
   const technical = job.technical_compatibility || {};
   const queueApplicantId = String(state.fastApplyApplicantId || "");
   const queueLoadToken = state.fastApplyLoadToken;
+  const isEce = String(state.fastApplyWorkflow || "").toLowerCase() === "ece";
+  const employment = job.discovery_employment_status || job.employment_type || "Employment type unconfirmed";
+  const registration = job.registration_requirements || job.qualification_requirements || "Registration requirements not listed";
+  const relevance = isEce
+    ? `<p><strong>Employment:</strong> ${escapeHtml(employment)} · <strong>Registration:</strong> ${escapeHtml(String(registration))}</p><p>${escapeHtml((job.discovery_result_reason || job.discovery_employment_evidence || "Educator opportunity retained under the ECE policy.").toString())}</p>`
+    : `<p><strong>Detected seniority:</strong> ${escapeHtml(seniority)} · <strong>Required experience:</strong> ${escapeHtml(JSON.stringify(experience.required || "Not stated"))} · <strong>Preferred:</strong> ${escapeHtml(JSON.stringify(experience.preferred || "Not stated"))}</p><p><strong>Technical compatibility:</strong> ${escapeHtml(job.qualification_fit_label || "Not fully assessed")} · <strong>Application priority:</strong> ${Number(job.application_priority_score || 0)}/100</p><p>${escapeHtml((job.application_priority_reasons || []).join(" ") || "Priority uses applicant-aware relevance, seniority, experience, technical compatibility and evidence.")}</p><details><summary>Relevant verified skills and missing requirements</summary><p><strong>Verified:</strong> ${escapeHtml((technical.matched || job.qualification_fit_matched_requirements || []).join(", ") || "Not available")}</p><p><strong>Missing / review:</strong> ${escapeHtml((technical.missing || job.qualification_fit_missing_requirements || []).join(", ") || "None recorded")}</p><p><strong>Requirements:</strong> ${escapeHtml((job.qualification_requirements || job.required_skills || "Not fully assessed from the posting.").toString())}</p></details>`;
   const actionDisabled = state.fastApplyPendingAction ? "disabled" : "";
-  target.innerHTML = `${state.fastApplyActionError ? `<p class="risk high" role="alert">${escapeHtml(state.fastApplyActionError)} Try again; this job remains current.</p>` : ""}<p class="muted">Applicant: ${escapeHtml(state.fastApplyApplicantId)} · Initial eligible queue: ${state.fastApplyInitialTotal} · Processed: ${state.fastApplyInitialTotal - queue.length} · Remaining: ${queue.length - state.fastApplyIndex}</p><article class="discovery-card"><h3>${escapeHtml(job.title || "Untitled role")}</h3><p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(resultWorkplaceLabel(job))}</p><p><strong>Detected seniority:</strong> ${escapeHtml(seniority)} · <strong>Required experience:</strong> ${escapeHtml(JSON.stringify(experience.required || "Not stated"))} · <strong>Preferred:</strong> ${escapeHtml(JSON.stringify(experience.preferred || "Not stated"))}</p><p><strong>Technical compatibility:</strong> ${escapeHtml(job.qualification_fit_label || "Not fully assessed")} · <strong>Application priority:</strong> ${Number(job.application_priority_score || 0)}/100</p><p class="muted">${escapeHtml(displaySalary(job))} · ${escapeHtml(job.work_arrangement || job.remote_type || "Work arrangement unknown")} · ${escapeHtml(commuteDisplayLabel(job))}</p><p>${escapeHtml((job.application_priority_reasons || []).join(" ") || "Priority uses applicant-aware relevance, seniority, experience, technical compatibility and evidence.")}</p><details><summary>Relevant verified skills and missing requirements</summary><p><strong>Verified:</strong> ${escapeHtml((technical.matched || job.qualification_fit_matched_requirements || []).join(", ") || "Not available")}</p><p><strong>Missing / review:</strong> ${escapeHtml((technical.missing || job.qualification_fit_missing_requirements || []).join(", ") || "None recorded")}</p><p><strong>Requirements:</strong> ${escapeHtml((job.qualification_requirements || job.required_skills || "Not fully assessed from the posting.").toString())}</p></details><div class="row-actions">${url ? `<a class="button small" href="${escapeAttribute(url)}" target="_blank" rel="noreferrer">Open Original / Apply</a>` : ""}<button class="button small ghost" ${actionDisabled} data-fast-action="applied" data-job-key="${key}">Confirm Applied</button><button class="button small ghost" ${actionDisabled} data-fast-action="save" data-job-key="${key}">Save for later</button><button class="button small ghost" ${actionDisabled} data-fast-action="skip" data-job-key="${key}">Skip</button><button class="button small ghost" data-fast-close>Close</button></div><p class="muted helper">Opening a posting never marks a job applied. Confirm only after submitting externally.</p></article>`;
+  target.innerHTML = `${state.fastApplyActionError ? `<p class="risk high" role="alert">${escapeHtml(state.fastApplyActionError)} Try again; this job remains current.</p>` : ""}<p class="muted">Applicant: ${escapeHtml(state.fastApplyApplicantId)} · Initial eligible queue: ${state.fastApplyInitialTotal} · Processed: ${state.fastApplyInitialTotal - queue.length} · Remaining: ${queue.length - state.fastApplyIndex}</p><article class="discovery-card"><h3>${escapeHtml(job.title || "Untitled role")}</h3><p><strong>${escapeHtml(job.company || "Unknown company")}</strong> · ${escapeHtml(resultWorkplaceLabel(job))}</p>${relevance}<p class="muted">${escapeHtml(displaySalary(job))} · ${escapeHtml(job.work_arrangement || job.remote_type || "Work arrangement unknown")} · ${escapeHtml(commuteDisplayLabel(job))}</p><div class="row-actions">${url ? `<a class="button small" href="${escapeAttribute(url)}" target="_blank" rel="noreferrer">Open Application</a>` : ""}<button class="button small ghost" ${actionDisabled} data-fast-action="applied" data-job-key="${key}">Confirm Applied</button><button class="button small ghost" ${actionDisabled} data-fast-action="save" data-job-key="${key}">Save for later</button><button class="button small ghost" ${actionDisabled} data-fast-action="skip" data-job-key="${key}">Skip</button><button class="button small ghost" data-fast-close>Close</button></div><p class="muted helper">Opening a posting never marks a job applied. Confirm only after submitting externally.</p></article>`;
   target.querySelectorAll("[data-fast-action]").forEach((button) => button.addEventListener("click", async () => {
     const action = button.dataset.fastAction;
     if (state.fastApplyPendingAction) return;

@@ -37,12 +37,6 @@
 
     <main class="layout">
       <section id="discovery" class="tab-panel active">
-        <nav class="discovery-subnav" aria-label="Discovery views">
-          <button class="discovery-subnav-button active" type="button" data-discovery-view="find">Find jobs</button>
-          <button class="discovery-subnav-button" type="button" data-discovery-view="inbox">Jobs Inbox</button>
-          <button class="discovery-subnav-button" type="button" data-discovery-view="pipeline">Pipeline</button>
-          <button class="discovery-subnav-button" type="button" data-discovery-view="saved">Saved searches</button>
-        </nav>
         <section class="pipeline-dashboard beta-secondary" aria-labelledby="pipeline-title" hidden>
           <div class="pipeline-heading">
             <div>
@@ -74,7 +68,7 @@
           <aside id="pipeline-job-details" class="pipeline-job-details" hidden aria-live="polite"></aside>
         </section>
         <section class="workspace discovery-layout">
-          <section class="panel discovery-saved-searches discovery-view-saved">
+          <section class="panel discovery-saved-searches discovery-view-saved workspace-settings-content">
             <div class="panel-header">
               <div><h2>Saved searches</h2><p class="muted helper">Scheduled discovery is off until you enable it.</p></div>
               <div class="actions compact"><button class="button ghost small" type="button" id="refresh-saved-searches">Refresh</button><button class="button small" type="button" id="new-saved-search">New search</button></div>
@@ -112,25 +106,25 @@
               <p class="muted helper">To disable it later, run <code>scripts\\uninstall_discovery_task.ps1</code>. No administrator permission is normally required.</p>
             </div>
           </section>
-          <form id="discovery-form" class="panel discovery-search-panel discovery-view-find beta-search-panel">
+          <form id="discovery-form" class="panel discovery-search-panel discovery-view-find beta-search-panel workspace-discover-content">
             <div class="panel-header"><div><h2>Find jobs</h2><p class="muted helper">Choose an applicant workflow, then search and review only its results.</p></div></div>
             <div class="grid two">
-              <label>Workflow
+              <label hidden>
                 <select id="discovery-workflow" aria-label="Applicant workflow">
                   <option value="software" selected>Software Jobs — technical shortlist</option>
                   <option value="ece">ECE Jobs — title and seniority match</option>
                 </select>
               </label>
-              <label>Applicant / résumé
+              <label hidden>
                 <select id="discovery-profile"><option value="">Choose applicant</option></select>
                 <small id="discovery-profile-help" class="muted">Software matching uses this applicant’s selected SWE résumé.</small>
               </label>
               <label>Job titles<input id="discovery-keywords" required placeholder="software developer; junior software engineer"><small class="muted">Use semicolons for multiple titles.</small></label>
-              <label>Search area<input id="discovery-location" placeholder="Toronto, Ontario"></label>
+              <input id="discovery-location" type="hidden" value="">
               <label>Commute From<input id="discovery-distance-origin" placeholder="Enter an address or postal code"><small class="muted">The selected applicant's saved origin is loaded here. A failed lookup stays unresolved; it never falls back to another location.</small></label>
               <label>Number of new matching jobs<input id="discovery-new-matching-target" type="number" min="1" max="500" step="1" value="50"><small class="muted">Target for qualifying new jobs, not the raw provider-fetch limit.</small></label>
               <label>Distance radius<input id="discovery-distance" type="number" min="0" step="1" placeholder="50 km"></label>
-              <label>Remote preference
+              <label class="swe-advanced-control">Remote preference
                 <select id="discovery-remote-preference">
                   <option value="">Any</option>
                   <option value="remote">Remote</option>
@@ -138,7 +132,7 @@
                   <option value="on-site">On-site</option>
                 </select>
               </label>
-              <label>Target seniority
+              <label class="swe-advanced-control">Target seniority
                 <select id="discovery-seniority">
                   <option value="entry_level,junior,intermediate" selected>Entry-level to intermediate / stretch</option>
                   <option value="entry_level,junior">Entry-level or junior</option>
@@ -147,20 +141,20 @@
                 </select>
                 <small id="discovery-seniority-help" class="muted">Seniority influences application priority; Apply Broadly keeps plausible senior and stretch roles visible.</small>
               </label>
-              <label>Maximum required experience
+              <label class="swe-advanced-control">Maximum required experience
                 <input id="discovery-maximum-years" type="number" min="0" max="30" step="1" value="3">
                 <small class="muted">In Apply Broadly this influences priority; Strict Matching may enforce confirmed professional experience.</small>
               </label>
-              <label id="discovery-match-policy-label">Matching approach
+              <label class="swe-advanced-control" id="discovery-match-policy-label">Matching approach
                 <select id="discovery-match-policy">
                   <option value="apply_broadly" selected>Apply Broadly — plausible technical roles</option>
                   <option value="strict_matching">Strict Matching — closely qualifying roles</option>
                 </select>
                 <small class="muted">Broad mode ranks fit; it does not claim an unverified résumé match.</small>
               </label>
-              <label class="checkline"><input id="discovery-include-provisional" type="checkbox" checked> Include plausible matches with unstated seniority</label>
-              <label class="checkline"><input id="discovery-include-internships" type="checkbox"> Include internships in the junior eligibility policy</label>
-              <label>Location confidence
+              <label class="checkline swe-advanced-control"><input id="discovery-include-provisional" type="checkbox" checked> Include plausible matches with unstated seniority</label>
+              <label class="checkline swe-advanced-control"><input id="discovery-include-internships" type="checkbox"> Include internships in the junior eligibility policy</label>
+              <label class="swe-advanced-control">Location confidence
                 <select id="discovery-geographic-match-mode">
                   <option value="provisional" selected>Include city/region matches; verify commute later</option>
                   <option value="strict">Strict radius; verified workplaces only</option>
@@ -175,14 +169,14 @@
             <details class="settings-block">
               <summary>Search options</summary>
               <div class="grid three">
-                <label>Search depth
+                <label class="swe-advanced-control">Search depth
                   <select id="discovery-search-depth">
                     <option value="quick">Quick</option>
                     <option value="standard" selected>Standard</option>
                     <option value="thorough">Thorough</option>
                   </select>
                 </label>
-                <label>Date range
+                <label class="swe-advanced-control">Date range
                   <select id="discovery-date-window">
                     <option value="24h">24 hours</option>
                     <option value="3d">3 days</option>
@@ -192,8 +186,8 @@
                     <option value="any">Any time supported by source</option>
                   </select>
                 </label>
-                <label class="checkline"><input id="discovery-bypass-cache" type="checkbox"> Bypass cache</label>
-                <label>Title matching
+                <label class="checkline swe-advanced-control"><input id="discovery-bypass-cache" type="checkbox"> Bypass cache</label>
+                <label class="swe-advanced-control">Title matching
                   <select id="discovery-title-match-mode">
                     <option value="related" selected>Related titles</option>
                     <option value="strict">Exact titles only</option>
@@ -206,19 +200,11 @@
             <div id="discovery-source-test-output" class="muted helper" aria-live="polite"></div>
             <div class="actions">
               <button class="button" type="submit" id="discovery-submit">Search</button>
-              <button class="button ghost" type="button" id="fast-apply-open">Fast Apply</button>
               <button class="button ghost" type="button" id="discovery-stop" hidden>Stop Search</button>
               <button class="button ghost beta-secondary" type="button" id="save-current-discovery-search">Save current search</button>
               <button class="button ghost beta-secondary" type="button" id="discovery-test-sources">Test job sources</button>
               <button class="button ghost beta-secondary" type="button" id="discovery-recalculate-distances">Recalculate distances</button>
-              <button class="button ghost" type="button" id="discovery-enrich-workplaces">Find workplace</button>
               <button class="button ghost beta-secondary" type="button" id="discovery-re-evaluate">Re-evaluate stored history</button>
-            </div>
-            <div class="workplace-enrichment-selector" id="workplace-enrichment-selector">
-              <label>Choose previous search
-                <select id="workplace-enrichment-search" aria-label="Choose previous search"></select>
-              </label>
-              <p id="workplace-enrichment-selection-status" class="muted helper" aria-live="polite">Loading completed searches…</p>
             </div>
             <div class="compatibility-fields" aria-hidden="true">
               <select id="discovery-search-mode"><option value="shortlist">shortlist</option></select>
@@ -226,17 +212,12 @@
             </div>
           </form>
 
-          <section class="panel discovery-results-panel discovery-view-find">
+          <section class="panel discovery-results-panel discovery-view-find workspace-discover-content">
             <div class="panel-header discovery-toolbar">
               <div>
                 <h2>Discovery results</h2>
                 <p id="discovery-active-state" class="muted helper">Search results will appear here.</p>
                 <p id="discovery-distance-origin-summary" class="muted helper">Distance calculated from: not configured.</p>
-              <details id="workplace-enrichment-details" open>
-                <summary>Workplace preview <button class="button ghost small" type="button" id="dismiss-workplace-preview">Dismiss</button></summary>
-                <div id="workplace-enrichment-preview" class="generated-output empty" aria-live="polite">Workplace enrichment preview details will appear here.</div>
-              </details>
-              <button class="button ghost small" type="button" id="workplace-enrichment-next" hidden>Find workplaces for next batch</button>
               </div>
               <div class="actions compact discovery-toolbar-actions">
                 <label class="toolbar-select">
@@ -298,19 +279,19 @@
             <div id="discovery-results" class="generated-output empty">Search results will appear here.</div>
           </section>
 
-          <section class="panel discovery-view-find" id="fast-apply-panel" hidden>
+          <section class="panel discovery-view-find workspace-fastapply" id="fast-apply-panel" hidden>
             <div class="panel-header"><div><h2>Fast Apply</h2><p class="muted helper">Open the original posting, submit externally, then confirm the outcome here.</p></div><button class="button ghost small" type="button" id="fast-apply-close">Close</button></div>
             <div id="fast-apply-current" class="generated-output empty">Select an applicant to load the persistent Ready to Apply queue.</div>
           </section>
 
-          <section class="panel discovery-inbox-panel discovery-view-inbox" hidden>
+          <section class="panel discovery-inbox-panel discovery-view-inbox workspace-inbox" hidden>
             <div class="panel-header"><div><h2>Jobs Inbox</h2><p class="muted helper">New, review, saved, applied, skipped and history stay applicant-specific.</p></div><div class="actions compact"><button class="button ghost small" type="button" id="inbox-audit-history">Audit history</button><button class="button ghost small" type="button" id="inbox-reassess-history">Preview reassessment</button><button class="button ghost small" type="button" id="inbox-bulk-save">Save selected</button><button class="button ghost small" type="button" id="inbox-bulk-skip">Skip selected</button><button class="button ghost small" type="button" id="inbox-bulk-applied">Confirm selected Applied</button><button class="button ghost small" type="button" id="refresh-discovery-inbox">Refresh</button></div></div>
             <div id="inbox-audit-summary" class="muted helper" role="status" hidden></div>
             <nav id="discovery-inbox-filters" class="actions compact" role="navigation" aria-label="Jobs Inbox views"><span class="muted">New Jobs · Needs Review · History</span></nav>
             <div id="discovery-inbox" class="generated-output empty">No discovered opportunities yet.</div>
           </section>
 
-          <form id="csv-import-form" class="panel discovery-secondary-panel discovery-view-find beta-secondary">
+          <form id="csv-import-form" class="panel discovery-secondary-panel discovery-view-find workspace-settings-content beta-secondary">
             <div class="panel-header"><h2>Import jobs</h2></div>
             <label>Import job links from external searches<input id="csv-file" type="file" accept=".csv"></label>
             <div class="actions">

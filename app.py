@@ -2741,6 +2741,12 @@ def create_app() -> Flask:
             if evidence_profile:
                 qualification = build_qualification_fit(item, evidence_profile)
                 item.update(qualification)
+            elif workflow != "ece":
+                item["qualification_fit_seniority"] = analyze_job_seniority(item)
+                item["experience_requirements"] = {
+                    "required": item["qualification_fit_seniority"].get("required_experience"),
+                    "preferred": item["qualification_fit_seniority"].get("preferred_experience"),
+                }
             # Recompute geographic status from stored evidence. A historical
             # strict flag with no verified distance cannot override a newly
             # selected provisional policy.
@@ -2769,7 +2775,18 @@ def create_app() -> Flask:
             description = text(item.get("job_description"))
             grounded = bool(len(description) >= 80 and text(item.get("url")))
             category_counts[category] = category_counts.get(category, 0) + 1
-            preview_item = {"id": int(row["id"]), "title": text(item.get("title")), "company": text(item.get("company")), "current_category": text(row["discovery_result_category"]), "proposed_category": category, "reason": reason, "evidence_sufficient": grounded, "source": text(item.get("source")), "url": text(item.get("url")), "search_criteria": criteria, "effective_policy": reassessment_policy}
+            derived_columns = (
+                "discovery_result_category", "discovery_result_reason", "discovery_employment_status",
+                "discovery_employment_evidence", "qualification_fit_seniority", "experience_requirements",
+                "application_priority_score", "application_priority_reasons", "qualification_fit_label",
+                "qualification_fit_score", "qualification_match_score", "technical_compatibility",
+                "qualification_fit_reasons", "qualification_fit_missing_requirements", "qualification_fit_matched_requirements",
+                "qualification_evidence_profile_name", "qualification_evidence_source", "distance_radius_status",
+                "location_search_eligible", "geographic_eligibility",
+            )
+            after = {column: item.get(column) for column in derived_columns if column in JOB_COLUMNS or column in {"qualification_fit_seniority", "experience_requirements", "technical_compatibility", "application_priority_reasons", "qualification_fit_reasons", "qualification_fit_missing_requirements", "qualification_fit_matched_requirements"}}
+            before = {column: job_to_dict(row, include_legacy_details=False).get(column) for column in after}
+            preview_item = {"id": int(row["id"]), "title": text(item.get("title")), "company": text(item.get("company")), "current_category": text(row["discovery_result_category"]), "proposed_category": category, "reason": reason, "evidence_sufficient": grounded, "source": text(item.get("source")), "url": text(item.get("url")), "search_criteria": criteria, "effective_policy": reassessment_policy, "before": before, "after": after}
             changed.append(preview_item)
         targeted = [item for item in changed if item["evidence_sufficient"] and item["current_category"] != item["proposed_category"]]
         preview_token = hashlib.sha256(json.dumps({"policy": reassessment_policy, "targeted": targeted}, sort_keys=True, default=str).encode("utf-8")).hexdigest()
@@ -2778,7 +2795,18 @@ def create_app() -> Flask:
                 return jsonify({"error": "A matching reassessment preview token is required before applying changes."}), 409
             db = get_db()
             for item in targeted:
-                db.execute("UPDATE jobs SET discovery_result_category = ?, discovery_result_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [item["proposed_category"], item["reason"], item["id"]])
+                updates = {"discovery_result_category": item["proposed_category"], "discovery_result_reason": item["reason"], **(item.get("after") or {})}
+                assignments = []
+                values = []
+                for column, value in updates.items():
+                    if column not in JOB_COLUMNS:
+                        continue
+                    if isinstance(value, (dict, list, tuple)):
+                        value = dumps_json(value, sort_keys=True)
+                    assignments.append(f"{column} = ?")
+                    values.append(value)
+                assignments.append("updated_at = CURRENT_TIMESTAMP")
+                db.execute(f"UPDATE jobs SET {', '.join(assignments)} WHERE id = ?", [*values, item["id"]])
                 if item["proposed_category"] == "actionable":
                     db.execute(
                         """INSERT OR REPLACE INTO discovery_requalifications(job_id, applicant_profile_id, reason)
@@ -5993,7 +6021,7 @@ def find_canonical_identity_match(job: dict[str, Any]) -> sqlite3.Row | None:
         candidate = dict(row)
         if int(candidate.get("id") or 0) == int(job.get("id") or 0):
             continue
-        if normalize_dedupe_company(candidate.get("company")) != company or normalize_dedupe_location(candidate.get("location")) != location:
+        if not employer_identity_compatible(candidate.get("company"), job.get("company")) or not geographic_location_compatible(candidate.get("location"), job.get("location")):
             continue
         evidence = vacancy_identity_pair(job, candidate)
         if evidence["identity"] == "strong":
@@ -9103,7 +9131,7 @@ def dedupe_match(first: dict[str, Any], second: dict[str, Any]) -> bool:
         return False
     first_workplace = normalize_dedupe_location(first.get("workplace_address") or first.get("workplace_postal_code"))
     second_workplace = normalize_dedupe_location(second.get("workplace_address") or second.get("workplace_postal_code"))
-    if first_workplace and second_workplace and first_workplace != second_workplace:
+    if first_workplace and second_workplace and not geographic_location_compatible(first_workplace, second_workplace):
         return False
     if (first_urls - {""}) & (second_urls - {""}):
         return True
@@ -9147,15 +9175,15 @@ def vacancy_identity_pair(first: dict[str, Any], second: dict[str, Any]) -> dict
         return {"identity": "separate", "confidence": 0, "evidence": ["conflicting_requisition_ids"]}
     first_workplace = normalize_dedupe_location(first.get("workplace_address") or first.get("workplace_postal_code"))
     second_workplace = normalize_dedupe_location(second.get("workplace_address") or second.get("workplace_postal_code"))
-    if first_workplace and second_workplace and first_workplace != second_workplace:
+    if first_workplace and second_workplace and not geographic_location_compatible(first_workplace, second_workplace):
         return {"identity": "separate", "confidence": 0, "evidence": ["conflicting_workplaces"]}
     urls_shared = bool(source_link_values(first) & source_link_values(second))
     if urls_shared:
         return {"identity": "strong", "confidence": 1.0, "evidence": ["shared_canonical_url"]}
     same_context = (
-        normalize_dedupe_company(first.get("company")) == normalize_dedupe_company(second.get("company"))
+        employer_identity_compatible(first.get("company"), second.get("company"))
         and normalize_dedupe_text(first.get("title")) == normalize_dedupe_text(second.get("title"))
-        and normalize_dedupe_location(first.get("location")) == normalize_dedupe_location(second.get("location"))
+        and geographic_location_compatible(first.get("location"), second.get("location"))
     )
     if not same_context:
         return {"identity": "separate", "confidence": 0, "evidence": ["different_context"]}
@@ -9213,7 +9241,10 @@ def reconciliation_candidate_groups(applicant_profile_id: int = 0) -> list[dict[
     by_block: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     by_url: dict[str, list[dict[str, Any]]] = {}
     for item in records:
-        block = (normalize_dedupe_company(item.get("company")), normalize_dedupe_text(item.get("title")), normalize_dedupe_location(item.get("location")))
+        # Location is deliberately excluded from the blocking key. Provider
+        # strings such as “Toronto, ON, Canada” and “Toronto, Canada” are
+        # compatible evidence and must reach the identity comparison stage.
+        block = (normalize_dedupe_company(item.get("company")), normalize_dedupe_text(item.get("title")))
         if all(block):
             by_block.setdefault(block, []).append(item)
         for url in source_link_values(item):
@@ -9369,6 +9400,13 @@ def normalize_dedupe_company(value: Any) -> str:
         "rbc royal bank": "royal bank of canada",
         "healthcare of ontario pension plan": "hoopp",
         "hoopp": "hoopp",
+        "td bank": "td",
+        "td canada trust": "td",
+        "toronto dominion bank": "td",
+        "university health network": "uhn",
+        "priceline com": "priceline",
+        "pricelinecom": "priceline",
+        "yuja inc": "yuja",
     }
     return aliases.get(normalized, normalized)
 
@@ -9384,6 +9422,44 @@ def normalize_dedupe_location(value: Any) -> str:
     for name, code in replacements.items():
         normalized = normalized.replace(name, code)
     return re.sub(r"\s+", " ", normalized).strip()
+
+
+def employer_identity_compatible(first: Any, second: Any) -> bool:
+    """Compare employer identity without requiring provider spelling equality."""
+    left = normalize_dedupe_company(first)
+    right = normalize_dedupe_company(second)
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    left_tokens, right_tokens = set(left.split()), set(right.split())
+    return len(left_tokens) >= 2 and len(right_tokens) >= 2 and (left_tokens <= right_tokens or right_tokens <= left_tokens)
+
+
+def geographic_location_compatible(first: Any, second: Any) -> bool:
+    """Return compatibility for advertised locations at city/region precision.
+
+    Provider location strings are not canonical addresses. Country and
+    province suffixes may be omitted, while a different city remains a hard
+    conflict. Exact workplace fields are checked separately by callers.
+    """
+    def location_core(value: Any) -> str:
+        raw = normalize_space(text(value)).lower()
+        raw = re.sub(r"\b(?:canada|ca)\b", " ", raw)
+        raw = re.sub(r"\b(?:ontario|quebec|alberta|british columbia|manitoba|saskatchewan|nova scotia|new brunswick|newfoundland and labrador|prince edward island|on|qc|ab|bc|mb|sk|ns|nb|nl|pe)\b", " ", raw)
+        parts = [normalize_dedupe_text(part) for part in raw.split(",") if normalize_dedupe_text(part)]
+        return parts[0] if parts else normalize_dedupe_text(raw)
+    left = location_core(first)
+    right = location_core(second)
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    if left == right:
+        return True
+    # A provider may return “Toronto / GTA” versus “Toronto”. Treat this as
+    # compatible, but never make two distinct city cores compatible.
+    return len(left) >= 4 and len(right) >= 4 and (left in right or right in left)
 
 
 def determine_salary(job: dict[str, Any]) -> dict[str, Any]:
@@ -12632,6 +12708,10 @@ def ece_result_category(job: dict[str, Any]) -> tuple[str, str]:
         not has_rece_evidence
         or bool(re.search(r"\b(?:assistant|ECA)s?\b[^.\n]{0,50}\b(?:only|exclusively|solely)\b|\b(?:only|exclusively|solely)\b[^.\n]{0,50}\b(?:assistant|ECA)s?\b", body, re.I))
     )
+    assistant_only = assistant_only or (
+        not re.search(r"\b(?:RECE|registered early child(?:hood)? educator|early childhood educator)\b", body, re.I)
+        and bool(re.search(r"\b(?:seeking|looking for|hiring|need|requires?)\b[^.\n]{0,80}\b(?:assistant|ECA)s?\b", body, re.I))
+    )
     if assistant_only:
         return "excluded", "The posting evidence is assistant-only; a mixed or generic title does not establish RECE/ECE work."
     permanent = bool(re.search(r"\b(?:permanent|regular)\b", combined))
@@ -12798,6 +12878,9 @@ def discovery_reason_bucket(job: dict[str, Any]) -> str:
     """One mutually exclusive diagnostic reason per non-new discovery row."""
     category = text(job.get("discovery_result_category"))
     reason = text(job.get("discovery_result_reason")).lower()
+    if normalize_space(text(job.get("discovery_occupation") or job.get("occupation"))).lower() == "early childhood educator":
+        employment = text(job.get("discovery_employment_status")).lower()
+        return "ece_supply_or_casual" if employment == "supply_or_casual" else "ece_provisional_employment" if employment == "provisional" else "ece_employment_or_title_review"
     if category == "excluded":
         return "confirmed_hard_ineligibility"
     if "location" in reason or "workplace" in reason or "arrangement" in reason or "canadian" in reason:

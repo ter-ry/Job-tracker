@@ -63,7 +63,7 @@ async function main() {
   await page.waitForFunction(() => state.fastApplyApplicantId === "1" && state.fastApplyQueue.length === 501);
   assert.strictEqual(await page.evaluate(() => state.fastApplyApplicantId), "1");
 
-  await page.getByRole("button", { name: "Save for later" }).click();
+  await page.locator('[data-fast-action="save"]').click();
   await page.waitForFunction(() => state.fastApplyQueue.length === 500 && state.fastApplyPendingAction === false && /Persisted role 2/.test(document.querySelector("#fast-apply-current").innerText));
   assert.match(await page.locator("#fast-apply-current").innerText(), /Persisted role 2/);
   await page.getByRole("button", { name: "Skip" }).click();
