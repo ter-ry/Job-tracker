@@ -339,6 +339,42 @@ def test_ready_to_apply_excludes_applications_but_keeps_seen_unapplied(tmp_path,
     assert counts["ready_to_apply"] == 2
 
 
+def test_current_exclusion_cannot_be_resurrected_by_historical_requalification(tmp_path, monkeypatch):
+    client = _isolated_client(tmp_path, monkeypatch)
+    swe = _profile(client, "SWE", "software")
+    job_id = _stored_job(client, category="excluded", occupation="software developer")
+    with app_module.app.app_context():
+        app_module.get_db().execute(
+            "UPDATE jobs SET job_description = ? WHERE id = ?",
+            ["Build and maintain production software services with APIs, testing, deployment, and ownership for a current engineering team.", job_id],
+        )
+        app_module.get_db().commit()
+    broad_policy = {"match_policy": "apply_broadly", "geographic_match_mode": "provisional", "distance": 20, "seniority": "any", "maximum_required_years": 10, "include_internships": False}
+    first_preview = client.post("/api/discovery/re-evaluate", json={"applicant_profile_id": swe, "workflow": "software", **broad_policy}).get_json()
+    assert first_preview["jobs"][0]["proposed_category"] == "actionable"
+    first_apply = client.post("/api/discovery/re-evaluate", json={"applicant_profile_id": swe, "workflow": "software", "preview": False, "confirm_apply": True, "preview_token": first_preview["preview_token"], **broad_policy})
+    assert first_apply.status_code == 200
+    with app_module.app.app_context():
+        app_module.get_db().execute(
+            "UPDATE jobs SET title = ?, job_description = ?, discovery_result_category = 'actionable' WHERE id = ?",
+            ["Accounting Assistant", "Build reports, develop client relationships, and use accounting software and automation for a finance department with documented responsibilities.", job_id],
+        )
+        app_module.get_db().commit()
+    second_preview = client.post("/api/discovery/re-evaluate", json={"applicant_profile_id": swe, "workflow": "software", **broad_policy}).get_json()
+    assert second_preview["jobs"][0]["proposed_category"] == "excluded"
+    second_apply = client.post("/api/discovery/re-evaluate", json={"applicant_profile_id": swe, "workflow": "software", "preview": False, "confirm_apply": True, "preview_token": second_preview["preview_token"], **broad_policy})
+    assert second_apply.status_code == 200
+    ready_url = f"/api/discovery/inbox?candidate_profile_id={swe}&category=ready_to_apply&include_history=1"
+    assert client.get(ready_url).get_json() == []
+    assert client.get(f"/api/discovery/inbox/counts?candidate_profile_id={swe}").get_json()["ready_to_apply"] == 0
+    with app_module.app.app_context():
+        assert app_module.query_db("SELECT 1 FROM discovery_requalifications WHERE job_id = ? AND applicant_profile_id = ?", [job_id, swe], one=True)
+        app_module.get_db().close()
+        app_module.g.pop("db", None)
+    assert client.get(ready_url).get_json() == []
+    assert client.get(f"/api/discovery/inbox/counts?candidate_profile_id={swe}").get_json()["ready_to_apply"] == 0
+
+
 def test_ready_to_apply_is_globally_ranked_before_pagination(tmp_path, monkeypatch):
     client = _isolated_client(tmp_path, monkeypatch)
     swe = _profile(client, "SWE", "software")

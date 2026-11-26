@@ -288,6 +288,34 @@ def test_O_uncertain_candidates_are_review_only_and_M_is_idempotent(tmp_path, mo
     assert _apply(client, preview, {key: "merge"}).get_json()["idempotent"] is True
 
 
+def test_selective_strong_only_reconciliation_leaves_uncertain_group_and_decision_untouched(tmp_path, monkeypatch):
+    client = _client(tmp_path, monkeypatch)
+    profile = _profile(client, "Selective Applicant")
+    with app_module.app.app_context():
+        strong_left = _insert_raw(_job("Indeed", "strong-1"))
+        strong_right = _insert_raw(_job("Glassdoor", "strong-1"))
+        uncertain_left = _insert_raw(_job("Indeed", "uncertain-1", company="HOOPP", description="A general role with communication and collaboration responsibilities." * 3))
+        uncertain_right = _insert_raw(_job("Glassdoor", "uncertain-2", company="HOOPP", description="A different role with communication and collaboration responsibilities." * 3))
+        app_module.set_applicant_discovery_state(strong_right, profile, "saved")
+        app_module.set_applicant_discovery_state(uncertain_left, profile, "skipped")
+        app_module.get_db().commit()
+    preview = _preview(client)
+    assert preview["candidate_count"] == 2
+    strong = next(candidate for candidate in preview["candidates"] if candidate["identity_status"] == "strong")
+    uncertain = next(candidate for candidate in preview["candidates"] if candidate["identity_status"] != "strong")
+    applied = client.post(
+        f"/api/discovery/reconciliation/{preview['reconciliation_id']}/apply",
+        json={"confirm": True, "confirmation_token": preview["confirmation_token"], "selection_mode": "strong_only"},
+    )
+    assert applied.status_code == 200, applied.get_json()
+    assert applied.get_json()["selected_groups"] == ["group:" + ",".join(map(str, strong["job_ids"]))]
+    with app_module.app.app_context():
+        assert app_module.query_db("SELECT canonical_job_id FROM jobs WHERE id = ?", [strong_right], one=True)["canonical_job_id"] == strong_left
+        assert app_module.query_db("SELECT canonical_job_id FROM jobs WHERE id = ?", [uncertain["job_ids"][1]], one=True)["canonical_job_id"] == 0
+        assert app_module.query_db("SELECT state FROM discovery_applicant_states WHERE job_id = ? AND applicant_profile_id = ?", [strong_left, profile], one=True)["state"] == "saved"
+        assert app_module.query_db("SELECT state FROM discovery_applicant_states WHERE job_id = ? AND applicant_profile_id = ?", [uncertain_left, profile], one=True)["state"] == "skipped"
+
+
 def test_uncertain_pairs_collect_decision_conflicts_and_never_downgrade_applied(tmp_path, monkeypatch):
     client = _client(tmp_path, monkeypatch)
     profile = _profile(client, "Uncertain Decisions")

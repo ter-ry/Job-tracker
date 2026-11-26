@@ -2260,16 +2260,55 @@ def create_app() -> Flask:
         row = query_db("SELECT * FROM discovery_reconciliation_runs WHERE reconciliation_id = ?", [reconciliation_id], one=True)
         if row is None:
             return jsonify({"error": "Reconciliation preview was not found."}), 404
-        candidates = parse_json_array(row["candidate_json"])
-        token = hashlib.sha256(dumps_json(candidates, sort_keys=True).encode("utf-8")).hexdigest()
+        all_candidates = parse_json_array(row["candidate_json"])
+        token = hashlib.sha256(dumps_json(all_candidates, sort_keys=True).encode("utf-8")).hexdigest()
         if payload.get("confirmation_token") != token or payload.get("confirm") is not True:
             return jsonify({"error": "Explicit confirmation token and confirm=true are required; no records changed."}), 409
         if text(row["status"]) == "applied":
             return jsonify({"ok": True, "idempotent": True, "reconciliation_id": reconciliation_id, "status": "applied"})
-        current_fingerprint = reconciliation_state_fingerprint([job_id for candidate in candidates for job_id in candidate.get("job_ids", [])])
+        current_fingerprint = reconciliation_state_fingerprint([job_id for candidate in all_candidates for job_id in candidate.get("job_ids", [])])
         if current_fingerprint != text(row["state_fingerprint"]):
             return jsonify({"error": "This reconciliation preview is stale because a vacancy or applicant decision changed. Create a new preview.", "stale": True}), 409
         resolutions = payload.get("resolutions") if isinstance(payload.get("resolutions"), dict) else {}
+        selection_mode = text(payload.get("selection_mode")).lower()
+        selected_group_keys = payload.get("group_keys")
+        explicit_selection = selection_mode == "strong_only" or selected_group_keys is not None
+        if selected_group_keys is not None and not isinstance(selected_group_keys, list):
+            return jsonify({"error": "group_keys must be an array of preview group keys."}), 400
+        candidate_by_key = {
+            "group:" + ",".join(map(str, candidate.get("job_ids", []))): candidate
+            for candidate in all_candidates
+        }
+        if selection_mode not in {"", "strong_only"} and selected_group_keys is None:
+            return jsonify({"error": "selection_mode must be strong_only or omitted."}), 400
+        if selection_mode == "strong_only":
+            selected_group_keys = [
+                key for key, candidate in candidate_by_key.items()
+                if candidate.get("identity_status") == "strong"
+                and not candidate.get("requires_review")
+                and not candidate.get("decision_conflicts")
+            ]
+        elif selected_group_keys is None:
+            selected_group_keys = list(candidate_by_key)
+        unknown_groups = [key for key in selected_group_keys if key not in candidate_by_key]
+        if unknown_groups:
+            return jsonify({"error": "One or more selected reconciliation groups are not in this preview.", "unknown_groups": unknown_groups}), 409
+        selected_candidates = [candidate_by_key[key] for key in selected_group_keys]
+        selected_job_ids = [int(job_id) for candidate in selected_candidates for job_id in candidate.get("job_ids", [])]
+        if len(selected_job_ids) != len(set(selected_job_ids)):
+            return jsonify({"error": "Selected reconciliation groups overlap; no records changed."}), 409
+        if explicit_selection:
+            unsafe_groups = [
+                key for key in selected_group_keys
+                if candidate_by_key[key].get("identity_status") != "strong"
+                or candidate_by_key[key].get("requires_review")
+                or candidate_by_key[key].get("decision_conflicts")
+            ]
+            if unsafe_groups:
+                return jsonify({"error": "Only strong, conflict-free reconciliation groups may be selected.", "unsafe_groups": unsafe_groups}), 409
+        if not selected_candidates:
+            return jsonify({"error": "No strong, conflict-free reconciliation groups were selected; no records changed."}), 409
+        candidates = selected_candidates
         unresolved = []
         for candidate in candidates:
             group_key = "group:" + ",".join(map(str, candidate.get("job_ids", [])))
@@ -2287,7 +2326,7 @@ def create_app() -> Flask:
         backups = []
         try:
             db.execute("BEGIN IMMEDIATE")
-            current_fingerprint = reconciliation_state_fingerprint([job_id for candidate in candidates for job_id in candidate.get("job_ids", [])])
+            current_fingerprint = reconciliation_state_fingerprint([job_id for candidate in all_candidates for job_id in candidate.get("job_ids", [])])
             if current_fingerprint != text(row["state_fingerprint"]):
                 db.rollback()
                 return jsonify({"error": "This reconciliation preview is stale because a vacancy or applicant decision changed. Create a new preview.", "stale": True}), 409
@@ -2359,7 +2398,7 @@ def create_app() -> Flask:
         except Exception:
             db.rollback()
             return jsonify({"error": "Reconciliation was not applied.", "detail": str(sys.exc_info()[1])}), 409
-        return jsonify({"ok": True, "reconciliation_id": reconciliation_id, "status": "applied", "changed": len(backups), "backup_available": bool(backups)})
+        return jsonify({"ok": True, "reconciliation_id": reconciliation_id, "status": "applied", "changed": len(backups), "selected_groups": selected_group_keys, "backup_available": bool(backups)})
 
     @app.post("/api/discovery/reconciliation/<reconciliation_id>/rollback")
     def rollback_discovery_reconciliation(reconciliation_id: str) -> Response:
@@ -3014,8 +3053,10 @@ def create_app() -> Flask:
         elif requested_category == "ready_to_apply":
             if not applicant_id:
                 return jsonify({"error": "candidate_profile_id is required for Ready to Apply."}), 400
-            query += " AND (discovery_result_category = 'actionable' OR EXISTS (SELECT 1 FROM discovery_requalifications r WHERE r.job_id = jobs.id AND r.applicant_profile_id = ?))"
-            query_args.append(applicant_id)
+            # Historical requalification is audit evidence only. Current
+            # classification is the sole eligibility source for the active
+            # queue; otherwise a later exclusion can be resurrected here.
+            query += " AND discovery_result_category = 'actionable'"
             query += " AND status NOT IN ('Applied', 'shortlisted')"
             query += " AND NOT EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = jobs.id AND s.applicant_profile_id = ? AND s.state IN ('applied', 'skipped', 'ignored'))"
             query_args.append(applicant_id)
@@ -3263,7 +3304,7 @@ def create_app() -> Flask:
                 counts["all_relevant"] += 1
             globally_applied = text(row["status"]) in {"Applied", "shortlisted"}
             if category == "actionable" and not globally_applied and not presented and not state and not pending_duplicate: counts["new_actionable"] += 1
-            if (category == "actionable" or int(row["requalified"] or 0)) and not globally_applied and state not in {"applied", "skipped", "ignored"} and not pending_duplicate: counts["ready_to_apply"] += 1
+            if category == "actionable" and not globally_applied and state not in {"applied", "skipped", "ignored"} and not pending_duplicate: counts["ready_to_apply"] += 1
             if category == "review_required" or state == "reviewed": counts["review_required"] += 1
             elif category == "excluded": counts["excluded"] += 1
         return jsonify(counts)
