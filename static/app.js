@@ -2063,7 +2063,10 @@ function renderCandidateProfiles() {
 }
 
 async function selectCandidateProfile(profileId) {
-  if (String(profileId) !== String(state.selectedCandidateProfileId || "")) invalidateApplicantContext();
+  if (!profileId) return;
+  const previousProfileId = String(state.selectedCandidateProfileId || "");
+  if (String(profileId) !== previousProfileId) await persistDiscoveryPreferences();
+  if (String(profileId) !== previousProfileId) invalidateApplicantContext();
   state.selectedCandidateProfileId = String(profileId);
   const selected = state.candidateProfiles.find((profile) => String(profile.id) === String(profileId));
   const workflow = selected?.workflow === "ece" ? "ece" : "software";
@@ -3684,7 +3687,7 @@ function persistDiscoveryPreferences() {
 
 function handleDiscoveryControlsChanged() {
   state.discoveryPreferences = discoveryPreferencesFromControls();
-  if (state.discoverySearchKey) persistDiscoveryPreferences();
+  if (state.selectedCandidateProfileId || value("discovery-profile")) persistDiscoveryPreferences();
   updateDiscoveryFilterToggleLabel();
   renderDiscoveryResults(state.discoveryMeta || {});
 }

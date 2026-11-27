@@ -58,7 +58,17 @@ def test_fast_apply_returns_first_bounded_page_without_qualification_hydration(t
                 for index in range(500)
             ],
         )
+        db.execute(
+            """UPDATE jobs SET qualification_fit_label = 'Good match',
+               qualification_fit_seniority = ?, experience_requirements = ?,
+               technical_compatibility = ?, qualification_fit_reasons = ?,
+               qualification_fit_matched_requirements = ?
+               WHERE source_job_id = 'fast-0'""",
+            ('{"detected_level":"junior"}', '{"required":{"min":0,"max":3}}',
+             '{"matched":["Python"]}', '["Stored evidence"]', '["Python"]'),
+        )
         db.commit()
+    monkeypatch.setattr(app_module, "_cached_qualification_fit", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("queue read hydrated qualification")))
     started = time.perf_counter()
     response = client.get(
         f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=ready_to_apply"
@@ -69,6 +79,11 @@ def test_fast_apply_returns_first_bounded_page_without_qualification_hydration(t
     assert len(response.get_json()) == 10
     assert response.headers["X-Job-Tracker-Total"] == "500"
     assert len(response.data) < 100_000
+    first = response.get_json()[0]
+    assert first["qualification_fit_label"] == "Good match"
+    assert first["qualification_fit_seniority"]["detected_level"] == "junior"
+    assert first["experience_requirements"]["required"]["max"] == 3
+    assert first["technical_compatibility"]["matched"] == ["Python"]
     assert elapsed < 2.0
 
 
@@ -123,6 +138,38 @@ def test_discovery_preferences_are_isolated_by_applicant_and_workflow(tmp_path, 
     assert ece_loaded["preferences"]["search"]["keywords"] == "Registered Early Childhood Educator; RECE"
     assert ece_loaded["preferences"]["search"]["include_internships"] is False
     assert swe_loaded["search_key"] != ece_loaded["search_key"]
+
+
+def test_progressive_discovery_policy_payload_preserves_broad_matching_and_internships():
+    payload = {
+        "workflow": "software",
+        "keywords": "software developer",
+        "location": "Toronto, ON",
+        "enabled_sources": ["indeed", "glassdoor"],
+        "match_policy": "apply_broadly",
+        "include_internships": True,
+        "distance": 50,
+        "new_matching_target": 50,
+    }
+    config = app_module.discovery_search_config(payload)
+    assert config["match_policy"] == "apply_broadly"
+    assert config["include_internships"] is True
+    assert config["enabled_sources"] == ["indeed", "glassdoor"]
+
+
+def test_cross_provider_owner_pair_fixtures_remain_conservative_without_shared_identity():
+    pairs = [
+        ("Junior Software Engineer", "Junior Software Engineer/Developer"),
+        ("Software Engineer I", "Software Engineer I"),
+        ("Software Engineer II", "Software Engineer II"),
+        ("Frontend Engineer", "Frontend Engineer"),
+    ]
+    for left_title, right_title in pairs:
+        left = {"source": "indeed", "source_job_id": f"left-{left_title}", "company": "Fixture Employer", "title": left_title, "location": "Toronto, ON", "url": f"https://indeed.example/{left_title}"}
+        right = {"source": "glassdoor", "source_job_id": f"right-{right_title}", "company": "Fixture Employer", "title": right_title, "location": "Toronto, ON", "url": f"https://glassdoor.example/{right_title}"}
+        evidence = app_module.vacancy_identity_pair(left, right)
+        assert evidence["identity"] in {"separate", "uncertain"}
+        assert evidence["identity"] != "strong"
 
 
 def test_applications_history_is_applicant_scoped_and_paginated_for_10000_records(tmp_path, monkeypatch):

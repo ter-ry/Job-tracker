@@ -1901,6 +1901,14 @@ class JobAssistantTest(unittest.TestCase):
         }
         self.assertFalse(app_module.geocode_matches_canadian_location("M2J0B6", result))
 
+    def test_postal_match_accepts_locality_consistent_regional_approximation_without_postal_echo(self):
+        result = {"display_name": "North York, Ontario, Canada", "match_level": "city", "raw": {"country_code": "ca"}}
+        self.assertTrue(app_module.geocode_matches_canadian_location("M2J 0B6", result))
+
+    def test_postal_match_rejects_conflicting_city_when_provider_omits_postal(self):
+        result = {"display_name": "Mississauga, Ontario, Canada", "match_level": "city", "raw": {"country_code": "ca"}}
+        self.assertFalse(app_module.geocode_matches_canadian_location("M2J 0B6", result))
+
     def test_postal_match_rejects_other_canadian_postal_code(self):
         result = {"display_name": "Toronto, Ontario, Canada", "postal_code": "M5V 2T6", "match_level": "postal"}
         self.assertFalse(app_module.geocode_matches_canadian_location("M2J 0B6", result))

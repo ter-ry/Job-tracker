@@ -526,6 +526,12 @@ JOB_COLUMNS = {
     "discovery_result_reason": "TEXT NOT NULL DEFAULT ''",
     "recommendation_eligible": "INTEGER NOT NULL DEFAULT 0",
     "qualification_fit_seniority": "TEXT NOT NULL DEFAULT '{}'",
+    "experience_requirements": "TEXT NOT NULL DEFAULT '{}'",
+    "technical_compatibility": "TEXT NOT NULL DEFAULT '{}'",
+    "qualification_fit_label": "TEXT NOT NULL DEFAULT ''",
+    "qualification_fit_score": "INTEGER NOT NULL DEFAULT 0",
+    "qualification_fit_reasons": "TEXT NOT NULL DEFAULT '[]'",
+    "application_priority_reasons": "TEXT NOT NULL DEFAULT '[]'",
     "qualification_fit_matched_requirements": "TEXT NOT NULL DEFAULT '[]'",
     "qualification_fit_missing_requirements": "TEXT NOT NULL DEFAULT '[]'",
     "qualification_fit_partial_requirements": "TEXT NOT NULL DEFAULT '[]'",
@@ -5411,6 +5417,9 @@ def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, ru
                 "discovery_result_category", "discovery_result_reason", "recommendation_eligible",
                 "discovery_match_status", "discovery_match_explanation", "discovery_employment_status",
                 "discovery_employment_evidence",
+                "qualification_fit_seniority", "experience_requirements", "technical_compatibility",
+                "qualification_fit_label", "qualification_fit_score", "qualification_fit_reasons",
+                "application_priority_reasons",
                 "source_links_json",
             }
             incoming_profile_id = clamp_int(job.get("candidate_profile_id"), 0, 1_000_000_000)
@@ -5432,6 +5441,9 @@ def persist_discovery_jobs(jobs: list[dict[str, Any]], search_id: int | None, ru
                     "discovery_match_status", "discovery_match_explanation", "workplace_address",
                     "workplace_postal_code", "workplace_evidence", "workplace_evidence_source",
                     "workplace_precision", "workplace_confidence", "workplace_alternatives_json",
+                    "qualification_fit_seniority", "experience_requirements", "technical_compatibility",
+                    "qualification_fit_label", "qualification_fit_score", "qualification_fit_reasons",
+                    "application_priority_reasons",
                 }
             if canonical_match or protected_cross_applicant:
                 # Employment status/evidence is also applicant-scoped: a
@@ -11131,10 +11143,15 @@ def geocode_matches_canadian_location(raw_location: str, geocode: dict[str, Any]
     if postal and returned_postal:
         return postal == returned_postal
     if postal:
-        # Some Canadian geocoders return a city/province centroid for a valid
-        # postal query but omit the echoed postal code. Accept that result only
-        # when its regional evidence is consistent with the postal prefix; a
-        # different explicit postal code remains a hard rejection.
+        # Some Canadian geocoders return a city/province approximation for a
+        # valid postal query but omit the echoed postal code. Accept that only
+        # when the FSA's known locality is present; province-only evidence is
+        # deliberately insufficient because it can point to arbitrary Ontario
+        # coordinates. A different explicit postal code remains a rejection.
+        if postal[:3] == "M2J":
+            locality = any(token in display for token in ("toronto", "north york", "scarborough"))
+            province = "ontario" in display or re.search(r"(?:,|\s)on(?:,|\s|$)", display) is not None
+            return locality and province
         postal_prefix_province = {"A": "NL", "B": "NS", "C": "PE", "E": "NB", "G": "QC", "H": "QC", "J": "QC", "K": "ON", "L": "ON", "M": "ON", "N": "ON", "P": "ON", "R": "MB", "S": "SK", "T": "AB", "V": "BC"}.get(postal[0])
         if postal_prefix_province:
             province_name = next((normalize_space(text(name)).lower() for name, code in PROVINCE_CODE_BY_NAME.items() if code.lower() == postal_prefix_province.lower()), "")
@@ -14856,8 +14873,11 @@ def job_to_dict(
         data["discovery_result_reason"] = stored_reason
     data["recommendation_eligible"] = data["discovery_result_category"] == "actionable"
     data["score_breakdown"] = parse_json_object(data.get("score_breakdown"))
-    for field in ("qualification_fit_matched_requirements", "qualification_fit_missing_requirements", "qualification_fit_partial_requirements", "warnings"):
+    for field in ("qualification_fit_matched_requirements", "qualification_fit_missing_requirements", "qualification_fit_partial_requirements", "qualification_fit_reasons", "application_priority_reasons", "warnings"):
         data[field] = parse_json_array(data.get(field))
+    for field in ("experience_requirements", "technical_compatibility"):
+        if isinstance(data.get(field), str):
+            data[field] = parse_json_object(data.get(field))
     data["opportunity_score_reasons"] = parse_json_values(data.get("opportunity_score_reasons"))
     data["data_quality_flags"] = parse_json_values(data.get("data_quality_flags"))
     data["workplace_alternatives"] = parse_json_array(data.get("workplace_alternatives_json"))

@@ -13,6 +13,7 @@ async function main() {
   const page = await browser.newPage();
   const startupRequests = [];
   const preferenceRequests = [];
+  let progressiveSearchPayload = null;
   page.on("request", (request) => {
     if (request.url().includes("/api/")) startupRequests.push(request.url());
   });
@@ -24,7 +25,11 @@ async function main() {
     const url = new URL(route.request().url());
     preferenceRequests.push({ profile: url.searchParams.get("candidate_profile_id"), workflow: url.searchParams.get("workflow") });
     const ece = url.searchParams.get("workflow") === "ece";
-    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ preferences: { search: { workflow: ece ? "ece" : "software", keywords: ece ? "Registered Early Childhood Educator; RECE" : "platform engineer", include_internships: !ece, match_policy: ece ? "strict_matching" : "apply_broadly" } } }) });
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ preferences: { search: { workflow: ece ? "ece" : "software", keywords: ece ? "Registered Early Childhood Educator; RECE" : "platform engineer", include_internships: !ece, match_policy: ece ? "strict_matching" : "apply_broadly", enabled_sources: ["indeed", "glassdoor", "employer_direct"] } } }) });
+  });
+  await page.route("**/api/discovery/searches", async (route) => {
+    progressiveSearchPayload = JSON.parse(route.request().postData() || "{}");
+    return route.fulfill({ status: 202, contentType: "application/json", body: JSON.stringify({ accepted: true, search_id: 1 }) });
   });
   await page.route("**/api/discovery/inbox**", async (route) => route.fulfill({ status: 200, contentType: "application/json", headers: { "X-Job-Tracker-Total": "0" }, body: "[]" }));
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
@@ -45,6 +50,13 @@ async function main() {
   assert.strictEqual(searchState.keywords, "platform engineer");
   assert.strictEqual(searchState.criteria.match_policy, "apply_broadly");
   assert.strictEqual(searchState.criteria.include_internships, true);
+  await page.evaluate(async () => fetch("/api/discovery/searches", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(discoverySearchCriteriaFromControls()),
+  }));
+  assert.strictEqual(progressiveSearchPayload.match_policy, "apply_broadly");
+  assert.strictEqual(progressiveSearchPayload.include_internships, true);
+  assert.deepStrictEqual(progressiveSearchPayload.enabled_sources, ["indeed", "glassdoor", "employer_direct"]);
   await page.locator("#global-applicant-selector").selectOption("202");
   await page.waitForTimeout(100);
 
