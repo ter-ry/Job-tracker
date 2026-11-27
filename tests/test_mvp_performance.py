@@ -127,15 +127,23 @@ def test_discovery_preferences_are_isolated_by_applicant_and_workflow(tmp_path, 
     client.get("/api/health")
     swe = client.post("/api/candidate-profiles", json={"name": "SWE", "workflow": "software"}).get_json()
     ece = client.post("/api/candidate-profiles", json={"name": "ECE", "workflow": "ece"}).get_json()
-    swe_preferences = {"search": {"workflow": "software", "keywords": "platform engineer", "distance_origin_input": "M2J 0B6", "match_policy": "apply_broadly", "include_internships": True}}
-    ece_preferences = {"search": {"workflow": "ece", "keywords": "Registered Early Childhood Educator; RECE", "distance_origin_input": "M5V 2T6", "match_policy": "strict_matching", "include_internships": False}}
+    swe_preferences = {"search": {"workflow": "software", "keywords": "platform engineer", "distance_origin_input": "M2J 0B6", "distance": "35", "new_matching_target": 27, "enabled_sources": ["indeed", "glassdoor"], "match_policy": "apply_broadly", "include_internships": True}}
+    ece_preferences = {"search": {"workflow": "ece", "keywords": "Registered Early Childhood Educator; RECE", "distance_origin_input": "M5V 2T6", "distance": "12", "new_matching_target": 11, "enabled_sources": ["indeed", "employer_direct"], "match_policy": "strict_matching", "include_internships": False}}
     assert client.post("/api/discovery/preferences", json={"candidate_profile_id": swe["id"], "workflow": "software", "preferences": swe_preferences}).status_code == 200
     assert client.post("/api/discovery/preferences", json={"candidate_profile_id": ece["id"], "workflow": "ece", "preferences": ece_preferences}).status_code == 200
     swe_loaded = client.get(f"/api/discovery/preferences?candidate_profile_id={swe['id']}&workflow=software").get_json()
     ece_loaded = client.get(f"/api/discovery/preferences?candidate_profile_id={ece['id']}&workflow=ece").get_json()
     assert swe_loaded["preferences"]["search"]["keywords"] == "platform engineer"
+    assert swe_loaded["preferences"]["search"]["match_policy"] == "apply_broadly"
+    assert swe_loaded["preferences"]["search"]["enabled_sources"] == ["indeed", "glassdoor"]
+    assert swe_loaded["preferences"]["search"]["distance"] == "35"
+    assert swe_loaded["preferences"]["search"]["new_matching_target"] == 27
     assert swe_loaded["preferences"]["search"]["include_internships"] is True
     assert ece_loaded["preferences"]["search"]["keywords"] == "Registered Early Childhood Educator; RECE"
+    assert ece_loaded["preferences"]["search"]["match_policy"] == "strict_matching"
+    assert ece_loaded["preferences"]["search"]["enabled_sources"] == ["indeed", "employer_direct"]
+    assert ece_loaded["preferences"]["search"]["distance"] == "12"
+    assert ece_loaded["preferences"]["search"]["new_matching_target"] == 11
     assert ece_loaded["preferences"]["search"]["include_internships"] is False
     assert swe_loaded["search_key"] != ece_loaded["search_key"]
 

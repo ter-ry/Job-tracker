@@ -57,6 +57,9 @@ const state = {
   fastApplyProcessedCount: 0,
   fastApplyPendingAction: false,
   discoveryPreferenceLoadToken: 0,
+  discoveryPreferenceWriteSuppressed: 0,
+  discoveryPreferenceEditGeneration: 0,
+  discoveryPreferenceWriteChain: Promise.resolve(),
   applicationsHistoryPage: 0,
   applicationsHistoryPageSize: 50,
   applicationsHistoryTotal: 0,
@@ -284,7 +287,10 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("profile-form").addEventListener("submit", saveProfile);
   document.getElementById("discovery-form").addEventListener("submit", searchDiscovery);
   document.getElementById("discovery-stop")?.addEventListener("click", stopProgressiveDiscoverySearch);
-  document.getElementById("discovery-workflow")?.addEventListener("change", () => applyDiscoveryWorkflow(value("discovery-workflow"), { reset: true }));
+  document.getElementById("discovery-workflow")?.addEventListener("change", () => {
+    applyDiscoveryWorkflow(value("discovery-workflow"), { reset: true });
+    handleDiscoveryControlsChanged();
+  });
   document.getElementById("saved-search-form").addEventListener("submit", saveSavedSearch);
   document.getElementById("new-saved-search").addEventListener("click", () => toggleSavedSearchForm(true));
   document.getElementById("cancel-saved-search").addEventListener("click", () => toggleSavedSearchForm(false));
@@ -2098,11 +2104,12 @@ async function selectCandidateProfile(profileId) {
 
 async function loadApplicantDiscoveryPreferences(profileId, workflow) {
   const token = ++state.discoveryPreferenceLoadToken;
+  const editGeneration = state.discoveryPreferenceEditGeneration;
   const expectedProfile = String(profileId || "");
   const expectedWorkflow = workflow === "ece" ? "ece" : "software";
   try {
     const result = await api.get(`/api/discovery/preferences?candidate_profile_id=${encodeURIComponent(expectedProfile)}&workflow=${encodeURIComponent(expectedWorkflow)}`);
-    if (token !== state.discoveryPreferenceLoadToken || expectedProfile !== String(state.selectedCandidateProfileId || "")) return;
+    if (token !== state.discoveryPreferenceLoadToken || editGeneration !== state.discoveryPreferenceEditGeneration || expectedProfile !== String(state.selectedCandidateProfileId || "")) return;
     const preferences = result.preferences || {};
     if (preferences.search) {
       applyDiscoverySearchCriteriaToControls({ ...preferences.search, workflow: expectedWorkflow });
@@ -3432,8 +3439,19 @@ function applyDiscoveryWorkflow(workflow = "software", { reset = false } = {}) {
     ? "The selected SWE résumé is used for technical matching."
     : "The applicant is kept on the search record; ECE matching does not require a résumé.";
   if (reset) {
-    clearDiscoveryFilters();
-    clearVisibleDiscoveryResults();
+    withDiscoveryPreferenceWritesSuppressed(() => {
+      clearDiscoveryFilters();
+      clearVisibleDiscoveryResults();
+    });
+  }
+}
+
+function withDiscoveryPreferenceWritesSuppressed(callback) {
+  state.discoveryPreferenceWriteSuppressed += 1;
+  try {
+    return callback();
+  } finally {
+    state.discoveryPreferenceWriteSuppressed = Math.max(0, state.discoveryPreferenceWriteSuppressed - 1);
   }
 }
 
@@ -3520,6 +3538,7 @@ function applyDiscoverySearchCriteriaToControls(criteria = {}) {
   applyDiscoveryWorkflow(workflow);
   setValue("discovery-search-mode", isEce ? "title" : (criteria.search_mode || "title"));
   setValue("discovery-title-match-mode", isEce ? "related" : (criteria.title_match_mode || "related"));
+  setValue("discovery-match-policy", isEce ? "strict_matching" : (criteria.match_policy || "apply_broadly"));
   setValue("discovery-keywords", isEce ? "Registered Early Childhood Educator; RECE" : (criteria.keywords || ""));
   setValue("discovery-location", criteria.location || criteria.discovery_location || "");
   setValue("discovery-distance-origin", criteria.distance_origin_input || criteria.original_origin || "");
@@ -3533,6 +3552,8 @@ function applyDiscoverySearchCriteriaToControls(criteria = {}) {
   setValue("discovery-maximum-years", criteria.maximum_required_years || 3);
   setChecked("discovery-include-provisional", criteria.include_provisional_matches !== false);
   setChecked("discovery-include-internships", !isEce && criteria.include_internships === true);
+  setChecked("discovery-strict-technical", !isEce && criteria.strict_technical === true);
+  setChecked("discovery-bypass-cache", criteria.bypass_cache === true);
   setValue("discovery-geographic-match-mode", criteria.geographic_match_mode || "provisional");
   document.querySelectorAll('input[name="discovery-source"]').forEach((input) => { input.checked = (criteria.enabled_sources || []).includes(input.value); });
 }
@@ -3676,18 +3697,30 @@ function persistDiscoveryPreferences() {
   const profileId = String(state.selectedCandidateProfileId || value("discovery-profile") || "");
   if (!profileId) return Promise.resolve();
   const preferences = { ...discoveryPreferencesFromControls(), search: discoverySearchCriteriaFromControls() };
-  const writes = [api.send("/api/discovery/preferences", "POST", {
-    candidate_profile_id: profileId,
-    workflow: state.discoveryWorkflow,
-    preferences,
-  })];
-  if (state.discoverySearchKey) writes.push(api.send("/api/discovery/preferences", "POST", { search_key: state.discoverySearchKey, preferences }));
-  return Promise.all(writes).catch(() => null);
+  const workflow = state.discoveryWorkflow;
+  const searchKey = state.discoverySearchKey;
+  const operation = () => {
+    const writes = [api.send("/api/discovery/preferences", "POST", {
+      candidate_profile_id: profileId,
+      workflow,
+      preferences,
+    })];
+    if (searchKey) writes.push(api.send("/api/discovery/preferences", "POST", { search_key: searchKey, preferences }));
+    return Promise.all(writes);
+  };
+  state.discoveryPreferenceWriteChain = state.discoveryPreferenceWriteChain
+    .catch(() => null)
+    .then(operation)
+    .catch(() => null);
+  return state.discoveryPreferenceWriteChain;
 }
 
 function handleDiscoveryControlsChanged() {
   state.discoveryPreferences = discoveryPreferencesFromControls();
-  if (state.selectedCandidateProfileId || value("discovery-profile")) persistDiscoveryPreferences();
+  if (!state.discoveryPreferenceWriteSuppressed) {
+    state.discoveryPreferenceEditGeneration += 1;
+    if (state.selectedCandidateProfileId || value("discovery-profile")) persistDiscoveryPreferences();
+  }
   updateDiscoveryFilterToggleLabel();
   renderDiscoveryResults(state.discoveryMeta || {});
 }

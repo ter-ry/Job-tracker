@@ -13,6 +13,7 @@ async function main() {
   const page = await browser.newPage();
   const startupRequests = [];
   const preferenceRequests = [];
+  const preferenceWrites = [];
   let progressiveSearchPayload = null;
   page.on("request", (request) => {
     if (request.url().includes("/api/")) startupRequests.push(request.url());
@@ -23,6 +24,9 @@ async function main() {
   ]) }));
   await page.route("**/api/discovery/preferences*", async (route) => {
     const url = new URL(route.request().url());
+    if (route.request().method() === "POST") {
+      preferenceWrites.push(JSON.parse(route.request().postData() || "{}"));
+    }
     preferenceRequests.push({ profile: url.searchParams.get("candidate_profile_id"), workflow: url.searchParams.get("workflow") });
     const ece = url.searchParams.get("workflow") === "ece";
     return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ preferences: { search: { workflow: ece ? "ece" : "software", keywords: ece ? "Registered Early Childhood Educator; RECE" : "platform engineer", include_internships: !ece, match_policy: ece ? "strict_matching" : "apply_broadly", enabled_sources: ["indeed", "glassdoor", "employer_direct"] } } }) });
@@ -50,6 +54,9 @@ async function main() {
   assert.strictEqual(searchState.keywords, "platform engineer");
   assert.strictEqual(searchState.criteria.match_policy, "apply_broadly");
   assert.strictEqual(searchState.criteria.include_internships, true);
+  assert.ok(preferenceWrites.some((write) => String(write.candidate_profile_id) === "202" && write.preferences?.search?.keywords === "Registered Early Childhood Educator; RECE"));
+  assert.ok(preferenceWrites.some((write) => String(write.candidate_profile_id) === "201" && write.preferences?.search?.keywords === "platform engineer"));
+  assert.ok(!preferenceWrites.some((write) => write.preferences?.search?.keywords === "software developer; junior software engineer"));
   await page.evaluate(async () => fetch("/api/discovery/searches", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify(discoverySearchCriteriaFromControls()),
