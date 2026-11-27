@@ -157,6 +157,9 @@ DISCOVERY_DATE_WINDOWS = {
 APP_SCHEMA_VERSION = 1
 CURRENT_DB_SCHEMA_VERSION = 14
 DEFAULT_ACTIVE_VACANCY_DAYS = 14
+# Retention remains an opt-in migration because the owner requires complete
+# historical Inbox visibility until the reversible policy is approved.
+DISCOVERY_RETENTION_ENABLED = False
 DISCOVERY_DEBUG_SNAPSHOT_LIMIT = 25
 GEOCODING_FAILURE_CACHE_SECONDS = 15 * 60
 DISCOVERY_TASK_NAME = "Job Tracker Discovery"
@@ -3062,6 +3065,8 @@ def create_app() -> Flask:
         durable applicant decision; those decisions keep history accessible.
         Explicitly archived rows are never active.
         """
+        if not DISCOVERY_RETENTION_ENABLED:
+            return "1 = 1", []
         prefix = f"{alias}." if alias else ""
         date_expr = f"date(COALESCE(NULLIF({prefix}posted_date, ''), NULLIF({prefix}discovery_first_seen_at, '')))"
         predicate = (
@@ -3608,6 +3613,8 @@ def create_app() -> Flask:
     @app.post("/api/discovery/inbox/archive-expired")
     def archive_expired_discovery_jobs() -> Response:
         """Explicitly archive stale, unprocessed vacancies; never delete data."""
+        if not DISCOVERY_RETENTION_ENABLED:
+            return jsonify({"error": "Vacancy retention is disabled; no vacancies were changed.", "archived_count": 0}), 409
         payload = request.get_json(silent=True) or {}
         if not as_bool(payload.get("confirm_archive")):
             return jsonify({"error": "Explicit confirm_archive=true is required; no vacancies were changed."}), 400
@@ -3628,6 +3635,8 @@ def create_app() -> Flask:
     @app.post("/api/discovery/inbox/cleanup-archived-payloads")
     def cleanup_archived_discovery_payloads() -> Response:
         """Optional, explicit 90-day payload cleanup; durable rows stay intact."""
+        if not DISCOVERY_RETENTION_ENABLED:
+            return jsonify({"error": "Archived-payload cleanup is disabled; no data was changed.", "cleaned_count": 0}), 409
         payload = request.get_json(silent=True) or {}
         if not as_bool(payload.get("confirm_cleanup")):
             return jsonify({"error": "Cleanup is disabled until explicit confirm_cleanup=true.", "cleaned_count": 0}), 400

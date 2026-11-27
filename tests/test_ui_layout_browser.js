@@ -11,6 +11,10 @@ async function main() {
   fs.mkdirSync(screenshotDir, { recursive: true });
   const browser = await chromium.launch({ headless: true, executablePath: process.env.CHROMIUM_PATH || "/usr/bin/chromium", args: ["--no-sandbox"] });
   const page = await browser.newPage();
+  const startupRequests = [];
+  page.on("request", (request) => {
+    if (request.url().includes("/api/")) startupRequests.push(request.url());
+  });
   await page.route("**/api/candidate-profiles", async (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify([
     { id: 201, name: "SWE applicant", workflow: "software" },
     { id: 202, name: "ECE applicant", workflow: "ece" },
@@ -18,6 +22,7 @@ async function main() {
   await page.route("**/api/discovery/inbox**", async (route) => route.fulfill({ status: 200, contentType: "application/json", headers: { "X-Job-Tracker-Total": "0" }, body: "[]" }));
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
   await page.locator("#global-applicant-selector option").nth(1).waitFor({ state: "attached" });
+  assert.ok(!startupRequests.some((url) => /\/api\/jobs(?:\?|$)|\/documents(?:\?|$)|saved-search|scheduler|task-status/.test(url)), `startup hydrated unrelated data: ${startupRequests.join("\n")}`);
   await page.locator("#global-applicant-selector").selectOption("202");
 
   for (const viewport of [{ width: 1280, height: 720 }, { width: 1920, height: 1080 }]) {

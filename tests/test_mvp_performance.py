@@ -72,6 +72,38 @@ def test_fast_apply_returns_first_bounded_page_without_qualification_hydration(t
     assert elapsed < 2.0
 
 
+def test_inbox_sql_order_matches_canonical_application_priority_order(tmp_path, monkeypatch):
+    monkeypatch.setattr(app_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(app_module, "DB_PATH", tmp_path / "ranking.sqlite")
+    monkeypatch.setattr(app_module, "_INITIALIZED_DATABASE_PATH", None)
+    client = app_module.app.test_client()
+    client.get("/api/health")
+    profile = client.post("/api/candidate-profiles", json={"name": "Ranking benchmark", "workflow": "software"}).get_json()
+    records = [
+        ("entry", "entry_level", 70),
+        ("junior", "junior", 80),
+        ("unknown", "unknown", 99),
+        ("senior", "senior", 100),
+        ("intermediate", "intermediate", 85),
+    ]
+    with app_module.app.app_context():
+        db = app_module.get_db()
+        db.executemany(
+            """INSERT INTO jobs(company, title, location, url, source, source_job_id,
+               discovery_first_seen_at, discovery_result_category, candidate_profile_id,
+               canonical_job_id, application_priority_score, qualification_fit_seniority)
+               VALUES ('Ranking Co', ?, 'Toronto, ON', ?, 'fixture', ?, '2026-11-27',
+                       'actionable', ?, 0, ?, ?)""",
+            [(f"Software {name}", f"https://ranking/{name}", name, profile["id"], score, '{"detected_level": "' + level + '"}') for name, level, score in records],
+        )
+        db.commit()
+        rows = [dict(row) for row in db.execute("SELECT * FROM jobs WHERE source = 'fixture' ORDER BY id").fetchall()]
+        expected = [row["source_job_id"] for row in sorted(rows, key=app_module.application_priority_sort_key)]
+    response = client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=ready_to_apply&page_size=20")
+    assert response.status_code == 200
+    assert [row["source_job_id"] for row in response.get_json()] == expected
+
+
 def test_applications_history_is_applicant_scoped_and_paginated_for_10000_records(tmp_path, monkeypatch):
     monkeypatch.setattr(app_module, "DATA_DIR", tmp_path)
     monkeypatch.setattr(app_module, "DB_PATH", tmp_path / "applications.sqlite")
@@ -153,7 +185,7 @@ def test_applications_history_filters_searches_and_sorts_server_side(tmp_path, m
     assert response.get_json()[0]["title"] == "Skipped Analyst"
 
 
-def test_active_vacancy_window_archives_only_unprocessed_records_and_restores(tmp_path, monkeypatch):
+def test_vacancy_retention_is_disabled_without_hiding_history(tmp_path, monkeypatch):
     monkeypatch.setattr(app_module, "DATA_DIR", tmp_path)
     monkeypatch.setattr(app_module, "DB_PATH", tmp_path / "retention.sqlite")
     monkeypatch.setattr(app_module, "_INITIALIZED_DATABASE_PATH", None)
@@ -180,16 +212,13 @@ def test_active_vacancy_window_archives_only_unprocessed_records_and_restores(tm
         )
         db.commit()
     response = client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=ready_to_apply&page_size=20")
-    assert {item["title"] for item in response.get_json()} == {"recent role", "unknown role"}
+    assert {item["title"] for item in response.get_json()} == {"recent role", "old role", "unknown role"}
     archived = client.post("/api/discovery/inbox/archive-expired", json={"confirm_archive": True})
-    assert archived.status_code == 200
-    assert archived.get_json()["archived_count"] == 1
+    assert archived.status_code == 409
+    assert archived.get_json()["archived_count"] == 0
     cleanup_blocked = client.post("/api/discovery/inbox/cleanup-archived-payloads", json={})
-    assert cleanup_blocked.status_code == 400
+    assert cleanup_blocked.status_code == 409
     archived_view = client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=archived&page_size=20")
-    assert [item["title"] for item in archived_view.get_json()] == ["old role"]
+    assert archived_view.get_json() == []
     saved = client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=saved&include_history=1&page_size=20")
     assert [item["title"] for item in saved.get_json()] == ["saved role"]
-    restored = client.post(f"/api/discovery/inbox/{ids['old']}/restore-archive", json={})
-    assert restored.status_code == 200
-    assert client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=archived&page_size=20").get_json() == []
