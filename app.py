@@ -156,6 +156,7 @@ DISCOVERY_DATE_WINDOWS = {
 # database itself is now tracked independently by the migration runner.
 APP_SCHEMA_VERSION = 1
 CURRENT_DB_SCHEMA_VERSION = 14
+DEFAULT_ACTIVE_VACANCY_DAYS = 14
 DISCOVERY_DEBUG_SNAPSHOT_LIMIT = 25
 GEOCODING_FAILURE_CACHE_SECONDS = 15 * 60
 DISCOVERY_TASK_NAME = "Job Tracker Discovery"
@@ -482,6 +483,8 @@ JOB_COLUMNS = {
     "profile_updated_at": "TEXT NOT NULL DEFAULT ''",
     "discovery_first_seen_at": "TEXT NOT NULL DEFAULT ''",
     "discovery_last_seen_at": "TEXT NOT NULL DEFAULT ''",
+    "discovery_archived_at": "TEXT NOT NULL DEFAULT ''",
+    "discovery_archive_reason": "TEXT NOT NULL DEFAULT ''",
     "discovery_seen_count": "INTEGER NOT NULL DEFAULT 0",
     "discovery_state": "TEXT NOT NULL DEFAULT ''",
     "discovery_last_search_id": "INTEGER NOT NULL DEFAULT 0",
@@ -3051,10 +3054,28 @@ def create_app() -> Flask:
             headers={"Content-Disposition": "attachment; filename=job-tracker-qa-diagnostics.json", "Cache-Control": "no-store"},
         )
 
+    def _discovery_lifecycle_predicate(alias: str = "") -> tuple[str, list[Any]]:
+        """Return the shared active-vacancy predicate used by Inbox reads.
+
+        Unknown posting dates remain active.  A dated vacancy is eligible for
+        the active views only during the configured window unless it has a
+        durable applicant decision; those decisions keep history accessible.
+        Explicitly archived rows are never active.
+        """
+        prefix = f"{alias}." if alias else ""
+        date_expr = f"date(COALESCE(NULLIF({prefix}posted_date, ''), NULLIF({prefix}discovery_first_seen_at, '')))"
+        predicate = (
+            f"COALESCE({prefix}discovery_archived_at, '') = '' AND "
+            f"({date_expr} = '' OR {date_expr} IS NULL OR {date_expr} >= date('now', '-{DEFAULT_ACTIVE_VACANCY_DAYS} days'))"
+        )
+        return predicate, []
+
     @app.get("/api/discovery/inbox")
     def discovery_inbox() -> Response:
         include_history = as_bool(request.args.get("include_history"))
-        lightweight = as_bool(request.args.get("lightweight"))
+        # Inbox cards use persisted classification/evidence. Detailed résumé
+        # qualification is an explicit opt-in for a detail request.
+        lightweight = as_bool(request.args.get("lightweight", "1"))
         requested_category = text(request.args.get("category")).lower()
         search_query = normalize_space(text(request.args.get("q")))
         reason_filter = normalize_space(text(request.args.get("reason")))
@@ -3074,6 +3095,11 @@ def create_app() -> Flask:
             return jsonify({"error": "candidate_profile_id is required for Presented / Seen history."}), 400
         query = "SELECT * FROM jobs WHERE discovery_first_seen_at <> '' AND (canonical_job_id = 0 OR canonical_job_id = '')"
         query_args: list[Any] = []
+        active_categories = {"new", "new_actionable", "ready_to_apply", "all_relevant", "all_discovered"}
+        lifecycle_sql, lifecycle_args = _discovery_lifecycle_predicate()
+        if requested_category in active_categories:
+            query += f" AND {lifecycle_sql}"
+            query_args.extend(lifecycle_args)
         if requested_category == "requalified":
             query = """SELECT j.* FROM jobs j
                        JOIN discovery_requalifications r ON r.job_id = j.id AND r.applicant_profile_id = ?
@@ -3119,6 +3145,8 @@ def create_app() -> Flask:
             query += ")"
         elif requested_category == "excluded":
             query += " AND discovery_result_category = 'excluded'"
+        elif requested_category == "archived":
+            query += " AND COALESCE(discovery_archived_at, '') <> ''"
         elif requested_category == "presented":
             query += " AND EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = jobs.id AND p.applicant_profile_id = ?)"
             query_args.append(applicant_id)
@@ -3149,6 +3177,10 @@ def create_app() -> Flask:
                        WHERE j.discovery_first_seen_at <> ''
                          AND m.search_execution_id = ? AND (j.canonical_job_id = 0 OR j.canonical_job_id = '')"""
             query_args = [requested_search_id]
+            if requested_category in active_categories:
+                membership_lifecycle_sql, membership_lifecycle_args = _discovery_lifecycle_predicate("j")
+                query += f" AND {membership_lifecycle_sql}"
+                query_args.extend(membership_lifecycle_args)
             if applicant_id:
                 query += " AND (j.candidate_profile_id IN ('', 0) OR j.candidate_profile_id = ? OR EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = j.id AND p.applicant_profile_id = ?) OR EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = j.id AND s.applicant_profile_id = ?))"
                 query_args.extend([applicant_id, applicant_id, applicant_id])
@@ -3189,22 +3221,31 @@ def create_app() -> Flask:
             one=True,
         )
         total_count = int(total_row["total"] or 0) if total_row else 0
-        if membership_search:
-            query += " ORDER BY j.discovery_last_seen_at DESC, j.id DESC"
-        page_size = clamp_int_default(request.args.get("page_size"), 500, 1, 500)
+        page_size = clamp_int_default(request.args.get("page_size"), 20, 1, 500)
         page = clamp_int_default(request.args.get("page"), 0, 0, 100000)
-        # Best Match is applicant-aware. Fetch the full filtered relation and
-        # rank it before slicing so page boundaries cannot hide better fits.
-        rows = query_db(
-            query, query_args
-        )
-        pre_paged = False
-        # Ready-to-apply SQL already excludes terminal applicant states. Rank
-        # the full relation, but hydrate only the requested page; job_to_dict
-        # performs evidence work that is unnecessary for rows not returned.
-        if not membership_search and requested_category == "ready_to_apply":
-            rows = sorted((dict(row) for row in rows), key=application_priority_sort_key)[page * page_size:(page + 1) * page_size]
-            pre_paged = True
+        if membership_search:
+            query += " ORDER BY j.discovery_last_seen_at DESC, j.id DESC LIMIT ? OFFSET ?"
+        else:
+            # This is the SQL equivalent of application_priority_sort_key for
+            # persisted ranking fields.  It keeps page boundaries stable while
+            # avoiding full-table hydration and Python sorting on every read.
+            query += """ ORDER BY
+                CASE WHEN lower(discovery_occupation) = 'early childhood educator' THEN
+                    CASE lower(discovery_employment_status)
+                        WHEN 'permanent_full_time' THEN 0
+                        WHEN 'temporary_full_time' THEN 1
+                        WHEN 'full_time_unspecified_term' THEN 2
+                        WHEN 'provisional' THEN 3
+                        WHEN 'supply_or_casual' THEN 4
+                        ELSE 3 END
+                    ELSE 100 + CASE lower(COALESCE(CASE WHEN json_valid(qualification_fit_seniority) THEN json_extract(qualification_fit_seniority, '$.detected_level') ELSE '' END, seniority_level))
+                        WHEN 'entry_level' THEN 0 WHEN 'junior' THEN 0 WHEN 'internship' THEN 0
+                        WHEN 'intermediate' THEN 1 WHEN 'unknown' THEN 1 WHEN '' THEN 1 ELSE 2 END
+                END,
+                application_priority_score DESC, id DESC
+                LIMIT ? OFFSET ?"""
+        query_args.extend([page_size, page * page_size])
+        rows = query_db(query, query_args)
         evidence_profile = None
         if request.args.get("candidate_profile_id") and not lightweight:
             try:
@@ -3218,6 +3259,12 @@ def create_app() -> Flask:
         jobs = []
         for row in rows:
             item = job_to_dict(row, evidence_profile, include_qualification=not lightweight, include_legacy_details=False, preparation_status=statuses.get(int(row["id"])))
+            if lightweight:
+                # Source descriptions and provider payloads are fetched only
+                # by the evidence dialog endpoint. Keep the list response
+                # bounded even when a provider supplied a very large posting.
+                for field in ("job_description", "provider_raw_json", "qualification_evidence_excerpt", "source_excerpt"):
+                    item.pop(field, None)
             state = applicant_discovery_state(int(row["id"]), applicant_id)
             if state:
                 item["discovery_state"] = state
@@ -3286,6 +3333,8 @@ def create_app() -> Flask:
             elif requested_category == "requalified" and requalified:
                 category = "requalified"
                 item["requalified_reason"] = text(requalified["reason"])
+            elif text(item.get("discovery_archived_at")):
+                category = "archived"
             elif state == "applied" or text(item.get("status")) == "Applied" or text(item.get("discovery_state")) == "applied":
                 category = "applied"
             elif state in {"ignored", "skipped"} or text(item.get("discovery_state")) in {"ignored", "skipped"}:
@@ -3320,42 +3369,71 @@ def create_app() -> Flask:
             jobs = sort_discovery_jobs(jobs, "application_priority_score", "desc")
         else:
             jobs.sort(key=lambda item: (text(item.get("discovery_last_seen_at")), int(item.get("id") or 0)), reverse=True)
-        if not pre_paged:
-            jobs = jobs[page * page_size:(page + 1) * page_size]
+        # SQL already applied the page window.  Keep this final sort only for
+        # deterministic presentation of the bounded page.
         response = jsonify(jobs)
         response.headers["X-Job-Tracker-Total"] = str(total_count)
         response.headers["X-Job-Tracker-Page"] = str(page)
         response.headers["X-Job-Tracker-Page-Size"] = str(page_size)
         return response
 
+    @app.get("/api/discovery/inbox/<int:job_id>/evidence")
+    def discovery_inbox_evidence(job_id: int) -> Response:
+        row = query_db("SELECT id, title, company, source, url, job_description, discovery_result_category, discovery_result_reason, qualification_evidence_source, qualification_evidence_confidence FROM jobs WHERE id = ? AND discovery_first_seen_at <> ''", [job_id], one=True)
+        if row is None:
+            return jsonify({"error": "Discovered job not found"}), 404
+        description = normalize_space(text(row["job_description"]))
+        return jsonify({
+            "id": job_id,
+            "title": text(row["title"]),
+            "company": text(row["company"]),
+            "source": text(row["source"]),
+            "url": text(row["url"]),
+            "category": text(row["discovery_result_category"]),
+            "reason": text(row["discovery_result_reason"]),
+            "evidence_source": text(row["qualification_evidence_source"]),
+            "evidence_confidence": text(row["qualification_evidence_confidence"]),
+            "excerpt": description[:4000] if description else "No readable source excerpt is stored.",
+        })
+
     @app.get("/api/discovery/inbox/counts")
     def discovery_inbox_counts() -> Response:
         applicant_id = applicant_profile_id(request.args)
         if not applicant_id:
             return jsonify({"error": "candidate_profile_id is required for applicant-specific Inbox counts."}), 400
+        lifecycle_sql, lifecycle_args = _discovery_lifecycle_predicate("j")
         base = "j.discovery_first_seen_at <> '' AND (j.canonical_job_id = 0 OR j.canonical_job_id = '') AND (j.candidate_profile_id IN ('', 0) OR j.candidate_profile_id = ? OR EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = j.id AND p.applicant_profile_id = ?) OR EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = j.id AND s.applicant_profile_id = ?))"
-        args = [applicant_id, applicant_id, applicant_id]
-        rows = query_db(f"SELECT j.id, j.status, j.discovery_result_category, EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = j.id AND p.applicant_profile_id = ?) AS presented, COALESCE((SELECT state FROM discovery_applicant_states s WHERE s.job_id = j.id AND s.applicant_profile_id = ?), '') AS applicant_state, EXISTS (SELECT 1 FROM discovery_requalifications r WHERE r.job_id = j.id AND r.applicant_profile_id = ?) AS requalified, EXISTS (SELECT 1 FROM discovery_applicant_duplicate_matches d WHERE d.existing_job_id = j.id AND d.applicant_profile_id = ? AND d.status = 'pending') AS pending_duplicate FROM jobs j WHERE {base}", [applicant_id, applicant_id, applicant_id, applicant_id, *args])
+        rows = query_db(
+            f"""WITH scoped AS (
+                SELECT j.id, j.status, j.discovery_result_category,
+                       EXISTS (SELECT 1 FROM discovery_applicant_presentations p WHERE p.job_id = j.id AND p.applicant_profile_id = ?) AS presented,
+                       COALESCE((SELECT state FROM discovery_applicant_states s WHERE s.job_id = j.id AND s.applicant_profile_id = ?), '') AS applicant_state,
+                       EXISTS (SELECT 1 FROM discovery_applicant_duplicate_matches d WHERE d.existing_job_id = j.id AND d.applicant_profile_id = ? AND d.status = 'pending') AS pending_duplicate
+                FROM jobs j WHERE {base} AND ({lifecycle_sql} OR EXISTS (
+                    SELECT 1 FROM discovery_applicant_states hs
+                    WHERE hs.job_id = j.id AND hs.applicant_profile_id = ?
+                      AND hs.state IN ('saved', 'applied', 'skipped', 'ignored')
+                ))
+            )
+            SELECT COUNT(*) AS all_discovered,
+                   COALESCE(SUM(presented), 0) AS presented,
+                   COALESCE(SUM(applicant_state = 'saved'), 0) AS saved,
+                   COALESCE(SUM(applicant_state = 'applied'), 0) AS applied,
+                   COALESCE(SUM(applicant_state IN ('skipped', 'ignored')), 0) AS skipped,
+                   COALESCE(SUM(discovery_result_category IN ('actionable', 'review_required') OR applicant_state IN ('saved', 'applied', 'reviewed')), 0) AS all_relevant,
+                   COALESCE(SUM(discovery_result_category = 'actionable' AND status NOT IN ('Applied', 'shortlisted') AND NOT presented AND applicant_state = '' AND NOT pending_duplicate), 0) AS new_actionable,
+                   COALESCE(SUM(discovery_result_category = 'actionable' AND status NOT IN ('Applied', 'shortlisted') AND applicant_state NOT IN ('saved', 'applied', 'skipped', 'ignored') AND NOT pending_duplicate), 0) AS ready_to_apply,
+                   COALESCE(SUM(discovery_result_category = 'review_required' OR applicant_state = 'reviewed'), 0) AS review_required,
+                   COALESCE(SUM(discovery_result_category = 'excluded'), 0) AS excluded,
+                   COALESCE(SUM(pending_duplicate), 0) AS pending_duplicate
+            FROM scoped""",
+            [applicant_id, applicant_id, applicant_id, applicant_id, applicant_id, applicant_id, applicant_id, *lifecycle_args],
+            one=True,
+        )
         counts = {"all_discovered": 0, "all_relevant": 0, "new_actionable": 0, "ready_to_apply": 0, "review_required": 0, "excluded": 0, "presented": 0, "saved": 0, "applied": 0, "skipped": 0, "pending_duplicate": 0}
-        for row in rows:
-            counts["all_discovered"] += 1
-            if int(row["presented"] or 0): counts["presented"] += 1
-            state = text(row["applicant_state"])
-            if state == "saved": counts["saved"] += 1
-            elif state == "applied": counts["applied"] += 1
-            elif state in {"skipped", "ignored"}: counts["skipped"] += 1
-            category = text(row["discovery_result_category"])
-            presented = int(row["presented"] or 0)
-            pending_duplicate = int(row["pending_duplicate"] or 0)
-            if pending_duplicate:
-                counts["pending_duplicate"] += 1
-            if category in {"actionable", "review_required"} or int(row["requalified"] or 0) or state in {"saved", "applied", "reviewed"}:
-                counts["all_relevant"] += 1
-            globally_applied = text(row["status"]) in {"Applied", "shortlisted"}
-            if category == "actionable" and not globally_applied and not presented and not state and not pending_duplicate: counts["new_actionable"] += 1
-            if category == "actionable" and not globally_applied and state not in {"saved", "applied", "skipped", "ignored"} and not pending_duplicate: counts["ready_to_apply"] += 1
-            if category == "review_required" or state == "reviewed": counts["review_required"] += 1
-            elif category == "excluded": counts["excluded"] += 1
+        if rows:
+            for key in counts:
+                counts[key] = int(rows[key] or 0)
         return jsonify(counts)
 
     @app.get("/api/discovery/inbox/search-runs")
@@ -3507,6 +3585,86 @@ def create_app() -> Flask:
             get_db().execute("UPDATE jobs SET discovery_state = 'ignored', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
         get_db().commit()
         return jsonify({"ok": True, "applicant_profile_id": profile_id})
+
+    @app.post("/api/discovery/inbox/<int:job_id>/archive")
+    def archive_discovery_job(job_id: int) -> Response:
+        """Archive a vacancy without deleting its source or applicant history."""
+        row = query_db("SELECT * FROM jobs WHERE id = ? AND discovery_first_seen_at <> ''", [job_id], one=True)
+        if row is None:
+            return jsonify({"error": "Discovered job not found"}), 404
+        payload = request.get_json(silent=True) or {}
+        try:
+            validate_discovery_action_owner(row, payload)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        reason = normalize_space(text(payload.get("reason"))) or "Outside the active vacancy retention window."
+        get_db().execute(
+            "UPDATE jobs SET discovery_archived_at = CURRENT_TIMESTAMP, discovery_archive_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            [reason, job_id],
+        )
+        get_db().commit()
+        return jsonify({"ok": True, "job_id": job_id, "archived": True, "reason": reason})
+
+    @app.post("/api/discovery/inbox/archive-expired")
+    def archive_expired_discovery_jobs() -> Response:
+        """Explicitly archive stale, unprocessed vacancies; never delete data."""
+        payload = request.get_json(silent=True) or {}
+        if not as_bool(payload.get("confirm_archive")):
+            return jsonify({"error": "Explicit confirm_archive=true is required; no vacancies were changed."}), 400
+        lifecycle_sql = """COALESCE(discovery_archived_at, '') = ''
+            AND date(COALESCE(NULLIF(posted_date, ''), NULLIF(discovery_first_seen_at, ''))) < date('now', '-14 days')
+            AND status NOT IN ('Applied', 'shortlisted')
+            AND NOT EXISTS (SELECT 1 FROM discovery_applicant_states s WHERE s.job_id = jobs.id AND s.state IN ('saved', 'applied', 'skipped', 'ignored'))"""
+        db = get_db()
+        rows = db.execute(f"SELECT id FROM jobs WHERE discovery_first_seen_at <> '' AND {lifecycle_sql}").fetchall()
+        if rows:
+            db.execute(
+                f"UPDATE jobs SET discovery_archived_at = CURRENT_TIMESTAMP, discovery_archive_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE discovery_first_seen_at <> '' AND {lifecycle_sql}",
+                ["Outside the active 14-day vacancy retention window."],
+            )
+            db.commit()
+        return jsonify({"ok": True, "archived_count": len(rows), "destructive_cleanup": False})
+
+    @app.post("/api/discovery/inbox/cleanup-archived-payloads")
+    def cleanup_archived_discovery_payloads() -> Response:
+        """Optional, explicit 90-day payload cleanup; durable rows stay intact."""
+        payload = request.get_json(silent=True) or {}
+        if not as_bool(payload.get("confirm_cleanup")):
+            return jsonify({"error": "Cleanup is disabled until explicit confirm_cleanup=true.", "cleaned_count": 0}), 400
+        retention_days = clamp_int_default(payload.get("retention_days"), 90, 90, 3650)
+        db = get_db()
+        rows = db.execute(
+            """SELECT id FROM jobs
+               WHERE COALESCE(discovery_archived_at, '') <> ''
+                 AND date(discovery_archived_at) <= date('now', ?)
+            """,
+            [f"-{retention_days} days"],
+        ).fetchall()
+        if rows:
+            db.execute(
+                """UPDATE jobs SET job_description = '', provider_raw_json = '{}',
+                   responsibilities = '', required_skills = '', preferred_skills = '',
+                   description_source = '', description_fetched_at = '', updated_at = CURRENT_TIMESTAMP
+                   WHERE COALESCE(discovery_archived_at, '') <> ''
+                     AND date(discovery_archived_at) <= date('now', ?)""",
+                [f"-{retention_days} days"],
+            )
+            db.commit()
+        return jsonify({"ok": True, "cleaned_count": len(rows), "retention_days": retention_days, "durable_identity_preserved": True})
+
+    @app.post("/api/discovery/inbox/<int:job_id>/restore-archive")
+    def restore_discovery_archive(job_id: int) -> Response:
+        row = query_db("SELECT * FROM jobs WHERE id = ? AND discovery_first_seen_at <> ''", [job_id], one=True)
+        if row is None:
+            return jsonify({"error": "Discovered job not found"}), 404
+        payload = request.get_json(silent=True) or {}
+        try:
+            validate_discovery_action_owner(row, payload)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        get_db().execute("UPDATE jobs SET discovery_archived_at = '', discovery_archive_reason = '', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [job_id])
+        get_db().commit()
+        return jsonify({"ok": True, "job_id": job_id, "archived": False})
 
     @app.post("/api/discovery/inbox/<int:job_id>/restore")
     def restore_discovery_job(job_id: int) -> Response:
@@ -13589,6 +13747,7 @@ def init_db() -> None:
     db.execute("CREATE INDEX IF NOT EXISTS jobs_application_url_idx ON jobs(application_url)")
     db.execute("CREATE INDEX IF NOT EXISTS jobs_company_title_location_idx ON jobs(company, title, location)")
     db.execute("CREATE INDEX IF NOT EXISTS jobs_title_lower_idx ON jobs(lower(title))")
+    db.execute("CREATE INDEX IF NOT EXISTS jobs_discovery_lifecycle_idx ON jobs(discovery_first_seen_at, discovery_archived_at, discovery_result_category, application_priority_score)")
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS job_source_aliases (

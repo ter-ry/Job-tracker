@@ -450,7 +450,7 @@ def test_new_count_and_listing_reconcile_with_mixed_applicant_history(tmp_path, 
             app_module.get_db().execute("INSERT INTO discovery_applicant_presentations(job_id, applicant_profile_id) VALUES (?, ?)", [job_id, swe])
         app_module.get_db().commit()
     counts = client.get(f"/api/discovery/inbox/counts?candidate_profile_id={swe}").get_json()
-    rows = client.get(f"/api/discovery/inbox?candidate_profile_id={swe}&category=new_actionable&include_history=1").get_json()
+    rows = client.get(f"/api/discovery/inbox?candidate_profile_id={swe}&category=new_actionable&include_history=1&page_size=100").get_json()
     assert counts["new_actionable"] == 47
     assert len(rows) == counts["new_actionable"]
     assert {row["id"] for row in rows} == set(ids[:47])

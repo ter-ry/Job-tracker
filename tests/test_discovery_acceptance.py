@@ -167,7 +167,7 @@ def test_ece_fifty_target_runs_full_discovery_pipeline_and_persists_inbox(monkey
         # Title-only educator rows are provisional: they remain actionable in
         # the queue, but none satisfies the grounded full-time target.
         assert len(body["jobs"]) == 52
-        persisted = client.get("/api/discovery/inbox?include_history=1").get_json()
+        persisted = client.get("/api/discovery/inbox?include_history=1&page_size=100").get_json()
         saved_ids = {item.get("source_job_id") for item in persisted}
         assert {f"pipeline-ece-{index}" for index in range(52)} <= saved_ids
     finally:

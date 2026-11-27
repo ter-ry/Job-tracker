@@ -1,4 +1,5 @@
 import time
+from datetime import date, timedelta
 
 import app as app_module
 
@@ -150,3 +151,45 @@ def test_applications_history_filters_searches_and_sorts_server_side(tmp_path, m
     response = client.get(base + "&history_q=Analyst&history_category=skipped")
     assert response.status_code == 200
     assert response.get_json()[0]["title"] == "Skipped Analyst"
+
+
+def test_active_vacancy_window_archives_only_unprocessed_records_and_restores(tmp_path, monkeypatch):
+    monkeypatch.setattr(app_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(app_module, "DB_PATH", tmp_path / "retention.sqlite")
+    monkeypatch.setattr(app_module, "_INITIALIZED_DATABASE_PATH", None)
+    client = app_module.app.test_client()
+    client.get("/api/health")
+    profile = client.post("/api/candidate-profiles", json={"name": "Retention owner", "workflow": "software"}).get_json()
+    recent = (date.today() - timedelta(days=3)).isoformat()
+    old = (date.today() - timedelta(days=30)).isoformat()
+    with app_module.app.app_context():
+        db = app_module.get_db()
+        ids = {}
+        for key, posted in (("recent", recent), ("old", old), ("unknown", ""), ("saved", old)):
+            cursor = db.execute(
+                """INSERT INTO jobs(company, title, location, url, source, source_job_id,
+                   discovery_first_seen_at, posted_date, discovery_result_category,
+                   canonical_job_id, status) VALUES (?, ?, 'Toronto, ON', ?, 'fixture', ?,
+                   ?, ?, 'actionable', 0, 'Discovered')""",
+                ("Retention Co", f"{key} role", f"https://retention/{key}", key, recent, posted),
+            )
+            ids[key] = cursor.lastrowid
+        db.execute(
+            "INSERT INTO discovery_applicant_states(job_id, applicant_profile_id, state) VALUES (?, ?, 'saved')",
+            (ids["saved"], profile["id"]),
+        )
+        db.commit()
+    response = client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=ready_to_apply&page_size=20")
+    assert {item["title"] for item in response.get_json()} == {"recent role", "unknown role"}
+    archived = client.post("/api/discovery/inbox/archive-expired", json={"confirm_archive": True})
+    assert archived.status_code == 200
+    assert archived.get_json()["archived_count"] == 1
+    cleanup_blocked = client.post("/api/discovery/inbox/cleanup-archived-payloads", json={})
+    assert cleanup_blocked.status_code == 400
+    archived_view = client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=archived&page_size=20")
+    assert [item["title"] for item in archived_view.get_json()] == ["old role"]
+    saved = client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=saved&include_history=1&page_size=20")
+    assert [item["title"] for item in saved.get_json()] == ["saved role"]
+    restored = client.post(f"/api/discovery/inbox/{ids['old']}/restore-archive", json={})
+    assert restored.status_code == 200
+    assert client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=archived&page_size=20").get_json() == []

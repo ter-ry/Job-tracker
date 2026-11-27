@@ -18,6 +18,7 @@ async function main() {
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
   await page.getByRole("button", { name: "Job Inbox", exact: true }).click();
   await page.locator("#discovery-inbox").waitFor({ state: "visible" });
+  await page.locator("#discovery-inbox article").first().waitFor({ state: "visible" });
   const labels = await page.locator("#discovery-inbox-filters").innerText();
   for (const label of ["Ready to Apply", "New", "Saved", "Applied", "Skipped", "All Discovered"]) assert.match(labels, new RegExp(label));
   assert.strictEqual(await page.locator("#discovery-form").isVisible(), false);

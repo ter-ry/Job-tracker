@@ -37,7 +37,7 @@ const state = {
   discoveryInboxReason: "",
   discoveryInboxSource: "",
   discoveryInboxHasMore: false,
-  discoveryInboxPageSize: 50,
+  discoveryInboxPageSize: 20,
   discoveryInboxTotal: 0,
   discoveryInboxCounts: {},
   discoveryInboxRuns: [],
@@ -429,10 +429,9 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   applyDiscoverySearchDefaults();
   setDiscoveryControlsEnabled(false);
-  loadAll({ lightweight: true });
-  loadSavedSearches();
-  loadDiscoveryScheduler();
-  loadDiscoveryTaskStatus();
+  // Inbox is the useful first paint.  Do not hydrate every job, document and
+  // workspace just to show the first 20 applicant-scoped vacancies.
+  void loadCandidateProfiles({ loadDocuments: false }).then(() => loadDiscoveryInbox(true));
   loadQAStatus();
 });
 
@@ -641,7 +640,7 @@ function selectWorkplaceSearchRun(searchId) {
   renderWorkplaceSearchRuns();
 }
 
-async function loadCandidateProfiles({ reloadPanelsOnSelectionChange = false } = {}) {
+async function loadCandidateProfiles({ reloadPanelsOnSelectionChange = false, loadDocuments = true } = {}) {
   state.candidateProfilesStatus = "loading";
   state.candidateProfilesError = "";
   renderCandidateProfiles();
@@ -668,7 +667,7 @@ async function loadCandidateProfiles({ reloadPanelsOnSelectionChange = false } =
     if (selectedProfile && (selectedAtStart !== state.selectedCandidateProfileId || !String(value("discovery-distance-origin") || "").trim())) {
       setValue("discovery-distance-origin", selectedProfile.commute_origin_input || "");
     }
-    if (state.selectedCandidateProfileId) await renderCandidateProfileDocuments();
+    if (loadDocuments && state.selectedCandidateProfileId) await renderCandidateProfileDocuments();
     if (reloadPanelsOnSelectionChange && selectedAtStart !== state.selectedCandidateProfileId) {
       void loadAll({ skipProfiles: true });
     }
@@ -1533,6 +1532,7 @@ async function runSavedSearch(id) {
 }
 
 function discoveryInboxCategory(job) {
+  if (String(job.discovery_archived_at || "")) return "archived";
   if (String(job.discovery_inbox_category || "") === "requalified") return "requalified";
   if (String(job.status || "") === "Applied" || String(job.discovery_state || "") === "applied") return "applied";
   if (["ignored", "skipped"].includes(String(job.discovery_state || ""))) return "skipped";
@@ -1543,12 +1543,12 @@ function discoveryInboxCategory(job) {
 }
 
 function inboxPaginationMarkup(position) {
-  const size = Number(state.discoveryInboxPageSize || 50);
+  const size = Number(state.discoveryInboxPageSize || 20);
   const total = Number(state.discoveryInboxTotal || 0);
   const page = Number(state.discoveryInboxPage || 0);
   const pages = Math.max(1, Math.ceil(total / size));
   return `<nav class="inbox-pagination ${position}" aria-label="Inbox pagination" data-inbox-pagination>
-    <label>Results per page <select data-inbox-page-size aria-label="Results per page"><option value="25" ${size === 25 ? "selected" : ""}>25</option><option value="50" ${size === 50 ? "selected" : ""}>50</option><option value="100" ${size === 100 ? "selected" : ""}>100</option></select></label>
+    <label>Results per page <select data-inbox-page-size aria-label="Results per page"><option value="20" ${size === 20 ? "selected" : ""}>20</option><option value="50" ${size === 50 ? "selected" : ""}>50</option><option value="100" ${size === 100 ? "selected" : ""}>100</option></select></label>
     <button class="button ghost small" type="button" data-inbox-prev ${page <= 0 ? "disabled" : ""}>Previous</button>
     <span class="muted" data-inbox-page-status>Page ${Math.min(page + 1, pages)} of ${pages} · ${total} results</span>
     <button class="button ghost small" type="button" data-inbox-next ${page + 1 >= pages ? "disabled" : ""}>Next</button>
@@ -1557,7 +1557,7 @@ function inboxPaginationMarkup(position) {
 
 function bindInboxPagination(root) {
   root?.querySelectorAll("[data-inbox-page-size]").forEach((select) => select.addEventListener("change", async (event) => {
-    state.discoveryInboxPageSize = Number(event.target.value) || 50;
+    state.discoveryInboxPageSize = Number(event.target.value) || 20;
     state.discoveryInboxPage = 0;
     state.discoveryInboxJobs = [];
     await loadDiscoveryInbox(true);
@@ -1584,10 +1584,10 @@ function renderDiscoveryInbox(jobs) {
     const button = document.getElementById(`inbox-bulk-${action}`);
     if (button) button.disabled = Boolean(state.discoveryInboxBulkAction);
   });
-  const labels = { all_relevant: "All Relevant", new_actionable: "New Opportunities", ready_to_apply: "Ready to Apply", review_required: "Needs Review", presented: "Presented / Seen", excluded: "Excluded Jobs", requalified: "Requalified Since Update", saved: "Saved", applied: "Applied", skipped: "Skipped", all_discovered: "All Discovered" };
+  const labels = { all_relevant: "All Relevant", new_actionable: "New Opportunities", ready_to_apply: "Ready to Apply", review_required: "Needs Review", presented: "Presented / Seen", excluded: "Excluded Jobs", requalified: "Requalified Since Update", archived: "Archived", saved: "Saved", applied: "Applied", skipped: "Skipped", all_discovered: "All Discovered" };
   const primaryViews = { ready_to_apply: "Ready to Apply", new_actionable: "New", saved: "Saved", review_required: "Needs Review", applied: "Applied", skipped: "Skipped", all_discovered: "All Discovered" };
-  const historyViews = ["saved", "applied", "skipped", "all_discovered"];
-  const pagedCategory = ["new", "new_actionable", "review", "review_required", "ready_to_apply", "requalified", "presented", "saved", "applied", "skipped", "excluded", "all_relevant", "all_discovered"].includes(state.discoveryInboxCategory);
+  const historyViews = ["saved", "applied", "skipped", "archived", "all_discovered"];
+  const pagedCategory = ["new", "new_actionable", "review", "review_required", "ready_to_apply", "requalified", "presented", "saved", "applied", "skipped", "excluded", "archived", "all_relevant", "all_discovered"].includes(state.discoveryInboxCategory);
   const counts = jobs.reduce((result, job) => {
     const category = job.discovery_inbox_category || discoveryInboxCategory(job);
     result[category] = (result[category] || 0) + 1;
@@ -1603,7 +1603,7 @@ function renderDiscoveryInbox(jobs) {
     if (showHistoryControls) {
       filters.insertAdjacentHTML("beforeend", `<div class="inbox-history-views" role="tablist" aria-label="History filters">${historyViews.map((category) => `<button class="button ghost small ${state.discoveryInboxCategory === category ? "active" : ""}" type="button" data-inbox-category="${category}" ${state.discoveryInboxBulkAction ? "disabled" : ""}>${labels[category]} <span class="muted">${countLabel(category)}</span></button>`).join("")}</div>`);
     }
-    const runOptions = state.discoveryInboxRuns.map((run) => `<option value="${escapeAttribute(run.search_id)}" ${state.discoveryInboxSearchId === run.search_id ? "selected" : ""}>${escapeHtml(run.search_id.slice(0, 12))} · ${Number(run.review_count || 0)} review · ${Number(run.excluded_count || 0)} excluded</option>`).join("");
+    const runOptions = state.discoveryInboxRuns.filter((run) => run && run.search_id).map((run) => `<option value="${escapeAttribute(run.search_id)}" ${state.discoveryInboxSearchId === run.search_id ? "selected" : ""}>${escapeHtml(String(run.search_id).slice(0, 12))} · ${Number(run.review_count || 0)} review · ${Number(run.excluded_count || 0)} excluded</option>`).join("");
     if (showHistoryControls) filters.insertAdjacentHTML("beforeend", `<div class="inbox-history-search"><label>Search title or company<input type="search" data-inbox-history-search value="${escapeAttribute(state.discoveryInboxQuery)}" placeholder="Search history"></label><label>Reason filter<input type="search" data-inbox-reason-filter value="${escapeAttribute(state.discoveryInboxReason)}" placeholder="Reason"></label><label>Source filter<input type="search" data-inbox-source-filter value="${escapeAttribute(state.discoveryInboxSource)}" placeholder="Provider"></label></div>`);
     if (runOptions && showHistoryControls) filters.insertAdjacentHTML("beforeend", `<label class="inbox-search-run">Search run <select data-inbox-search-run><option value="">All runs</option>${runOptions}</select></label>`);
     filters.querySelectorAll("[data-inbox-primary]").forEach((button) => button.addEventListener("click", async () => {
@@ -1679,7 +1679,9 @@ function renderDiscoveryInbox(jobs) {
       `<button class="button ghost small" type="button" onclick="reassessInboxJob(${job.id})">Reassess now</button>`,
     ].join("") : "";
     const workplaceActions = isEce ? renderEceInboxWorkplaceActions(job) : `${!job.workplace_address && !job.workplace_postal_code ? `<button class="button ghost small" type="button" data-find-workplace-job="${escapeAttribute(job.id)}">Verify workplace</button>` : ""}${renderMapLinks(job)}`;
-    const actions = category === "saved"
+    const actions = category === "archived"
+      ? `<button class="button ghost small" type="button" onclick="restoreInboxArchive(${job.id})">Restore to Inbox</button>`
+      : category === "saved"
       ? `<button class="button ghost small" type="button" onclick="restoreInboxJob(${job.id})">Restore to Ready</button>${workplaceActions}`
       : category === "new_actionable" || category === "ready_to_apply" || category === "review_required" || category === "requalified" || category === "presented" || category === "applied"
       ? `<button class="button ghost small" type="button" onclick="saveInboxJob(${job.id})">Save</button><button class="button ghost small" type="button" onclick="applyInboxJob(${job.id})">Confirm Applied</button><button class="button ghost small" type="button" onclick="ignoreInboxJob(${job.id})">Skip</button>${workplaceActions}`
@@ -1697,7 +1699,7 @@ function renderDiscoveryInbox(jobs) {
   target.querySelectorAll("[data-inbox-evidence]").forEach((button) => button.addEventListener("click", () => openInboxEvidence(button.dataset.inboxEvidence)));
 }
 
-function openInboxEvidence(jobId) {
+async function openInboxEvidence(jobId) {
   const job = state.discoveryInboxJobs.find((item) => Number(item.id) === Number(jobId));
   const dialog = document.getElementById("inbox-evidence-dialog");
   const body = document.getElementById("inbox-evidence-body");
@@ -1706,8 +1708,16 @@ function openInboxEvidence(jobId) {
   const excerpt = membership.source_excerpt || job.qualification_evidence_excerpt || job.job_description || "No readable source excerpt is stored.";
   const source = job.source || membership.source || "Source unavailable";
   const url = job.url || membership.url || "";
-  body.innerHTML = `<p><strong>${escapeHtml(job.company || "Unknown employer")}</strong> · ${escapeHtml(job.title || "Untitled role")}</p><p><strong>Decision:</strong> ${escapeHtml(job.discovery_result_category || "Unverified")}<br><strong>Reason:</strong> ${escapeHtml(job.discovery_result_reason || "No persisted reason")}</p><p><strong>Source:</strong> ${escapeHtml(source)}${url ? ` · <a href="${escapeAttribute(url)}" target="_blank" rel="noreferrer">Open original</a>` : ""}</p><hr><p><strong>Readable evidence</strong></p><p>${escapeHtml(String(excerpt).slice(0, 4000))}</p>`;
+  const renderEvidence = (evidence) => {
+    const currentSource = evidence.source || source;
+    const currentUrl = evidence.url || url;
+    const currentExcerpt = evidence.excerpt || excerpt;
+    body.innerHTML = `<p><strong>${escapeHtml(evidence.company || job.company || "Unknown employer")}</strong> · ${escapeHtml(evidence.title || job.title || "Untitled role")}</p><p><strong>Decision:</strong> ${escapeHtml(evidence.category || job.discovery_result_category || "Unverified")}<br><strong>Reason:</strong> ${escapeHtml(evidence.reason || job.discovery_result_reason || "No persisted reason")}</p><p><strong>Source:</strong> ${escapeHtml(currentSource || "Source unavailable")}${currentUrl ? ` · <a href="${escapeAttribute(currentUrl)}" target="_blank" rel="noreferrer">Open original</a>` : ""}</p><hr><p><strong>Readable evidence</strong></p><p>${escapeHtml(String(currentExcerpt).slice(0, 4000))}</p>`;
+  };
+  renderEvidence({});
   dialog.showModal();
+  try { renderEvidence(await api.get(`/api/discovery/inbox/${encodeURIComponent(jobId)}/evidence`)); }
+  catch (_) { /* The persisted card evidence remains available offline. */ }
 }
 
 async function findWorkplaceForJob(jobId) {
@@ -1751,7 +1761,7 @@ async function bulkInboxAction(action) {
   await loadDiscoveryInbox(true);
 }
 
-function discoveryInboxRequestUrl({ profileId = "", category = "all_relevant", searchId = "", page = 0, pageSize = 50, query = "", reason = "", source = "", lightweight = 0 } = {}) {
+function discoveryInboxRequestUrl({ profileId = "", category = "all_relevant", searchId = "", page = 0, pageSize = 20, query = "", reason = "", source = "", lightweight = 1 } = {}) {
   const params = new URLSearchParams();
   if (profileId) params.set("candidate_profile_id", String(profileId));
   params.set("include_history", "1");
@@ -1765,7 +1775,7 @@ function discoveryInboxRequestUrl({ profileId = "", category = "all_relevant", s
     params.set("search_id", String(searchId));
     params.set("page_size", String(pageSize));
     params.set("page", String(page));
-  } else if (["new", "new_actionable", "review", "review_required", "requalified", "ready_to_apply", "presented", "saved", "applied", "skipped", "excluded", "all_relevant", "all_discovered"].includes(category)) {
+  } else if (["new", "new_actionable", "review", "review_required", "requalified", "ready_to_apply", "presented", "saved", "applied", "skipped", "excluded", "archived", "all_relevant", "all_discovered"].includes(category)) {
     params.set("category", category === "all_discovered" ? "all_discovered" : category);
     params.set("page_size", String(pageSize));
     params.set("page", String(page));
@@ -1782,8 +1792,12 @@ async function loadDiscoveryInbox(force = false, append = false) {
     return;
   }
   try {
-    if (force && !append) target.textContent = "Loading Inbox history…";
-    const pagedCategory = ["new", "new_actionable", "review", "review_required", "ready_to_apply", "requalified", "presented", "saved", "applied", "skipped", "excluded", "all_relevant", "all_discovered"].includes(state.discoveryInboxCategory);
+    if (force && !append) {
+      target.textContent = "Loading Inbox history…";
+      const filters = document.getElementById("discovery-inbox-filters");
+      if (filters) filters.innerHTML = '<span class="muted" role="status">Loading applicant-specific Inbox counts…</span>';
+    }
+    const pagedCategory = ["new", "new_actionable", "review", "review_required", "ready_to_apply", "requalified", "presented", "saved", "applied", "skipped", "excluded", "archived", "all_relevant", "all_discovered"].includes(state.discoveryInboxCategory);
     const jobsUrl = discoveryInboxRequestUrl({
       profileId: state.selectedCandidateProfileId,
       category: state.discoveryInboxCategory,
@@ -1793,6 +1807,7 @@ async function loadDiscoveryInbox(force = false, append = false) {
       query: state.discoveryInboxQuery,
       reason: state.discoveryInboxReason,
       source: state.discoveryInboxSource,
+      lightweight: 1,
     });
     const selectedProfile = state.selectedCandidateProfileId ? String(state.selectedCandidateProfileId) : "";
     const [jobResponse, counts, runs] = await Promise.all([
@@ -1886,6 +1901,7 @@ function discoveryApplicantActionPayload() {
 async function reviewInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/review`, "POST", discoveryApplicantActionPayload()); updateInboxLocalJob(id, { discovery_state: "reviewed" }); } catch (error) { toast(error.message); } }
 async function ignoreInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/ignore`, "POST", discoveryApplicantActionPayload()); updateInboxLocalJob(id, { discovery_state: "ignored" }); } catch (error) { toast(error.message); } }
 async function restoreInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/restore`, "POST", discoveryApplicantActionPayload()); updateInboxLocalJob(id, { discovery_state: "new", status: "Discovered" }); if (document.querySelector('.tab.active')?.dataset.workspace === "applications") await loadApplicationsHistory(); toast("Job restored to new matches"); } catch (error) { toast(error.message); } }
+async function restoreInboxArchive(id) { try { await api.send(`/api/discovery/inbox/${id}/restore-archive`, "POST", discoveryApplicantActionPayload()); await loadDiscoveryInbox(true); toast("Archived vacancy restored to the Inbox."); } catch (error) { toast(error.message); } }
 async function applyInboxJob(id) { try { await api.send(`/api/discovery/inbox/${id}/applied`, "POST", discoveryApplicantActionPayload()); toast("Marked applied for the selected applicant."); updateInboxLocalJob(id, { discovery_state: "applied" }); } catch (error) { toast(error.message); } }
 async function saveInboxJob(id) {
   try { await api.send(`/api/discovery/inbox/${id}/save`, "POST", discoveryApplicantActionPayload()); toast("Saved for the selected applicant"); updateInboxLocalJob(id, { discovery_state: "saved" }); }
@@ -2049,7 +2065,9 @@ function renderCandidateProfiles() {
       <div><h3>${escapeHtml(profile.name)}</h3><p class="muted">${profile.workflow === "ece" ? "ECE workflow" : "Software / SWE workflow"} · ${profile.identity_mode === "distinct" ? escapeHtml(profile.applicant_name || "Distinct identity not set") : "Uses active profile identity"}</p></div>
       <div class="actions compact"><button class="button small ghost" type="button" onclick="selectCandidateProfile(${profile.id})">Manage documents</button><button class="button small ghost" type="button" onclick='showCandidateProfileForm(${JSON.stringify(profile).replaceAll("'", "&#39;")})'>Edit identity</button></div>
     </article>`).join("");
-  renderCandidateProfileDocuments();
+  // Documents are a settings-only surface; keep profile switching and Inbox
+  // navigation independent of résumé/template payloads.
+  if (document.querySelector(".tab.active")?.dataset.workspace === "settings") renderCandidateProfileDocuments();
 }
 
 async function selectCandidateProfile(profileId) {
@@ -2066,7 +2084,6 @@ async function selectCandidateProfile(profileId) {
   state.discoveryInboxBulkMessage = "";
   clearVisibleDiscoveryResults();
   renderCandidateProfiles();
-  await renderCandidateProfileDocuments();
   const activeWorkspace = document.querySelector(".tab.active")?.dataset.workspace || "discover";
   if (activeWorkspace === "fastapply") {
     const panel = document.getElementById("fast-apply-panel");
@@ -2149,6 +2166,8 @@ function switchTab(event) {
   } else if (workspace === "applications") {
     setValue("status-filter", "");
     void loadApplicationsHistory({ page: 0 });
+  } else if (workspace === "settings") {
+    void renderCandidateProfileDocuments();
   }
 }
 

@@ -29,7 +29,7 @@ vm.runInNewContext(`${source.slice(start, end)}; this.loadDiscoveryInbox = loadD
   assert.strictEqual(scoped.searchParams.get("search_id"), searchId);
   assert.strictEqual(scoped.searchParams.get("include_history"), "1");
   assert.strictEqual(scoped.searchParams.get("page"), "0");
-  assert.strictEqual(scoped.searchParams.get("page_size"), "50");
+  assert.strictEqual(scoped.searchParams.get("page_size"), "20");
 
   context.state.discoveryInboxCategory = "all_relevant";
   context.state.discoveryInboxSearchId = "";
