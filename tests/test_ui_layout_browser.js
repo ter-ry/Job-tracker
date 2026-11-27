@@ -12,6 +12,7 @@ async function main() {
   const browser = await chromium.launch({ headless: true, executablePath: process.env.CHROMIUM_PATH || "/usr/bin/chromium", args: ["--no-sandbox"] });
   const page = await browser.newPage();
   const startupRequests = [];
+  const preferenceRequests = [];
   page.on("request", (request) => {
     if (request.url().includes("/api/")) startupRequests.push(request.url());
   });
@@ -19,11 +20,33 @@ async function main() {
     { id: 201, name: "SWE applicant", workflow: "software" },
     { id: 202, name: "ECE applicant", workflow: "ece" },
   ]) }));
+  await page.route("**/api/discovery/preferences*", async (route) => {
+    const url = new URL(route.request().url());
+    preferenceRequests.push({ profile: url.searchParams.get("candidate_profile_id"), workflow: url.searchParams.get("workflow") });
+    const ece = url.searchParams.get("workflow") === "ece";
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ preferences: { search: { workflow: ece ? "ece" : "software", keywords: ece ? "Registered Early Childhood Educator; RECE" : "platform engineer", include_internships: !ece, match_policy: ece ? "strict_matching" : "apply_broadly" } } }) });
+  });
   await page.route("**/api/discovery/inbox**", async (route) => route.fulfill({ status: 200, contentType: "application/json", headers: { "X-Job-Tracker-Total": "0" }, body: "[]" }));
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
   await page.locator("#global-applicant-selector option").nth(1).waitFor({ state: "attached" });
   assert.ok(!startupRequests.some((url) => /\/api\/jobs(?:\?|$)|\/documents(?:\?|$)|saved-search|scheduler|task-status/.test(url)), `startup hydrated unrelated data: ${startupRequests.join("\n")}`);
   await page.locator("#global-applicant-selector").selectOption("202");
+  await page.waitForTimeout(100);
+  await page.locator("#discovery-profile").selectOption("201");
+  await page.waitForTimeout(100);
+  const searchState = await page.evaluate(() => ({
+    workflow: state.discoveryWorkflow,
+    keywords: document.querySelector("#discovery-keywords")?.value || "",
+    criteria: discoverySearchCriteriaFromControls(),
+  }));
+  assert.ok(preferenceRequests.some((request) => request.profile === "202" && request.workflow === "ece"));
+  assert.ok(preferenceRequests.some((request) => request.profile === "201" && request.workflow === "software"));
+  assert.strictEqual(searchState.workflow, "software");
+  assert.strictEqual(searchState.keywords, "platform engineer");
+  assert.strictEqual(searchState.criteria.match_policy, "apply_broadly");
+  assert.strictEqual(searchState.criteria.include_internships, true);
+  await page.locator("#global-applicant-selector").selectOption("202");
+  await page.waitForTimeout(100);
 
   for (const viewport of [{ width: 1280, height: 720 }, { width: 1920, height: 1080 }]) {
     await page.setViewportSize(viewport);

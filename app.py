@@ -2554,12 +2554,20 @@ def create_app() -> Flask:
     @app.get("/api/discovery/preferences")
     def discovery_preferences_get() -> Response:
         search_key = text(request.args.get("search_key"))
+        applicant_profile_id = clamp_int(request.args.get("candidate_profile_id"), 0, 10**9)
+        workflow = normalize_choice(request.args.get("workflow"), {"software", "ece"})
+        if not search_key and applicant_profile_id:
+            search_key = discovery_applicant_preferences_key(applicant_profile_id, workflow)
         return jsonify({"search_key": search_key, "preferences": load_discovery_preferences(search_key)})
 
     @app.post("/api/discovery/preferences")
     def discovery_preferences_set() -> Response:
         payload = request.get_json(force=True)
-        search_key = text(payload.get("search_key")) or discovery_search_signature(payload)
+        applicant_profile_id = clamp_int(payload.get("candidate_profile_id") or payload.get("applicant_profile_id"), 0, 10**9)
+        workflow = normalize_choice(payload.get("workflow"), {"software", "ece"})
+        search_key = text(payload.get("search_key")) or (
+            discovery_applicant_preferences_key(applicant_profile_id, workflow) if applicant_profile_id else discovery_search_signature(payload)
+        )
         preferences = discovery_preferences_payload(payload.get("preferences") if isinstance(payload.get("preferences"), dict) else payload)
         save_discovery_preferences(search_key, preferences)
         return jsonify({"search_key": search_key, "preferences": preferences})
@@ -11123,7 +11131,14 @@ def geocode_matches_canadian_location(raw_location: str, geocode: dict[str, Any]
     if postal and returned_postal:
         return postal == returned_postal
     if postal:
-        # A postal-level result for another code is not evidence for this one.
+        # Some Canadian geocoders return a city/province centroid for a valid
+        # postal query but omit the echoed postal code. Accept that result only
+        # when its regional evidence is consistent with the postal prefix; a
+        # different explicit postal code remains a hard rejection.
+        postal_prefix_province = {"A": "NL", "B": "NS", "C": "PE", "E": "NB", "G": "QC", "H": "QC", "J": "QC", "K": "ON", "L": "ON", "M": "ON", "N": "ON", "P": "ON", "R": "MB", "S": "SK", "T": "AB", "V": "BC"}.get(postal[0])
+        if postal_prefix_province:
+            province_name = next((normalize_space(text(name)).lower() for name, code in PROVINCE_CODE_BY_NAME.items() if code.lower() == postal_prefix_province.lower()), "")
+            return province_name in display or re.search(rf"(?:,|\s){re.escape(postal_prefix_province.lower())}(?:,|\s|$)", display) is not None
         return False
     if postal and postal[0] == "M":
         expected_code = "ON"
@@ -13658,7 +13673,19 @@ def discovery_preferences_payload(payload: dict[str, Any]) -> dict[str, Any]:
             for key, default in DISCOVERY_SCORE_WEIGHTS.items()
         },
     }
+    # Keep the applicant's search controls beside the display preferences. A
+    # search-key snapshot remains useful for completed-search restoration, but
+    # applicant-scoped preferences are the authority when switching profiles.
+    search = payload.get("search")
+    if isinstance(search, dict):
+        preferences["search"] = dict(search)
     return preferences
+
+
+def discovery_applicant_preferences_key(profile_id: int, workflow: str = "") -> str:
+    """Stable private preference namespace for one applicant workflow."""
+    normalized_workflow = normalize_choice(workflow, {"software", "ece"}) or "software"
+    return f"applicant:{int(profile_id)}:{normalized_workflow}"
 
 
 def apply_discovery_filters(job: dict[str, Any], filters: dict[str, Any]) -> bool:

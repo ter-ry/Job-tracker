@@ -56,6 +56,7 @@ const state = {
   fastApplyInitialTotal: 0,
   fastApplyProcessedCount: 0,
   fastApplyPendingAction: false,
+  discoveryPreferenceLoadToken: 0,
   applicationsHistoryPage: 0,
   applicationsHistoryPageSize: 50,
   applicationsHistoryTotal: 0,
@@ -663,7 +664,11 @@ async function loadCandidateProfiles({ reloadPanelsOnSelectionChange = false, lo
     state.candidateProfilesStatus = "ready";
     renderCandidateProfiles();
     const selectedProfile = state.candidateProfiles.find((profile) => String(profile.id) === String(state.selectedCandidateProfileId));
-    if (selectedProfile) applyDiscoveryWorkflow(selectedProfile.workflow === "ece" ? "ece" : "software", { reset: selectedAtStart !== state.selectedCandidateProfileId });
+    if (selectedProfile) {
+      const selectedWorkflow = selectedProfile.workflow === "ece" ? "ece" : "software";
+      applyDiscoveryWorkflow(selectedWorkflow, { reset: selectedAtStart !== state.selectedCandidateProfileId });
+      await loadApplicantDiscoveryPreferences(state.selectedCandidateProfileId, selectedWorkflow);
+    }
     if (selectedProfile && (selectedAtStart !== state.selectedCandidateProfileId || !String(value("discovery-distance-origin") || "").trim())) {
       setValue("discovery-distance-origin", selectedProfile.commute_origin_input || "");
     }
@@ -2045,20 +2050,7 @@ function renderCandidateProfiles() {
   if (discoveryProfile) {
     discoveryProfile.innerHTML = `<option value="">Use active Profile</option>${state.candidateProfiles.map((profile) => `<option value="${escapeAttribute(profile.id)}">${escapeHtml(profile.name)}</option>`).join("")}`;
     discoveryProfile.value = state.selectedCandidateProfileId;
-    discoveryProfile.onchange = async () => {
-      invalidateApplicantContext();
-      state.selectedCandidateProfileId = discoveryProfile.value;
-      const selected = state.candidateProfiles.find((profile) => String(profile.id) === String(state.selectedCandidateProfileId));
-      setValue("discovery-distance-origin", selected?.commute_origin_input || "");
-      try { localStorage.setItem("jobTracker.selectedCandidateProfileId", state.selectedCandidateProfileId); } catch (_) { /* storage may be disabled */ }
-      clearVisibleDiscoveryResults();
-      state.discoveryInboxJobs = [];
-      state.discoveryInboxPage = 0;
-      state.discoveryInboxHasMore = false;
-      state.discoveryInboxSelected.clear();
-      state.discoveryInboxBulkMessage = "";
-      await Promise.all([loadAll(), loadDiscoveryInbox(true)]);
-    };
+    discoveryProfile.onchange = () => { void selectCandidateProfile(discoveryProfile.value); };
   }
   list.innerHTML = state.candidateProfiles.map((profile) => `
     <article class="candidate-profile-card ${String(profile.id) === state.selectedCandidateProfileId ? "selected" : ""}">
@@ -2074,7 +2066,8 @@ async function selectCandidateProfile(profileId) {
   if (String(profileId) !== String(state.selectedCandidateProfileId || "")) invalidateApplicantContext();
   state.selectedCandidateProfileId = String(profileId);
   const selected = state.candidateProfiles.find((profile) => String(profile.id) === String(profileId));
-  applyDiscoveryWorkflow(selected?.workflow === "ece" ? "ece" : "software", { reset: true });
+  const workflow = selected?.workflow === "ece" ? "ece" : "software";
+  applyDiscoveryWorkflow(workflow, { reset: true });
   setValue("discovery-distance-origin", selected?.commute_origin_input || "");
   try { localStorage.setItem("jobTracker.selectedCandidateProfileId", state.selectedCandidateProfileId); } catch (_) { /* storage may be disabled */ }
   state.discoveryInboxJobs = [];
@@ -2084,6 +2077,8 @@ async function selectCandidateProfile(profileId) {
   state.discoveryInboxBulkMessage = "";
   clearVisibleDiscoveryResults();
   renderCandidateProfiles();
+  await loadApplicantDiscoveryPreferences(state.selectedCandidateProfileId, workflow);
+  if (String(profileId) !== String(state.selectedCandidateProfileId || "")) return;
   const activeWorkspace = document.querySelector(".tab.active")?.dataset.workspace || "discover";
   if (activeWorkspace === "fastapply") {
     const panel = document.getElementById("fast-apply-panel");
@@ -2095,6 +2090,27 @@ async function selectCandidateProfile(profileId) {
     await loadApplicationsHistory({ page: 0 });
   } else {
     await loadDiscoveryInbox(true);
+  }
+}
+
+async function loadApplicantDiscoveryPreferences(profileId, workflow) {
+  const token = ++state.discoveryPreferenceLoadToken;
+  const expectedProfile = String(profileId || "");
+  const expectedWorkflow = workflow === "ece" ? "ece" : "software";
+  try {
+    const result = await api.get(`/api/discovery/preferences?candidate_profile_id=${encodeURIComponent(expectedProfile)}&workflow=${encodeURIComponent(expectedWorkflow)}`);
+    if (token !== state.discoveryPreferenceLoadToken || expectedProfile !== String(state.selectedCandidateProfileId || "")) return;
+    const preferences = result.preferences || {};
+    if (preferences.search) {
+      applyDiscoverySearchCriteriaToControls({ ...preferences.search, workflow: expectedWorkflow });
+    } else {
+      applyDiscoveryWorkflow(expectedWorkflow, { reset: true });
+      setValue("discovery-distance-origin", (state.candidateProfiles.find((item) => String(item.id) === expectedProfile) || {}).commute_origin_input || "");
+    }
+    state.discoveryPreferences = preferences;
+    applyDiscoveryPreferencesToControls(preferences);
+  } catch (_) {
+    // A missing preference record leaves the workflow defaults usable.
   }
 }
 
@@ -3457,11 +3473,12 @@ function syncDiscoveryDepthDefaults() {
 function discoverySearchCriteriaFromControls(continuation = false) {
   const workflow = value("discovery-workflow") || state.discoveryWorkflow || "software";
   const origin = value("discovery-distance-origin");
+  const isEce = workflow === "ece";
   return {
-    search_mode: workflow === "software" ? "shortlist" : "title",
-    match_policy: workflow === "software" ? (value("discovery-match-policy") || "apply_broadly") : "strict_matching",
-    title_match_mode: value("discovery-title-match-mode") || "related",
-    keywords: value("discovery-keywords"),
+    search_mode: isEce ? "title" : "shortlist",
+    match_policy: isEce ? "strict_matching" : (value("discovery-match-policy") || "apply_broadly"),
+    title_match_mode: isEce ? "related" : (value("discovery-title-match-mode") || "related"),
+    keywords: isEce ? "Registered Early Childhood Educator; RECE" : value("discovery-keywords"),
     // Commute From is the single location authority for both workflows. The
     // provider query must never depend on a hidden Search Area field.
     location: origin,
@@ -3487,7 +3504,7 @@ function discoverySearchCriteriaFromControls(continuation = false) {
     seniority: workflow === "software" ? value("discovery-seniority") : "",
     maximum_required_years: workflow === "software" ? value("discovery-maximum-years") : "",
     include_provisional_matches: checked("discovery-include-provisional"),
-    include_internships: checked("discovery-include-internships"),
+    include_internships: isEce ? false : checked("discovery-include-internships"),
     geographic_match_mode: workflow === "ece" ? "provisional" : (value("discovery-geographic-match-mode") || "provisional"),
     workflow,
     continuation_index: continuation ? Number(state.discoveryContinuationIndex || 0) : 0,
@@ -3496,10 +3513,11 @@ function discoverySearchCriteriaFromControls(continuation = false) {
 
 function applyDiscoverySearchCriteriaToControls(criteria = {}) {
   const workflow = criteria.workflow || (criteria.search_mode === "shortlist" ? "software" : "ece");
+  const isEce = workflow === "ece";
   applyDiscoveryWorkflow(workflow);
-  setValue("discovery-search-mode", criteria.search_mode || "title");
-  setValue("discovery-title-match-mode", criteria.title_match_mode || "related");
-  setValue("discovery-keywords", criteria.keywords || "");
+  setValue("discovery-search-mode", isEce ? "title" : (criteria.search_mode || "title"));
+  setValue("discovery-title-match-mode", isEce ? "related" : (criteria.title_match_mode || "related"));
+  setValue("discovery-keywords", isEce ? "Registered Early Childhood Educator; RECE" : (criteria.keywords || ""));
   setValue("discovery-location", criteria.location || criteria.discovery_location || "");
   setValue("discovery-distance-origin", criteria.distance_origin_input || criteria.original_origin || "");
   setValue("discovery-distance", criteria.distance ?? 50);
@@ -3511,7 +3529,7 @@ function applyDiscoverySearchCriteriaToControls(criteria = {}) {
   setValue("discovery-seniority", criteria.seniority || "entry_level,junior,intermediate");
   setValue("discovery-maximum-years", criteria.maximum_required_years || 3);
   setChecked("discovery-include-provisional", criteria.include_provisional_matches !== false);
-  setChecked("discovery-include-internships", criteria.include_internships === true);
+  setChecked("discovery-include-internships", !isEce && criteria.include_internships === true);
   setValue("discovery-geographic-match-mode", criteria.geographic_match_mode || "provisional");
   document.querySelectorAll('input[name="discovery-source"]').forEach((input) => { input.checked = (criteria.enabled_sources || []).includes(input.value); });
 }
@@ -3652,11 +3670,16 @@ function toggleDiscoveryFilters() {
 }
 
 function persistDiscoveryPreferences() {
-  if (!state.discoverySearchKey) return Promise.resolve();
-  return api.send("/api/discovery/preferences", "POST", {
-    search_key: state.discoverySearchKey,
-    preferences: discoveryPreferencesFromControls(),
-  }).catch(() => null);
+  const profileId = String(state.selectedCandidateProfileId || value("discovery-profile") || "");
+  if (!profileId) return Promise.resolve();
+  const preferences = { ...discoveryPreferencesFromControls(), search: discoverySearchCriteriaFromControls() };
+  const writes = [api.send("/api/discovery/preferences", "POST", {
+    candidate_profile_id: profileId,
+    workflow: state.discoveryWorkflow,
+    preferences,
+  })];
+  if (state.discoverySearchKey) writes.push(api.send("/api/discovery/preferences", "POST", { search_key: state.discoverySearchKey, preferences }));
+  return Promise.all(writes).catch(() => null);
 }
 
 function handleDiscoveryControlsChanged() {
