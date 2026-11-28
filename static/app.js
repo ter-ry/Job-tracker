@@ -67,6 +67,7 @@ const state = {
   pendingAppliedJobs: new Set(),
   tailoring: { draftId: null, jobId: null, profileId: null, resumeId: null, data: null, selectedParagraph: null, selectedKeyword: null, aiImproveJobId: null },
   discoveryWorkflow: "software",
+  eceWorkflowEnabled: Boolean(window.JOB_TRACKER_ECE_ENABLED),
   appearance: (() => { try { return localStorage.getItem("jobTracker.appearance") || "dark"; } catch (_) { return "dark"; } })(),
 };
 
@@ -3518,7 +3519,7 @@ function discoverySearchCriteriaFromControls(continuation = false) {
     // Software shortlist scoring needs the selected résumé. ECE title search
     // deliberately stays résumé-independent, but retains the selected
     // applicant ID for durable saved-job/application association.
-    candidate_profile_id: workflow === "software" ? value("discovery-profile") : "",
+    candidate_profile_id: workflow === "software" ? (value("discovery-profile") || state.selectedCandidateProfileId || "") : "",
     applicant_profile_id: value("discovery-profile") || state.selectedCandidateProfileId || "",
     shortlist_size: Number(value("discovery-new-matching-target") || 50),
     strict_technical: workflow === "software" ? checked("discovery-strict-technical") : false,
@@ -4309,6 +4310,11 @@ function renderGlobalApplicantContext() {
   const selector = document.getElementById("global-applicant-selector");
   if (!selector) return;
   const profiles = state.candidateProfiles || [];
+  if (!state.eceWorkflowEnabled) {
+    setText("global-workflow-badge", "SOFTWARE");
+    setText("global-selection-status", "Selected SWE applicant");
+    return;
+  }
   selector.innerHTML = profiles.length
     ? profiles.map((profile) => `<option value="${escapeAttribute(profile.id)}">${escapeHtml(profile.name || profile.display_name || `Profile ${profile.id}`)} · ${escapeHtml(String(profile.workflow || "software").toUpperCase())}</option>`).join("")
     : '<option value="">No applicant profiles</option>';

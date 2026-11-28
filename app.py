@@ -96,8 +96,19 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("JOB_TRACKER_DATA_DIR", BASE_DIR / "data"))
 DB_PATH = DATA_DIR / "jobs.sqlite"
 SQLITE_BUSY_TIMEOUT_MS = 30_000
+ECE_WORKFLOW_ENVIRONMENT_VARIABLE = "JOB_TRACKER_ECE_ENABLED"
 _DATABASE_INIT_LOCK = threading.RLock()
 _INITIALIZED_DATABASE_PATH: Path | None = None
+
+
+def ece_workflow_enabled() -> bool:
+    """Return whether the reversible multi-applicant ECE workflow is enabled.
+
+    The default is deliberately SWE-only.  Installations can reactivate the
+    preserved ECE implementation with ``JOB_TRACKER_ECE_ENABLED=1`` before
+    starting Flask or the discovery worker.
+    """
+    return text(os.environ.get(ECE_WORKFLOW_ENVIRONMENT_VARIABLE)).lower() in {"1", "true", "yes", "on"}
 _LAST_MIGRATION_BACKUP: Path | None = None
 _ACTIVE_DISCOVERY_SEARCHES: set[str] = set()
 _ACTIVE_DISCOVERY_SEARCHES_LOCK = threading.Lock()
@@ -655,6 +666,7 @@ def create_app() -> Flask:
         return render_template(
             "index.html", statuses=STATUSES, role_types=ROLE_TYPES, app_name=APP_NAME,
             app_version=APP_VERSION, exit_token=os.environ.get("JOB_TRACKER_EXIT_TOKEN", ""),
+            ece_enabled=ece_workflow_enabled(),
         )
 
     @app.get("/api/qa/status")
@@ -744,7 +756,10 @@ def create_app() -> Flask:
 
     @app.get("/api/candidate-profiles")
     def candidate_profiles() -> Response:
-        return jsonify(CandidateProfileStore(get_db()).list_profiles())
+        profiles = CandidateProfileStore(get_db()).list_profiles()
+        if not ece_workflow_enabled():
+            profiles = [profile for profile in profiles if text(profile.get("workflow")).lower() != "ece"]
+        return jsonify(profiles)
 
     @app.post("/api/candidate-profiles")
     def create_candidate_profile() -> Response:
@@ -2581,11 +2596,17 @@ def create_app() -> Flask:
     @app.get("/api/discovery/searches")
     def saved_discovery_searches() -> Response:
         rows = query_db("SELECT * FROM saved_search_profiles ORDER BY enabled DESC, name COLLATE NOCASE")
-        return jsonify([saved_search_to_dict(row) for row in rows])
+        searches = [saved_search_to_dict(row) for row in rows]
+        if not ece_workflow_enabled():
+            searches = [search for search in searches if not payload_uses_ece_workflow(saved_search_to_discovery_payload(search))]
+        return jsonify(searches)
 
     @app.post("/api/discovery/searches")
     def create_saved_discovery_search() -> Response:
         request_payload = request.get_json(force=True) or {}
+        disabled_ece = reject_disabled_ece(request_payload)
+        if disabled_ece is not None:
+            return disabled_ece
         # An unnamed discovery request is the asynchronous search API. Named
         # payloads retain the saved-search CRUD contract used by existing
         # clients and the scheduler.
@@ -2732,6 +2753,9 @@ def create_app() -> Flask:
         if not bool(row.get("continuation_available")):
             return jsonify({"error": "No continuation is currently available", "search_id": search_id}), 409
         payload = parse_json_object(row.get("search_json"))
+        disabled_ece = reject_disabled_ece(payload)
+        if disabled_ece is not None:
+            return disabled_ece
         payload["continue_search"] = True
         _update_async_discovery(search_id, status="queued", cancel_requested=0, termination_reason="", error_json={})
         _ASYNC_DISCOVERY_EXECUTOR.submit(_run_async_discovery_search, search_id, payload)
@@ -3916,6 +3940,9 @@ def create_app() -> Flask:
         if row is None:
             return jsonify({"error": "Saved search not found"}), 404
         search = saved_search_to_dict(row)
+        disabled_ece = reject_disabled_ece(saved_search_to_discovery_payload(search))
+        if disabled_ece is not None:
+            return disabled_ece
         try:
             saved_payload = saved_search_to_discovery_payload(search)
             discovery_search_config(saved_payload)
@@ -3995,6 +4022,9 @@ def create_app() -> Flask:
     @app.post("/api/discovery/jobspy")
     def discovery_jobspy() -> Response:
         payload = request.get_json(force=True)
+        disabled_ece = reject_disabled_ece(payload)
+        if disabled_ece is not None:
+            return disabled_ece
         keywords = text(payload.get("keywords"))
         if not keywords:
             return jsonify({"error": "Keywords are required"}), 400
@@ -4460,6 +4490,9 @@ def create_app() -> Flask:
     @app.post("/api/discovery/jobspy/test-sources")
     def discovery_jobspy_test_sources() -> Response:
         payload = request.get_json(force=True)
+        disabled_ece = reject_disabled_ece(payload)
+        if disabled_ece is not None:
+            return disabled_ece
         enabled_sources = normalize_discovery_sources(payload.get("enabled_sources"))
         keywords = text(payload.get("keywords")) or "software developer"
         location_input = text(payload.get("location")) or "Toronto, ON"
@@ -4860,6 +4893,27 @@ def discovery_workflow(payload: dict[str, Any] | None = None, search: dict[str, 
         return explicit
     occupation = normalize_space(text(search.get("occupation") or search.get("discovery_occupation") or payload.get("occupation") or payload.get("discovery_occupation"))).lower()
     return "ece" if occupation == "early childhood educator" else "software"
+
+
+def payload_uses_ece_workflow(payload: dict[str, Any] | None = None) -> bool:
+    payload = payload or {}
+    if normalize_space(text(payload.get("workflow"))).lower() == "ece":
+        return True
+    profile_id = applicant_profile_id(payload) or clamp_int(payload.get("auto_prepare_candidate_profile_id"), 0, 10**9)
+    if profile_id:
+        row = query_db("SELECT workflow FROM candidate_profiles WHERE id = ?", [profile_id], one=True)
+        return bool(row and text(row["workflow"]).lower() == "ece")
+    occupation = normalize_space(text(payload.get("occupation") or payload.get("discovery_occupation"))).lower()
+    if occupation == "early childhood educator":
+        return True
+    keywords = normalize_space(text(payload.get("keywords"))).lower()
+    return bool(re.search(r"\b(?:rece|eca|early childhood (?:educator|assistant))\b", keywords))
+
+
+def reject_disabled_ece(payload: dict[str, Any] | None = None) -> Response | None:
+    if not ece_workflow_enabled() and payload_uses_ece_workflow(payload):
+        return jsonify({"error": "The ECE workflow is disabled. Set JOB_TRACKER_ECE_ENABLED=1 and restart Job Tracker to reactivate it."}), 409
+    return None
 
 
 def validate_discovery_applicant(payload: dict[str, Any], workflow: str) -> int:
