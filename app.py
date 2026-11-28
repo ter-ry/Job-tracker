@@ -14859,6 +14859,12 @@ def job_to_dict(
     }.get(legacy_eligibility, "unknown")
     data["ontario_eligibility"], data["ontario_eligibility_explanation"] = discovery_ontario_eligibility(data)
     data["qualification_fit_seniority"] = parse_json_object(data.get("qualification_fit_seniority"))
+    # Legacy databases acquire these columns during migration. Normalize the
+    # JSON defaults before any classification helper reads them; otherwise a
+    # migrated row's textual '{}' value can be mistaken for a mapping.
+    for field in ("experience_requirements", "technical_compatibility"):
+        if isinstance(data.get(field), str):
+            data[field] = parse_json_object(data.get(field))
     if text(data.get("discovery_location_scope")) and normalize_space(text(data.get("discovery_remote_preference"))).lower() != "remote":
         data["location_search_eligible"] = not outside_requested_location(data, text(data.get("discovery_location_scope")))
     stored_category = text(data.get("discovery_result_category"))
@@ -14875,9 +14881,6 @@ def job_to_dict(
     data["score_breakdown"] = parse_json_object(data.get("score_breakdown"))
     for field in ("qualification_fit_matched_requirements", "qualification_fit_missing_requirements", "qualification_fit_partial_requirements", "qualification_fit_reasons", "application_priority_reasons", "warnings"):
         data[field] = parse_json_array(data.get(field))
-    for field in ("experience_requirements", "technical_compatibility"):
-        if isinstance(data.get(field), str):
-            data[field] = parse_json_object(data.get(field))
     data["opportunity_score_reasons"] = parse_json_values(data.get("opportunity_score_reasons"))
     data["data_quality_flags"] = parse_json_values(data.get("data_quality_flags"))
     data["workplace_alternatives"] = parse_json_array(data.get("workplace_alternatives_json"))

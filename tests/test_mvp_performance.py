@@ -1,3 +1,4 @@
+import sqlite3
 import time
 from datetime import date, timedelta
 
@@ -85,6 +86,39 @@ def test_fast_apply_returns_first_bounded_page_without_qualification_hydration(t
     assert first["experience_requirements"]["required"]["max"] == 3
     assert first["technical_compatibility"]["matched"] == ["Python"]
     assert elapsed < 2.0
+
+
+def test_schema9_upgrade_keeps_jobs_endpoint_usable_with_new_qualification_columns(tmp_path, monkeypatch):
+    db_path = tmp_path / "historical.sqlite"
+    new_qualification_columns = {
+        "experience_requirements", "technical_compatibility", "qualification_fit_label",
+        "qualification_fit_score", "qualification_fit_reasons", "application_priority_reasons",
+    }
+    old_columns = {name: definition for name, definition in app_module.JOB_COLUMNS.items() if name not in new_qualification_columns}
+    db = sqlite3.connect(db_path)
+    db.execute(
+        "CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+        + ", ".join(f"{name} {definition}" for name, definition in old_columns.items())
+        + ")"
+    )
+    db.execute(
+        "INSERT INTO jobs(company, title, status, date_applied, date_added) VALUES (?, ?, ?, ?, ?)",
+        ("Version Lifecycle Test", "Disposable job", "Applied", "2026-11-27", "2026-11-27"),
+    )
+    db.execute("PRAGMA user_version = 9")
+    db.commit()
+    db.close()
+    monkeypatch.setattr(app_module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(app_module, "DB_PATH", db_path)
+    monkeypatch.setattr(app_module, "_INITIALIZED_DATABASE_PATH", None)
+    client = app_module.app.test_client()
+    assert client.get("/api/health").status_code == 200
+    response = client.get("/api/jobs")
+    assert response.status_code == 200
+    jobs = response.get_json()
+    assert len(jobs) == 1
+    assert jobs[0]["company"] == "Version Lifecycle Test"
+    assert jobs[0]["status"] == "Applied"
 
 
 def test_inbox_sql_order_matches_canonical_application_priority_order(tmp_path, monkeypatch):
