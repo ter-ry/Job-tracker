@@ -206,6 +206,7 @@ jobs:
       contents: write
     environment: release
     steps:
+      - uses: actions/checkout@v4
       - name: Validate stable semantic-version tag
         shell: pwsh
         run: |
