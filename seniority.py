@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -174,15 +175,21 @@ def experience_range_dict(item: ExperienceRange, content: str) -> dict[str, Any]
 
 
 def detect_level(content: str) -> tuple[str, list[str]]:
-    lowered = content.lower()
+    lowered = normalize_experience_text(content).lower()
+    # Policy wording such as ``non-internship`` is not an internship role.
+    # Remove only explicit negations; ordinary internship titles remain
+    # detectable.
+    lowered = re.sub(r"\bnon[- ]?(?:intern|internship)\b", " ", lowered)
     checks = [
         ("director", ["director", "head of", "vp engineering"]),
         ("manager", ["engineering manager", "development manager", "manager, software", "people manager"]),
         ("lead", ["lead ", "tech lead", "technical lead", "principal", "staff engineer", "staff software engineer"]),
-        ("senior", ["senior", "sr.", "sr "]),
-        ("intermediate", ["intermediate", "mid-level", "mid level", "level 2"]),
-        ("junior", ["junior", "jr.", "jr ", "early career"]),
-        ("entry_level", ["entry level", "entry-level", "new grad", "graduate developer", "no experience required"]),
+        # Providers often omit the period in ``Sr Software Engineer``. This
+        # must be recognized before Roman I/II entry-level signals.
+        ("senior", ["senior", "sr.", "sr"]),
+        ("intermediate", ["intermediate", "mid-level", "mid level", "level 2", "engineer ii"]),
+        ("junior", ["junior", "jr.", "jr ", "associate", "early career"]),
+        ("entry_level", ["entry level", "entry-level", "new grad", "recent graduate", "graduate developer", "software engineer i", "engineer i", "no experience required"]),
         ("internship", ["intern", "internship", "co-op", "coop"]),
     ]
     hits: list[str] = []
@@ -202,7 +209,20 @@ def detect_description_level(content: str) -> tuple[str, list[str]]:
     unrelated_reference = re.compile(r"\b(?:with|alongside|among|our|other|team of|reports to|work(?:s)? with)\s+(?:the\s+)?(?:technical\s+)?(?:senior|lead|principal|staff|manager|director|intern|co-?op)\b", re.I)
     for chunk in chunks:
         level, hits = detect_level(chunk)
-        if level == "unknown" or not role_context.search(chunk) or unrelated_reference.search(chunk):
+        # Mentoring, onboarding, or collaborating with junior colleagues is
+        # evidence about the surrounding team, not the advertised role.  Do
+        # not let that sentence turn an ordinary Developer into a junior role.
+        junior_reference = re.search(
+            r"\b(?:mentor(?:ing)?|coach(?:ing)?|support(?:ing)?|train(?:ing)?)\b[^.\n]{0,80}\b(?:junior|early[- ]career|new grad|intern)",
+            chunk,
+            re.I,
+        )
+        surrounding_reference = re.search(
+            r"\b(?:support(?:s|ing)?|assist(?:s|ing)?|collaborat(?:e|es|ing)?|work(?:s|ing)?\s+with|alongside)\b[^.\n]{0,60}\b(?:senior|lead|principal|staff|manager|director)\b",
+            chunk,
+            re.I,
+        )
+        if level == "unknown" or not role_context.search(chunk) or unrelated_reference.search(chunk) or junior_reference or surrounding_reference:
             continue
         candidates.append((level, hits))
     if not candidates:
@@ -237,6 +257,11 @@ def role_has_budget_or_hiring_scope(description: str) -> bool:
 
 
 def extract_experience_ranges(content: str) -> tuple[list[ExperienceRange], list[ExperienceRange], list[ExperienceRange]]:
+    # Job feeds occasionally preserve UTF-8 bytes as mojibake (for example
+    # ``2â€“5``). Normalize before matching so the lower bound of a range is
+    # retained instead of the trailing number being parsed as a standalone
+    # requirement.
+    content = normalize_experience_text(content or "")
     lowered = content.lower()
     required: list[ExperienceRange] = []
     preferred: list[ExperienceRange] = []
@@ -245,7 +270,7 @@ def extract_experience_ranges(content: str) -> tuple[list[ExperienceRange], list
         required.append(ExperienceRange(0, 0, "required", "no experience required"))
 
     range_pattern = re.compile(
-        r"(?P<a>\d{1,2})(?:\s*(?:\+|\\\+|plus)|\s*(?:-|\\-|to|–)\s*(?P<b>\d{1,2})(?:\s*(?:\+|\\\+|plus))?)?\s*(?:years?|yrs?)"
+        r"(?P<a>\d{1,2})(?:\s*(?:\+|\\\+|plus)|\s*(?:-|\\-|to|–|—|‑)\s*(?P<b>\d{1,2})(?:\s*(?:\+|\\\+|plus))?)?\s*(?:years?|yrs?)"
         r"(?:\s+of)?\s+(?:professional\s+)?(?:work\s+)?(?:experience|development|engineering|programming|building|shipping|working|with\s+(?:children|families|software))?(?:\s+(?:experience|development|engineering|programming|building|shipping|working))?",
         re.I,
     )
@@ -253,7 +278,7 @@ def extract_experience_ranges(content: str) -> tuple[list[ExperienceRange], list
         if is_false_experience_match(content, match.start(), match.end()):
             continue
         snippet = content[max(0, match.start() - 80) : min(len(content), match.end() + 80)]
-        kind = classify_experience_section(content, match.start()) or classify_experience_context(snippet)
+        kind = classify_experience_section(content, match.start()) or classify_experience_context(snippet, min(80, match.start()))
         a = float(match.group("a"))
         b = float(match.group("b")) if match.group("b") else (None if "+" in match.group(0) or r"\+" in match.group(0) or "plus" in match.group(0).lower() else a)
         if re.search(r"\b(?:no more than|up to|at most|maximum of)\b", snippet, re.I):
@@ -277,7 +302,7 @@ def extract_experience_ranges(content: str) -> tuple[list[ExperienceRange], list
         if is_false_experience_match(content, match.start(), match.end()):
             continue
         snippet = content[max(0, match.start() - 80) : min(len(content), match.end() + 80)]
-        kind = classify_experience_section(content, match.start()) or classify_experience_context(snippet)
+        kind = classify_experience_section(content, match.start()) or classify_experience_context(snippet, min(80, match.start()))
         minimum = word_values[(match.group("a") or match.group("c")).lower()]
         maximum = word_values[match.group("b").lower()] if match.group("b") else None
         item = ExperienceRange(minimum, maximum, kind, match.group(0).strip())
@@ -290,12 +315,24 @@ def extract_experience_ranges(content: str) -> tuple[list[ExperienceRange], list
     return required, preferred, ambiguous
 
 
+def normalize_experience_text(content: str) -> str:
+    """Normalize HTML entities, common mojibake dashes and Unicode spacing."""
+    value = html.unescape(str(content or ""))
+    replacements = {
+        "â€“": "–", "â€”": "—", "â€‘": "‑", "âˆ’": "−",
+        "â€¯": " ", "Â ": " ", "\u00a0": " ",
+    }
+    for source, target in replacements.items():
+        value = value.replace(source, target)
+    return value
+
+
 def classify_experience_section(content: str, position: int) -> str:
     """Use the nearest Markdown/plain qualifications heading as context."""
     headings: list[str] = []
     for raw_line in content[:position].splitlines():
         heading = re.sub(r"[*_`#]", "", raw_line).replace(r"\&", "&").replace(r"\-", "-").strip(" -:").lower()
-        if len(heading) <= 120 and not re.search(r"[.!?]", heading) and re.search(r"\b(?:requirements?|qualifications?|experience|what you bring|what we're looking for|what we are looking for|what you’re looking for|what we’re looking for|what you are looking for|who you are|your background|core skills|education and experience|basic qualifications?|minimum qualifications?)\b", heading):
+        if len(heading) <= 120 and not re.search(r"[.!?]", heading) and re.search(r"\b(?:requirements?|qualifications?|experience|preferred|nice to have|bonus|asset|what you bring|what we're looking for|what we are looking for|what you’re looking for|what we’re looking for|what you are looking for|who you are|your background|core skills|education and experience|basic qualifications?|minimum qualifications?)\b", heading):
             headings.append(heading)
     if not headings:
         return ""
@@ -309,7 +346,13 @@ def classify_experience_section(content: str, position: int) -> str:
 
 def is_false_experience_match(content: str, start: int, end: int) -> bool:
     snippet = content[max(0, start - 30) : min(len(content), end + 30)].lower()
-    if re.search(r"\$\s*\d", snippet) or re.search(r"\bfor\s+\d{1,2}\s*(?:\+|\\\+)?\s*years?\s*,?\s*(?:we|our|the company)\b", snippet) or re.search(r"\b(?:founded|operating|in business|history|mission)\b[^.\n]{0,45}\b\d{1,2}\s*years?\b", snippet) or re.search(r"\b\d{1,2}\s*years?\b[^.\n]{0,45}\b(?:founded|in business|history|company)\b", snippet) or any(term in snippet for term in ["salary", "per year", "annually", "version", "python 3", "team of", "people on", "joined us", "joined the team"]):
+    local = content[max(0, start - 12) : min(len(content), end + 20)].lower()
+    # Age/eligibility requirements such as "must be 18+ years" are not
+    # professional experience, even when they appear under a generic
+    # requirements heading. Keep them out of required/preferred years.
+    if re.search(r"\b(?:age|aged|minimum\s+age|years?\s+old)\b", local) or (re.search(r"\b\d{1,2}\s*\+\s*years?\b", local) and re.search(r"\b(?:must\s+be|eligible|legal)\b", local)):
+        return True
+    if re.search(r"\$\s*\d", snippet) or re.search(r"\bfor\s+\d{1,2}\s*(?:\+|\\\+)?\s*years?\s*,?\s*(?:we|our|the company)\b", snippet) or re.search(r"\b(?:for\s+)?(?:more\s+than|over)\s+\d{1,2}\s*years?\s+across\s+the\b", snippet) or re.search(r"\b(?:founded|operating|in business|history|mission)\b[^.\n]{0,45}\b\d{1,2}\s*years?\b", snippet) or re.search(r"\b\d{1,2}\s*years?\b[^.\n]{0,45}\b(?:founded|in business|history|company)\b", snippet) or any(term in snippet for term in ["salary", "per year", "annually", "version", "python 3", "team of", "people on", "joined us", "joined the team"]):
         return True
     number_match = re.search(r"\d{1,4}", content[start:end])
     if not number_match:
@@ -320,12 +363,20 @@ def is_false_experience_match(content: str, start: int, end: int) -> bool:
     return False
 
 
-def classify_experience_context(snippet: str) -> str:
+def classify_experience_context(snippet: str, match_offset: int | None = None) -> str:
     lowered = snippet.lower()
-    if any(term in lowered for term in ["required", "requirements", "must have", "minimum", "at least", "need", "requires", "no more than", "up to", "at most", "maximum of"]):
-        return "required"
-    if any(term in lowered for term in ["preferred", "nice to have", "bonus", "asset", "ideally"]):
-        return "preferred"
+    markers = [
+        ("required", ["required", "requirements", "must have", "minimum", "at least", "need", "requires", "no more than", "up to", "at most", "maximum of"]),
+        ("preferred", ["preferred", "nice to have", "bonus", "asset", "ideally"]),
+    ]
+    found: list[tuple[int, str]] = []
+    anchor = match_offset if match_offset is not None else len(snippet) // 2
+    for kind, terms in markers:
+        for term in terms:
+            for hit in re.finditer(rf"\b{re.escape(term)}\b", lowered):
+                found.append((abs(hit.start() - anchor), kind))
+    if found:
+        return min(found, key=lambda item: item[0])[1]
     return "ambiguous"
 
 

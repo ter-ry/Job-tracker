@@ -1,6 +1,7 @@
 import json
 import gc
 import io
+import os
 import re
 import tempfile
 import time
@@ -87,6 +88,10 @@ class JobAssistantTest(unittest.TestCase):
         self.tmpdir = tempfile.TemporaryDirectory()
         app_module.DATA_DIR = Path(self.tmpdir.name)
         app_module.DB_PATH = app_module.DATA_DIR / "test.sqlite"
+        # The application caches its initialized path process-wide. Reset it
+        # between disposable test databases so a Windows temp-path reuse can
+        # never make one fixture's rows visible to another test.
+        app_module._INITIALIZED_DATABASE_PATH = None
         app_module.app.config.update(TESTING=True)
         self.client = app_module.app.test_client()
 
@@ -245,7 +250,7 @@ class JobAssistantTest(unittest.TestCase):
             {"title": "Software Engineer", "job_description": "Required: 3+ years of professional software development experience."},
             evidence_profile={"target_seniority_levels": "junior, intermediate", "resume_text": "Built Python projects."},
         )
-        self.assertEqual(unverified["experience_requirements"]["candidate_years_status"], "unverified from selected résumé")
+        self.assertEqual(unverified["experience_requirements"]["candidate_years_status"], "résumé loaded; professional years are not explicitly quantified")
         self.assertEqual(unverified["experience_requirements"]["fit_status"], "unverified")
 
     def test_cached_home_coordinates_are_rejected_by_canadian_region(self):
@@ -268,9 +273,11 @@ class JobAssistantTest(unittest.TestCase):
         toronto_distance = app_module.location_distance_snapshot(toronto, "Toronto, ON", "", "remote_after_local", toronto_job)
         calgary_distance = app_module.location_distance_snapshot(toronto, "Calgary, AB", "", "remote_after_local", calgary_job)
         vancouver_distance = app_module.location_distance_snapshot(toronto, "Vancouver, BC", "", "remote_after_local", vancouver_job)
-        self.assertEqual(toronto_distance["distance_km"], 0)
-        self.assertGreater(calgary_distance["distance_km"], 2000)
-        self.assertGreater(vancouver_distance["distance_km"], 3000)
+        self.assertEqual(toronto_distance["distance_km"], 9999)
+        self.assertEqual(toronto_distance["distance_label"], "unknown")
+        self.assertEqual(toronto_distance["city_estimate_km"], 0)
+        self.assertGreater(calgary_distance["city_estimate_km"], 2000)
+        self.assertGreater(vancouver_distance["city_estimate_km"], 3000)
 
     def test_persisted_apple_markdown_record_reaches_api_with_required_years(self):
         created = self.client.post(
@@ -449,6 +456,23 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(analysis["required_experience"]["minimum"], 6)
         self.assertNotIn("30", analysis["required_experience"]["source_evidence"])
 
+    def test_employer_longevity_across_region_is_not_job_experience(self):
+        # Source: Villa Charities ECE posting, January 2026. Its company-history
+        # sentence precedes qualitative experience requirements, not a 50-year bar.
+        description = (
+            "For\tmore\tthan\t50\tyears\tacross\tthe GTA, Villa Charities has provided programs.\n"
+            "Qualifications Required\nExperience working with toddler/preschool children."
+        )
+        normalized = jobspy_source.normalize_jobspy_row(
+            {"title": "Early Childhood Educator", "description": description}, "indeed"
+        )
+        self.assertEqual(normalized["experience_requirement"], "")
+        analysis = seniority.analyze_job_seniority(
+            {"title": "Early Childhood Educator", "job_description": description}
+        )
+        self.assertIsNone(analysis["required_experience"])
+        self.assertFalse(analysis["ambiguous_experience"])
+
     def test_experience_extraction_parses_spelled_out_ranges(self):
         required, preferred, ambiguous = seniority.extract_experience_ranges(
             "This role requires one to five years of relevant software experience."
@@ -607,7 +631,11 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn('const source = String(job.source || job.source_name || "jobspy")', source)
         self.assertIn("return `${source}|${identity}`", source)
         self.assertIn('data-discovery-action="save"', source)
-        self.assertIn('data-discovery-action="hide"', source)
+        self.assertIn('data-discovery-action="applied"', source)
+        self.assertIn("resultWorkplaceLabel(job)", source)
+        self.assertIn("resultDistanceLabel(job)", source)
+        self.assertIn("renderBenefits(job)", source)
+        self.assertIn('>Open job</a>', source)
         self.assertIn('Application Priority', source)
         self.assertNotIn("saveDiscoveryJob(${index})", source)
         self.assertNotIn("hideDiscoveryJob(${index})", source)
@@ -877,7 +905,15 @@ class JobAssistantTest(unittest.TestCase):
 
     def test_discovery_page_uses_compact_toolbar_and_full_width_layout(self):
         html = self.client.get("/").data.decode("utf-8")
-        self.assertIn('id="discovery-submit">Search jobs</button>', html)
+        self.assertIn('data-tab="discovery" type="button">Find Jobs</button>', html)
+        self.assertIn('data-tab="tracker" type="button">Applications</button>', html)
+        self.assertIn('data-tab="profile" type="button">Profiles</button>', html)
+        self.assertIn('id="discovery-workflow"', html)
+        self.assertIn("Software Jobs", html)
+        self.assertIn("ECE Jobs", html)
+        self.assertIn('id="discovery-total-cap"', html)
+        self.assertIn('id="discovery-profile"', html)
+        self.assertIn('id="discovery-submit">Search</button>', html)
         self.assertIn('id="discovery-sort-mode"', html)
         self.assertIn('id="discovery-filter-toggle"', html)
         self.assertIn('id="discovery-filter-panel"', html)
@@ -889,10 +925,10 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn('id="csv-import-form"', html)
         self.assertIn('id="pipeline-job-details"', html)
         self.assertIn('Analyze job and generate diagnostic suggestions', html)
-        self.assertIn('Sort: distance', html)
-        self.assertIn('Sort: posting date', html)
+        self.assertIn('Distance: nearest first', html)
+        self.assertIn('Date posted: newest first', html)
         self.assertIn('id="pipeline-sort"', html)
-        self.assertIn('Strong qualification matches', html)
+        self.assertIn('class="pipeline-dashboard beta-secondary"', html)
         self.assertIn('data-view-application-package', Path('static/app.js').read_text(encoding='utf-8'))
         self.assertIn('focusPreparationPackage', Path('static/app.js').read_text(encoding='utf-8'))
         self.assertNotIn('data-start-pipeline-preparation', Path('static/app.js').read_text(encoding='utf-8'))
@@ -917,6 +953,56 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn('tailoring-requirement-filters', html)
         self.assertIn('buildTailoringRequirementGroups', Path('static/app.js').read_text(encoding='utf-8'))
         self.assertIn('Related résumé evidence for review', Path('static/app.js').read_text(encoding='utf-8'))
+        frontend = Path('static/app.js').read_text(encoding='utf-8')
+        self.assertIn('applyDiscoveryWorkflow', frontend)
+        self.assertIn('prior applicant\'s cached results are never shown automatically', frontend)
+        self.assertIn('candidate_profile_id: workflow === "software"', frontend)
+        self.assertIn('applicant_profile_id:', frontend)
+        self.assertIn('Exact workplace unknown', frontend)
+        self.assertIn('Remote · eligibility', frontend)
+        self.assertIn('verifiedPrecision', frontend)
+        self.assertIn('beta-secondary', Path('static/styles.css').read_text(encoding='utf-8'))
+
+    def test_ece_title_search_keeps_applicant_identity_without_resume_scoring(self):
+        profile = self.client.post(
+            "/api/candidate-profiles",
+            json={"name": "ECE Applicant", "identity_mode": "distinct", "applicant_name": "ECE Candidate"},
+        ).get_json()
+        provider = FakeGeocodingProvider({
+            "Toronto, Ontario, Canada": {
+                "latitude": 43.6532, "longitude": -79.3832, "display_name": "Toronto, Ontario, Canada",
+                "ok": True, "status": "saved", "provider": "fake", "confidence": 80,
+                "precision": "city", "normalized_query": "Toronto, ON", "error": "",
+            },
+        })
+        fake = {
+            "jobs": [{
+                "source_job_id": "ece-fixture-1", "title": "Registered Early Childhood Educator", "company": "Lullaboo",
+                "location": "Toronto, ON", "source": "indeed", "job_url": "https://example.test/ece-fixture-1",
+                "description": "Hybrid role. Benefits include PTO, dental and vision.", "salary": "$25.86/hour",
+                "benefits": [{"value": "PTO"}, {"value": "dental"}, {"value": "vision"}],
+            }],
+            "errors": {}, "source_counts": {"indeed": 1}, "source_diagnostics": {}, "source_snapshots": {},
+        }
+        with patch.object(app_module, "get_geocoding_provider", return_value=provider), patch.object(app_module, "fetch_jobspy_jobs", return_value=fake):
+            response = self.client.post(
+                "/api/discovery/jobspy",
+                json={
+                    "keywords": "Registered Early Childhood Educator", "location": "Toronto", "search_mode": "title",
+                    "enabled_sources": ["indeed"], "candidate_profile_id": "", "applicant_profile_id": profile["id"],
+                },
+            )
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        result = response.get_json()["jobs"][0]
+        self.assertEqual(result["candidate_profile_id"], profile["id"])
+        self.assertEqual(result["discovery_profile_independent"], 1)
+        self.assertEqual({item["value"] for item in result["benefits"]}, {"PTO", "dental", "vision"})
+        self.assertEqual(result["salary"], "CAD $25.86/hour")
+        self.assertEqual(self.client.post(f"/api/discovery/inbox/{result['id']}/save", json={"applicant_profile_id": profile["id"], "workflow": "ece"}).status_code, 200)
+        applied = self.client.post(f"/api/discovery/inbox/{result['id']}/applied", json={"applicant_profile_id": profile["id"], "workflow": "ece"}).get_json()
+        self.assertEqual(applied["applicant_discovery_state"], "applied")
+        self.assertEqual(applied["status"], "Discovered")
+        self.assertEqual(applied["candidate_profile_id"], profile["id"])
 
     def test_candidate_profile_creation_is_committed_and_returned_by_list_endpoint(self):
         response = self.client.post(
@@ -931,6 +1017,41 @@ class JobAssistantTest(unittest.TestCase):
         saved = next(profile for profile in profiles.get_json() if profile["id"] == profile_id)
         self.assertEqual(saved["name"], "Software Engineering")
         self.assertEqual(saved["identity_mode"], "shared")
+
+    def test_selected_swe_resume_docx_is_loaded_as_discovery_evidence(self):
+        profile = self.client.post(
+            "/api/candidate-profiles",
+            json={"name": "Synthetic SWE", "identity_mode": "distinct", "applicant_name": "SWE Candidate"},
+        ).get_json()
+        document = Document()
+        document.add_heading("SWE Candidate", level=1)
+        document.add_heading("Summary", level=2)
+        document.add_paragraph("Early-career software developer building Python services.")
+        document.add_heading("Experience", level=2)
+        document.add_paragraph("Built Python and Flask REST APIs backed by SQL and automated tests.")
+        document.add_heading("Skills", level=2)
+        document.add_paragraph("Python, Flask, SQL, REST APIs, JavaScript")
+        buffer = io.BytesIO()
+        document.save(buffer)
+        upload = self.client.post(
+            f"/api/candidate-profiles/{profile['id']}/resumes/upload",
+            data={"file": (io.BytesIO(buffer.getvalue()), "synthetic-swe.docx"), "is_default": "true"},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(upload.status_code, 201, upload.get_data(as_text=True))
+        with app_module.app.app_context():
+            selected = app_module.resolve_discovery_evidence_profile({
+                "search_mode": "shortlist", "candidate_profile_id": profile["id"],
+            })
+        self.assertEqual(selected["_candidate_profile_id"], str(profile["id"]))
+        self.assertIn("Python", selected["key_skills"])
+        self.assertIn("Flask REST APIs", selected["work_experience"])
+        fit = app_module.build_qualification_fit(
+            {"title": "Junior Backend Developer", "job_description": "Python, Flask and SQL required."},
+            selected,
+        )
+        self.assertEqual(fit["qualification_evidence_profile_id"], str(profile["id"]))
+        self.assertNotEqual(fit["qualification_evidence_source"], "")
 
     def test_tailoring_studio_analyzes_selected_resume_and_applies_copy_edit(self):
         self.client.post("/api/profile", json={"name": "Terry Mak", "email": "terry@example.com"})
@@ -1431,7 +1552,10 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(prepared.status_code, 200, prepared.get_json())
         package = prepared.get_json()
         self.assertEqual(package["status"], "ready_for_review", package)
-        self.assertEqual(Path(package["prepared_resume_path"]), tailored_path)
+        self.assertEqual(
+            os.path.normcase(os.path.realpath(package["prepared_resume_path"])),
+            os.path.normcase(os.path.realpath(tailored_path)),
+        )
         self.assertIn("rest apis", [item["normalized"] for item in package["keywords_score"].get("matched", [])], {"score": package["keywords_score"], "text": app_module.extract_docx_text(tailored_path.read_bytes()), "job": package["job"].get("required_skills")})
         self.assertIn("REST APIs", app_module.extract_docx_text(tailored_path.read_bytes()))
         tailored_path.unlink()
@@ -1500,6 +1624,58 @@ class JobAssistantTest(unittest.TestCase):
             self.assertEqual(self.client.get("/api/profile").status_code, 200)
             self.assertEqual(self.client.get("/api/profile").status_code, 200)
         self.assertEqual(initialize.call_count, 1)
+
+    def test_update_check_uses_normalized_semver_comparison(self):
+        response = FakeUrlopenResponse({
+            "tag_name": "v1.0.0",
+            "html_url": "https://github.com/ter-ry/Job-tracker/releases/tag/v1.0.0",
+        })
+        with patch.object(app_module, "APP_VERSION", "1.0.0"), patch.object(app_module.urllib.request, "urlopen", return_value=response):
+            result = self.client.get("/api/updates")
+        self.assertEqual(result.status_code, 200)
+        self.assertFalse(result.get_json()["update_available"])
+        self.assertEqual(result.get_json()["latest_version"], "1.0.0")
+
+    def test_migration_aborts_when_pre_migration_backup_fails(self):
+        with app_module.app.app_context():
+            app_module.init_db()
+            app_module.get_db().execute("PRAGMA user_version = 1")
+            app_module.get_db().commit()
+            app_module._INITIALIZED_DATABASE_PATH = None
+            app_module._LAST_MIGRATION_BACKUP = None
+            with patch.object(app_module, "backup_database_before_migration", return_value=None):
+                with self.assertRaisesRegex(RuntimeError, "backup could not be created"):
+                    app_module.init_db()
+
+    def test_schema_14_backfills_legacy_single_workplace_without_changing_assignment(self):
+        connection = sqlite3.connect(app_module.DB_PATH)
+        connection.execute(
+            """CREATE TABLE jobs (
+                   id INTEGER PRIMARY KEY, workplace_address TEXT NOT NULL DEFAULT '',
+                   workplace_postal_code TEXT NOT NULL DEFAULT '', workplace_evidence TEXT NOT NULL DEFAULT '',
+                   workplace_evidence_source TEXT NOT NULL DEFAULT '', workplace_precision TEXT NOT NULL DEFAULT '',
+                   workplace_confidence INTEGER NOT NULL DEFAULT 0
+               )"""
+        )
+        connection.execute(
+            "INSERT INTO jobs VALUES (1, '10 Legacy Road, Toronto, ON M1M 1M1', 'M1M 1M1', '10 Legacy Road', 'legacy', 'street address', 95)"
+        )
+        connection.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+        connection.executemany("INSERT INTO schema_migrations(version, name) VALUES (?, ?)", [(version, f"migration {version}") for version in range(1, 14)])
+        connection.execute("PRAGMA user_version = 13")
+        connection.commit()
+        connection.close()
+        app_module._INITIALIZED_DATABASE_PATH = None
+        app_module._LAST_MIGRATION_BACKUP = None
+        with app_module.app.app_context():
+            app_module.init_db()
+            row = app_module.get_db().execute(
+                "SELECT workplace_alternatives_json FROM jobs WHERE id = 1"
+            ).fetchone()
+            self.assertEqual(app_module.get_db().execute("PRAGMA user_version").fetchone()[0], 14)
+        alternatives = json.loads(row[0])
+        self.assertEqual(alternatives[0]["address"], "10 Legacy Road, Toronto, ON M1M 1M1")
+        self.assertEqual(alternatives[0]["assignment_status"], "confirmed")
 
     def test_pipeline_manual_application_preserves_job_and_allows_date_correction(self):
         created = self.client.post(
@@ -1635,6 +1811,7 @@ class JobAssistantTest(unittest.TestCase):
             "latitude": 43.787,
             "longitude": -79.353,
             "display_name": "Toronto, Ontario, Canada",
+            "postal_code": "M2J 0B6",
         }
         provider = FakeGeocodingProvider({"M2J 0B6, Canada": good})
         with app_module.app.app_context():
@@ -1676,6 +1853,7 @@ class JobAssistantTest(unittest.TestCase):
                     "provider": "fake",
                     "confidence": 95,
                     "precision": "postal code",
+                    "postal_code": "M5V 2T6",
                     "geocoded_at": "2026-06-20T10:00:00",
                     "normalized_query": "M5V 2T6, Canada",
                     "error": "",
@@ -1689,11 +1867,108 @@ class JobAssistantTest(unittest.TestCase):
             self.assertEqual(profile["home_location_normalized"], "M5V 2T6, Canada")
             self.assertEqual(profile["home_location_precision"], "postal code")
             self.assertEqual(len(provider.calls), 1)
-
             cached_profile, second = app_module.geocode_profile_home_location(profile, provider)
             self.assertTrue(second["ok"])
             self.assertEqual(cached_profile["home_location_normalized"], "M5V 2T6, Canada")
             self.assertEqual(len(provider.calls), 1)
+
+    def test_postal_match_accepts_provider_postal_evidence_without_province_name(self):
+        result = {
+            "latitude": 43.6426,
+            "longitude": -79.3871,
+            "display_name": "M5V 2T6, Canada",
+            "raw": {"address": {"postcode": "M5V 2T6", "country_code": "ca"}},
+        }
+        self.assertTrue(app_module.geocode_matches_canadian_location("M5V2T6", result))
+        self.assertFalse(app_module.geocode_matches_canadian_location("M5V 2T7", result))
+
+    def test_postal_match_rejects_postal_level_country_evidence_without_exact_code(self):
+        result = {
+            "latitude": 43.787,
+            "longitude": -79.353,
+            "display_name": "M2J 0B6, Canada",
+            "match_level": "postal",
+            "raw": {"country_code": "ca"},
+        }
+        self.assertFalse(app_module.geocode_matches_canadian_location("M2J0B6", result))
+
+    def test_postal_match_does_not_accept_country_only_coordinates_without_postal_evidence(self):
+        result = {
+            "latitude": 43.787,
+            "longitude": -79.353,
+            "display_name": "Toronto, Canada",
+            "raw": {"country_code": "ca"},
+        }
+        self.assertFalse(app_module.geocode_matches_canadian_location("M2J0B6", result))
+
+    def test_postal_match_accepts_locality_consistent_regional_approximation_without_postal_echo(self):
+        result = {"display_name": "North York, Ontario, Canada", "match_level": "city", "raw": {"country_code": "ca"}}
+        self.assertTrue(app_module.geocode_matches_canadian_location("M2J 0B6", result))
+
+    def test_postal_match_rejects_conflicting_city_when_provider_omits_postal(self):
+        result = {"display_name": "Mississauga, Ontario, Canada", "match_level": "city", "raw": {"country_code": "ca"}}
+        self.assertFalse(app_module.geocode_matches_canadian_location("M2J 0B6", result))
+
+    def test_postal_match_rejects_other_canadian_postal_code(self):
+        result = {"display_name": "Toronto, Ontario, Canada", "postal_code": "M5V 2T6", "match_level": "postal"}
+        self.assertFalse(app_module.geocode_matches_canadian_location("M2J 0B6", result))
+
+    def test_geocoder_ca_requires_explicit_installation_configuration(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsInstance(app_module.get_geocoding_provider(), app_module.NominatimGeocodingProvider)
+        with patch.dict(os.environ, {"JOB_TRACKER_GEOCODING_PROVIDER": "geocoder.ca"}):
+            self.assertIsInstance(app_module.get_geocoding_provider(), app_module.GeocoderCaProvider)
+
+    def test_postal_provider_failure_never_substitutes_city_coordinates(self):
+        provider = FakeGeocodingProvider({"M2J 0B6, Canada": ValueError("No geocoding match found")})
+        result = app_module.geocode_location_value("M2J0B6", lookup_type="distance_origin", provider=provider, use_cache=False)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["latitude"], "")
+
+    def test_geocoder_ca_provider_parses_canadian_coordinates_and_postal(self):
+        response = FakeUrlopenResponse({
+            "latt": "43.6426",
+            "longt": "-79.3871",
+            "standardized": "M5V 2T6, Canada",
+            "postal": "M5V 2T6",
+            "matchlevel": "postal",
+        })
+        with patch.object(app_module.urllib.request, "urlopen", return_value=response):
+            result = app_module.GeocoderCaProvider().geocode("M5V 2T6, Canada")
+        self.assertEqual(result["postal_code"], "M5V 2T6")
+        self.assertEqual(result["match_level"], "postal")
+        self.assertAlmostEqual(result["latitude"], 43.6426)
+
+    def test_discovery_score_uses_search_origin_and_radius_status(self):
+        job = {
+            "location": "Toronto, ON",
+            "remote_type": "On-site",
+            "location_latitude": 43.7000,
+            "location_longitude": -79.3500,
+            "location_confidence": 95,
+            "location_precision": "city",
+        }
+        origin = {"normalized": "M2J 0B6", "latitude": 43.7800, "longitude": -79.3400, "confidence": 95, "precision": "postal code", "status": "saved"}
+        breakdown = app_module.discovery_score_breakdown(job, {}, {"distance_origin": origin})
+        self.assertGreater(breakdown["distance"]["distance_km"], 0)
+        within = app_module.apply_discovery_search_constraints({**job, "distance_km": 10}, "", "Toronto, ON", 20)
+        outside = app_module.apply_discovery_search_constraints({**job, "distance_km": 30}, "", "Toronto, ON", 20)
+        unknown = app_module.apply_discovery_search_constraints({**job, "distance_km": 9999}, "", "Toronto, ON", 20)
+        self.assertEqual(within["distance_radius_status"], "within_radius")
+        self.assertEqual(outside["distance_radius_status"], "outside_radius")
+        self.assertFalse(outside["location_search_eligible"])
+        self.assertEqual(unknown["distance_radius_status"], "unknown")
+
+    def test_verified_distance_overrides_city_name_mismatch_but_unknown_stays_reviewable(self):
+        inside = {
+            "location": "Toronto, ON",
+            "distance_km": 12,
+            "distance_confidence": 90,
+            "distance_type": "straight_line",
+        }
+        unknown = {"location": "Toronto, ON", "distance_km": 9999, "distance_confidence": 0, "distance_type": "unknown"}
+        self.assertFalse(app_module.outside_requested_location(inside, "North York"))
+        self.assertTrue(app_module.outside_requested_location(unknown, "North York"))
 
     def test_invalid_canadian_postal_code_is_rejected(self):
         response = self.client.post("/api/profile", json={"location": "M5V2T"})
@@ -1875,6 +2150,7 @@ class JobAssistantTest(unittest.TestCase):
                     "latitude": 43.6426,
                     "longitude": -79.3871,
                     "display_name": "Toronto, Ontario, Canada",
+                    "postal_code": "M5V 2T6",
                     "ok": True,
                     "status": "saved",
                     "provider": "fake",
@@ -1921,9 +2197,10 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(body["total"], 1)
         job = body["jobs"][0]
         self.assertEqual(job["normalized_location"], "M5V 2T6, Canada")
-        self.assertEqual(job["distance_label"], "approximate")
-        self.assertTrue(job["distance_note"].startswith("Approx. distance from Toronto, ON"))
-        self.assertGreaterEqual(job["distance_km"], 0)
+        self.assertEqual(job["distance_label"], "unknown")
+        self.assertIn("city-centre distance is an estimate", job["distance_note"])
+        self.assertEqual(job["distance_km"], 9999)
+        self.assertGreaterEqual(job["city_estimate_km"], 0)
 
     def test_discovery_jobspy_accepts_date_objects_in_raw_payloads(self):
         provider = FakeGeocodingProvider(
@@ -2040,7 +2317,7 @@ class JobAssistantTest(unittest.TestCase):
         def fake_scrape_jobs(**kwargs):
             if kwargs["site_name"] == "linkedin":
                 return [
-                    {"title": "Role", "company": "A", "location": "Toronto, ON", "date_posted": "2026-06-19"}
+                    {"title": "Role", "company": "A", "location": "Toronto, ON", "date_posted": datetime.now().isoformat()}
                 ]
             raise RuntimeError("parser error")
 
@@ -2092,8 +2369,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertTrue(result["source_diagnostics"]["indeed"]["attempted"])
         self.assertFalse(result["source_diagnostics"]["indeed"]["success"])
         self.assertIn("parser error", result["source_diagnostics"]["indeed"]["error"])
-        self.assertFalse(result["source_diagnostics"]["google"]["attempted"])
-        self.assertEqual(result["source_diagnostics"]["google"]["skipped_reason"], "disabled")
+        self.assertNotIn("google", result["source_diagnostics"])
 
     def test_jobspy_provider_timeout_is_reported_as_partial_failure(self):
         def stalled_provider(**_kwargs):
@@ -2127,8 +2403,417 @@ class JobAssistantTest(unittest.TestCase):
         )
         self.assertTrue(captured[0]["linkedin_fetch_description"])
         self.assertEqual(result["jobs"][0]["remote_type"], "Unknown")
-        self.assertEqual(jobspy_source.infer_remote_type({"is_remote": False, "location": "Toronto, ON"}), "Unknown")
+        self.assertEqual(jobspy_source.infer_remote_type({"is_remote": False, "location": "Toronto, ON"}), "On-site")
+        self.assertEqual(jobspy_source.infer_remote_type({"location": "Maple, ON", "description": "Join our remote team supporting a childcare centre."}), "Unknown")
+        self.assertEqual(jobspy_source.infer_remote_type({"location": "Canada", "description": "This is a fully remote RECE position."}), "Remote")
         self.assertEqual(jobspy_source.infer_remote_type({"is_remote": True, "location": "London, UK"}), "Remote")
+
+    def test_jobspy_preserves_explicit_maple_workplace_and_remote_negative_evidence(self):
+        row = jobspy_source.normalize_jobspy_row(
+            {
+                "title": "Registered Early Childhood Educator",
+                "company": "Community of Maple Child Care Services",
+                "location": "Maple, ON",
+                "is_remote": False,
+                "salary": "From $31.00 per hour",
+                "description": (
+                    "Location: 9350 Keele St, Maple, ON L6A 1P4\n"
+                    "Work remotely: No\n"
+                    "Permanent full-time. Benefits include paid time off, dental and vision."
+                ),
+                "job_url": "https://ca.indeed.com/viewjob?jk=17d1a3d362cc12f0",
+            },
+            fallback_source="indeed",
+        )
+        self.assertEqual(row["remote_type"], "On-site")
+        self.assertEqual(row["workplace_address"], "9350 Keele St, Maple, ON L6A 1P4")
+        self.assertEqual(row["workplace_postal_code"], "L6A 1P4")
+        self.assertEqual(row["workplace_precision"], "street address")
+        self.assertEqual(row["salary_text"], "From $31.00 per hour")
+
+    def test_jobspy_extracts_unlabeled_street_workplace_from_description(self):
+        row = jobspy_source.normalize_jobspy_row(
+            {
+                "title": "Registered Early Childhood Educator",
+                "location": "Maple, ON",
+                "description": "The Maple RECE posting is based at 9350 Keele St, Maple, ON L6A 1P4.",
+            },
+            fallback_source="indeed",
+        )
+        self.assertEqual(row["workplace_address"], "9350 Keele St")
+        self.assertEqual(row["workplace_postal_code"], "L6A 1P4")
+        self.assertEqual(row["workplace_precision"], "street address")
+
+    def test_jobspy_extracts_flattened_workplace_list_and_canadian_suffixes(self):
+        description = (
+            "Work locations: 70 Playfair Ave., Toronto, ON M6B 2P9; "
+            "340 Falstaff Ave., Toronto, ON M6L 3E7; "
+            "12 Learning Terrace, Toronto, ON M4P 1A1."
+        )
+        alternatives = jobspy_source.extract_workplace_alternatives({}, description)
+        self.assertEqual(
+            [(item["address"], item["postal_code"]) for item in alternatives],
+            [
+                ("70 Playfair Ave., Toronto, ON M6B 2P9", "M6B 2P9"),
+                ("340 Falstaff Ave., Toronto, ON M6L 3E7", "M6L 3E7"),
+                ("12 Learning Terrace, Toronto, ON M4P 1A1", "M4P 1A1"),
+            ],
+        )
+
+    def test_jobspy_does_not_promote_nearby_corporate_address_in_workplace_list(self):
+        description = (
+            "Corporate mailing address: 100 Queen Street West, Toronto, ON M5H 2N2. "
+            "Work locations: 70 Playfair Avenue, Toronto, ON M6B 2P9; "
+            "340 Falstaff Avenue, Toronto, ON M6L 3E7."
+        )
+        alternatives = jobspy_source.extract_workplace_alternatives({}, description)
+        self.assertEqual(
+            [item["postal_code"] for item in alternatives],
+            ["M6B 2P9", "M6L 3E7"],
+        )
+
+    def test_jobspy_does_not_use_employer_mailing_address_as_workplace(self):
+        row = jobspy_source.normalize_jobspy_row(
+            {"title": "Developer", "location": "Toronto, ON", "description": "Work remotely in Canada. Corporate mailing address: 9350 Keele St, Maple, ON L6A 1P4."},
+            fallback_source="indeed",
+        )
+        self.assertEqual(row["workplace_address"], "")
+        self.assertEqual(row["workplace_postal_code"], "")
+
+    def test_remote_provider_conflict_is_reviewable(self):
+        row = {"is_remote": True, "location": "Toronto, ON", "description": "Work remotely: No"}
+        self.assertEqual(jobspy_source.infer_remote_type(row), "Unknown")
+        self.assertEqual(
+            jobspy_source.remote_classification_conflict(row),
+            "provider_remote_conflicts_with_explicit_on_site_evidence",
+        )
+
+    def test_private_beta_source_linked_accuracy_cases_preserve_original_evidence(self):
+        exa = jobspy_source.normalize_jobspy_row(
+            {
+                "id": "12ff082aaa676235",
+                "title": "Full Stack Developer",
+                "company": "ExaSystems",
+                "location": "Mississauga ON L5L 5Y1",
+                "is_remote": True,
+                "salary": "From $23/hour",
+                "description": "Work Location: Hybrid remote in Mississauga, ON L5L 5Y1.",
+                "job_url": "https://ca.indeed.com/viewjob?jk=12ff082aaa676235",
+            },
+            fallback_source="indeed",
+        )
+        self.assertEqual(exa["source_job_id"], "12ff082aaa676235")
+        self.assertEqual(exa["company"], "ExaSystems")
+        self.assertEqual(exa["salary_text"], "From $23/hour")
+        self.assertEqual(exa["remote_type"], "Hybrid")
+        self.assertEqual(exa["workplace_postal_code"], "L5L 5Y1")
+        self.assertEqual(exa["job_url"], "https://ca.indeed.com/viewjob?jk=12ff082aaa676235")
+
+        lullaboo = jobspy_source.normalize_jobspy_row(
+            {
+                "id": "70075bfc7b7c2f68",
+                "title": "Early Childhood Teacher",
+                "company": "Lullaboo",
+                "location": "860 College Street, Toronto ON M6H 1A2",
+                "salary": "$25.86/hour",
+                "description": "Benefits include PTO, dental, vision and other benefits.",
+                "job_url": "https://ca.indeed.com/viewjob?jk=70075bfc7b7c2f68",
+            },
+            fallback_source="indeed",
+        )
+        self.assertEqual(lullaboo["source_job_id"], "70075bfc7b7c2f68")
+        self.assertEqual(lullaboo["company"], "Lullaboo")
+        self.assertEqual(lullaboo["salary_text"], "$25.86/hour")
+        self.assertEqual(lullaboo["workplace_address"], "860 College Street, Toronto ON M6H 1A2")
+        self.assertEqual(lullaboo["workplace_postal_code"], "M6H 1A2")
+        self.assertEqual({item["value"] for item in lullaboo["benefits"]}, {"PTO", "dental", "vision"})
+        self.assertEqual(lullaboo["job_url"], "https://ca.indeed.com/viewjob?jk=70075bfc7b7c2f68")
+
+    def test_private_beta_workplace_alternatives_keep_source_addresses_for_distance_lookup(self):
+        description = (
+            "Work locations: 296 Lawrence Avenue East, Toronto ON M4N 1T7; "
+            "1293 Meredith Avenue, Mississauga ON L5E 2E6."
+        )
+        row = jobspy_source.normalize_jobspy_row(
+            {
+                "id": "tfs-source-1",
+                "title": "Registered Early Childhood Educator",
+                "company": "Toronto French School",
+                "location": "Toronto, ON",
+                "description": description,
+                "job_url": "https://example.invalid/source-unavailable-in-ci-report",
+            },
+            fallback_source="indeed",
+        )
+        self.assertEqual(
+            [(item["address"], item["postal_code"]) for item in row["workplace_alternatives"]],
+            [
+                ("296 Lawrence Avenue East, Toronto ON M4N 1T7", "M4N 1T7"),
+                ("1293 Meredith Avenue, Mississauga ON L5E 2E6", "L5E 2E6"),
+            ],
+        )
+        self.assertEqual(row["job_url"], "https://example.invalid/source-unavailable-in-ci-report")
+
+        provider = FakeGeocodingProvider({
+            "296 Lawrence Avenue East, Toronto ON M4N 1T7, Canada": {
+                "latitude": 43.725, "longitude": -79.401, "display_name": "296 Lawrence Avenue East, Toronto, Ontario, M4N 1T7, Canada", "postal_code": "M4N 1T7",
+            },
+            "1293 Meredith Avenue, Mississauga ON L5E 2E6, Canada": {
+                "latitude": 43.585, "longitude": -79.57, "display_name": "1293 Meredith Avenue, Mississauga, Ontario, L5E 2E6, Canada", "postal_code": "L5E 2E6",
+            },
+        })
+        enriched, result = app_module.geocode_discovery_job(
+            {"remote_type": "On-site", "location": "Toronto, ON", "workplace_alternatives": row["workplace_alternatives"]},
+            {},
+            {"normalized": "M5V 2T6", "latitude": 43.643, "longitude": -79.387, "confidence": 95, "precision": "postal code", "status": "saved"},
+            provider,
+            use_cache=False,
+        )
+        self.assertEqual(result["status"], "multiple_alternatives")
+        self.assertTrue(all(item["coordinates_verified"] for item in enriched["workplace_alternatives"]))
+        self.assertTrue(all(item["distance_label"] == "approximate" and item["geocode_precision"] == "street address" for item in enriched["workplace_alternatives"]))
+        self.assertEqual(enriched["distance_label"], "multiple_alternatives")
+
+    def test_source_identifiers_prevent_same_provider_similar_title_merge(self):
+        first = {"source": "indeed", "source_job_id": "12ff082aaa676235", "company": "ExaSystems", "title": "Full Stack Developer", "location": "Mississauga, ON"}
+        second = {"source": "indeed", "source_job_id": "70075bfc7b7c2f68", "company": "ExaSystems", "title": "Full Stack Developer", "location": "Mississauga, ON"}
+        self.assertFalse(app_module.dedupe_match(first, second))
+
+    def test_distinct_verified_cross_provider_ids_do_not_merge_without_shared_url(self):
+        first = {"source": "indeed", "source_job_id": "indeed-1", "company": "Example", "title": "Software Engineer", "location": "Toronto, ON", "url": "https://ca.indeed.com/viewjob?jk=indeed-1"}
+        second = {"source": "employer_direct", "source_job_id": "greenhouse:example:2", "company": "Example", "title": "Software Engineer", "location": "Toronto, ON", "url": "https://boards.greenhouse.io/example/jobs/2"}
+        assert not app_module.dedupe_match(first, second)
+
+    def test_shared_canonical_application_url_merges_provider_records(self):
+        first = {"source": "indeed", "source_job_id": "indeed-1", "company": "Example", "title": "Software Engineer", "location": "Toronto, ON", "url": "https://example.test/jobs/1?utm_source=indeed"}
+        second = {"source": "employer_direct", "source_job_id": "greenhouse:example:2", "company": "Example", "title": "Software Engineer", "location": "Toronto, ON", "url": "https://example.test/jobs/1"}
+        assert app_module.dedupe_match(first, second)
+
+    def test_source_links_are_retained_when_a_vacancy_is_seen_again(self):
+        first = {"url": "https://ca.indeed.com/viewjob?jk=one", "application_url": "https://ca.indeed.com/viewjob?jk=one"}
+        second = {"url": "https://jobs.example.test/roles/one", "application_url": "https://jobs.example.test/roles/one"}
+        links = app_module.merge_source_links(existing={"url": first["url"], "application_url": first["application_url"], "source_links_json": "[]"}, incoming=second)
+        self.assertEqual(links, [first["url"], second["url"]])
+
+    def test_persisted_cross_source_alias_survives_duplicate_discovery(self):
+        with app_module.app.app_context():
+            app_module.init_db()
+            first = app_module.normalize_job_payload({
+                "source": "indeed", "source_job_id": "indeed-1", "company": "Alias Co", "title": "Software Engineer",
+                "location": "Toronto, ON", "url": "https://jobs.alias.test/roles/one?utm_source=indeed",
+                "description": "Build software.", "discovery_first_seen_at": "2026-11-17T00:00:00",
+            })
+            second = app_module.normalize_job_payload({
+                "source": "employer_direct", "source_job_id": "greenhouse:alias:one", "company": "Alias Co", "title": "Software Engineer",
+                "location": "Toronto, ON", "url": "https://jobs.alias.test/roles/one",
+                "description": "Build software.", "discovery_first_seen_at": "2026-11-17T00:00:00",
+            })
+            self.assertEqual(app_module.persist_discovery_jobs([first], None, None)["new"], 1)
+            self.assertEqual(app_module.persist_discovery_jobs([second], None, None)["duplicate"], 1)
+        row = self.client.get("/api/jobs").get_json()[0]
+        self.assertEqual(set(row["source_links"]), {first["url"], second["url"]})
+
+    def test_three_provider_discovery_resolves_persisted_secondary_alias(self):
+        with app_module.app.app_context():
+            app_module.init_db()
+            indeed = app_module.normalize_job_payload({
+                "source": "indeed", "source_job_id": "indeed-three", "company": "Three Source Co",
+                "title": "Software Engineer", "location": "Toronto, ON",
+                "url": "https://ca.indeed.com/viewjob?jk=three",
+                "source_links": ["https://careers.three.test/jobs/three"],
+            })
+            direct = app_module.normalize_job_payload({
+                "source": "employer_direct", "source_job_id": "greenhouse:three:three",
+                "company": "Three Source Co", "title": "Software Engineer", "location": "Toronto, ON",
+                "url": "https://careers.three.test/jobs/three",
+            })
+            glassdoor = app_module.normalize_job_payload({
+                "source": "glassdoor", "source_job_id": "glassdoor-three",
+                "company": "Three Source Co", "title": "Software Engineer", "location": "Toronto, ON",
+                "url": "https://www.glassdoor.ca/job-listing/three",
+                "application_url": "https://careers.three.test/jobs/three",
+            })
+            assert app_module.persist_discovery_jobs([indeed], None, None)["new"] == 1
+            assert app_module.persist_discovery_jobs([direct], None, None)["duplicate"] == 1
+            assert app_module.persist_discovery_jobs([glassdoor], None, None)["duplicate"] == 1
+            row = app_module.query_db("SELECT * FROM jobs WHERE source_job_id = ?", ["indeed-three"], one=True)
+            self.assertIsNotNone(row)
+            self.assertEqual(app_module.query_db("SELECT COUNT(*) AS count FROM jobs", one=True)["count"], 1)
+            self.assertEqual(len(app_module.query_db("SELECT * FROM job_source_aliases WHERE job_id = ?", [row["id"]])), 6)
+
+    def test_possible_duplicate_scans_more_than_one_hundred_same_title_records(self):
+        with app_module.app.app_context():
+            app_module.init_db()
+            for index in range(150):
+                job = app_module.normalize_job_payload({
+                    "source": "indeed", "source_job_id": f"history-{index}",
+                    "company": "Other Company", "title": "Software Engineer", "location": "Toronto, ON",
+                    "url": f"https://indeed.test/jobs/{index}",
+                })
+                app_module.persist_discovery_jobs([job], None, None)
+            target = app_module.normalize_job_payload({
+                "source": "employer_direct", "source_job_id": "direct-target",
+                "company": "Other Company", "title": "Software Engineer", "location": "Toronto, ON",
+                "url": "https://careers.other.test/jobs/target",
+            })
+            possible = app_module.find_possible_duplicate_match(target)
+            self.assertIsNotNone(possible)
+
+    def test_hybrid_prose_overrides_boolean_remote_without_provider_work_model(self):
+        row = {"is_remote": True, "location": "Mississauga, ON", "description": "Hybrid remote in Mississauga, ON L5L 5Y1."}
+        self.assertEqual(jobspy_source.infer_remote_type(row), "Hybrid")
+        self.assertEqual(jobspy_source.remote_classification_conflict(row), "provider_remote_conflicts_with_description_hybrid_evidence")
+
+    def test_indeed_remote_classification_wins_over_hybrid_prose_and_preserves_salary(self):
+        row = jobspy_source.normalize_jobspy_row(
+            {
+                "title": "Full-Stack Developer - Toronto, ON M5T 1X5",
+                "location": "Toronto, ON M5T 1X5",
+                "is_remote": True,
+                "remote_work_model": {"type": "REMOTE_ALWAYS", "text": "Remote"},
+                "min_amount": 100772.50,
+                "max_amount": 136337.50,
+                "interval": "yearly",
+                "description": "This is a Hybrid position. See #LI-Hybrid.",
+            },
+            fallback_source="indeed",
+        )
+        self.assertEqual(row["remote_type"], "Remote")
+        self.assertEqual(row["remote_classification_conflict"], "provider_remote_conflicts_with_description_hybrid_evidence")
+        self.assertEqual(row["workplace_postal_code"], "M5T 1X5")
+        self.assertEqual(row["salary_text"], "$100,772.50-$136,337.50 yearly")
+        salary = app_module.determine_salary(row)
+        self.assertEqual(salary["salary_advertised_min"], 100772.50)
+        self.assertEqual(salary["salary_advertised_max"], 136337.50)
+        self.assertIn("100,772.50", salary["salary_text"])
+        self.assertIn("136,337.50", salary["salary_text"])
+
+    def test_indeed_hybrid_description_recovers_postal_code_without_street_guess(self):
+        row = jobspy_source.normalize_jobspy_row(
+            {
+                "title": "Full Stack Developer (ASP.NET / Blazor / MAUI)",
+                "location": "Mississauga, ON",
+                "remote_work_model": {"type": "REMOTE_HYBRID", "text": "Hybrid work"},
+                "salary": "From $23 an hour",
+                "description": "Work Location: Hybrid remote in Mississauga, ON L5L 5Y1.",
+            },
+            fallback_source="indeed",
+        )
+        self.assertEqual(row["remote_type"], "Hybrid")
+        self.assertEqual(row["workplace_postal_code"], "L5L 5Y1")
+        self.assertEqual(row["workplace_precision"], "postal code")
+        self.assertEqual(row["workplace_address"], "Mississauga, ON, L5L 5Y1")
+        self.assertNotIn("Street", row["workplace_address"])
+        self.assertEqual(row["salary_text"], "From $23 an hour")
+
+    def test_job_tracker_directions_and_remote_labels_are_conservative(self):
+        frontend = Path("static/app.js").read_text(encoding="utf-8")
+        self.assertIn("geographic eligibility region", frontend)
+        self.assertIn("Driving directions", frontend)
+        self.assertNotIn("Transit directions", frontend)
+        self.assertIn("Qualification evidence incomplete", frontend)
+
+    def test_salary_parser_preserves_from_and_rejects_truncated_structured_range(self):
+        maple = app_module.determine_salary({"salary_text": "From $31.00 per hour"})
+        self.assertEqual(maple["salary_interval"], "hourly")
+        self.assertIn("From CAD $31", maple["salary_text"])
+        self.assertEqual(maple["salary_advertised_min"], 31)
+        self.assertEqual(maple["salary_advertised_max"], 0)
+        self.assertIn("only lower bound", maple["salary_ambiguity"])
+
+        truncated = app_module.determine_salary({"salary_min": 60000, "salary_max": 63, "salary_interval": "yearly"})
+        self.assertEqual(truncated["salary_source"], "missing")
+        truncated_text = app_module.determine_salary({"salary_text": "$60,000-$63/year"})
+        self.assertEqual(truncated_text["salary_source"], "missing")
+
+        benefits = app_module.determine_salary(
+            {"job_description": "Pay: $20.60-$23.54 per hour. Wage enhancement up to $2/hour is separate."}
+        )
+        self.assertEqual(benefits["salary_interval"], "hourly")
+        self.assertEqual(benefits["salary_advertised_min"], 20.60)
+        self.assertEqual(benefits["salary_advertised_max"], 23.54)
+
+    def test_authentic_source_salary_fallbacks_preserve_endpoints_qualifiers_and_provenance(self):
+        # Independently labelled excerpts from the four originals recorded in
+        # the private-beta acceptance audit. These are parser regressions, not
+        # a live provider fetch or a retained posting snapshot.
+        policyme = jobspy_source.normalize_jobspy_row({
+            "title": "Junior Software Engineer (Remote)", "company": "PolicyMe",
+            "location": "Canada", "remote_type": "Remote",
+            "description": "Compensation: The total target cash compensation for this role is $80,000–$110,000 CAD, based on experience.",
+        }, fallback_source="lever")
+        rose = jobspy_source.normalize_jobspy_row({
+            "title": "Junior Software Engineer", "company": "Rose Rocket", "location": "Toronto",
+            "remote_type": "Hybrid", "description": "The expected salary range for this role is $72,000–$88,000 CAD.",
+        }, fallback_source="ashby")
+        for row, expected in ((policyme, (80000, 110000)), (rose, (72000, 88000))):
+            payload = app_module.jobspy_result_to_job_payload(row)
+            self.assertEqual((payload["salary_advertised_min"], payload["salary_advertised_max"]), expected)
+            self.assertEqual(payload["salary_source"], "description")
+            self.assertTrue(payload["salary_evidence_text"])
+
+        mcafee = app_module.determine_salary({"job_description": "Salary: CAD $100,772.50–$136,337.50 per year."})
+        self.assertEqual((mcafee["salary_advertised_min"], mcafee["salary_advertised_max"]), (100772.50, 136337.50))
+        self.assertEqual(mcafee["salary_interval"], "yearly")
+        self.assertIn("136,337.50", mcafee["salary_text"])
+
+        exa = app_module.determine_salary({"salary_text": "From $23/hour"})
+        self.assertEqual((exa["salary_advertised_min"], exa["salary_advertised_max"]), (23, 0))
+        self.assertEqual(exa["salary_annual_min"], 0)
+        self.assertEqual(exa["salary_annual_max"], 0)
+        self.assertIn("From", exa["salary_text"])
+        snapshot = app_module.normalize_salary_snapshot(exa)
+        self.assertEqual((snapshot["salary_advertised_midpoint"], snapshot["salary_annual_midpoint"]), (0, 0))
+
+    def test_salary_structured_precedence_flags_description_conflict_and_one_sided_bounds(self):
+        structured = app_module.determine_salary({
+            "salary_min": 80000, "salary_max": 110000, "salary_interval": "yearly", "salary_currency": "CAD",
+            "job_description": "Salary range: $70,000-$90,000 per year.",
+        })
+        self.assertEqual((structured["salary_advertised_min"], structured["salary_advertised_max"]), (80000, 110000))
+        self.assertEqual(structured["salary_source"], "structured")
+        self.assertIn("conflicts with description", structured["salary_ambiguity"])
+
+        upper = app_module.determine_salary({"salary_text": "Up to $30/hour"})
+        self.assertEqual((upper["salary_advertised_min"], upper["salary_advertised_max"]), (0, 30))
+        self.assertEqual((upper["salary_annual_min"], upper["salary_annual_max"]), (0, 0))
+        self.assertIn("only upper bound", upper["salary_ambiguity"])
+
+    def test_benefits_require_employee_perk_context_and_keep_source_excerpts(self):
+        policyme = (
+            "Our product suite includes Life Insurance, Critical Illness Insurance, and Health & Dental Insurance. "
+            "Why join us: Generous PTO - 20 vacation days. A comprehensive benefits plan with premiums paid in full by PolicyMe. "
+            "Investment in your professional development, including an L&D budget and AI tooling budget. Access to stock options based on performance."
+        )
+        policyme_benefits = jobspy_source.extract_explicit_benefits(policyme)
+        policyme_values = {item["value"] for item in policyme_benefits}
+        self.assertNotIn("Dental", policyme_values)
+        self.assertIn("Generous PTO - 20 vacation days", policyme_values)
+        self.assertIn("comprehensive benefits plan with premiums paid in full by PolicyMe", policyme_values)
+        self.assertTrue(all(item["evidence"] for item in policyme_benefits))
+
+        rose = (
+            "Perks & Benefits at Rose Rocket: A comprehensive benefits program and health care spending account. "
+            "Parental leave top-up. Stock option plan. A MacBook and a sweet tech equipment combo. "
+            "Start with three weeks of vacation + winter holidays office closure and 3 personal days!"
+        )
+        rose_values = {item["value"] for item in jobspy_source.extract_explicit_benefits(rose)}
+        self.assertIn("three weeks of vacation", rose_values)
+        self.assertIn("winter holidays office closure", rose_values)
+        self.assertIn("3 personal days", rose_values)
+
+        marketing = "Our platform's dental-insurance product and vision technology help customers manage benefits."
+        self.assertEqual(jobspy_source.extract_explicit_benefits(marketing), [])
+
+    def test_jobspy_converts_application_kilometres_to_provider_miles(self):
+        captured = []
+
+        def fake_scrape_jobs(**kwargs):
+            captured.append(kwargs)
+            return []
+
+        jobspy_source.fetch_jobspy_jobs(keywords="ECE", location="Toronto", distance=20, enabled_sources=["indeed"], scrape_jobs_func=fake_scrape_jobs)
+        self.assertEqual(captured[0]["distance"], 12)
 
     def test_jobspy_discovery_scores_saved_profile_and_handles_missing_fields(self):
         self.client.post(
@@ -2200,7 +2885,8 @@ class JobAssistantTest(unittest.TestCase):
 
         body = response.get_json()
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(body["source_counts"]["indeed"], 1)
+        # LinkedIn's timeout no longer aborts later distinct Indeed batches.
+        self.assertEqual(body["source_counts"]["indeed"], 4)
         self.assertEqual(body["source_counts"]["linkedin"], 0)
         self.assertIn("linkedin", body["errors"])
         self.assertEqual(body["total"], 1)
@@ -2242,14 +2928,17 @@ class JobAssistantTest(unittest.TestCase):
             "source_counts": {"linkedin": 1, "indeed": 1},
         }
         with patch.object(app_module, "fetch_jobspy_jobs", return_value=fake):
-            response = self.client.post("/api/discovery/jobspy", json={"keywords": "software developer"})
+            response = self.client.post("/api/discovery/jobspy", json={"keywords": "software developer", "enabled_sources": ["linkedin", "indeed"]})
 
         body = response.get_json()
         self.assertEqual(body["total"], 2)
-        self.assertEqual(body["visible_total"], 1)
-        self.assertEqual(body["duplicates"], 1)
+        # Distinct verified provider IDs remain distinct when URLs do not
+        # prove that the postings are the same vacancy.
+        self.assertEqual(body["visible_total"], 2)
+        self.assertEqual(body["duplicates"], 0)
         self.assertEqual(body["diagnostics"]["already_saved_matches"], 1)
-        self.assertTrue(body["jobs"][0]["already_saved"])
+        self.assertTrue(any(job["already_saved"] for job in body["jobs"]))
+        self.assertTrue(any(job.get("possible_duplicate") for job in body["jobs"]))
 
     def test_discovered_result_can_save_to_tracker_and_prevent_future_duplicate_button(self):
         fake = {
@@ -2303,6 +2992,208 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(categories["Backend Developer"], "skipped")
         self.assertEqual(self.client.get("/api/discovery/inbox").get_json(), [])
 
+    def test_actionable_discovery_records_are_explicit_new_opportunities(self):
+        self.client.get("/api/health")
+        job = {
+            "company": "Actionable Co", "title": "Junior Software Developer",
+            "location": "Toronto, ON", "url": "https://example.test/actionable",
+            "source": "Indeed", "source_job_id": "actionable-1",
+            "job_description": "Build Python services.",
+            "discovery_result_category": "actionable",
+            "discovery_result_reason": "Verified match",
+        }
+        with app_module.app.app_context():
+            app_module.persist_discovery_jobs([job], None, None)
+        response = self.client.get("/api/discovery/inbox?include_history=1")
+        assert response.status_code == 200
+        row = next(item for item in response.get_json() if item["title"] == job["title"])
+        self.assertEqual(row["discovery_inbox_category"], "new_actionable")
+
+    def test_opaque_search_membership_limits_needs_review_to_that_search(self):
+        self.client.get("/api/health")
+        jobs = [
+            {
+                "company": "Review Co", "title": f"Software Developer {index}",
+                "location": "Toronto, ON", "url": f"https://example.test/review-{index}",
+                "source": "Indeed", "source_job_id": f"review-{index}",
+                "discovery_result_category": "review_required",
+                "discovery_result_reason": f"reason-{index}",
+            }
+            for index in range(3)
+        ]
+        with app_module.app.app_context():
+            app_module.persist_discovery_jobs(jobs, None, None)
+            app_module.persist_discovery_search_memberships("a" * 32, jobs[:2], 0)
+            app_module.persist_discovery_search_memberships("b" * 32, jobs[1:], 0)
+        first = self.client.get(f"/api/discovery/inbox?include_history=1&category=review_required&search_id={'a' * 32}")
+        second = self.client.get(f"/api/discovery/inbox?include_history=1&category=review_required&search_id={'b' * 32}")
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual({item["source_job_id"] for item in first.get_json()}, {"review-0", "review-1"})
+        self.assertEqual({item["source_job_id"] for item in second.get_json()}, {"review-1", "review-2"})
+        self.assertEqual({item["discovery_result_reason"] for item in first.get_json()}, {"reason-0", "reason-1"})
+        self.assertEqual(self.client.get("/api/discovery/inbox?include_history=1&category=review_required").status_code, 200)
+
+    def test_incomplete_search_scoped_inbox_request_does_not_fall_back_to_history(self):
+        self.client.get("/api/health")
+        self.assertEqual(self.client.get(f"/api/discovery/inbox?include_history=1&search_id={'c' * 32}").status_code, 400)
+        self.assertEqual(self.client.get("/api/discovery/inbox?include_history=1&category=review_required&search_id=not-hex").status_code, 400)
+
+    def test_presented_and_excluded_history_are_paginated_and_auditable(self):
+        self.client.get("/api/health")
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Audit applicant", "workflow": "software"}).get_json()
+        jobs = [
+            {
+                "company": "Audit Co", "title": f"Role {index}", "location": "Toronto, ON",
+                "url": f"https://example.test/audit-{index}", "source": "Indeed",
+                "source_job_id": f"audit-{index}", "discovery_result_category": "actionable" if index == 0 else "excluded",
+                "discovery_result_reason": "Confirmed unrelated occupation" if index else "Verified match",
+                "discovery_occupation": "software developer",
+                "qualification_evidence_source": "Original posting description",
+            }
+            for index in range(3)
+        ]
+        with app_module.app.app_context():
+            app_module.persist_discovery_jobs(jobs, None, None)
+            app_module.mark_discovery_jobs_presented([jobs[0]["id"]], profile["id"])
+        presented = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=presented&include_history=1&page_size=1")
+        excluded = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=excluded&include_history=1&page_size=2")
+        counts = self.client.get(f"/api/discovery/inbox/counts?candidate_profile_id={profile['id']}")
+        self.assertEqual(presented.status_code, 200)
+        self.assertEqual(presented.get_json()[0]["discovery_inbox_category"], "presented")
+        self.assertEqual(excluded.status_code, 200)
+        self.assertEqual(len(excluded.get_json()), 2)
+        self.assertEqual(counts.status_code, 200)
+        self.assertEqual(counts.get_json()["excluded"], 2)
+        flagged = self.client.post(f"/api/discovery/inbox/{jobs[1]['id']}/flag-reassessment", json={"applicant_profile_id": profile["id"], "workflow": "software", "note": "Check source evidence"})
+        self.assertEqual(flagged.status_code, 200)
+        reassessed = self.client.post(f"/api/discovery/inbox/{jobs[1]['id']}/reassess", json={"applicant_profile_id": profile["id"], "workflow": "software"})
+        self.assertEqual(reassessed.status_code, 200)
+        self.assertEqual(reassessed.get_json()["status"], "reviewed")
+        self.assertFalse(reassessed.get_json()["evidence_grounded"])
+        refreshed = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=excluded&include_history=1").get_json()
+        refreshed_job = next(item for item in refreshed if item["id"] == jobs[1]["id"])
+        self.assertEqual(refreshed_job["reassessment_flag"]["status"], "reviewed")
+
+    def test_presented_actionable_jobs_are_not_new_and_counts_match(self):
+        self.client.get("/api/health")
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Inbox owner", "workflow": "software"}).get_json()
+        job = {
+            "company": "Repeat Co", "title": "Junior Software Developer", "location": "Toronto, ON",
+            "url": "https://example.test/repeat", "source": "Indeed", "source_job_id": "repeat-1",
+            "discovery_result_category": "actionable", "discovery_result_reason": "Verified match",
+        }
+        with app_module.app.app_context():
+            app_module.persist_discovery_jobs([job], None, None)
+            app_module.mark_discovery_jobs_presented([job["id"]], profile["id"])
+        new_view = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=new_actionable&include_history=1")
+        presented = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=presented&include_history=1")
+        counts = self.client.get(f"/api/discovery/inbox/counts?candidate_profile_id={profile['id']}")
+        self.assertEqual(new_view.status_code, 200)
+        self.assertEqual(new_view.get_json(), [])
+        self.assertEqual(presented.get_json()[0]["discovery_inbox_category"], "presented")
+        self.assertEqual(counts.get_json()["new_actionable"], 0)
+        self.assertEqual(counts.get_json()["presented"], 1)
+        self.assertEqual(counts.get_json()["all_relevant"], 1)
+        cumulative = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=all_discovered&include_history=1").get_json()
+        cumulative_row = next(item for item in cumulative if item["id"] == job["id"])
+        self.assertEqual(cumulative_row["discovery_inbox_category"], "presented")
+        self.assertEqual(cumulative_row["discovery_result_category"], "actionable")
+
+    def test_reviewed_actionable_count_and_view_share_one_predicate(self):
+        self.client.get("/api/health")
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Reviewed owner", "workflow": "software"}).get_json()
+        job = {
+            "company": "Reviewed Co", "title": "Software Developer", "location": "Toronto, ON",
+            "url": "https://example.test/reviewed-actionable", "source": "Indeed", "source_job_id": "reviewed-actionable-1",
+            "discovery_result_category": "actionable", "discovery_result_reason": "Verified match",
+            "candidate_profile_id": profile["id"], "discovery_occupation": "software developer",
+        }
+        with app_module.app.app_context():
+            app_module.persist_discovery_jobs([job], None, None)
+        job_id = job["id"]
+        self.assertEqual(self.client.post(f"/api/discovery/inbox/{job_id}/review", json={"candidate_profile_id": profile["id"], "workflow": "software"}).status_code, 200)
+        rows = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=review_required&include_history=1").get_json()
+        counts = self.client.get(f"/api/discovery/inbox/counts?candidate_profile_id={profile['id']}").get_json()
+        self.assertEqual([row["id"] for row in rows], [job_id])
+        self.assertEqual(counts["review_required"], len(rows))
+        self.assertEqual(rows[0]["discovery_result_category"], "actionable")
+
+    def test_cumulative_membership_is_evidence_not_latest_category_override(self):
+        self.client.get("/api/health")
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Two run owner", "workflow": "software"}).get_json()
+        job = {
+            "company": "Two Run Co", "title": "Software Developer", "location": "Toronto, ON",
+            "url": "https://example.test/two-run", "source": "Indeed", "source_job_id": "two-run-1",
+            "discovery_result_category": "actionable", "discovery_result_reason": "Current verified match",
+            "candidate_profile_id": profile["id"], "discovery_occupation": "software developer", "role_type": "marketing",
+        }
+        with app_module.app.app_context():
+            app_module.persist_discovery_jobs([job], None, None)
+            app_module.persist_discovery_search_memberships("e" * 32, [job], profile["id"])
+            app_module.persist_discovery_search_memberships("f" * 32, [{**job, "discovery_result_category": "review_required", "discovery_result_reason": "Second run uncertainty"}], profile["id"])
+            app_module.get_db().execute("UPDATE jobs SET discovery_result_category = 'review_required', discovery_result_reason = 'Current uncertainty' WHERE id = ?", [job["id"]])
+            app_module.get_db().commit()
+        history = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=all_discovered&include_history=1").get_json()
+        row = next(item for item in history if item["id"] == job["id"])
+        self.assertEqual(row["discovery_inbox_category"], "review_required")
+        self.assertEqual(row["discovery_result_category"], "review_required")
+        self.assertEqual(row["latest_search_membership_category"], "review_required")
+        scoped = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=all_relevant&search_id={'e' * 32}&include_history=1").get_json()
+        self.assertEqual(scoped[0]["discovery_result_category"], "actionable")
+
+    def test_search_run_history_and_membership_evidence_are_immutable(self):
+        self.client.get("/api/health")
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Run audit", "workflow": "software"}).get_json()
+        job = {
+            "company": "Evidence Co", "title": "Software Developer", "location": "Toronto, ON",
+            "url": "https://example.test/evidence", "source": "Indeed", "source_job_id": "evidence-1",
+            "discovery_result_category": "excluded", "discovery_result_reason": "Original exclusion",
+            "discovery_occupation": "software developer", "qualification_evidence_source": "Original JD",
+        }
+        with app_module.app.app_context():
+            app_module.persist_discovery_jobs([job], None, None)
+            app_module.persist_discovery_search_memberships("d" * 32, [job], profile["id"])
+            job["discovery_result_reason"] = "Replay must not overwrite"
+            app_module.persist_discovery_search_memberships("d" * 32, [job], profile["id"])
+        runs = self.client.get(f"/api/discovery/inbox/search-runs?candidate_profile_id={profile['id']}")
+        scoped = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=excluded&search_id={'d' * 32}&include_history=1")
+        self.assertEqual(runs.status_code, 200)
+        self.assertEqual(runs.get_json()[0]["search_id"], "d" * 32)
+        self.assertEqual(runs.get_json()[0]["excluded_count"], 1)
+        self.assertEqual(scoped.get_json()[0]["search_membership_evidence"]["reason"], "Original exclusion")
+
+    def test_all_relevant_is_server_filtered_and_paginated_with_reviewed_state(self):
+        self.client.get("/api/health")
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Paging owner", "workflow": "software"}).get_json()
+        jobs = [
+            {
+                "company": "Paging Co", "title": f"Software Developer {index}", "location": "Toronto, ON",
+                "url": f"https://example.test/paging-{index}", "source": "Indeed", "source_job_id": f"paging-{index}",
+                "discovery_result_category": "actionable", "discovery_result_reason": "Verified match",
+                "candidate_profile_id": profile["id"], "discovery_occupation": "software developer",
+            }
+            for index in range(501)
+        ]
+        with app_module.app.app_context():
+            app_module.persist_discovery_jobs(jobs, None, None)
+        first = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=all_relevant&include_history=1&page_size=500&page=0")
+        second = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=all_relevant&include_history=1&page_size=500&page=1")
+        counts = self.client.get(f"/api/discovery/inbox/counts?candidate_profile_id={profile['id']}").get_json()
+        self.assertEqual(len(first.get_json()), 500)
+        self.assertEqual(len(second.get_json()), 1)
+        self.assertEqual(counts["all_relevant"], 501)
+        self.assertEqual(counts["new_actionable"], 501)
+        reviewed_id = jobs[0]["id"]
+        reviewed = self.client.post(f"/api/discovery/inbox/{reviewed_id}/review", json={"candidate_profile_id": profile["id"], "workflow": "software"})
+        self.assertEqual(reviewed.status_code, 200)
+        new_rows = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=new_actionable&include_history=1").get_json()
+        self.assertNotIn(reviewed_id, {item["id"] for item in new_rows})
+        reviewed_rows = []
+        for page in (0, 1):
+            reviewed_rows.extend(self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=all_relevant&include_history=1&page_size=500&page={page}").get_json())
+        self.assertEqual(next(item for item in reviewed_rows if item["id"] == reviewed_id)["discovery_inbox_category"], "review_required")
+
     def test_live_discovery_persists_save_skip_and_applied_without_generation(self):
         fake = {
             "jobs": [
@@ -2312,31 +3203,63 @@ class JobAssistantTest(unittest.TestCase):
             ],
             "errors": {}, "source_counts": {"linkedin": 1, "indeed": 2}, "source_diagnostics": {}, "source_snapshots": {},
         }
+        profile = self.client.post("/api/candidate-profiles", json={"name": "SWE persistence", "workflow": "software"}).get_json()
         with patch.object(app_module, "fetch_jobspy_jobs", return_value=fake):
-            first = self.client.post("/api/discovery/jobspy", json={"keywords": "software developer", "enabled_sources": ["linkedin", "indeed"]}).get_json()
+            first = self.client.post("/api/discovery/jobspy", json={"keywords": "software developer", "enabled_sources": ["linkedin", "indeed"], "applicant_profile_id": profile["id"], "workflow": "software"}).get_json()
             by_title = {job["title"]: job for job in first["jobs"]}
             self.assertTrue(all(job.get("id") for job in by_title.values()))
+            persisted = {job["title"]: job for job in self.client.get("/api/jobs").get_json()}
+            self.assertEqual(persisted["Junior React Developer"]["status"], "Discovered")
+            self.assertEqual(persisted["Junior React Developer"]["record_origin"], "discovered")
             save_id = by_title["Junior React Developer"]["id"]
             skip_id = by_title["Python Developer"]["id"]
             apply_id = by_title["Backend Developer"]["id"]
-            self.assertEqual(self.client.post(f"/api/discovery/inbox/{save_id}/save", json={}).status_code, 200)
-            self.assertEqual(self.client.post(f"/api/discovery/inbox/{skip_id}/ignore", json={}).status_code, 200)
-            applied = self.client.post(f"/api/discovery/inbox/{apply_id}/applied", json={}).get_json()
-            self.assertEqual(applied["status"], "Applied")
-            self.assertTrue(applied["date_applied"])
-            second = self.client.post("/api/discovery/jobspy", json={"keywords": "software developer", "enabled_sources": ["linkedin", "indeed"]}).get_json()
+            saved_response = self.client.post(f"/api/discovery/inbox/{save_id}/save", json={"applicant_profile_id": profile["id"], "workflow": "software"})
+            self.assertEqual(saved_response.status_code, 200)
+            self.assertEqual(saved_response.get_json()["applicant_discovery_state"], "saved")
+            self.assertEqual(saved_response.get_json()["status"], "Discovered")
+            self.assertEqual(self.client.post(f"/api/discovery/inbox/{skip_id}/ignore", json={"applicant_profile_id": profile["id"], "workflow": "software"}).status_code, 200)
+            applied = self.client.post(f"/api/discovery/inbox/{apply_id}/applied", json={"applicant_profile_id": profile["id"], "workflow": "software"}).get_json()
+            self.assertEqual(applied["applicant_discovery_state"], "applied")
+            self.assertEqual(applied["status"], "Discovered")
+            with app_module.app.app_context():
+                applicant_application = app_module.query_db(
+                    "SELECT date_applied FROM discovery_applicant_states WHERE job_id = ? AND applicant_profile_id = ?",
+                    [apply_id, profile["id"]], one=True,
+                )
+            self.assertTrue(applicant_application["date_applied"])
+            second = self.client.post("/api/discovery/jobspy", json={"keywords": "software developer", "enabled_sources": ["linkedin", "indeed"], "applicant_profile_id": profile["id"], "workflow": "software"}).get_json()
 
         self.assertEqual(second["jobs"], [])
-        history = self.client.get("/api/discovery/inbox?include_history=1").get_json()
+        history = self.client.get(f"/api/discovery/inbox?include_history=1&applicant_profile_id={profile['id']}").get_json()
         categories = {item["title"]: item["discovery_inbox_category"] for item in history}
         self.assertEqual(categories["Junior React Developer"], "saved")
         self.assertEqual(categories["Python Developer"], "skipped")
         self.assertEqual(categories["Backend Developer"], "applied")
-        self.assertEqual(self.client.get("/api/discovery/inbox").get_json(), [])
+        self.assertEqual(self.client.get(f"/api/discovery/inbox?applicant_profile_id={profile['id']}").get_json(), [])
         row = next(item for item in history if item["title"] == "Backend Developer")
         self.assertEqual(row["url"], "https://example.test/apply")
         self.assertEqual(row["date_applied"], applied["date_applied"])
         self.assertEqual(self.client.get("/api/shortlist").get_json(), [])
+
+    def test_discovery_actions_are_scoped_to_the_selected_applicant(self):
+        swe = self.client.post("/api/candidate-profiles", json={"name": "SWE QA"}).get_json()
+        ece = self.client.post("/api/candidate-profiles", json={"name": "Second SWE QA", "workflow": "software"}).get_json()
+        job = self.client.post("/api/jobs", json={
+            "company": "Shared Vacancy", "title": "Junior Developer", "location": "Toronto, ON",
+            "url": "https://example.test/shared", "source": "indeed", "job_description": "Python",
+            "discovery_occupation": "software developer",
+            "discovery_first_seen_at": "2026-11-13T00:00:00", "discovery_last_seen_at": "2026-11-13T00:00:00",
+        }).get_json()
+        self.assertEqual(self.client.post(f"/api/discovery/inbox/{job['id']}/ignore", json={"applicant_profile_id": swe["id"]}).status_code, 200)
+        swe_history = self.client.get(f"/api/discovery/inbox?include_history=1&applicant_profile_id={swe['id']}").get_json()
+        ece_history = self.client.get(f"/api/discovery/inbox?include_history=1&applicant_profile_id={ece['id']}").get_json()
+        self.assertEqual(swe_history[0]["discovery_inbox_category"], "skipped")
+        self.assertNotEqual(ece_history[0]["discovery_inbox_category"], "skipped")
+        self.assertEqual(self.client.post(f"/api/discovery/inbox/{job['id']}/save", json={"applicant_profile_id": ece["id"]}).status_code, 200)
+        self.assertEqual(self.client.post(f"/api/discovery/inbox/{job['id']}/restore", json={"applicant_profile_id": swe["id"]}).status_code, 200)
+        restored = self.client.get(f"/api/discovery/inbox?include_history=1&applicant_profile_id={swe['id']}").get_json()
+        self.assertNotEqual(restored[0]["discovery_inbox_category"], "skipped")
     def test_saved_discovery_searches_are_named_disabled_by_default_and_editable(self):
         created = self.client.post(
             "/api/discovery/searches",
@@ -2357,19 +3280,20 @@ class JobAssistantTest(unittest.TestCase):
             "jobs": [{"source_job_id": "saved-1", "title": "Backend Developer", "company": "Acme", "location": "Toronto, Ontario", "source": "linkedin", "job_url": "https://example.com/acme/1", "description": "Python SQL backend", "remote_type": "Hybrid"}],
             "errors": {}, "source_counts": {"linkedin": 1}, "source_diagnostics": {"linkedin": {"success": True}}, "source_snapshots": {},
         }
-        search = self.client.post("/api/discovery/searches", json={"name": "Backend", "keywords": "backend developer", "location": "Toronto, Ontario", "enabled_sources": ["linkedin"]}).get_json()
+        profile = self.client.post("/api/candidate-profiles", json={"name": "SWE saved search", "workflow": "software"}).get_json()
+        search = self.client.post("/api/discovery/searches", json={"name": "Backend", "keywords": "backend developer", "location": "Toronto, Ontario", "enabled_sources": ["linkedin"], "search_mode": "title"}).get_json()
         location = {"original_input": "Toronto, Ontario", "normalized_input": "Toronto, Ontario", "distance_origin": "Toronto, Ontario", "discovery_location": "Toronto, ON", "resolution_method": "test", "lookup": {}}
         with patch.object(app_module, "get_geocoding_provider", return_value=provider), patch.object(app_module, "resolve_discovery_location_context", return_value=location), patch.object(app_module, "fetch_jobspy_jobs", return_value=fake):
             first = self.client.post(f"/api/discovery/searches/{search['id']}/run")
             self.assertEqual(first.status_code, 200, first.get_json())
             self.assertEqual(first.get_json()["persisted"]["new"], 1)
             job = self.client.get("/api/discovery/inbox").get_json()[0]
-            self.client.post(f"/api/discovery/inbox/{job['id']}/review")
+            self.client.post(f"/api/discovery/inbox/{job['id']}/review", json={"applicant_profile_id": profile["id"], "workflow": "software"})
             second = self.client.post(f"/api/discovery/searches/{search['id']}/run")
         self.assertEqual(second.status_code, 200)
         self.assertEqual(second.get_json()["persisted"]["duplicate"], 1)
-        refreshed = self.client.get("/api/discovery/inbox").get_json()[0]
-        self.assertEqual(refreshed["discovery_state"], "reviewed")
+        refreshed = self.client.get(f"/api/discovery/inbox?applicant_profile_id={profile['id']}").get_json()[0]
+        self.assertEqual(refreshed["applicant_discovery_state"], "reviewed")
         self.assertEqual(len(self.client.get("/api/discovery/runs").get_json()), 2)
 
     def test_discovery_scheduler_is_disabled_until_explicitly_enabled(self):
@@ -2399,6 +3323,106 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(second["status"], "rate_limited")
         self.assertEqual(provider.calls, 1)
         self.assertIn("temporarily rate limited", second["error"])
+
+    def test_geocoding_failures_are_categorized_without_exposing_coordinates(self):
+        cases = [
+            ("M5V 2T", ValueError("invalid"), "invalid_input"),
+            ("M5V 2T6", ValueError("No geocoding match found"), "no_match"),
+            ("M5V 2T6", urllib.error.HTTPError("https://example.test", 403, "Forbidden", {}, None), "http_403"),
+            ("M5V 2T6", urllib.error.URLError("offline"), "network_error"),
+        ]
+        for value, failure, expected in cases:
+            provider = FakeGeocodingProvider({"M5V 2T6, Canada": failure})
+            with app_module.app.app_context():
+                app_module.init_db()
+                result = app_module.geocode_location_value(value, lookup_type="distance_origin", provider=provider, use_cache=False)
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["status"], expected)
+            self.assertIn(expected, result["failure_reasons"])
+            self.assertNotIn("latitude", result["error"].lower())
+            self.assertNotIn("longitude", result["error"].lower())
+
+    def test_discovery_search_signature_changes_with_private_distance_origin(self):
+        base = {"keywords": "software developer", "location": "Toronto", "enabled_sources": ["linkedin"], "distance": 50}
+        first = app_module.discovery_search_signature({**base, "distance_origin_input": "M5V 2T6"})
+        second = app_module.discovery_search_signature({**base, "distance_origin_input": "M2J 0B6"})
+        self.assertNotEqual(first, second)
+
+    def test_private_origin_recalculates_cached_workplace_distance_without_scraping(self):
+        provider = FakeGeocodingProvider({
+            "M5V 2T6, Canada": {"latitude": 43.6426, "longitude": -79.3871, "display_name": "Toronto, Ontario, Canada", "postal_code": "M5V 2T6"},
+            "M2J 0B6, Canada": {"latitude": 43.787, "longitude": -79.353, "display_name": "Toronto, Ontario, Canada", "postal_code": "M2J 0B6"},
+        })
+        job = {"location": "M2J 0B6", "workplace_postal_code": "M2J 0B6", "remote_type": "On-site"}
+        origin = app_module.geocode_location_value("M5V 2T6", lookup_type="distance_origin", provider=provider, use_cache=False)
+        refreshed, _ = app_module.geocode_discovery_job(job, {}, origin, provider, use_cache=False)
+        self.assertEqual(refreshed["distance_type"], "straight_line")
+        self.assertGreater(refreshed["distance_km"], 0)
+        self.assertEqual(refreshed["location_precision"], "postal code")
+
+    def test_multiple_rece_workplaces_survive_extraction_storage_and_display(self):
+        # Source-backed Villa Charities alternatives from the independently
+        # reviewed complete posting snapshot.  This is an evidence excerpt,
+        # not a synthetic address fixture.
+        description = (
+            "Work locations: 70 Playfair Avenue, Toronto, ON M6B 2P9; "
+            "340 Falstaff Avenue, Toronto, ON M6L 3E7. "
+            "The successful candidate may work at either childcare centre."
+        )
+        alternatives = jobspy_source.extract_workplace_alternatives({}, description)
+        self.assertEqual(
+            [(item["address"], item["postal_code"]) for item in alternatives],
+            [
+                ("70 Playfair Avenue, Toronto, ON M6B 2P9", "M6B 2P9"),
+                ("340 Falstaff Avenue, Toronto, ON M6L 3E7", "M6L 3E7"),
+            ],
+        )
+        self.assertTrue(all(item["assignment_status"] == "advertised_alternative" for item in alternatives))
+
+        created = self.client.post(
+            "/api/jobs",
+            json={"company": "Villa Charities", "title": "Registered Early Childhood Educator", "job_description": description},
+        )
+        self.assertEqual(created.status_code, 201, created.get_json())
+        stored = created.get_json()
+        self.assertEqual(len(stored["workplace_alternatives"]), 2)
+        self.assertEqual(stored["workplace_assignment_status"], "alternatives_unassigned")
+        self.assertEqual(stored["workplace_address"], "")
+        source = (Path(app_module.BASE_DIR) / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("Assigned site not confirmed", source)
+        self.assertIn("renderWorkplaceAlternatives(job)", source)
+
+    def test_multiple_rece_workplaces_get_separate_verified_straight_line_distances(self):
+        provider = FakeGeocodingProvider({
+            "70 Playfair Avenue, Toronto, ON M6B 2P9, Canada": {
+                "latitude": 43.7110390, "longitude": -79.4594629,
+                "display_name": "70, Playfair Avenue, Toronto, Ontario, M6B 2P9, Canada",
+                "postal_code": "M6B 2P9", "precision": "house",
+            },
+            "340 Falstaff Avenue, Toronto, ON M6L 3E7, Canada": {
+                "latitude": 43.7205044, "longitude": -79.4822959,
+                "display_name": "340, Falstaff Avenue, Toronto, Ontario, M6L 3E7, Canada",
+                "postal_code": "M6L 3E7", "precision": "house",
+            },
+        })
+        origin = {
+            "normalized": "M5H 2N2", "latitude": 43.6532898, "longitude": -79.3842134,
+            "confidence": 90, "precision": "postal code", "status": "saved",
+        }
+        job = {
+            "remote_type": "On-site", "location": "Toronto, ON",
+            "workplace_alternatives": [
+                {"address": "70 Playfair Avenue, Toronto, ON M6B 2P9", "postal_code": "M6B 2P9", "precision": "street address"},
+                {"address": "340 Falstaff Avenue, Toronto, ON M6L 3E7", "postal_code": "M6L 3E7", "precision": "street address"},
+            ],
+        }
+        enriched, result = app_module.geocode_discovery_job(job, {}, origin, provider, use_cache=False)
+        self.assertEqual(result["status"], "multiple_alternatives")
+        self.assertEqual([item["distance_km"] for item in enriched["workplace_alternatives"]], [9, 11])
+        self.assertTrue(all(item["coordinates_verified"] for item in enriched["workplace_alternatives"]))
+        self.assertEqual(enriched["distance_km"], 9999)
+        self.assertEqual(enriched["distance_label"], "multiple_alternatives")
+        self.assertIn("assigned site not confirmed", enriched["distance_note"].lower())
 
     def test_discovery_task_status_is_read_only_and_scripts_are_present(self):
         response = self.client.get("/api/discovery/task-status")
@@ -2432,8 +3456,8 @@ class JobAssistantTest(unittest.TestCase):
         location = {"original_input": "Toronto", "normalized_input": "Toronto", "distance_origin": "Toronto", "discovery_location": "Toronto, ON", "resolution_method": "test", "lookup": {}}
         fake = {
             "jobs": [
-                {"source_job_id": "below", "title": "Software Developer", "company": "Below", "location": "Toronto", "source": "linkedin", "job_url": "https://example.com/below", "salary_min": 50000, "salary_max": 60000, "description": "Python"},
-                {"source_job_id": "above", "title": "Software Developer", "company": "Above", "location": "Toronto", "source": "linkedin", "job_url": "https://example.com/above", "salary_min": 90000, "salary_max": 100000, "description": "Python"},
+                {"source_job_id": "below", "title": "Software Developer", "company": "Below", "location": "Toronto", "source": "linkedin", "job_url": "https://example.com/below", "salary_min": 50000, "salary_max": 60000, "salary_interval": "yearly", "description": "Python"},
+                {"source_job_id": "above", "title": "Software Developer", "company": "Above", "location": "Toronto", "source": "linkedin", "job_url": "https://example.com/above", "salary_min": 90000, "salary_max": 100000, "salary_interval": "yearly", "description": "Python"},
                 {"source_job_id": "missing", "title": "Software Developer", "company": "Missing", "location": "Toronto", "source": "linkedin", "job_url": "https://example.com/missing", "description": "Python"},
                 {"source_job_id": "estimated", "title": "Software Developer", "company": "Estimated", "location": "Toronto", "source": "linkedin", "job_url": "https://example.com/estimated", "salary_text": "Estimated market range", "description": "Python"},
             ],
@@ -2477,7 +3501,7 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(first["runs"], 1)
         self.assertEqual(second["runs"], 0)
 
-    def test_discovery_salary_normalization_and_hourly_conversion(self):
+    def test_discovery_salary_normalization_preserves_advertised_hourly_units(self):
         salary = app_module.determine_salary(
             {
                 "salary_text": "$30 an hour",
@@ -2485,8 +3509,17 @@ class JobAssistantTest(unittest.TestCase):
             }
         )
         self.assertEqual(salary["salary_interval"], "hourly")
-        self.assertEqual(salary["salary_min"], 62400)
-        self.assertEqual(salary["salary_max"], 62400)
+        self.assertEqual((salary["salary_min"], salary["salary_max"]), (30, 30))
+        self.assertEqual((salary["salary_annual_min"], salary["salary_annual_max"]), (0, 0))
+        self.assertIn("weekly hours not stated", salary["salary_ambiguity"])
+        self.assertEqual((salary["salary_advertised_min"], salary["salary_advertised_max"]), (30, 30))
+
+    def test_salary_parser_preserves_decimal_hourly_advertised_values(self):
+        salary = app_module.parse_salary_text("Salary: $24.47-$28.36/hour")
+        self.assertEqual(salary["salary_interval"], "hourly")
+        self.assertEqual((salary["salary_advertised_min"], salary["salary_advertised_max"]), (24.47, 28.36))
+        self.assertEqual((salary["salary_annual_min"], salary["salary_annual_max"]), (0, 0))
+        self.assertIn("24.47", salary["salary_text"])
 
     def test_discovery_salary_sorting_keeps_unknowns_after_known_when_requested(self):
         jobs = [
@@ -2595,9 +3628,9 @@ class JobAssistantTest(unittest.TestCase):
 
     def test_discovery_filters_before_sorting(self):
         jobs = [
-            {"company": "SkipCo", "title": "Role A", "salary_max": 60000, "distance_km": 5, "overall_score": 90, "remote_type": "Remote", "posted_date": "2026-06-19"},
-            {"company": "KeepCo", "title": "Role B", "salary_max": 90000, "distance_km": 10, "overall_score": 85, "remote_type": "Hybrid", "posted_date": "2026-06-19"},
-            {"company": "LowerCo", "title": "Role C", "salary_max": 95000, "distance_km": 50, "overall_score": 60, "remote_type": "Hybrid", "posted_date": "2026-06-19"},
+            {"company": "SkipCo", "title": "Role A", "salary_max": 60000, "salary_interval": "yearly", "distance_km": 5, "overall_score": 90, "remote_type": "Remote", "posted_date": "2026-06-19"},
+            {"company": "KeepCo", "title": "Role B", "salary_max": 90000, "salary_interval": "yearly", "distance_km": 10, "overall_score": 85, "remote_type": "Hybrid", "posted_date": "2026-06-19"},
+            {"company": "LowerCo", "title": "Role C", "salary_max": 95000, "salary_interval": "yearly", "distance_km": 50, "overall_score": 60, "remote_type": "Hybrid", "posted_date": "2026-06-19"},
         ]
         filters = {"salary_min": 80000, "overall_score_min": 70, "remote_type": "Hybrid"}
         filtered = [job for job in jobs if app_module.apply_discovery_filters(job, filters)]
@@ -2728,6 +3761,10 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(stored["metadata"]["raw_jobs_returned"], 2)
         self.assertTrue(stored["cache_hit"])
         self.assertEqual(stored["cached_raw_result_count"], 2)
+        latest = self.client.get("/api/discovery/results/latest").get_json()
+        self.assertTrue(latest["found"])
+        self.assertEqual(len(latest["jobs"]), 2)
+        self.assertEqual(latest["jobs"][0]["discovery_search_mode"], "title")
 
     def test_salary_extraction_from_structured_fields(self):
         salary = app_module.determine_salary(
@@ -2743,17 +3780,65 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(salary["salary_min"], 65000)
         self.assertEqual(salary["salary_max"], 80000)
 
-    def test_salary_extraction_from_description_and_hourly_annualization(self):
+    def test_salary_extraction_from_description_keeps_advertised_and_annual_values(self):
         yearly = app_module.parse_salary_text("Compensation range: $65,000-$80,000 per year plus benefits.")
         hourly = app_module.parse_salary_text("From $30 an hour for full-time support work.")
         self.assertEqual(yearly["salary_source"], "description")
         self.assertEqual(yearly["salary_max"], 80000)
         self.assertEqual(hourly["salary_interval"], "hourly")
-        self.assertEqual(hourly["salary_min"], 62400)
+        self.assertEqual(hourly["salary_min"], 30)
+        self.assertEqual(hourly["salary_annual_min"], 0)
+
+    def test_advertised_35_hour_schedule_controls_hourly_annualization(self):
+        # Mothercraft RECE Float PDF states both 35 hours/week and this hourly
+        # hiring range. The advertised range must stay hourly and unchanged.
+        salary = app_module.determine_salary({
+            "job_description": "Full-Time, 12-Month Contract (35 hours per week)\nPosition level: Level 4\nHiring range: $24.47 – $28.36 per hour\nSalary range: $24.47 – $32.88 per hour",
+        })
+        self.assertEqual((salary["salary_advertised_min"], salary["salary_advertised_max"]), (24.47, 28.36))
+        self.assertEqual((salary["salary_annual_min"], salary["salary_annual_max"]), (44535, 51615))
+        self.assertEqual(salary["salary_interval"], "hourly")
+        self.assertIn("35 hours/week", salary["salary_ambiguity"])
+        provider = jobspy_source.normalize_jobspy_row({
+            "site": "indeed", "title": "Registered Early Childhood Educator - Float",
+            "company": "Mothercraft", "location": "Toronto, ON",
+            "description": "Full-Time, 12-Month Contract (35 hours per week)\nPosition level: Level 4\nHiring range: $24.47 – $28.36 per hour\nSalary range: $24.47 – $32.88 per hour",
+        })
+        saved = self.client.post("/api/jobs", json=app_module.jobspy_result_to_job_payload(provider))
+        self.assertEqual(saved.status_code, 201)
+        self.assertEqual((saved.get_json()["salary_advertised_min"], saved.get_json()["salary_advertised_max"]), (24.47, 28.36))
+        self.assertEqual((saved.get_json()["salary_annual_min"], saved.get_json()["salary_annual_max"]), (44535, 51615))
+
+    def test_source_backed_childcare_addresses_have_distinct_distances(self):
+        # Villa Charities Jan 2026 ECE PDF names both workplaces; Toronto's
+        # City Hall page supplies the origin address. Coordinates are matching
+        # Nominatim address-level results, not Toronto city centroids.
+        origin = {"latitude": 43.6536032, "longitude": -79.3840055,
+                  "precision": "street address", "confidence": 90,
+                  "normalized": "100 Queen St W, Toronto, ON M5H 2N2"}
+        locations = [
+            (43.7110390, -79.4594629, 9),   # 70 Playfair Ave, M6B 2P9
+            (43.7205044, -79.4822959, 11),  # 340 Falstaff Ave, M6L 3E7
+        ]
+        for lat, lon, expected_km in locations:
+            distance = app_module.location_distance_snapshot(
+                origin, "Toronto, ON", "On-site", "remote_after_local",
+                {"latitude": lat, "longitude": lon, "precision": "street address", "confidence": 90},
+            )
+            self.assertEqual(distance["distance_km"], expected_km)
+            self.assertEqual(distance["distance_label"], "approximate")
+            self.assertIsNone(distance["city_estimate_km"])
+        city = app_module.location_distance_snapshot(
+            origin, "Toronto, ON", "On-site", "remote_after_local",
+            {"latitude": 43.6536, "longitude": -79.3832, "precision": "city", "confidence": 70},
+        )
+        self.assertEqual(city["distance_km"], 9999)
+        self.assertEqual(city["distance_label"], "unknown")
 
     def test_salary_parser_preserves_decimal_and_currency_prefixed_range_endpoints(self):
         hourly = app_module.parse_salary_text("Salary: $18.00-$21.00 per hour")
-        self.assertEqual((hourly["salary_min"], hourly["salary_max"], hourly["salary_interval"], hourly["salary_currency"]), (37440, 43680, "hourly", "CAD"))
+        self.assertEqual((hourly["salary_min"], hourly["salary_max"], hourly["salary_interval"], hourly["salary_currency"]), (18, 21, "hourly", "CAD"))
+        self.assertEqual((hourly["salary_annual_min"], hourly["salary_annual_max"]), (0, 0))
         annual = app_module.parse_salary_text("Base salary: CA$90,000–CA$130,000 CAD per year")
         self.assertEqual((annual["salary_min"], annual["salary_max"], annual["salary_interval"], annual["salary_currency"]), (90000, 130000, "yearly", "CAD"))
 
@@ -2825,8 +3910,258 @@ class JobAssistantTest(unittest.TestCase):
                 },
                 evidence_profile=None,
             )
-        self.assertEqual(result["qualification_evidence_confidence"], "standard")
+        self.assertEqual(result["qualification_match_status"], "not_applicable")
+        self.assertEqual(result["qualification_evidence_confidence"], "not_applicable")
         self.assertEqual(result["qualification_evidence_profile_name"], "No résumé selected — title search")
+        self.assertGreater(result["opportunity_score"], 0)
+
+    def test_title_search_opportunity_score_is_not_resume_qualification(self):
+        result = app_module.build_qualification_fit({
+            "title": "Registered Early Childhood Educator",
+            "discovery_search_mode": "title",
+            "discovery_profile_independent": 1,
+            "occupation_match_type": "exact",
+            "title_match_score": 100,
+            "location": "Toronto, ON",
+            "remote_type": "Hybrid",
+            "remote_eligibility": "canadian_eligible",
+            "salary": "CAD $26/hour",
+            "salary_source": "description",
+            "salary_advertised_min": 26,
+            "salary_advertised_max": 26,
+            "salary_interval": "hourly",
+            "job_description": "No minimum years stated.",
+        })
+        self.assertEqual(result["qualification_fit_score"], 0)
+        self.assertEqual(result["qualification_fit_label"], "Not assessed — title search")
+        self.assertIn("Title relevance", " ".join(result["opportunity_score_reasons"]))
+
+    def test_resume_technical_compatibility_is_conservative_and_evidence_backed(self):
+        result = app_module.build_qualification_fit(
+            {
+                "title": "Junior Full Stack Developer",
+                "required_skills": "Python, React, Kubernetes",
+                "job_description": "Requirements:\nPython, React, Kubernetes",
+                "remote_eligibility": "canadian_eligible",
+            },
+            evidence_profile={
+                "_candidate_profile_id": "",
+                "resume_text": "",
+                "projects": "Built Python APIs and React dashboards as projects.",
+                "work_experience": "",
+                "key_skills": "",
+                "target_seniority_levels": "junior",
+            },
+        )
+        states = {item["requirement"].lower(): item["state"] for item in result["technical_compatibility"]["items"]}
+        self.assertEqual(states["python"], "Demonstrated")
+        self.assertEqual(states["react"], "Demonstrated")
+        self.assertEqual(states["kubernetes"], "Unverified")
+        self.assertIn("Unverified", result["technical_compatibility"]["explanation"])
+
+    def test_unclassified_technologies_cannot_be_a_strong_match(self):
+        # A live Rose Rocket junior posting labels its stack as technologies
+        # the hire will be exposed to, while its actual success criteria are
+        # non-stack requirements.  An empty required-technology set must not
+        # make all([]) turn missing résumé evidence into a strong match.
+        result = app_module.build_qualification_fit(
+            {
+                "title": "Junior Software Engineer",
+                "required_skills": "React, SQL, AWS",
+                "job_description": (
+                    "Technologies that we use (that you'll be exposed to): React, PostgreSQL, AWS. "
+                    "What you need to succeed: Proficiency with Git and version control best practices."
+                ),
+            },
+            evidence_profile={"resume_text": ""},
+        )
+        compatibility = result["technical_compatibility"]
+        self.assertFalse(compatibility["required_demonstrated"])
+        self.assertEqual(compatibility["required_unverified"], ["git"])
+        self.assertEqual(compatibility["decision"], "Possible / stretch — evidence incomplete")
+
+    def test_complete_swe_evidence_extracts_nine_mandatory_capabilities_without_stack_false_positives(self):
+        # Exact relevant excerpts from the 2026-11-12 employer ATS originals.
+        policyme = (
+            "Our core stack includes Python, React, Redux, PostgreSQL, n8n, LangChain/LangGraph and AWS. "
+            "What we are looking for: Strong full-stack development skills with the ability to work across backend and frontend "
+            "using Python, React, Redux, PostgreSQL, and AWS. Hands-on experience or projects interacting with AI APIs/models."
+        )
+        rose = (
+            "Technologies that we use (that you'll be exposed to): Backend: NodeJS, NestJS, Typescript. "
+            "Frontend: React. Database: PostgreSQL. Infrastructure: AWS, Docker, Kubernetes. "
+            "What you need to succeed: Bachelor’s degree in Computer or Software Engineering, or a related field. "
+            "You build with AI coding agents such as Claude Code or Cursor or any agentic coding tool. "
+            "Experience with agile project management tools (JIRA, Asana, Linear, or equivalent). "
+            "Proficiency with Git and have a solid understanding of version control best practices."
+        )
+        policy_required, _ = jobspy_source.extract_keyword_requirements(policyme)
+        rose_required, _ = jobspy_source.extract_keyword_requirements(rose)
+        self.assertEqual(
+            set(policy_required.split(", ")),
+            {"full-stack development", "python", "react", "redux", "postgresql", "aws", "ai api/model experience"},
+        )
+        self.assertEqual(set(rose_required.split(", ")), {"agentic coding tools", "agile project management tools", "git"})
+        # The independent audit's nine labels exclude the broader full-stack
+        # capability; all nine adjudicated technologies/capabilities are covered.
+        adjudicated = set(policy_required.split(", ")) - {"full-stack development"}
+        adjudicated.update(rose_required.split(", "))
+        self.assertEqual(len(adjudicated), 9)
+
+        rose_terms = app_module._qualification_terms({"title": "Junior Software Engineer", "job_description": rose})
+        by_name = {item["normalized"]: item for item in rose_terms}
+        for name in ("agentic coding tools", "agile project management tools", "git"):
+            self.assertEqual(by_name[name]["importance"], "required")
+            self.assertTrue(by_name[name]["source_evidence"])
+        for exposed in ("react", "postgresql", "aws", "docker", "kubernetes", "nodejs"):
+            if exposed in by_name:
+                self.assertNotEqual(by_name[exposed]["importance"], "required")
+
+        fit = app_module.build_qualification_fit(
+            {"title": "Junior Software Engineer", "job_description": rose},
+            evidence_profile={"resume_text": ""},
+        )
+        compatibility = fit["technical_compatibility"]
+        self.assertEqual(set(compatibility["required_unverified"]), {"agentic coding tools", "agile project management tools", "git"})
+        self.assertNotEqual(compatibility["decision"], "Strong technical match")
+
+    def test_swe_requirement_headings_survive_collapsed_ats_markup_without_colons(self):
+        # Some ATS converters emit heading text and bullets as one paragraph,
+        # dropping both HTML heading tags and the colon after the heading.
+        posting = (
+            "Technologies that we use (that you'll be exposed to) React, PostgreSQL, AWS. "
+            "What you need to succeed\n"
+            "- Python\n- React\n"
+            "Preferred qualifications\n"
+            "- Kubernetes"
+        )
+        required, preferred = jobspy_source.extract_keyword_requirements(posting)
+        self.assertEqual(set(required.split(", ")), {"python", "react"})
+        self.assertEqual(preferred, "kubernetes")
+
+        terms = app_module._qualification_terms({"title": "Software Engineer", "job_description": posting})
+        by_name = {item["normalized"]: item for item in terms}
+        self.assertEqual(by_name["python"]["importance"], "required")
+        self.assertEqual(by_name["react"]["importance"], "required")
+        self.assertEqual(by_name["kubernetes"]["importance"], "preferred")
+
+        fit = app_module.build_qualification_fit(
+            {"title": "Software Engineer", "job_description": posting},
+            evidence_profile={"resume_text": "Built Python and React applications."},
+        )
+        states = {item["requirement"].lower(): item["state"] for item in fit["technical_compatibility"]["items"]}
+        self.assertEqual(states["python"], "Demonstrated")
+        self.assertEqual(states["react"], "Demonstrated")
+        self.assertEqual(states["kubernetes"], "Unverified")
+        self.assertEqual(fit["technical_compatibility"]["decision"], "Strong technical match")
+
+    def test_complete_swe_evidence_extracts_credential_benefits_and_arrangement(self):
+        rose = (
+            "What you need to succeed: Bachelor’s degree in Computer or Software Engineering, or a related field. "
+            "Perks & Benefits at Rose Rocket: A comprehensive benefits program and health care spending account. "
+            "Parental leave top-up. Stock option plan. A MacBook and a sweet tech equipment combo. 3 personal days. "
+            "Hybrid structure, where we're in office together on Monday, Tuesday, and Thursdays."
+        )
+        normalized = jobspy_source.normalize_jobspy_row({
+            "title": "Junior Software Engineer", "company": "Rose Rocket", "description": rose,
+            "remote_type": "Hybrid", "location": "Toronto", "job_url": "https://jobs.ashbyhq.com/Rose%20Rocket/example",
+        })
+        self.assertEqual(len(normalized["credentials"]), 1)
+        self.assertIn("Bachelor", normalized["credentials"][0]["value"])
+        self.assertGreaterEqual(len(normalized["benefits"]), 5)
+        self.assertEqual(normalized["remote_type"], "Hybrid")
+        self.assertIn("Provider arrangement: Hybrid", normalized["arrangement_evidence"])
+
+    def test_opportunity_score_compares_advertised_pay_and_distance(self):
+        base = {
+            "occupation_match_type": "exact", "title_match_score": 100,
+            "remote_type": "Hybrid", "remote_eligibility": "canadian_eligible",
+            "distance_type": "straight_line", "posted_date": date.today().isoformat(),
+            "salary_interval": "hourly", "salary_source": "structured",
+            "salary_currency": "CAD", "salary_advertised_min": 26,
+            "salary_advertised_max": 26, "salary_annual_min": 54080,
+            "salary_annual_max": 54080, "salary_annual_midpoint": 54080,
+            "job_description": "Health and dental benefits.",
+        }
+        higher_pay = app_module.build_job_opportunity_fit({**base, "distance_km": 3, "salary_advertised_min": 30, "salary_advertised_max": 30, "salary_annual_min": 62400, "salary_annual_max": 62400, "salary_annual_midpoint": 62400})
+        lower_pay = app_module.build_job_opportunity_fit({**base, "distance_km": 3})
+        farther = app_module.build_job_opportunity_fit({**base, "distance_km": 30})
+        self.assertGreater(higher_pay["opportunity_score"], lower_pay["opportunity_score"])
+        self.assertGreater(lower_pay["opportunity_score"], farther["opportunity_score"])
+        self.assertTrue(any("$30" in reason for reason in higher_pay["opportunity_score_reasons"]))
+
+    def test_opportunity_score_keeps_unspecified_benefits_neutral_and_rewards_freshness(self):
+        base = {
+            "occupation_match_type": "exact", "title_match_score": 100,
+            "remote_type": "Hybrid", "remote_eligibility": "canadian_eligible",
+            "distance_km": 3, "distance_type": "straight_line",
+            "salary_interval": "yearly", "salary_source": "structured",
+            "salary_currency": "CAD", "salary_annual_min": 70000,
+            "salary_annual_max": 70000, "salary_annual_midpoint": 70000,
+        }
+        recent_benefits = app_module.build_job_opportunity_fit({**base, "posted_date": date.today().isoformat(), "job_description": "Extended health and paid vacation."})
+        old_unspecified = app_module.build_job_opportunity_fit({**base, "posted_date": (date.today() - timedelta(days=60)).isoformat(), "job_description": "Build software products."})
+        self.assertGreater(recent_benefits["opportunity_score"], old_unspecified["opportunity_score"])
+        self.assertIn("neutral component", " ".join(old_unspecified["opportunity_score_reasons"]))
+
+    def test_opportunity_score_keeps_exact_title_stronger_than_pay_and_unpaid_is_not_missing_salary(self):
+        exact_rece = app_module.build_job_opportunity_fit({
+            "occupation_match_type": "exact", "title_match_score": 100,
+            "salary_interval": "hourly", "salary_source": "structured", "salary_currency": "CAD",
+            "salary_annual_midpoint": 54080, "salary_advertised_min": 26, "salary_advertised_max": 26,
+            "distance_km": 3, "distance_type": "straight_line", "posted_date": date.today().isoformat(),
+            "job_description": "Registered Early Childhood Educator. Unspecified salary.",
+        })
+        unrelated = app_module.build_job_opportunity_fit({
+            "occupation_match_type": "uncertain", "title_match_score": 0,
+            "salary_interval": "yearly", "salary_source": "structured", "salary_currency": "CAD",
+            "salary_annual_midpoint": 150000, "salary_advertised_min": 150000, "salary_advertised_max": 150000,
+            "distance_km": 3, "distance_type": "straight_line", "posted_date": date.today().isoformat(),
+            "job_description": "Enterprise Strategy role.",
+        })
+        missing_salary = app_module.build_job_opportunity_fit({
+            "occupation_match_type": "exact", "title_match_score": 100, "distance_km": 3,
+            "distance_type": "straight_line", "posted_date": date.today().isoformat(),
+            "job_description": "Registered Early Childhood Educator. No salary stated.",
+        })
+        unpaid = app_module.build_job_opportunity_fit({
+            "occupation_match_type": "exact", "title_match_score": 100, "distance_km": 3,
+            "distance_type": "straight_line", "posted_date": date.today().isoformat(),
+            "job_description": "This unpaid internship is for a Registered Early Childhood Educator.",
+        })
+        self.assertGreater(exact_rece["opportunity_score"], unrelated["opportunity_score"])
+        self.assertGreater(missing_salary["opportunity_score"], unpaid["opportunity_score"])
+        self.assertIn("explicitly unpaid", " ".join(unpaid["opportunity_score_reasons"]))
+
+    def test_packaged_exit_requires_local_token_and_invokes_shutdown_callback(self):
+        called = []
+        original = app_module.app.config.get("JOB_TRACKER_SHUTDOWN")
+        with patch.dict(os.environ, {"JOB_TRACKER_EXIT_TOKEN": "test-exit-token"}, clear=False):
+            app_module.app.config["JOB_TRACKER_SHUTDOWN"] = lambda: called.append(True)
+            denied = self.client.post("/api/app/exit", headers={"X-Job-Tracker-Exit-Token": "wrong"})
+            accepted = self.client.post("/api/app/exit", headers={"X-Job-Tracker-Exit-Token": "test-exit-token"})
+        app_module.app.config["JOB_TRACKER_SHUTDOWN"] = original
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(accepted.status_code, 200)
+        for _ in range(20):
+            if called:
+                break
+            time.sleep(0.01)
+        self.assertTrue(called)
+
+    def test_packaged_exit_waits_for_active_discovery(self):
+        original = app_module.app.config.get("JOB_TRACKER_SHUTDOWN")
+        with patch.dict(os.environ, {"JOB_TRACKER_EXIT_TOKEN": "test-exit-token"}, clear=False):
+            app_module.app.config["JOB_TRACKER_SHUTDOWN"] = lambda: None
+            with app_module._ACTIVE_DISCOVERY_SEARCHES_LOCK:
+                app_module._ACTIVE_DISCOVERY_SEARCHES.add("active-test")
+            try:
+                blocked = self.client.post("/api/app/exit", headers={"X-Job-Tracker-Exit-Token": "test-exit-token"})
+            finally:
+                with app_module._ACTIVE_DISCOVERY_SEARCHES_LOCK:
+                    app_module._ACTIVE_DISCOVERY_SEARCHES.discard("active-test")
+                app_module.app.config["JOB_TRACKER_SHUTDOWN"] = original
+        self.assertEqual(blocked.status_code, 409)
 
     def test_explore_mode_retains_adjacent_roles_without_global_non_target_cap(self):
         job = {"role_type": "analyst", "discovery_search_mode": "explore", "occupation_match_type": "adjacent_opportunity", "location_search_eligible": True, "remote_type": "Hybrid", "application_priority_score": 80}
@@ -4656,7 +5991,8 @@ class JobAssistantTest(unittest.TestCase):
         self.assertIn("Keywords Score", shortlist)
         self.assertNotIn("Overall Fit</strong>", shortlist)
         self.assertNotIn("miniBreakdown(job)", shortlist)
-        self.assertIn("Application Priority", discovery)
+        self.assertIn("Technical match", discovery)
+        self.assertIn("Title/seniority", discovery)
         self.assertNotIn("<strong>Job Priority</strong>", discovery)
         self.assertNotIn("Overall score", discovery)
 
@@ -6017,27 +7353,100 @@ class JobAssistantTest(unittest.TestCase):
         self.assertEqual(quick["total_cap"], 50)
         self.assertEqual(quick["request_per_source_cap"], 25)
         three = app_module.discovery_search_config({
-            "enabled_sources": ["linkedin", "indeed", "google"],
+            "enabled_sources": ["linkedin", "indeed", "zip_recruiter"],
             "per_source_cap": 100,
             "total_cap": 20,
         })
         self.assertEqual(three["request_per_source_cap"], 6)
         self.assertLessEqual(three["aggregate_request_budget"], 20)
         minimum = app_module.discovery_search_config({
-            "enabled_sources": ["linkedin", "indeed", "google"],
+            "enabled_sources": ["linkedin", "indeed", "zip_recruiter"],
             "per_source_cap": 100,
             "total_cap": 3,
         })
         self.assertEqual(minimum["request_per_source_cap"], 1)
         with self.assertRaisesRegex(ValueError, "at least 3"):
             app_module.discovery_search_config({
-                "enabled_sources": ["linkedin", "indeed", "google"],
+                "enabled_sources": ["linkedin", "indeed", "zip_recruiter"],
                 "total_cap": 2,
             })
 
+    def test_inbox_page_metadata_and_saved_internship_preference_are_authoritative(self):
+        self.client.get("/api/health")
+        # Keep this deliberately large pagination fixture isolated even when
+        # the application module has been used by an earlier test in the
+        # same process.
+        with app_module.app.app_context():
+            app_module.get_db().execute("DELETE FROM discovery_applicant_states")
+            app_module.get_db().execute("DELETE FROM jobs")
+            app_module.get_db().commit()
+        profile = self.client.post("/api/candidate-profiles", json={"name": "Pagination owner", "workflow": "software"}).get_json()
+        jobs = [
+            {
+                "company": "Paging Co", "title": f"Junior Software Developer {index}", "location": "Toronto, ON",
+                "url": f"https://example.test/pagination-{index}", "source": "Indeed", "source_job_id": f"pagination-{index}",
+                "discovery_result_category": "actionable", "discovery_result_reason": "Verified match",
+                "candidate_profile_id": profile["id"], "discovery_occupation": "software developer",
+            }
+            for index in range(123)
+        ]
+        with app_module.app.app_context():
+            app_module.persist_discovery_jobs(jobs, None, None)
+        first = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=new_actionable&include_history=1&page_size=25&page=0")
+        second = self.client.get(f"/api/discovery/inbox?candidate_profile_id={profile['id']}&category=new_actionable&include_history=1&page_size=25&page=1")
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.headers["X-Job-Tracker-Total"], "123")
+        self.assertEqual(first.headers["X-Job-Tracker-Page"], "0")
+        self.assertEqual(first.headers["X-Job-Tracker-Page-Size"], "25")
+        self.assertEqual(len(first.get_json()), 25)
+        self.assertEqual(len(second.get_json()), 25)
+        self.assertTrue({row["id"] for row in first.get_json()}.isdisjoint({row["id"] for row in second.get_json()}))
+
+        created = self.client.post("/api/discovery/searches", json={
+            "name": "Internship preference", "keywords": "software developer", "enabled_sources": ["indeed"], "include_internships": True,
+        })
+        self.assertEqual(created.status_code, 201, created.get_json())
+        saved = created.get_json()
+        self.assertTrue(saved["include_internships"])
+        updated = self.client.put(f"/api/discovery/searches/{saved['id']}", json={**saved, "include_internships": False})
+        self.assertEqual(updated.status_code, 200, updated.get_json())
+        self.assertFalse(updated.get_json()["include_internships"])
+        with app_module.app.app_context():
+            payload = app_module.saved_search_to_discovery_payload(updated.get_json())
+        self.assertFalse(payload["include_internships"])
+        with app_module.app.app_context():
+            app_module.get_db().execute("DELETE FROM saved_search_profiles WHERE name = ?", ["Internship preference"])
+            app_module.get_db().execute("DELETE FROM discovery_applicant_states")
+            app_module.get_db().execute("DELETE FROM jobs")
+            app_module.get_db().commit()
+
+    def test_normal_source_defaults_exclude_disabled_providers_but_allow_explicit_reactivation(self):
+        self.assertEqual(app_module.normalize_discovery_sources(None), ["indeed", "glassdoor", "employer_direct"])
+        self.assertEqual(app_module.normalize_discovery_sources([]), ["indeed", "glassdoor", "employer_direct"])
+        self.assertEqual(app_module.normalize_discovery_sources(["linkedin", "zip_recruiter"]), ["linkedin", "zip_recruiter"])
+
+    def test_discovery_search_config_separates_new_match_target_from_fetch_budget(self):
+        config = app_module.discovery_search_config({
+            "keywords": "software developer",
+            "new_matching_target": 25,
+            "enabled_sources": ["linkedin", "indeed", "zip_recruiter", "glassdoor"],
+        })
+        self.assertEqual(config["requested_target"], 25)
+        self.assertGreaterEqual(config["total_cap"], 100)
+        self.assertLessEqual(config["aggregate_request_budget"], config["total_cap"])
+        legacy = app_module.discovery_search_config({"shortlist_size": 7, "enabled_sources": ["linkedin"]})
+        self.assertEqual(legacy["requested_target"], 7)
+
+    def test_clear_senior_swe_roles_are_review_only_for_shortlist(self):
+        search = {"search_mode": "shortlist", "occupation": "software developer"}
+        senior = {"qualification_fit_seniority": {"detected_level": "senior"}}
+        early = {"qualification_fit_seniority": {"detected_level": "junior"}}
+        self.assertTrue(app_module.discovery_is_clear_senior_role(senior, search))
+        self.assertFalse(app_module.discovery_is_clear_senior_role(early, search))
+
     def test_manual_search_rejects_aggregate_limit_below_selected_source_count(self):
         response = self.client.post("/api/discovery/jobspy", json={
-            "keywords": "backend", "enabled_sources": ["linkedin", "indeed", "google"], "total_cap": 2,
+            "keywords": "backend", "enabled_sources": ["linkedin", "indeed", "zip_recruiter"], "total_cap": 2,
         })
         self.assertEqual(response.status_code, 400)
         self.assertIn("at least 3", response.get_json()["error"])
@@ -6049,7 +7458,7 @@ class JobAssistantTest(unittest.TestCase):
             "location": "Toronto",
             "remote_preference": "hybrid",
             "distance": 25,
-            "enabled_sources": ["linkedin", "indeed", "google"],
+            "enabled_sources": ["linkedin", "indeed", "zip_recruiter"],
             "date_window": "7d",
             "search_depth": "thorough",
             "per_source_cap": 100,
@@ -6072,12 +7481,12 @@ class JobAssistantTest(unittest.TestCase):
 
     def test_saved_search_create_and_edit_reject_invalid_aggregate_budget(self):
         invalid = self.client.post("/api/discovery/searches", json={
-            "name": "Invalid budget", "keywords": "backend", "enabled_sources": ["linkedin", "indeed", "google"], "total_cap": 2,
+            "name": "Invalid budget", "keywords": "backend", "enabled_sources": ["linkedin", "indeed", "zip_recruiter"], "total_cap": 2,
         })
         self.assertEqual(invalid.status_code, 400)
         self.assertIn("at least 3", invalid.get_json()["error"])
         valid = self.client.post("/api/discovery/searches", json={
-            "name": "Editable budget", "keywords": "backend", "enabled_sources": ["linkedin", "indeed", "google"], "total_cap": 3,
+            "name": "Editable budget", "keywords": "backend", "enabled_sources": ["linkedin", "indeed", "zip_recruiter"], "total_cap": 3,
         }).get_json()
         invalid_update = self.client.put(f"/api/discovery/searches/{valid['id']}", json={**valid, "total_cap": 2})
         self.assertEqual(invalid_update.status_code, 400)
@@ -6088,7 +7497,7 @@ class JobAssistantTest(unittest.TestCase):
 
     def test_saved_search_run_uses_persisted_fetch_limits_and_reports_snapshot_separately(self):
         search = self.client.post("/api/discovery/searches", json={
-            "name": "Limited saved run", "keywords": "backend", "enabled_sources": ["linkedin", "indeed", "google"],
+            "name": "Limited saved run", "keywords": "backend", "enabled_sources": ["linkedin", "indeed", "zip_recruiter"],
             "total_cap": 20, "per_source_cap": 100,
         }).get_json()
         fake = {"jobs": [], "errors": {}, "source_counts": {}, "source_diagnostics": {}, "source_snapshots": {}}
@@ -6107,7 +7516,7 @@ class JobAssistantTest(unittest.TestCase):
         with app_module.app.app_context():
             cursor = app_module.get_db().execute(
                 "INSERT INTO saved_search_profiles (name, keywords, enabled_sources_json, total_cap) VALUES (?, ?, ?, ?)",
-                ["Invalid legacy budget", "backend", '["linkedin", "indeed", "google"]', 2],
+                ["Invalid legacy budget", "backend", '["linkedin", "indeed", "zip_recruiter"]', 2],
             )
             app_module.get_db().commit()
             search_id = cursor.lastrowid
@@ -6119,7 +7528,7 @@ class JobAssistantTest(unittest.TestCase):
         from scripts.discovery_worker import run_due_searches
 
         search = self.client.post("/api/discovery/searches", json={
-            "name": "Worker invalid budget", "keywords": "backend", "enabled_sources": ["linkedin", "indeed", "google"], "total_cap": 3, "enabled": True,
+            "name": "Worker invalid budget", "keywords": "backend", "enabled_sources": ["linkedin", "indeed", "zip_recruiter"], "total_cap": 3, "enabled": True,
         }).get_json()
         with app_module.app.app_context():
             app_module.get_db().execute("UPDATE saved_search_profiles SET total_cap = 2, next_run_at = '' WHERE id = ?", [search["id"]])
@@ -6185,15 +7594,17 @@ class JobAssistantTest(unittest.TestCase):
     def test_discovery_views_keep_search_results_and_saved_searches_separate(self):
         template = Path(app_module.BASE_DIR, "templates", "index.html").read_text(encoding="utf-8")
         frontend = Path(app_module.BASE_DIR, "static", "app.js").read_text(encoding="utf-8")
-        self.assertIn('data-discovery-view="pipeline"', template)
-        self.assertIn('data-discovery-view="find"', template)
-        self.assertIn('data-discovery-view="saved"', template)
-        self.assertIn('class="panel discovery-results-panel discovery-view-find"', template)
-        self.assertIn('class="panel discovery-saved-searches discovery-view-saved"', template)
+        self.assertIn('data-workspace="discover"', template)
+        self.assertIn('data-workspace="inbox"', template)
+        self.assertIn('data-workspace="fastapply"', template)
+        self.assertIn('class="panel discovery-results-panel discovery-view-find workspace-discover-content"', template)
+        self.assertIn('class="panel discovery-saved-searches discovery-view-saved workspace-settings-content"', template)
+        self.assertNotIn('class="discovery-subnav"', template)
+        self.assertNotIn('id="discovery-enrich-workplaces"', template)
         self.assertIn("setDiscoverySection", frontend)
         self.assertIn('id="save-current-discovery-search"', template)
         self.assertIn("saveCurrentDiscoverySearch", frontend)
-        self.assertIn("Search snapshot:", frontend)
+        self.assertIn("setPrimaryWorkspace", frontend)
         self.assertIn("discovery-counts", frontend)
         self.assertIn("configured home location", frontend)
 

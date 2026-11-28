@@ -81,6 +81,10 @@ def run_due_searches() -> dict[str, int]:
             [now],
         )
         for row in rows:
+            if not app.ece_workflow_enabled() and app.payload_uses_ece_workflow(app.saved_search_to_discovery_payload(app.saved_search_to_dict(row))):
+                # Preserve the saved search and its history, but suspend ECE
+                # execution while the installation is in SWE-only mode.
+                continue
             search_id = int(row["id"])
             search_owner = f"scheduled:{owner}:{search_id}"
             if not app.acquire_discovery_search_lease(search_id, search_owner):

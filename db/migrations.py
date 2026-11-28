@@ -6,6 +6,7 @@ that data intact while making schema changes explicit and auditable.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Callable
 
@@ -179,6 +180,51 @@ def _migration_009_skill_confirmation_metadata(db: sqlite3.Connection) -> None:
             db.execute(f"ALTER TABLE keyword_memory ADD COLUMN {name} {definition}")
 
 
+def ensure_candidate_workflow_column(db: sqlite3.Connection) -> None:
+    """Add candidate metadata without advancing the established schema 14."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'candidate_profiles'").fetchone():
+        return
+    existing = {row[1] for row in db.execute("PRAGMA table_info(candidate_profiles)")}
+    if "workflow" not in existing:
+        db.execute("ALTER TABLE candidate_profiles ADD COLUMN workflow TEXT NOT NULL DEFAULT 'software'")
+    db.execute("UPDATE candidate_profiles SET workflow = 'software' WHERE workflow IS NULL OR workflow = ''")
+    commute_columns = {
+        "commute_origin_input": "TEXT NOT NULL DEFAULT ''",
+        "commute_origin_normalized": "TEXT NOT NULL DEFAULT ''",
+        "commute_origin_latitude": "TEXT NOT NULL DEFAULT ''",
+        "commute_origin_longitude": "TEXT NOT NULL DEFAULT ''",
+        "commute_origin_provider": "TEXT NOT NULL DEFAULT ''",
+        "commute_origin_confidence": "INTEGER NOT NULL DEFAULT 0",
+        "commute_origin_precision": "TEXT NOT NULL DEFAULT ''",
+        "commute_origin_geocoded_at": "TEXT NOT NULL DEFAULT ''",
+        "commute_origin_status": "TEXT NOT NULL DEFAULT 'missing'",
+        "commute_origin_error": "TEXT NOT NULL DEFAULT ''",
+    }
+    for name, definition in commute_columns.items():
+        if name not in existing:
+            db.execute(f"ALTER TABLE candidate_profiles ADD COLUMN {name} {definition}")
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS discovery_requalifications (
+            job_id INTEGER NOT NULL,
+            applicant_profile_id INTEGER NOT NULL DEFAULT 0,
+            requalified_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            reason TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY(job_id, applicant_profile_id),
+            FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+        )"""
+    )
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS workplace_enrichment_cache (
+            url TEXT PRIMARY KEY,
+            fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            status TEXT NOT NULL DEFAULT '',
+            content_type TEXT NOT NULL DEFAULT '',
+            body TEXT NOT NULL DEFAULT '',
+            error TEXT NOT NULL DEFAULT ''
+        )"""
+    )
+
+
 def _migration_010_tailoring_revision_history(db: sqlite3.Connection) -> None:
     existing = {row[1] for row in db.execute("PRAGMA table_info(tailoring_drafts)")}
     if "revision_history_json" not in existing:
@@ -231,6 +277,86 @@ def _migration_011_versioned_tailoring_drafts(db: sqlite3.Connection) -> None:
         """
     )
 
+
+def _migration_012_discovery_status_semantics(db: sqlite3.Connection) -> None:
+    """Separate automatic discovery from explicit user saves without losing history."""
+    columns = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
+    if "discovery_first_seen_at" not in columns or "status" not in columns:
+        return
+    db.execute(
+        """UPDATE jobs
+           SET status = 'Discovered', updated_at = CURRENT_TIMESTAMP
+         WHERE discovery_first_seen_at <> ''
+           AND status = 'Saved'
+           AND discovery_state NOT IN ('saved', 'applied')"""
+    )
+
+
+def _migration_013_workplace_evidence(db: sqlite3.Connection) -> None:
+    """Store explicit workplace and provider-conflict evidence for re-enrichment."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'jobs'").fetchone():
+        # Profile-only migration tests and newly created stores create the jobs
+        # table later during application initialization.
+        return
+    columns = {
+        "workplace_address": "TEXT NOT NULL DEFAULT ''",
+        "workplace_postal_code": "TEXT NOT NULL DEFAULT ''",
+        "workplace_evidence": "TEXT NOT NULL DEFAULT ''",
+        "workplace_evidence_source": "TEXT NOT NULL DEFAULT ''",
+        "workplace_precision": "TEXT NOT NULL DEFAULT ''",
+        "workplace_confidence": "INTEGER NOT NULL DEFAULT 0",
+        "remote_classification_conflict": "TEXT NOT NULL DEFAULT ''",
+        "provider_raw_json": "TEXT NOT NULL DEFAULT '{}'",
+    }
+    existing = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
+    for name, definition in columns.items():
+        if name not in existing:
+            db.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
+
+
+def _migration_014_structured_posting_evidence(db: sqlite3.Connection) -> None:
+    """Preserve multi-site workplaces and explicit posting evidence."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'jobs'").fetchone():
+        return
+    columns = {
+        "workplace_alternatives_json": "TEXT NOT NULL DEFAULT '[]'",
+        "credentials_json": "TEXT NOT NULL DEFAULT '[]'",
+        "benefits_json": "TEXT NOT NULL DEFAULT '[]'",
+        "arrangement_evidence": "TEXT NOT NULL DEFAULT ''",
+    }
+    existing = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
+    for name, definition in columns.items():
+        if name not in existing:
+            db.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
+    existing = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
+    legacy_fields = {
+        "workplace_address", "workplace_postal_code", "workplace_evidence",
+        "workplace_evidence_source", "workplace_precision", "workplace_confidence",
+    }
+    if legacy_fields <= existing:
+        rows = db.execute(
+            """SELECT id, workplace_address, workplace_postal_code, workplace_evidence,
+                      workplace_evidence_source, workplace_precision, workplace_confidence,
+                      workplace_alternatives_json
+                 FROM jobs"""
+        ).fetchall()
+        for row in rows:
+            if str(row[7] or "").strip() not in {"", "[]"} or not str(row[1] or "").strip():
+                continue
+            alternative = {
+                "address": str(row[1] or "").strip(),
+                "postal_code": str(row[2] or "").strip(),
+                "precision": str(row[5] or "street address").strip(),
+                "confidence": int(row[6] or 0),
+                "evidence": str(row[3] or row[1] or "").strip(),
+                "evidence_source": str(row[4] or "legacy single workplace").strip(),
+                "assignment_status": "confirmed",
+            }
+            db.execute(
+                "UPDATE jobs SET workplace_alternatives_json = ? WHERE id = ?",
+                [json.dumps([alternative], ensure_ascii=False), int(row[0])],
+            )
+
 MIGRATIONS: tuple[tuple[int, str, Migration], ...] = (
     (1, "legacy baseline", _migration_001_baseline),
     (2, "candidate document profiles", _migration_002_candidate_documents),
@@ -243,6 +369,9 @@ MIGRATIONS: tuple[tuple[int, str, Migration], ...] = (
     (9, "skill confirmation metadata", _migration_009_skill_confirmation_metadata),
     (10, "tailoring revision history", _migration_010_tailoring_revision_history),
     (11, "versioned tailoring drafts", _migration_011_versioned_tailoring_drafts),
+    (12, "discovery status semantics", _migration_012_discovery_status_semantics),
+    (13, "workplace evidence", _migration_013_workplace_evidence),
+    (14, "structured posting evidence", _migration_014_structured_posting_evidence),
 )
 
 
@@ -271,5 +400,10 @@ def run_migrations(db: sqlite3.Connection) -> int:
             migration(db)
         db.execute("INSERT INTO schema_migrations(version, name) VALUES (?, ?)", (version, name))
         db.execute(f"PRAGMA user_version = {version}")
+    db.commit()
+    # This metadata addition intentionally does not advance the deployed
+    # schema-14 version, so standalone profile stores receive the same safe
+    # compatibility column as the full application.
+    ensure_candidate_workflow_column(db)
     db.commit()
     return int(db.execute("PRAGMA user_version").fetchone()[0])

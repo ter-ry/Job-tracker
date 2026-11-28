@@ -1,0 +1,3 @@
+# Optional semantic matching backend. The core Windows build uses the
+# deterministic keyword fallback unless this dependency is installed.
+sentence-transformers==5.5.1

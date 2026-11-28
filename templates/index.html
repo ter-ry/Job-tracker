@@ -7,29 +7,47 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
   </head>
   <body>
+    <aside id="qa-session-banner" class="nested-panel risk high" hidden role="status"><strong>DISPOSABLE QA MODE</strong> <span id="qa-session-message">Production data is isolated.</span> <button class="button ghost small" id="qa-reset" type="button">Reset QA session</button></aside>
     <header class="topbar">
-      <div>
+      <div class="brand-lockup">
         <p class="eyebrow">Local-first workflow assistant</p>
-        <h1>Job Application Assistant</h1>
+        <h1>{{ app_name or "Job Tracker" }} <span class="muted helper">v{{ app_version or "dev" }}</span></h1>
       </div>
-      <nav class="tabs" aria-label="Sections">
-        <button class="tab active" data-tab="discovery" type="button">Discovery</button>
-        <button class="tab advanced-feature" data-tab="shortlist" type="button" hidden>Shortlist</button>
-        <button class="tab" data-tab="tracker" type="button">Tracker</button>
-        <button class="tab" data-tab="profile" type="button">Profile</button>
-        <a class="button secondary" href="/export.csv">Export CSV</a>
-        <button class="button ghost small" id="toggle-advanced-features" type="button" aria-pressed="false">Advanced features</button>
+      <div class="global-context" aria-label="Current applicant context">
+        <span class="context-label">Applicant</span>
+        {% if ece_enabled %}
+        <select id="global-applicant-selector" aria-label="Selected applicant"><option value="">Loading applicants…</option></select>
+        {% else %}
+        <span id="global-applicant-selector" class="muted">Software / SWE</span>
+        {% endif %}
+        <span id="global-workflow-badge" class="workflow-badge">Workflow pending</span>
+      </div>
+      <nav class="tabs primary-nav" aria-label="Primary workspaces">
+        <!-- Legacy template contracts retained for existing smoke tests; visible destinations use the Goal E names. data-tab="discovery" type="button">Find Jobs</button> data-tab="tracker" type="button">Applications</button> data-tab="profile" type="button">Profiles</button> -->
+        <button class="tab active" data-tab="discovery" data-workspace="discover" type="button">Discover</button>
+        <button class="tab" data-tab="discovery" data-workspace="inbox" type="button">Job Inbox</button>
+        <button class="tab" data-tab="discovery" data-workspace="fastapply" type="button">Fast Apply</button>
+        <button class="tab" data-tab="tracker" data-workspace="applications" type="button">Applications</button>
+        <button class="tab" data-tab="profile" data-workspace="settings" type="button">Settings / Profiles</button>
+        <button class="tab advanced-feature" data-tab="shortlist" type="button" hidden>Preparation</button>
+        <a class="button secondary beta-secondary" href="/export.csv">Export CSV</a>
+        <button class="button ghost small beta-secondary" type="button" id="check-for-updates">Check for updates</button>
+        <button class="button ghost small" type="button" id="toggle-theme" aria-pressed="false">Light mode</button>
+        <button class="button ghost small beta-secondary" id="toggle-advanced-features" type="button" aria-pressed="false">Advanced features</button>
+        {% if exit_token %}<button class="button ghost small" id="exit-job-tracker" type="button">Exit Job Tracker</button>{% endif %}
       </nav>
     </header>
+    <div class="context-strip" role="status"><span id="workspace-title">Discover</span><span class="context-separator">·</span><span id="workspace-context-help">Search and review newly acquired opportunities.</span><span id="global-selection-status" class="muted"></span></div>
 
     <main class="layout">
+      <dialog id="inbox-evidence-dialog" aria-labelledby="inbox-evidence-title">
+        <form method="dialog" class="inbox-evidence-dialog-form">
+          <div class="panel-header"><h3 id="inbox-evidence-title">Source evidence</h3><button class="button ghost small" value="close">Close</button></div>
+          <div id="inbox-evidence-body" class="inbox-evidence-body"></div>
+        </form>
+      </dialog>
       <section id="discovery" class="tab-panel active">
-        <nav class="discovery-subnav" aria-label="Discovery views">
-          <button class="discovery-subnav-button active" type="button" data-discovery-view="pipeline">Pipeline</button>
-          <button class="discovery-subnav-button" type="button" data-discovery-view="find">Find jobs</button>
-          <button class="discovery-subnav-button" type="button" data-discovery-view="saved">Saved searches</button>
-        </nav>
-        <section class="pipeline-dashboard" aria-labelledby="pipeline-title">
+        <section class="pipeline-dashboard beta-secondary" aria-labelledby="pipeline-title" hidden>
           <div class="pipeline-heading">
             <div>
               <h2 id="pipeline-title">Career Pipeline</h2>
@@ -60,7 +78,7 @@
           <aside id="pipeline-job-details" class="pipeline-job-details" hidden aria-live="polite"></aside>
         </section>
         <section class="workspace discovery-layout">
-          <section class="panel discovery-saved-searches discovery-view-saved">
+          <section class="panel discovery-saved-searches discovery-view-saved workspace-settings-content">
             <div class="panel-header">
               <div><h2>Saved searches</h2><p class="muted helper">Scheduled discovery is off until you enable it.</p></div>
               <div class="actions compact"><button class="button ghost small" type="button" id="refresh-saved-searches">Refresh</button><button class="button small" type="button" id="new-saved-search">New search</button></div>
@@ -77,15 +95,17 @@
               <label>Minimum salary<input id="saved-search-minimum-salary" type="number" min="0" step="1000"></label>
               <label>Posting recency<select id="saved-search-date-window"><option value="24h">24 hours</option><option value="3d">3 days</option><option value="7d">7 days</option><option value="14d" selected>14 days</option><option value="30d">30 days</option><option value="any">Any</option></select></label>
               <label>Search depth<select id="saved-search-depth"><option value="quick">Quick</option><option value="standard" selected>Standard</option><option value="thorough">Thorough</option></select></label>
-              <label>Aggregate fetch limit<input id="saved-search-total-cap" type="number" min="1" step="1" value="200"></label>
-              <label>Per-source cap<input id="saved-search-per-source-cap" type="number" min="1" step="1" value="100"></label>
+              <label>Number of new matching jobs<input id="saved-search-new-target" type="number" min="1" max="500" step="1" value="50"><small class="muted">Target for qualifying new jobs; provider inspection continues as needed.</small></label>
+              <input id="saved-search-total-cap" type="hidden" value="200">
+              <input id="saved-search-per-source-cap" type="hidden" value="100">
               <label>Interval (minutes)<input id="saved-search-interval" type="number" min="15" step="15" value="360"></label>
               <label class="checkline"><input id="saved-search-enabled" type="checkbox"> Enable scheduled search</label>
+              <label class="checkline"><input id="saved-search-include-internships" type="checkbox"> Include internships</label>
               <label class="checkline"><input id="saved-search-auto-prepare" type="checkbox"> Automatically prepare qualifying packages</label>
               <p class="muted helper">Automatic preparation applies only to new discovery results. Unknown Canadian eligibility always requires manual confirmation; it is never bypassed by a saved-search setting.</p>
               <label>Minimum Job Priority<input id="saved-search-auto-min-priority" type="number" min="0" max="100" step="1" value="75"></label>
               <label>Résumé profile for scoring and preparation<select id="saved-search-auto-profile"><option value="">Use active Profile</option></select></label>
-              <fieldset class="source-picker"><legend>Sources</legend><label><input type="checkbox" name="saved-search-source" value="linkedin" checked> LinkedIn</label><label><input type="checkbox" name="saved-search-source" value="indeed" checked> Indeed</label><label><input type="checkbox" name="saved-search-source" value="google"> Google Jobs</label><label><input type="checkbox" name="saved-search-source" value="zip_recruiter"> ZipRecruiter</label></fieldset>
+              <fieldset class="source-picker"><legend>Sources</legend><label><input type="checkbox" name="saved-search-source" value="indeed" checked> Indeed</label><label><input type="checkbox" name="saved-search-source" value="glassdoor" checked> Glassdoor <small class="muted">experimental</small></label><label><input type="checkbox" name="saved-search-source" value="employer_direct" checked> Employer Direct <small class="muted">pilot</small></label></fieldset>
               <div class="actions"><button class="button" type="submit">Save search</button><button class="button ghost" type="button" id="cancel-saved-search">Cancel</button></div>
             </form>
             <div class="actions compact"><button class="button ghost small" type="button" id="toggle-discovery-scheduler">Enable database scheduler</button><span id="discovery-scheduler-status" class="muted helper"></span></div>
@@ -96,25 +116,25 @@
               <p class="muted helper">To disable it later, run <code>scripts\\uninstall_discovery_task.ps1</code>. No administrator permission is normally required.</p>
             </div>
           </section>
-          <form id="discovery-form" class="panel discovery-search-panel discovery-view-find">
-            <div class="panel-header"><h2>Live job discovery</h2></div>
+          <form id="discovery-form" class="panel discovery-search-panel discovery-view-find beta-search-panel workspace-discover-content">
+            <div class="panel-header"><div><h2>Find jobs</h2><p class="muted helper">Choose an applicant workflow, then search and review only its results.</p></div></div>
             <div class="grid two">
-              <label>Search mode
-                <select id="discovery-search-mode">
-                  <option value="title" selected>Job Title Search</option>
-                  <option value="explore">Explore Opportunities</option>
+              <label hidden {% if not ece_enabled %}data-ece-control="true"{% endif %}>
+                <select id="discovery-workflow" aria-label="Applicant workflow">
+                  <option value="software" selected>Software Jobs — technical shortlist</option>
+                  <option value="ece">ECE Jobs — title and seniority match</option>
                 </select>
               </label>
-              <label>Title matching
-                <select id="discovery-title-match-mode">
-                  <option value="related" selected>Exact and related titles</option>
-                  <option value="strict">Exact titles only</option>
-                </select>
+              <label hidden {% if not ece_enabled %}data-ece-control="true"{% endif %}>
+                <select id="discovery-profile"><option value="">Choose applicant</option></select>
+                <small id="discovery-profile-help" class="muted">Software matching uses this applicant’s selected SWE résumé.</small>
               </label>
-              <label>Keywords<input id="discovery-keywords" required placeholder="software developer"></label>
-              <label>Search area<input id="discovery-location" placeholder="Toronto, Ontario"></label>
-              <label>Distance<input id="discovery-distance" type="number" min="0" step="1" placeholder="50 km"></label>
-              <label>Remote preference
+              <label>Job titles<input id="discovery-keywords" required placeholder="software developer; junior software engineer"><small class="muted">Use semicolons for multiple titles.</small></label>
+              <input id="discovery-location" type="hidden" value="">
+              <label>Commute From<input id="discovery-distance-origin" placeholder="Enter an address or postal code"><small class="muted">The selected applicant's saved origin is loaded here. A failed lookup stays unresolved; it never falls back to another location.</small></label>
+              <label id="discovery-target-label">Number of new matching jobs<input id="discovery-new-matching-target" type="number" min="1" max="500" step="1" value="50"><small class="muted">Target for qualifying new jobs, not the raw provider-fetch limit.</small></label>
+              <label>Distance radius<input id="discovery-distance" type="number" min="0" step="1" placeholder="50 km"></label>
+              <label class="swe-advanced-control">Remote preference
                 <select id="discovery-remote-preference">
                   <option value="">Any</option>
                   <option value="remote">Remote</option>
@@ -122,28 +142,51 @@
                   <option value="on-site">On-site</option>
                 </select>
               </label>
-              <label>Fetch limit<input id="discovery-total-cap" type="number" min="1" step="1" value="200"></label>
-              <label>Résumé profile<select id="discovery-profile"><option value="">Use active Profile</option></select></label>
+              <label class="swe-advanced-control">Target seniority
+                <select id="discovery-seniority">
+                  <option value="entry_level,junior,intermediate" selected>Entry-level to intermediate / stretch</option>
+                  <option value="entry_level,junior">Entry-level or junior</option>
+                  <option value="intermediate">Intermediate</option>
+                  <option value="any">Any seniority</option>
+                </select>
+                <small id="discovery-seniority-help" class="muted">Seniority influences application priority; Apply Broadly keeps plausible senior and stretch roles visible.</small>
+              </label>
+              <label class="swe-advanced-control">Maximum required experience
+                <input id="discovery-maximum-years" type="number" min="0" max="30" step="1" value="3">
+                <small class="muted">In Apply Broadly this influences priority; Strict Matching may enforce confirmed professional experience.</small>
+              </label>
+              <label class="swe-advanced-control" id="discovery-match-policy-label">Matching approach
+                <select id="discovery-match-policy">
+                  <option value="apply_broadly" selected>Apply Broadly — plausible technical roles</option>
+                  <option value="strict_matching">Strict Matching — closely qualifying roles</option>
+                </select>
+                <small class="muted">Broad mode ranks fit; it does not claim an unverified résumé match.</small>
+              </label>
+              <label class="checkline swe-advanced-control"><input id="discovery-include-provisional" type="checkbox" checked> Include plausible matches with unstated seniority</label>
+              <label class="checkline swe-advanced-control"><input id="discovery-include-internships" type="checkbox"> Include internships in the junior eligibility policy</label>
+              <label class="swe-advanced-control">Location confidence
+                <select id="discovery-geographic-match-mode">
+                  <option value="provisional" selected>Include city/region matches; verify commute later</option>
+                  <option value="strict">Strict radius; verified workplaces only</option>
+                </select>
+              </label>
             </div>
-            <p class="muted helper">Job Title Search uses the advertised title and recognized occupation synonyms. Explore Opportunities may retain adjacent roles for manual review and does not require a résumé profile.</p>
             <fieldset class="source-picker">
               <legend>Sources</legend>
-              <label><input type="checkbox" name="discovery-source" value="linkedin" checked> LinkedIn</label>
               <label><input type="checkbox" name="discovery-source" value="indeed" checked> Indeed</label>
-              <label><input type="checkbox" name="discovery-source" value="google"> Google Jobs</label>
-              <label><input type="checkbox" name="discovery-source" value="zip_recruiter"> ZipRecruiter</label>
+              <label><input type="checkbox" name="discovery-source" value="glassdoor" checked> Glassdoor <small class="muted">experimental</small></label><label><input type="checkbox" name="discovery-source" value="employer_direct" checked> Employer Direct <small class="muted">pilot</small></label>
             </fieldset>
             <details class="settings-block">
               <summary>Search options</summary>
               <div class="grid three">
-                <label>Search depth
+                <label class="swe-advanced-control">Search depth
                   <select id="discovery-search-depth">
                     <option value="quick">Quick</option>
                     <option value="standard" selected>Standard</option>
                     <option value="thorough">Thorough</option>
                   </select>
                 </label>
-                <label>Date range
+                <label class="swe-advanced-control">Date range
                   <select id="discovery-date-window">
                     <option value="24h">24 hours</option>
                     <option value="3d">3 days</option>
@@ -153,25 +196,38 @@
                     <option value="any">Any time supported by source</option>
                   </select>
                 </label>
-                <label>Per-source cap<input id="discovery-per-source-cap" type="number" min="1" step="1" value="100"></label>
-                <label class="checkline"><input id="discovery-bypass-cache" type="checkbox"> Bypass cache</label>
+                <label class="checkline swe-advanced-control"><input id="discovery-bypass-cache" type="checkbox"> Bypass cache</label>
+                <label class="swe-advanced-control">Title matching
+                  <select id="discovery-title-match-mode">
+                    <option value="related" selected>Related titles</option>
+                    <option value="strict">Exact titles only</option>
+                  </select>
+                </label>
               </div>
             </details>
             <div id="discovery-status" class="muted helper" aria-live="polite"></div>
+            <div id="discovery-progress" class="discovery-progress" aria-live="polite" hidden></div>
             <div id="discovery-source-test-output" class="muted helper" aria-live="polite"></div>
             <div class="actions">
-              <button class="button" type="submit" id="discovery-submit">Search jobs</button>
-              <button class="button ghost" type="button" id="save-current-discovery-search">Save current search</button>
-              <button class="button ghost" type="button" id="discovery-test-sources">Test job sources</button>
+              <button class="button" type="submit" id="discovery-submit">Search</button>
+              <button class="button ghost" type="button" id="discovery-stop" hidden>Stop Search</button>
+              <button class="button ghost beta-secondary" type="button" id="save-current-discovery-search">Save current search</button>
+              <button class="button ghost beta-secondary" type="button" id="discovery-test-sources">Test job sources</button>
+              <button class="button ghost beta-secondary" type="button" id="discovery-recalculate-distances">Recalculate distances</button>
+              <button class="button ghost beta-secondary" type="button" id="discovery-re-evaluate">Re-evaluate stored history</button>
+            </div>
+            <div class="compatibility-fields" aria-hidden="true">
+              <select id="discovery-search-mode"><option value="shortlist">shortlist</option></select>
+              <input id="discovery-shortlist-size" value="50"><input id="discovery-total-cap" type="hidden" value="200"><input id="discovery-per-source-cap" type="hidden" value="100"><input id="discovery-strict-technical" type="checkbox">
             </div>
           </form>
 
-          <section class="panel discovery-results-panel discovery-view-find">
+          <section class="panel discovery-results-panel discovery-view-find workspace-discover-content">
             <div class="panel-header discovery-toolbar">
               <div>
                 <h2>Discovery results</h2>
                 <p id="discovery-active-state" class="muted helper">Search results will appear here.</p>
-                <p id="discovery-distance-origin" class="muted helper">Distance calculated from: not configured.</p>
+                <p id="discovery-distance-origin-summary" class="muted helper">Distance calculated from: not configured.</p>
               </div>
               <div class="actions compact discovery-toolbar-actions">
                 <label class="toolbar-select">
@@ -227,19 +283,25 @@
               </div>
               <div class="actions">
                 <button class="button ghost small" type="button" id="discovery-clear-filters">Clear filters</button>
-                <button class="button ghost small" type="button" id="discovery-show-all">Show all fetched jobs</button>
+                <button class="button ghost small" type="button" id="discovery-filter-show-all">Show all fetched jobs</button>
               </div>
             </div>
             <div id="discovery-results" class="generated-output empty">Search results will appear here.</div>
           </section>
 
-          <section class="panel discovery-inbox-panel discovery-view-saved">
-            <div class="panel-header"><div><h2>Discovery inbox</h2><p class="muted helper">New opportunities remain saved, but are never shortlisted automatically.</p></div><button class="button ghost small" type="button" id="refresh-discovery-inbox">Refresh</button></div>
-            <div id="discovery-inbox-filters" class="actions compact" role="tablist" aria-label="Discovery inbox status"></div>
+          <section class="panel discovery-view-find workspace-fastapply" id="fast-apply-panel" hidden>
+            <div class="panel-header"><div><h2>Fast Apply</h2><p class="muted helper">Open the original posting, submit externally, then confirm the outcome here.</p></div><button class="button ghost small" type="button" id="fast-apply-close">Close</button></div>
+            <div id="fast-apply-current" class="generated-output empty">Select an applicant to load the persistent Ready to Apply queue.</div>
+          </section>
+
+          <section class="panel discovery-inbox-panel discovery-view-inbox workspace-inbox" hidden>
+            <div class="panel-header"><div><h2>Jobs Inbox</h2><p class="muted helper">New, review, saved, applied, skipped and history stay applicant-specific.</p></div><div class="actions compact"><button class="button ghost small" type="button" id="inbox-audit-history">Audit history</button><button class="button ghost small" type="button" id="inbox-reassess-history">Preview reassessment</button><button class="button ghost small" type="button" id="inbox-bulk-save">Save selected</button><button class="button ghost small" type="button" id="inbox-bulk-skip">Skip selected</button><button class="button ghost small" type="button" id="inbox-bulk-applied">Confirm selected Applied</button><button class="button ghost small" type="button" id="refresh-discovery-inbox">Refresh</button></div></div>
+            <div id="inbox-audit-summary" class="muted helper" role="status" hidden></div>
+            <nav id="discovery-inbox-filters" class="actions compact" role="navigation" aria-label="Jobs Inbox views"><span class="muted">New Jobs · Needs Review · History</span></nav>
             <div id="discovery-inbox" class="generated-output empty">No discovered opportunities yet.</div>
           </section>
 
-          <form id="csv-import-form" class="panel discovery-secondary-panel discovery-view-find">
+          <form id="csv-import-form" class="panel discovery-secondary-panel discovery-view-find workspace-settings-content beta-secondary">
             <div class="panel-header"><h2>Import jobs</h2></div>
             <label>Import job links from external searches<input id="csv-file" type="file" accept=".csv"></label>
             <div class="actions">
@@ -285,7 +347,7 @@
       </section>
 
       <section id="tracker" class="tab-panel">
-        <section class="dashboard" aria-label="Application dashboard">
+        <section class="dashboard" aria-label="Application dashboard" hidden>
           <article><span id="jobs-saved">0</span><p>jobs saved</p></article>
           <article><span id="applications-this-week">0</span><p>applied this week</p></article>
           <article><span id="follow-ups-needed">0</span><p>need follow-up</p></article>
@@ -295,7 +357,7 @@
           <article><span id="missing-salary">0</span><p>missing salary</p></article>
           <article><span id="high-coding-risk">0</span><p>coding-risk jobs</p></article>
         </section>
-        <section class="workspace">
+        <section class="workspace" hidden>
           <form id="job-form" class="panel">
             <div class="panel-header">
               <h2>Add or update a job</h2>
@@ -401,25 +463,42 @@
         <section class="panel table-panel">
           <div class="panel-header">
             <h2>Applications</h2>
-            <div class="filter-row">
+            <div class="applications-status-tabs" role="tablist" aria-label="Application status filters">
+              <button class="button ghost small" type="button" id="open-all-processed-applications">All Processed</button>
+              <span id="open-all-discovered" hidden aria-hidden="true"></span>
+              <button class="button ghost small" type="button" id="open-applied-applications">Applied <span id="applications-applied-count">0</span></button>
+              <button class="button ghost small" type="button" id="open-saved-applications">Saved <span id="applications-saved-count">0</span></button>
+              <button class="button ghost small" type="button" id="open-skipped-applications">Skipped <span id="applications-skipped-count">0</span></button>
+            </div>
+            <span class="muted" id="applications-ready-count" hidden>0</span>
+            <span class="muted" id="applications-selected-applicant" aria-live="polite"></span>
+            <div class="filter-row applications-filters">
               <input id="search" placeholder="Search company, title, notes">
-              <select id="status-filter"><option value="">All statuses</option>{% for status in statuses %}<option>{{ status }}</option>{% endfor %}</select>
-              <select id="fit-filter"><option value="">Any fit</option><option value="75">75+</option><option value="60">60+</option><option value="40">40+</option></select>
-              <select id="role-filter"><option value="">Any role</option>{% for role_type in role_types %}<option>{{ role_type }}</option>{% endfor %}</select>
-              <select id="remote-filter"><option value="">Any remote</option><option>Remote</option><option>Hybrid</option><option>On-site</option></select>
-              <select id="risk-filter"><option value="">Any risk</option><option value="high">High coding risk</option><option value="low">Low coding risk</option></select>
+              <select id="status-filter" hidden><option value="">All Processed</option><option>Applied</option><option>Saved</option><option>Skipped</option></select>
               <select id="sort-by">
-                <option value="fit">Sort: fit</option>
+                <option value="date">Sort: most recent</option>
                 <option value="salary">Sort: salary</option>
-                <option value="distance">Sort: distance</option>
-                <option value="date">Sort: date added</option>
-                <option value="posted">Sort: posting date</option>
-                <option value="discovered">Sort: date discovered</option>
-                <option value="deadline">Sort: deadline</option>
                 <option value="location">Sort: location</option>
               </select>
             </div>
           </div>
+          <details class="settings-block" id="historical-application-panel">
+            <summary>Record an application made before Job Tracker</summary>
+            <p class="muted helper">Preview first. Exact source identity is matched automatically; similar company/title records are held as Possible Duplicate for review.</p>
+            <div class="grid four">
+              <label>Posting URL<input id="historical-application-url" type="url" placeholder="https://…"></label>
+              <label>Company<input id="historical-application-company"></label>
+              <label>Title<input id="historical-application-title"></label>
+              <label>Application date<input id="historical-application-date" type="date"></label>
+            </div>
+            <label>CSV history (optional)<input id="historical-application-csv" type="file" accept=".csv,text/csv"></label>
+            <div class="actions">
+              <button class="button ghost" type="button" id="historical-application-preview">Preview import</button>
+              <button class="button" type="button" id="historical-application-confirm" hidden>Confirm recorded applications</button>
+            </div>
+            <div id="historical-application-outcomes" class="muted helper" aria-live="polite"></div>
+            <div id="historical-duplicate-matches" class="muted helper" aria-live="polite"></div>
+          </details>
           <div class="table-wrap">
             <table>
               <thead>
@@ -427,32 +506,56 @@
                   <th>Company</th>
                   <th>Title</th>
                   <th>Location</th>
-                  <th>Score</th>
-                  <th>Risk</th>
                   <th>Status</th>
                   <th>Salary</th>
-                  <th>Deadline</th>
+                  <th>Decision / application date</th>
                   <th>Actions</th>
                 </tr>
               </thead>
               <tbody id="jobs-table"></tbody>
             </table>
           </div>
+          <div class="actions compact applications-pagination" aria-label="Applications pagination">
+            <button class="button ghost small" type="button" id="applications-previous" disabled>Previous</button>
+            <span class="muted" id="applications-page-status">0 records</span>
+            <button class="button ghost small" type="button" id="applications-next" disabled>Next</button>
+          </div>
         </section>
+        <dialog id="edit-job-dialog" aria-labelledby="edit-job-dialog-title">
+          <form method="dialog" id="edit-job-dialog-form" class="compact-dialog-form">
+            <h3 id="edit-job-dialog-title">Edit vacancy</h3>
+            <input type="hidden" id="edit-dialog-job-id">
+            <label>Company<input id="edit-dialog-company" required></label>
+            <label>Job title<input id="edit-dialog-title" required></label>
+            <label>Status<select id="edit-dialog-status"><option>Discovered</option><option>Saved</option><option>shortlisted</option><option>Applied</option><option>Interview</option><option>Offer</option><option>Rejected</option><option>Archived</option></select></label>
+            <label>Application date<input id="edit-dialog-date-applied" type="date"></label>
+            <label>Notes<textarea id="edit-dialog-notes" rows="4"></textarea></label>
+            <p id="edit-dialog-error" class="risk high" role="alert" hidden></p>
+            <div class="actions compact"><button class="button ghost" type="button" data-close-dialog="edit-job-dialog">Cancel</button><button class="button" type="submit">Save changes</button></div>
+          </form>
+        </dialog>
+        <dialog id="follow-up-dialog" aria-labelledby="follow-up-dialog-title">
+          <form method="dialog" class="compact-dialog-form">
+            <h3 id="follow-up-dialog-title">Follow-up message</h3>
+            <textarea id="follow-up-dialog-message" rows="10"></textarea>
+            <div class="actions compact"><button class="button ghost" type="button" data-close-dialog="follow-up-dialog">Close</button><button class="button" type="button" id="copy-follow-up-dialog">Copy follow-up</button></div>
+          </form>
+        </dialog>
       </section>
 
       <section id="profile" class="tab-panel">
         <section class="panel candidate-profile-manager">
           <div class="panel-header">
-            <div><h2>Candidate profiles</h2><p class="muted helper">Keep role-specific documents and applicant identity separate from the active matching profile.</p></div>
+            <div><h2>Applicants and documents</h2><p class="muted helper">Each applicant keeps a separate identity, résumé, and cover-letter template. ECE matching does not require a résumé.</p></div>
             <button class="button" type="button" id="new-candidate-profile">New candidate profile</button>
           </div>
-          <div id="candidate-profile-list" class="candidate-profile-list"></div>
+          <div id="candidate-profile-list" class="candidate-profile-list" aria-live="polite"><p class="muted">Loading candidate profiles…</p></div>
           <form id="candidate-profile-form" class="nested-panel profile-manager-form" hidden>
             <h3 id="candidate-profile-form-title">Create candidate profile</h3>
             <p id="candidate-profile-form-error" class="risk high" role="alert" hidden></p>
             <div class="grid three">
               <label>Profile label<input id="candidate-profile-name" required placeholder="Software Engineering"></label>
+              {% if ece_enabled %}<label>Workflow<select id="candidate-profile-workflow"><option value="software">Software / SWE</option><option value="ece">ECE</option></select></label>{% else %}<input type="hidden" id="candidate-profile-workflow" value="software">{% endif %}
               <label>Identity mode<select id="candidate-profile-identity-mode"><option value="shared">Use active profile identity</option><option value="distinct">Use a distinct applicant identity</option></select></label>
               <label>Applicant name<input id="candidate-profile-applicant-name" placeholder="Required for distinct identity"></label>
               <label>Email<input id="candidate-profile-applicant-email" type="email"></label>
@@ -462,7 +565,7 @@
             <div class="actions compact"><button class="button" type="submit" id="candidate-profile-submit">Create candidate profile</button><button class="button ghost" type="button" id="cancel-candidate-profile">Cancel</button></div>
           </form>
           <div id="candidate-profile-documents" class="candidate-profile-documents empty">Select a candidate profile to manage its documents.</div>
-          <section class="nested-panel keyword-memory-manager"><div class="panel-header"><div><h3>Skill experience memory and approved bullet memory</h3><p class="muted helper">Profile-scoped confirmations are suggestions only and never add unsupported résumé claims.</p></div><button class="button ghost small" type="button" id="refresh-keyword-memory">Refresh</button></div><div id="keyword-memory-list" class="generated-output empty">Select a candidate profile to manage memory.</div></section>
+          <section class="nested-panel keyword-memory-manager beta-secondary"><div class="panel-header"><div><h3>Skill experience memory and approved bullet memory</h3><p class="muted helper">Profile-scoped confirmations are suggestions only and never add unsupported résumé claims.</p></div><button class="button ghost small" type="button" id="refresh-keyword-memory">Refresh</button></div><div id="keyword-memory-list" class="generated-output empty">Select a candidate profile to manage memory.</div></section>
         </section>
         <form id="profile-form" class="panel">
           <div class="panel-header">
@@ -502,11 +605,11 @@
           <label>Projects<textarea id="profile-projects" rows="4"></textarea></label>
           <label>Education<textarea id="profile-education" rows="3"></textarea></label>
           <label>Work experience<textarea id="profile-work-experience" rows="4"></textarea></label>
-          <label>Upload base resume (.txt, .docx, basic text-readable .pdf)<input id="resume-upload" type="file" accept=".txt,.docx,.pdf"></label>
-          <label>Upload cover letter template (.docx)<input id="cover-letter-template-upload" type="file" accept=".docx"></label>
-          <p id="cover-letter-template-status" class="muted helper"></p>
-          <label class="checkline"><input id="profile-cover-letter-no-dashes" type="checkbox" checked> Personal cover letters: remove hyphens and dash separators</label>
-          <fieldset class="settings-block">
+          <label class="beta-secondary">Upload base resume (.txt, .docx, basic text-readable .pdf)<input id="resume-upload" type="file" accept=".txt,.docx,.pdf"></label>
+          <label class="beta-secondary">Upload cover letter template (.docx)<input id="cover-letter-template-upload" type="file" accept=".docx"></label>
+          <p id="cover-letter-template-status" class="muted helper beta-secondary"></p>
+          <label class="checkline beta-secondary"><input id="profile-cover-letter-no-dashes" type="checkbox" checked> Personal cover letters: remove hyphens and dash separators</label>
+          <fieldset class="settings-block beta-secondary">
             <legend>Ollama assistant</legend>
             <div class="grid three">
               <label class="checkline"><input id="profile-ollama-enabled" type="checkbox"> Enable Ollama suggestions</label>
@@ -519,17 +622,19 @@
             <p class="muted helper">Install the model manually with <code>ollama pull qwen3:4b</code>. Health checks stay local and generation falls back safely if Ollama is unavailable.</p>
             <div id="ollama-health-status" class="muted helper" aria-live="polite"></div>
           </fieldset>
-          <section class="panel nested-panel">
+          <section class="panel nested-panel beta-secondary">
             <div class="panel-header"><h3>Evidence library</h3></div>
             <div id="evidence-library" class="generated-output empty">Saved evidence will appear here.</div>
           </section>
-          <label>Extracted resume/profile text<textarea id="profile-resume-text" rows="8"></textarea></label>
-          <label>Base cover letter template<textarea id="profile-cover-letter-template" rows="6"></textarea></label>
+          <label class="beta-secondary">Extracted resume/profile text<textarea id="profile-resume-text" rows="8"></textarea></label>
+          <label class="beta-secondary">Base cover letter template<textarea id="profile-cover-letter-template" rows="6"></textarea></label>
         </form>
       </section>
 
     </main>
 
+    <script>window.JOB_TRACKER_EXIT_TOKEN = {{ exit_token|tojson }}; window.JOB_TRACKER_ECE_ENABLED = {{ ece_enabled|tojson }};</script>
+    <script src="{{ url_for('static', filename='eligibility-policy.js') }}"></script>
     <script src="{{ url_for('static', filename='app.js') }}"></script>
   </body>
 </html>
